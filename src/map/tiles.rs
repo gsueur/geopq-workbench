@@ -85,8 +85,16 @@ pub const TILE_SOURCES: &[TileSource] = &[
 enum TileState {
     Pending,
     Ready,
-    Failed,
+    /// Fetch failed; retried with exponential backoff (transient network
+    /// errors must not blank tiles for the whole session).
+    Failed {
+        at: std::time::Instant,
+        attempts: u32,
+    },
 }
+
+/// Max retry attempts per tile; backoff = 2^attempts seconds.
+const TILE_RETRY_MAX: u32 = 4;
 
 struct CacheEntry {
     state: TileState,
@@ -155,7 +163,16 @@ impl TileCache {
                     self.pending_uploads.push(TileUpload { key: res.key, rgba });
                     TileState::Ready
                 }
-                None => TileState::Failed,
+                None => {
+                    let attempts = match self.entries.get(&res.key).map(|e| &e.state) {
+                        Some(TileState::Failed { attempts, .. }) => attempts + 1,
+                        _ => 1,
+                    };
+                    TileState::Failed {
+                        at: std::time::Instant::now(),
+                        attempts,
+                    }
+                }
             };
             if let Some(e) = self.entries.get_mut(&res.key) {
                 e.state = state;
@@ -236,7 +253,15 @@ impl TileCache {
                             world_rect: id.world_rect(),
                         }),
                         TileState::Pending => fallback.push(*id),
-                        TileState::Failed => {}
+                        TileState::Failed { at, attempts } => {
+                            let backoff =
+                                std::time::Duration::from_secs(1u64 << attempts.min(6));
+                            if attempts < TILE_RETRY_MAX && at.elapsed() >= backoff {
+                                e.state = TileState::Pending;
+                                let _ = self.req_tx.send(key);
+                            }
+                            fallback.push(*id);
+                        }
                     }
                 }
                 None => {

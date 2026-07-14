@@ -164,15 +164,27 @@ pub mod aws {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    fn aws_dir() -> PathBuf {
+    fn dirs_home() -> Option<PathBuf> {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+    }
+
+    /// `~/.aws/credentials`, or `AWS_SHARED_CREDENTIALS_FILE`.
+    fn credentials_file() -> PathBuf {
         std::env::var_os("AWS_SHARED_CREDENTIALS_FILE")
-            .map(|f| PathBuf::from(f).parent().map(Path::to_path_buf).unwrap_or_default())
-            .or_else(|| dirs_home().map(|h| h.join(".aws")))
+            .map(PathBuf::from)
+            .or_else(|| dirs_home().map(|h| h.join(".aws").join("credentials")))
             .unwrap_or_default()
     }
 
-    fn dirs_home() -> Option<PathBuf> {
-        std::env::var_os("HOME").map(PathBuf::from)
+    /// `~/.aws/config`, or `AWS_CONFIG_FILE` (independent of the
+    /// credentials file — the two need not share a directory).
+    fn config_file() -> PathBuf {
+        std::env::var_os("AWS_CONFIG_FILE")
+            .map(PathBuf::from)
+            .or_else(|| dirs_home().map(|h| h.join(".aws").join("config")))
+            .unwrap_or_default()
     }
 
     /// Minimal INI parser: `[section]` + `key = value` lines.
@@ -201,10 +213,9 @@ pub mod aws {
 
     /// Profile names available in `~/.aws/{credentials,config}` (for the UI).
     pub fn profiles() -> Vec<String> {
-        let dir = aws_dir();
-        let mut names: Vec<String> = ini(&dir.join("credentials"))
+        let mut names: Vec<String> = ini(&credentials_file())
             .into_keys()
-            .chain(ini(&dir.join("config")).into_keys())
+            .chain(ini(&config_file()).into_keys())
             .filter(|n| !n.is_empty())
             .collect();
         names.sort();
@@ -222,9 +233,8 @@ pub mod aws {
     /// profile when none is selected). None = anonymous.
     fn credentials(profile: Option<&str>) -> Option<Creds> {
         let from_files = |name: &str| -> Option<Creds> {
-            let dir = aws_dir();
-            let mut merged = ini(&dir.join("config"));
-            for (sec, kv) in ini(&dir.join("credentials")) {
+            let mut merged = ini(&config_file());
+            for (sec, kv) in ini(&credentials_file()) {
                 merged.entry(sec).or_default().extend(kv);
             }
             let s = merged.get(name)?;
@@ -255,10 +265,9 @@ pub mod aws {
     /// probe (`x-amz-bucket-region` is present even on 403/301 answers),
     /// then us-east-1.
     fn region(profile: Option<&str>, bucket: &str, custom_endpoint: bool) -> String {
-        let dir = aws_dir();
         let files_region = |name: &str| -> Option<String> {
-            let config = ini(&dir.join("config"));
-            let creds = ini(&dir.join("credentials"));
+            let config = ini(&config_file());
+            let creds = ini(&credentials_file());
             config
                 .get(name)
                 .and_then(|s| s.get("region").cloned())
@@ -335,9 +344,8 @@ pub mod aws {
                 .map(str::to_string)
                 .or_else(|| std::env::var("AWS_PROFILE").ok())
                 .unwrap_or_else(|| "default".into());
-            let dir = aws_dir();
-            let config = ini(&dir.join("config"));
-            let creds_file = ini(&dir.join("credentials"));
+            let config = ini(&config_file());
+            let creds_file = ini(&credentials_file());
                 config
                     .get(&name)
                     .and_then(|s| s.get("endpoint_url").cloned())
@@ -598,7 +606,7 @@ impl Length for SourceReader {
 /// one request per connection, and counts body bytes served.
 #[cfg(test)]
 pub(crate) mod testserver {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -666,13 +674,14 @@ pub(crate) mod testserver {
                         conn,
                         "HTTP/1.1 {status}\r\nContent-Length: {n}\r\n{extra}Accept-Ranges: bytes\r\nConnection: close\r\n\r\n"
                     );
-                    use std::os::unix::fs::FileExt;
-                    let f = std::fs::File::open(&file).unwrap();
+                    use std::io::{Read as _, Seek, SeekFrom};
+                    let mut f = std::fs::File::open(&file).unwrap();
+                    f.seek(SeekFrom::Start(start)).unwrap();
                     let mut pos = start;
                     let mut chunk = vec![0u8; 256 * 1024];
                     while pos <= end {
                         let take = ((end - pos + 1) as usize).min(chunk.len());
-                        let read = f.read_at(&mut chunk[..take], pos).unwrap();
+                        let read = f.read(&mut chunk[..take]).unwrap();
                         if read == 0 || conn.write_all(&chunk[..read]).is_err() {
                             return;
                         }

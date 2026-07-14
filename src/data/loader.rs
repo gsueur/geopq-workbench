@@ -1228,10 +1228,6 @@ pub fn open_store_for_test(path: &std::path::PathBuf) -> Result<StoreOpen, Strin
     open_store(&Source::Local(path.clone()))
 }
 
-#[cfg(test)]
-pub fn open_store_for_test_source(source: &Source) -> Result<StoreOpen, String> {
-    open_store(source)
-}
 
 /// All groups of a store, unselected.
 #[cfg(test)]

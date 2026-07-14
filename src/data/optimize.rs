@@ -889,7 +889,7 @@ mod tests {
         )
         .unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(2048)
+            .set_max_row_group_row_count(Some(2048))
             .set_column_bloom_filter_enabled(ColumnPath::new(vec!["name".into()]), true)
             .build();
         let mut w =
@@ -1336,7 +1336,7 @@ mod tests {
         let dir = std::env::temp_dir().join("geopq_ga_speed");
         std::fs::create_dir_all(&dir).unwrap();
         let display = crate::data::crs::DisplayCrs::hobo_dyer();
-        let mut bench = |label: &str, fixture: &str| {
+        let bench = |label: &str, fixture: &str| {
             let src = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/"))
                 .join(fixture);
             if !src.exists() {
@@ -1358,7 +1358,7 @@ mod tests {
                 ..base
             };
             optimize(&Source::Local(src.clone()), &ga, &opts, None, &|_, _| {}).unwrap();
-            let mut time = |path: &std::path::PathBuf| {
+            let time = |path: &std::path::PathBuf| {
                 let (store, crs, _i, _r) =
                     crate::data::loader::open_store_for_test(path).unwrap();
                 let t = std::time::Instant::now();

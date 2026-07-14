@@ -79,7 +79,14 @@ impl Crs {
             return Ok(Self::wgs84());
         };
         if v.is_null() {
-            return Ok(Self::wgs84());
+            // Per spec an explicit null means the CRS is undefined/unknown —
+            // NOT the CRS84 default. We still have to place the data
+            // somewhere, so render as if CRS84, but say so honestly
+            // everywhere the CRS name is shown.
+            let mut crs = Self::wgs84();
+            crs.name = "undefined CRS (rendered as CRS84)".into();
+            crs.epsg = None;
+            return Ok(crs);
         }
         let name = v
             .get("name")
