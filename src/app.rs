@@ -612,10 +612,10 @@ impl ViewerApp {
                         ui.label(RichText::new(&l.name).strong())
                             .on_hover_text(l.store.source.label());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("▼").on_hover_text("move down").clicked() {
+                            if ui.small_button("⏷").on_hover_text("move down").clicked() {
                                 reorder = Some((l.id, -1));
                             }
-                            if ui.small_button("▲").on_hover_text("move up").clicked() {
+                            if ui.small_button("⏶").on_hover_text("move up").clicked() {
                                 reorder = Some((l.id, 1));
                             }
                         });
