@@ -91,6 +91,8 @@ pub struct LayerStyle {
     /// Draw the row-group bounding boxes overlay.
     pub show_rg_bboxes: bool,
     pub color: Color32,
+    /// Border / line color; None = derived from `color` (darkened).
+    pub line_color: Option<Color32>,
     pub line_width_px: f32,
     pub point_radius_px: f32,
     pub fill_opacity: f32,
@@ -103,6 +105,7 @@ impl LayerStyle {
             visible: true,
             show_rg_bboxes: false,
             color,
+            line_color: None,
             line_width_px: 1.2,
             point_radius_px: 3.0,
             fill_opacity: 0.35,

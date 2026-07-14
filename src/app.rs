@@ -39,6 +39,9 @@ struct OptimizeState {
     layer_name: String,
     src: Source,
     epsg: Option<u32>,
+    /// Layer CRS, for viewport-rect conversion at export time.
+    crs: Crs,
+    viewport_only: bool,
     opts: crate::data::optimize::OptimizeOptions,
     running: bool,
     progress: (f32, String),
@@ -76,6 +79,9 @@ pub struct ViewerApp {
     opt_rx: Receiver<OptMsg>,
     optimize: Option<OptimizeState>,
     loading: HashMap<u64, LoadingJob>,
+    /// Styles to apply when a context-restored layer finishes loading
+    /// (keyed by job id); also suppresses fit-on-first-load.
+    pending_styles: HashMap<u64, crate::data::layer::LayerStyle>,
     next_job: u64,
     next_layer_id: u64,
     palette_idx: usize,
@@ -141,6 +147,7 @@ impl ViewerApp {
             opt_rx,
             optimize: None,
             loading: HashMap::new(),
+            pending_styles: HashMap::new(),
             next_job: 0,
             next_layer_id: 0,
             palette_idx: 0,
@@ -164,7 +171,7 @@ impl ViewerApp {
         app
     }
 
-    fn enqueue_load(&mut self, source: Source, ctx: &egui::Context) {
+    fn enqueue_load(&mut self, source: Source, ctx: &egui::Context) -> u64 {
         let job = self.next_job;
         self.next_job += 1;
         let layer_id = self.next_layer_id;
@@ -191,6 +198,7 @@ impl ViewerApp {
             color,
             self.last_view_world,
         );
+        job
     }
 
     fn poll_loader(&mut self) {
@@ -211,8 +219,16 @@ impl ViewerApp {
                             layer.name, layer.stats.bad_geoms
                         ));
                     }
-                    self.layers.push(*layer);
-                    if first {
+                    let mut layer = *layer;
+                    let restored = match self.pending_styles.remove(&job) {
+                        Some(style) => {
+                            layer.style = style;
+                            true
+                        }
+                        None => false,
+                    };
+                    self.layers.push(layer);
+                    if first && !restored {
                         self.pending_fit = true;
                     }
                 }
@@ -418,6 +434,12 @@ impl ViewerApp {
                     }
                 }
             }
+            if ui.button("💾 Save ctx…").on_hover_text("Save layers, styles, camera and projection to a JSON context file").clicked() {
+                self.save_context();
+            }
+            if ui.button("📥 Load ctx…").on_hover_text("Restore a saved context (replaces current layers)").clicked() {
+                self.load_context(&ctx);
+            }
             if ui.button("🌐 URL…").clicked() && self.url_input.is_none() {
                 self.url_input = Some((
                     String::new(),
@@ -544,6 +566,7 @@ impl ViewerApp {
         }
 
         let mut remove: Option<u64> = None;
+        let mut reorder: Option<(u64, i32)> = None;
         let mut fit_to: Option<[f64; 4]> = None;
         let mut info_open: Option<u64> = None;
         let mut load_all: Option<u64> = None;
@@ -558,11 +581,44 @@ impl ViewerApp {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut l.style.visible, "");
                         let mut c = l.style.color;
-                        if ui.color_edit_button_srgba(&mut c).changed() {
+                        if ui
+                            .color_edit_button_srgba(&mut c)
+                            .on_hover_text("fill / point color")
+                            .changed()
+                        {
                             l.style.color = c;
+                        }
+                        if !matches!(l.kind(), crate::data::geometry::GeomKind::Point) {
+                            let mut lc = l
+                                .style
+                                .line_color
+                                .unwrap_or_else(|| derived_line_color(l.style.color));
+                            if ui
+                                .color_edit_button_srgba(&mut lc)
+                                .on_hover_text("border / line color")
+                                .changed()
+                            {
+                                l.style.line_color = Some(lc);
+                            }
+                            if l.style.line_color.is_some()
+                                && ui
+                                    .small_button("↺")
+                                    .on_hover_text("reset border color to auto")
+                                    .clicked()
+                            {
+                                l.style.line_color = None;
+                            }
                         }
                         ui.label(RichText::new(&l.name).strong())
                             .on_hover_text(l.store.source.label());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("▼").on_hover_text("move down").clicked() {
+                                reorder = Some((l.id, -1));
+                            }
+                            if ui.small_button("▲").on_hover_text("move up").clicked() {
+                                reorder = Some((l.id, 1));
+                            }
+                        });
                     });
                     ui.horizontal(|ui| {
                         ui.label(
@@ -694,6 +750,15 @@ impl ViewerApp {
             }
         });
 
+        if let Some((id, dir)) = reorder {
+            // Vec order is draw order (bottom→top); ▲ raises the layer.
+            if let Some(i) = self.layers.iter().position(|l| l.id == id) {
+                let j = i as i64 + dir as i64;
+                if j >= 0 && (j as usize) < self.layers.len() {
+                    self.layers.swap(i, j as usize);
+                }
+            }
+        }
         if let Some(id) = remove {
             self.layers.retain(|l| l.id != id);
             self.rebuilding.remove(&id);
@@ -715,6 +780,8 @@ impl ViewerApp {
                         layer_name: l.name.clone(),
                         src: l.store.source.clone(),
                         epsg: l.crs.epsg,
+                        crs: l.crs.clone(),
+                        viewport_only: false,
                         opts: Default::default(),
                         running: false,
                         progress: (0.0, String::new()),
@@ -761,6 +828,88 @@ impl ViewerApp {
                     }
                 }
             }
+        }
+    }
+
+    fn save_context(&mut self) {
+        use crate::context::{Context, LayerCtx, SourceCtx, StyleCtx, CONTEXT_VERSION};
+        let ctx = Context {
+            version: CONTEXT_VERSION,
+            camera_center: self.camera.center,
+            camera_zoom: self.camera.zoom,
+            projection: crate::context::projection_token(&self.display),
+            basemap: self.basemap,
+            show_graticule: self.show_graticule,
+            show_coastline: self.show_coastline,
+            layers: self
+                .layers
+                .iter()
+                .map(|l| LayerCtx {
+                    source: SourceCtx::of(&l.store.source),
+                    style: StyleCtx::of(&l.style),
+                })
+                .collect(),
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name("session.geopq.json")
+            .add_filter("geopq context", &["json"])
+            .save_file()
+        else {
+            return;
+        };
+        match serde_json::to_string_pretty(&ctx)
+            .map_err(|e| e.to_string())
+            .and_then(|json| std::fs::write(&path, json).map_err(|e| e.to_string()))
+        {
+            Ok(()) => log::info!("context saved to {}", path.display()),
+            Err(e) => self.push_error(format!("context save failed: {e}")),
+        }
+    }
+
+    fn load_context(&mut self, ctx: &egui::Context) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("geopq context", &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+        let parsed: Result<crate::context::Context, String> = std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()));
+        let saved = match parsed {
+            Ok(c) => c,
+            Err(e) => {
+                self.push_error(format!("context load failed: {e}"));
+                return;
+            }
+        };
+
+        // Replace the current session: projection first (so loads build in
+        // the right space), then camera, then layers with their styles.
+        match crate::context::projection_from_token(&saved.projection) {
+            Ok(d) => {
+                self.layers.clear();
+                self.rebuilding.clear();
+                self.appending.clear();
+                self.select(None);
+                self.set_display(d, ctx);
+            }
+            Err(e) => {
+                self.push_error(format!("context load failed: {e}"));
+                return;
+            }
+        }
+        self.camera.center = saved.camera_center;
+        self.camera.zoom = saved.camera_zoom;
+        self.pending_fit = false;
+        self.basemap = saved.basemap;
+        self.show_graticule = saved.show_graticule;
+        self.show_coastline = saved.show_coastline;
+        // Loads prune against the restored viewport once the map panel has
+        // recomputed it; seed with the whole world until then.
+        for layer in saved.layers {
+            let job = self.enqueue_load(layer.source.into_source(), ctx);
+            self.pending_styles.insert(job, layer.style.into_style());
         }
     }
 
@@ -865,11 +1014,23 @@ impl ViewerApp {
     }
 
     fn start_optimize(&mut self, dst: PathBuf, ctx: &egui::Context) {
+        let (view, display) = (self.last_view_world, self.display.clone());
         let Some(o) = &mut self.optimize else { return };
         o.running = true;
         o.error = None;
         o.report = None;
         o.progress = (0.0, "starting".into());
+        o.opts.filter_rect = if o.viewport_only {
+            let rect = loader::viewport_to_data_bbox(view, &display, &o.crs);
+            if rect.is_none() {
+                o.running = false;
+                o.error = Some("cannot map the viewport into the layer's CRS".into());
+                return;
+            }
+            rect
+        } else {
+            None
+        };
         let (src, opts, epsg) = (o.src.clone(), o.opts.clone(), o.epsg);
         let tx = self.opt_tx.clone();
         let ctx = ctx.clone();
@@ -1031,6 +1192,10 @@ impl ViewerApp {
                         .on_hover_text("Reorder features along a Hilbert curve over bbox centers");
                     ui.checkbox(&mut o.opts.covering, "bbox covering column")
                         .on_hover_text("Per-feature bbox struct column (GeoParquet 1.1 covering)");
+                    ui.checkbox(&mut o.viewport_only, "viewport only")
+                        .on_hover_text(
+                            "Export only features intersecting the current map viewport",
+                        );
                 });
 
                 ui.add_space(6.0);
@@ -1711,12 +1876,19 @@ pub(crate) fn build_rg_overlay(
     (Arc::new(mb.finish()), anchors)
 }
 
+/// Default border/line color: a darkened shade of the layer color.
+fn derived_line_color(color: egui::Color32) -> egui::Color32 {
+    let c = egui::Rgba::from(color);
+    egui::Rgba::from_rgba_premultiplied(c.r() * 0.55, c.g() * 0.55, c.b() * 0.55, 1.0).into()
+}
+
 fn resolve_style(s: &crate::data::layer::LayerStyle) -> DrawStyle {
     let rgba = egui::Rgba::from(s.color);
     let (r, g, b) = (rgba.r(), rgba.g(), rgba.b());
+    let lc = egui::Rgba::from(s.line_color.unwrap_or_else(|| derived_line_color(s.color)));
     DrawStyle {
         fill_color: [r, g, b, s.fill_opacity * s.opacity],
-        line_color: [r * 0.55, g * 0.55, b * 0.55, s.opacity],
+        line_color: [lc.r(), lc.g(), lc.b(), lc.a() * s.opacity],
         point_color: [r, g, b, s.opacity],
         line_half_width_px: (s.line_width_px * 0.5).max(0.01),
         point_radius_px: s.point_radius_px.max(0.1),

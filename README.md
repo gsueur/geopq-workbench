@@ -104,6 +104,8 @@ Fixture-dependent tests self-skip when the files are absent.
     the type), with native geospatial statistics written per row group — no
     covering column needed, smaller file.
   Geometry transcodes in any direction (WKB ↔ GeoArrow ↔ native type).
+  A "viewport only" option exports just the features intersecting the
+  current map viewport (bbox-based, metadata bbox shrinks accordingly).
   The covering bbox leaves are written in small (~4k-row) pages with
   dictionary encoding off, so the parquet page index (ColumnIndex/
   OffsetIndex) prunes well below row-group granularity in any reader.
@@ -132,7 +134,13 @@ Fixture-dependent tests self-skip when the files are absent.
   selection via `FeatureStore`), nothing is cached in RAM. Picking uses an
   R-tree over line/polygon bboxes, chunk-local scans for points, and an exact
   geometry test in the data CRS.
-- **Styling**: per-layer color, opacity, fill opacity, line width, point radius.
+- **Styling**: per-layer fill/point color, separate border/line color (auto-derived
+  dark shade by default, ↺ resets), opacity, fill opacity, line width, point
+  radius; layers reorder with ▲▼ (list order = draw order).
+- **Session context**: "Save ctx…" writes layers (sources incl. remote URLs and
+  s3 URIs + profile/endpoint — never presigned URLs), styles, order, camera,
+  projection and toggles to a JSON file; "Load ctx…" restores it, re-resolving
+  credentials and re-pruning against the restored viewport.
 - **Status bar**: cursor in WGS84 + display CRS, zoom, frame time, feature counts.
 
 ## Architecture

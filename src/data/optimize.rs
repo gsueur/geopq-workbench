@@ -126,6 +126,8 @@ pub struct OptimizeOptions {
     /// readers; redundant but allowed alongside 2.0 native stats).
     pub covering: bool,
     pub bloom: BloomMode,
+    /// Export only features whose bbox intersects this rect (data CRS).
+    pub filter_rect: Option<[f64; 4]>,
 }
 
 impl Default for OptimizeOptions {
@@ -137,6 +139,7 @@ impl Default for OptimizeOptions {
             hilbert_sort: true,
             covering: true,
             bloom: BloomMode::Preserve,
+            filter_rect: None,
         }
     }
 }
@@ -307,9 +310,26 @@ pub fn optimize(
         super::loader::bbox_overlap_metric(&boxes)
     };
 
-    // --- sort order ---
+    // --- selection + sort order ---
     progress(0.52, "sorting (Hilbert)");
     let mut order: Vec<u32> = (0..rows as u32).collect();
+    if let Some(rect) = opts.filter_rect {
+        order.retain(|&i| {
+            row_bboxes[i as usize].is_some_and(|b| {
+                b[0] <= rect[2] && b[2] >= rect[0] && b[1] <= rect[3] && b[3] >= rect[1]
+            })
+        });
+        if order.is_empty() {
+            return Err("no features intersect the current viewport".into());
+        }
+    }
+    let written_rows = order.len();
+    // Metadata bbox reflects what is actually exported.
+    let file_bbox = if opts.filter_rect.is_some() {
+        union_bboxes(order.iter().filter_map(|&i| row_bboxes[i as usize].as_ref()))
+    } else {
+        file_bbox
+    };
     if opts.hilbert_sort {
         let fb = file_bbox.unwrap_or([0.0, 0.0, 1.0, 1.0]);
         let sx = (fb[2] - fb[0]).max(f64::MIN_POSITIVE);
@@ -537,7 +557,7 @@ pub fn optimize(
             .map_err(|e| format!("batch assembly failed: {e}"))?;
         writer.write(&out).map_err(|e| format!("write failed: {e}"))?;
         written += chunk.len();
-        progress(0.55 + 0.45 * (written as f32 / rows as f32), "writing");
+        progress(0.55 + 0.45 * (written as f32 / written_rows as f32), "writing");
     }
     let closed = writer.close().map_err(|e| format!("finalize failed: {e}"))?;
 
@@ -560,7 +580,7 @@ pub fn optimize(
     };
 
     Ok(OptimizeReport {
-        rows: rows as u64,
+        rows: written_rows as u64,
         size_before: src.size(),
         size_after: std::fs::metadata(dst).map(|m| m.len()).unwrap_or(0),
         rg_before,
@@ -819,7 +839,6 @@ fn hilbert_xy2d(order: u32, mut x: u32, mut y: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::loader::parse_wkb_point_2d;
     use arrow::array::{BinaryArray, Int64Array, StringArray};
     use parquet::file::properties::WriterProperties;
 
@@ -1038,6 +1057,49 @@ mod tests {
             crate::data::loader::open_store_for_test(&dst11).unwrap();
         assert_eq!(crs11.epsg, Some(2154));
         assert!(info11.geo.version_label.contains("1.1"), "{}", info11.geo.version_label);
+    }
+
+    /// Viewport-only export: only features intersecting the rect survive,
+    /// rows stay consistent, and the metadata bbox shrinks to the export.
+    #[test]
+    fn viewport_only_export() {
+        let dir = std::env::temp_dir().join("geopq_optimize_vp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = write_scrambled(40_000, &dir);
+        let dst = dir.join("out_vp.parquet");
+        // Grid spans 0..10 in both axes; keep the lower-left quadrant.
+        let rect = [0.0, 0.0, 4.999, 4.999];
+        let opts = OptimizeOptions {
+            row_group_size: 2048,
+            filter_rect: Some(rect),
+            ..Default::default()
+        };
+        let report = optimize(&Source::Local(src.clone()), &dst, &opts, None, &|_, _| {}).unwrap();
+        let quarter = 40_000 / 4;
+        assert!(
+            (report.rows as i64 - quarter as i64).unsigned_abs() < 500,
+            "≈ one quadrant: {}",
+            report.rows
+        );
+        let (store, _crs, info, _rg) = crate::data::loader::open_store_for_test(&dst).unwrap();
+        assert_eq!(store.total_rows(), report.rows);
+        let b = info.geo.bbox.expect("metadata bbox");
+        assert!(b[2] <= 5.1 && b[3] <= 5.1, "bbox shrank to the export: {b:?}");
+        assert_rows_consistent(&dst);
+
+        // Empty viewport errors instead of writing a rowless file.
+        let err = optimize(
+            &Source::Local(src),
+            &dir.join("out_empty.parquet"),
+            &OptimizeOptions {
+                filter_rect: Some([1000.0, 1000.0, 1001.0, 1001.0]),
+                ..Default::default()
+            },
+            None,
+            &|_, _| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("viewport"), "{err}");
     }
 
     /// GeoArrow points: WKB → coordinate arrays, loader reads them, and the
