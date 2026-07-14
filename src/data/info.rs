@@ -20,7 +20,7 @@ pub struct ColumnInfo {
 
 #[derive(Clone, Debug, Default)]
 pub struct GeoParquetInfo {
-    /// e.g. "GeoParquet 1.1.0", "GeoParquet 2.0 (native GEOMETRY type)",
+    /// e.g. "GeoParquet 1.1.0", "GeoParquet 2.0.0 + native GEOMETRY logical type",
     /// "none (guessed WKB column)".
     pub version_label: String,
     pub primary_column: String,
@@ -80,7 +80,7 @@ pub fn summarize_geo_meta(
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
             info.version_label = if has_native_geometry_type {
-                format!("GeoParquet {version} + native GEOMETRY type (2.0)")
+                format!("GeoParquet {version} + native GEOMETRY logical type (2.0)")
             } else {
                 format!("GeoParquet {version}")
             };
@@ -95,6 +95,13 @@ pub fn summarize_geo_meta(
                     .and_then(Value::as_str)
                     .unwrap_or("WKB")
                     .to_string();
+                // The Parquet GEOMETRY logical type is an annotation on a
+                // binary column whose values are always WKB — spell that
+                // out so "native type" + "WKB" don't read as contradictory.
+                if has_native_geometry_type && info.encoding == "WKB" {
+                    info.encoding =
+                        "WKB (the GEOMETRY logical type stores WKB bytes)".into();
+                }
                 if let Some(types) = col.get("geometry_types").and_then(Value::as_array) {
                     info.geometry_types = types
                         .iter()
@@ -121,12 +128,16 @@ pub fn summarize_geo_meta(
         }
         None => {
             info.version_label = if has_native_geometry_type {
-                "GeoParquet 2.0 (native GEOMETRY type, no geo metadata)".into()
+                "GeoParquet 2.0 (native GEOMETRY logical type, no geo metadata)".into()
             } else {
                 "none (guessed WKB column, CRS assumed OGC:CRS84)".into()
             };
             info.primary_column = primary_fallback.to_string();
-            info.encoding = "WKB (assumed)".into();
+            info.encoding = if has_native_geometry_type {
+                "WKB (the GEOMETRY logical type stores WKB bytes)".into()
+            } else {
+                "WKB (assumed)".into()
+            };
         }
     }
     info
