@@ -17,11 +17,15 @@ cargo run --release [file.parquet ...]
 
 Or drag & drop `.parquet` files onto the window / use **Open…**.
 
-Test fixtures (DuckDB spatial) live in `testdata/`:
+Test fixtures (DuckDB spatial) live in `testdata/` but are not committed
+(~600 MB, generated). Rebuild them with:
 
 ```bash
+./testdata/regenerate.sh [/path/to/massgis_parcels.parquet]
 cargo run --release testdata/points_1m_wgs84.parquet testdata/polygons_5k_l93.parquet
 ```
+
+Fixture-dependent tests self-skip when the files are absent.
 
 ## Features
 
