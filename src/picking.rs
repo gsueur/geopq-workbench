@@ -128,7 +128,10 @@ pub fn pick(
         }
         candidates.sort();
         candidates.dedup();
-        candidates.truncate(512);
+        // Later rows render on top. If the safety cap is hit, preserve those
+        // highest row ids instead of discarding them with `truncate`.
+        let drop = candidates.len().saturating_sub(512);
+        candidates.drain(..drop);
 
         // Exact test in the data CRS: transform the click point + tolerance there.
         let (px, py) = display.projected_from_world(world);
