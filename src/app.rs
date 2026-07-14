@@ -27,6 +27,24 @@ struct LoadingJob {
     stage: String,
 }
 
+enum OptMsg {
+    Progress(f32, String),
+    Done(Box<crate::data::optimize::OptimizeReport>, PathBuf),
+    Failed(String),
+}
+
+/// State of the per-layer "Optimize" export dialog (one at a time).
+struct OptimizeState {
+    layer_name: String,
+    src: PathBuf,
+    epsg: Option<u32>,
+    opts: crate::data::optimize::OptimizeOptions,
+    running: bool,
+    progress: (f32, String),
+    report: Option<(crate::data::optimize::OptimizeReport, PathBuf)>,
+    error: Option<String>,
+}
+
 pub struct ViewerApp {
     camera: Camera,
     display: DisplayCrs,
@@ -53,6 +71,9 @@ pub struct ViewerApp {
 
     load_tx: Sender<LoadMsg>,
     load_rx: Receiver<LoadMsg>,
+    opt_tx: Sender<OptMsg>,
+    opt_rx: Receiver<OptMsg>,
+    optimize: Option<OptimizeState>,
     loading: HashMap<u64, LoadingJob>,
     next_job: u64,
     next_layer_id: u64,
@@ -89,6 +110,7 @@ impl ViewerApp {
             .insert(MapResources::new(&rs.device, rs.target_format));
 
         let (load_tx, load_rx) = channel();
+        let (opt_tx, opt_rx) = channel();
         let display = DisplayCrs::hobo_dyer();
         let graticule_chunks = build_graticule(&display);
         let coastline_chunks = crate::data::coastline::build_coastline(&display);
@@ -111,6 +133,9 @@ impl ViewerApp {
             basemap: Some(0),
             load_tx,
             load_rx,
+            opt_tx,
+            opt_rx,
+            optimize: None,
             loading: HashMap::new(),
             next_job: 0,
             next_layer_id: 0,
@@ -487,6 +512,7 @@ impl ViewerApp {
         let mut fit_to: Option<[f64; 4]> = None;
         let mut info_open: Option<u64> = None;
         let mut load_all: Option<u64> = None;
+        let mut optimize_open: Option<u64> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             // Top-most layer first in the list.
@@ -594,6 +620,16 @@ impl ViewerApp {
                         if ui.small_button("Info").clicked() {
                             info_open = Some(l.id);
                         }
+                        if ui
+                            .small_button("Optimize…")
+                            .on_hover_text(
+                                "Rewrite as a spatially sorted GeoParquet 1.1 or 2.0 file\n\
+                                 (Hilbert order, covering bbox / native geo stats, bloom filters)",
+                            )
+                            .clicked()
+                        {
+                            optimize_open = Some(l.id);
+                        }
                         if ui.small_button("Remove").clicked() {
                             remove = Some(l.id);
                         }
@@ -624,6 +660,23 @@ impl ViewerApp {
         if info_open.is_some() {
             self.info_open = info_open;
         }
+        if let Some(id) = optimize_open {
+            let already_running = self.optimize.as_ref().is_some_and(|o| o.running);
+            if !already_running {
+                if let Some(l) = self.layers.iter().find(|l| l.id == id) {
+                    self.optimize = Some(OptimizeState {
+                        layer_name: l.name.clone(),
+                        src: l.path.clone(),
+                        epsg: l.crs.epsg,
+                        opts: Default::default(),
+                        running: false,
+                        progress: (0.0, String::new()),
+                        report: None,
+                        error: None,
+                    });
+                }
+            }
+        }
         if let Some(id) = load_all {
             let ctx = ui.ctx().clone();
             if let Some(l) = self.layers.iter().find(|l| l.id == id) {
@@ -650,6 +703,218 @@ impl ViewerApp {
                     }
                 }
             }
+        }
+    }
+
+    fn poll_optimizer(&mut self) {
+        while let Ok(msg) = self.opt_rx.try_recv() {
+            let Some(o) = &mut self.optimize else { continue };
+            match msg {
+                OptMsg::Progress(f, s) => o.progress = (f, s),
+                OptMsg::Done(report, path) => {
+                    o.running = false;
+                    o.report = Some((*report, path));
+                }
+                OptMsg::Failed(e) => {
+                    o.running = false;
+                    o.error = Some(e);
+                }
+            }
+        }
+    }
+
+    fn start_optimize(&mut self, dst: PathBuf, ctx: &egui::Context) {
+        let Some(o) = &mut self.optimize else { return };
+        o.running = true;
+        o.error = None;
+        o.report = None;
+        o.progress = (0.0, "starting".into());
+        let (src, opts, epsg) = (o.src.clone(), o.opts.clone(), o.epsg);
+        let tx = self.opt_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let progress = |f: f32, s: &str| {
+                let _ = tx.send(OptMsg::Progress(f, s.to_string()));
+                ctx.request_repaint();
+            };
+            let msg = match crate::data::optimize::optimize(&src, &dst, &opts, epsg, &progress) {
+                Ok(r) => OptMsg::Done(Box::new(r), dst),
+                Err(e) => OptMsg::Failed(e),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    fn optimize_window(&mut self, ctx: &egui::Context) {
+        use crate::data::optimize::{BloomMode, Codec, GpVersion};
+        let Some(o) = &mut self.optimize else { return };
+        let mut open = true;
+        let mut start: Option<PathBuf> = None;
+        let mut load_result: Option<PathBuf> = None;
+        let mut close = false;
+        egui::Window::new(format!("Optimize — {}", o.layer_name))
+            .id(egui::Id::new("optimize_dialog"))
+            .open(&mut open)
+            .default_width(400.0)
+            .show(ctx, |ui| {
+                if let Some((rep, path)) = &o.report {
+                    use crate::data::info::fmt_bytes;
+                    ui.label(
+                        RichText::new(format!("Written: {}", path.display())).strong(),
+                    );
+                    ui.add_space(4.0);
+                    egui::Grid::new("opt_report").num_columns(2).striped(true).show(ui, |ui| {
+                        let row = |ui: &mut egui::Ui, k: &str, v: String| {
+                            ui.label(RichText::new(k).strong());
+                            ui.label(v);
+                            ui.end_row();
+                        };
+                        row(ui, "format", rep.version_label.clone());
+                        row(ui, "rows", fmt_count(rep.rows as usize));
+                        row(
+                            ui,
+                            "size",
+                            format!(
+                                "{} → {}",
+                                fmt_bytes(rep.size_before),
+                                fmt_bytes(rep.size_after)
+                            ),
+                        );
+                        row(ui, "row groups", format!("{} → {}", rep.rg_before, rep.rg_after));
+                        row(
+                            ui,
+                            "rg bbox overlap",
+                            format!(
+                                "×{:.1} → ×{:.1} ({:.0}% → {:.0}% of possible)",
+                                rep.overlap_before,
+                                rep.overlap_after,
+                                rep.overlap_frac_before() * 100.0,
+                                rep.overlap_frac_after() * 100.0,
+                            ),
+                        );
+                        row(
+                            ui,
+                            "bloom filters",
+                            if rep.bloom_columns.is_empty() {
+                                "none".into()
+                            } else {
+                                rep.bloom_columns.join(", ")
+                            },
+                        );
+                        row(ui, "elapsed", format!("{} ms", rep.elapsed_ms));
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Load as layer").clicked() {
+                            load_result = Some(path.clone());
+                        }
+                        if ui.button("Close").clicked() {
+                            close = true;
+                        }
+                    });
+                    return;
+                }
+
+                ui.add_enabled_ui(!o.running, |ui| {
+                    if ui
+                        .radio(o.opts.version == GpVersion::V1_1, GpVersion::V1_1.label())
+                        .clicked()
+                    {
+                        o.opts.version = GpVersion::V1_1;
+                        o.opts.covering = true;
+                    }
+                    if ui
+                        .radio(o.opts.version == GpVersion::V2_0, GpVersion::V2_0.label())
+                        .on_hover_text(
+                            "Native geo statistics replace the covering column for pruning;\n\
+                             needs GeoParquet 2.0 aware readers",
+                        )
+                        .clicked()
+                    {
+                        o.opts.version = GpVersion::V2_0;
+                        o.opts.covering = false;
+                    }
+                    ui.separator();
+                    egui::Grid::new("opt_opts").num_columns(2).show(ui, |ui| {
+                        ui.label("Row group size");
+                        egui::ComboBox::from_id_salt("opt_rg")
+                            .selected_text(fmt_count(o.opts.row_group_size))
+                            .show_ui(ui, |ui| {
+                                for s in [16_384usize, 32_768, 65_536, 131_072] {
+                                    ui.selectable_value(
+                                        &mut o.opts.row_group_size,
+                                        s,
+                                        fmt_count(s),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("Compression");
+                        egui::ComboBox::from_id_salt("opt_codec")
+                            .selected_text(o.opts.codec.label())
+                            .show_ui(ui, |ui| {
+                                for c in [Codec::Zstd, Codec::Snappy, Codec::Uncompressed] {
+                                    ui.selectable_value(&mut o.opts.codec, c, c.label());
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("Bloom filters");
+                        egui::ComboBox::from_id_salt("opt_bloom")
+                            .selected_text(o.opts.bloom.label())
+                            .show_ui(ui, |ui| {
+                                for b in
+                                    [BloomMode::Preserve, BloomMode::AllAttributes, BloomMode::None]
+                                {
+                                    ui.selectable_value(&mut o.opts.bloom, b, b.label());
+                                }
+                            });
+                        ui.end_row();
+                    });
+                    ui.checkbox(&mut o.opts.hilbert_sort, "Hilbert spatial sort")
+                        .on_hover_text("Reorder features along a Hilbert curve over bbox centers");
+                    ui.checkbox(&mut o.opts.covering, "bbox covering column")
+                        .on_hover_text("Per-feature bbox struct column (GeoParquet 1.1 covering)");
+                });
+
+                ui.add_space(6.0);
+                if o.running {
+                    ui.add(
+                        egui::ProgressBar::new(o.progress.0)
+                            .text(o.progress.1.clone())
+                            .animate(true),
+                    );
+                } else if ui.button("Export…").clicked() {
+                    let stem = o
+                        .src
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "layer".into());
+                    let mut dialog = rfd::FileDialog::new()
+                        .set_file_name(format!("{stem}_optimized.parquet"))
+                        .add_filter("GeoParquet", &["parquet"]);
+                    if let Some(dir) = o.src.parent() {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    if let Some(dst) = dialog.save_file() {
+                        start = Some(dst);
+                    }
+                }
+                if let Some(e) = &o.error {
+                    ui.add_space(4.0);
+                    ui.colored_label(Color32::from_rgb(230, 80, 80), e);
+                }
+            });
+        if let Some(dst) = start {
+            self.start_optimize(dst, ctx);
+        }
+        if let Some(p) = load_result {
+            self.enqueue_load(p, ctx);
+            close = true;
+        }
+        // Keep the worker's state visible: ignore window close while running.
+        if (close || !open) && self.optimize.as_ref().is_some_and(|o| !o.running) {
+            self.optimize = None;
         }
     }
 
@@ -1389,6 +1654,7 @@ impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_loader();
+        self.poll_optimizer();
         self.strip_uploaded_cpu_meshes(frame);
 
         // Drag & drop.
@@ -1417,6 +1683,7 @@ impl eframe::App for ViewerApp {
         }
         self.errors_window(&ctx);
         self.info_window(&ctx);
+        self.optimize_window(&ctx);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.map_panel(ui));

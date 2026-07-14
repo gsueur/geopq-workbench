@@ -1966,6 +1966,7 @@ dependencies = [
  "log",
  "lyon",
  "parquet",
+ "parquet-geospatial",
  "pollster 1.0.1",
  "proj4rs",
  "rayon",
@@ -3556,12 +3557,26 @@ dependencies = [
  "num-bigint",
  "num-integer",
  "num-traits",
+ "parquet-geospatial",
  "paste",
  "seq-macro",
  "simdutf8",
  "snap",
  "twox-hash",
  "zstd",
+]
+
+[[package]]
+name = "parquet-geospatial"
+version = "59.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2aabcf721f7e2c68a5528e57c7c1f741b781f07834260e885f34a025ae2164e3"
+dependencies = [
+ "arrow-schema",
+ "geo-traits",
+ "serde",
+ "serde_json",
+ "wkb",
 ]
 
 [[package]]

@@ -4,4 +4,5 @@ pub mod geometry;
 pub mod info;
 pub mod layer;
 pub mod loader;
+pub mod optimize;
 pub mod store;

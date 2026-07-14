@@ -531,7 +531,7 @@ fn rg_bboxes_from_metadata(
 }
 
 /// Average number of other boxes each box intersects.
-fn bbox_overlap_metric(boxes: &[[f64; 4]]) -> f64 {
+pub(crate) fn bbox_overlap_metric(boxes: &[[f64; 4]]) -> f64 {
     let n = boxes.len().min(4096);
     if n < 2 {
         return 0.0;
@@ -838,7 +838,7 @@ pub fn decode_wkb(buf: &[u8]) -> Option<geo_types::Geometry<f64>> {
 
 /// Fast parse of a plain 2D (or 2D+SRID) WKB point. Returns None for
 /// anything else, falling back to the generic decoder.
-fn parse_wkb_point_2d(buf: &[u8]) -> Option<(f64, f64)> {
+pub(crate) fn parse_wkb_point_2d(buf: &[u8]) -> Option<(f64, f64)> {
     if buf.len() < 21 {
         return None;
     }

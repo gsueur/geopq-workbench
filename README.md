@@ -50,6 +50,22 @@ Fixture-dependent tests self-skip when the files are absent.
   Global row indices are preserved, so picking/attributes work on partial
   layers. Fixture: `testdata/parcels_hilbert.parquet` (Hilbert-sorted, 1.1
   covering).
+- **Optimize / export**: per-layer "Optimize…" rewrites any loaded file as a
+  pruning-friendly GeoParquet — features Hilbert-sorted by bbox center, tuned
+  row-group size, zstd/snappy — in your choice of:
+  - **GeoParquet 1.1**: plain WKB column (native GEOMETRY logical types from
+    2.0 sources are stripped for reader compatibility) + `bbox` covering
+    struct column, so covering column statistics drive pruning;
+  - **GeoParquet 2.0**: parquet-native GEOMETRY logical type (CRS carried in
+    the type), with native geospatial statistics written per row group — no
+    covering column needed, smaller file.
+  Bloom filters found on source columns are reproduced (or added to all
+  string/integer attribute columns, or dropped). The report shows size,
+  row-group count and the bbox-overlap metric before/after, and the result
+  can be loaded as a layer directly. Real-world effect on the 1.89M-parcel
+  MassGIS file: row-group bbox overlap drops from 35% to 25% of possible
+  overlaps at 65k-row groups, in ~7 s. In-memory rewrite, capped at 8 GB
+  uncompressed.
 - **CRS handling**: data CRS read from PROJJSON (EPSG id), transformed via
   proj4rs + the embedded `crs-definitions` EPSG database. Mixed-CRS layers
   coexist on one map (e.g. Lambert-93 polygons over WGS84 points).
@@ -77,6 +93,7 @@ Fixture-dependent tests self-skip when the files are absent.
 |---|---|
 | `data/loader.rs` | streaming parquet read, `geo` metadata, WKB decode (fast path for 2D points), rayon-parallel build |
 | `data/store.rs` | `FeatureStore`: lazy row fetch (attributes, WKB) via row-group/RowSelection reads |
+| `data/optimize.rs` | Hilbert-sort rewrite to GeoParquet 1.1 (covering) or 2.0 (native GEOMETRY + geo stats), bloom filters |
 | `data/crs.rs` | PROJJSON → EPSG → proj4rs; native Winkel Tripel; `DisplayCrs` maps projected coords to normalized world space |
 | `data/geometry.rs` | lyon fill tessellation, line segments, points, accumulated into spatial chunks with per-chunk f64 origins (f32 GPU precision at deep zoom) |
 | `map/renderer.rs` | wgpu pipelines (fill / SDF lines / SDF points / tiles), per-chunk dynamic uniform offsets, drawn inside egui's render pass |
@@ -92,6 +109,7 @@ deep zoom stays jitter-free.
 ## Roadmap ideas
 
 - Native GeoArrow encodings (`geoarrow.point` etc.) without WKB decode
+- Streaming (external-sort) optimize for files beyond the 8 GB in-memory cap
 - Zoom-dependent coastline detail (embed 1:110m + fetch 1:10m on demand)
 - HTTP range-request streaming of remote GeoParquet (row-group pyramids)
 - Data-driven styling (color by attribute, graduated/categorical)
