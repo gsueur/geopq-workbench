@@ -80,9 +80,13 @@ Fixture-dependent tests self-skip when the files are absent.
     (requires a single geometry family; Polygon rows promote into a
     multipolygon column, etc.). The x/y leaves get ordinary parquet
     statistics, so any engine prunes with zero geo-awareness; GDAL reads
-    the output natively. Measured in this viewer (matched codec/order):
-    points load 1.17x faster than WKB, polygons are parity (tessellation
-    dominates), files ~7-8% larger.
+    the output natively. GeoArrow sources load through a bulk path: the
+    whole coordinate buffer is reprojected in one linear pass and features
+    are meshed straight from the arrow offsets, no per-feature geometry
+    allocation (verified mesh-identical to the WKB path). Measured
+    (matched codec/order): points load ~1.2x faster than WKB, polygons
+    are parity — lyon tessellation dominates polygon builds — and files
+    run ~7-8% larger.
   - **GeoParquet 2.0**: parquet-native GEOMETRY logical type (CRS carried in
     the type), with native geospatial statistics written per row group — no
     covering column needed, smaller file.
@@ -140,8 +144,6 @@ deep zoom stays jitter-free.
 
 ## Roadmap ideas
 
-- Bulk column-level reprojection straight into tessellation for GeoArrow
-  sources (skip per-feature geo-types allocation)
 - Streaming (external-sort) optimize for files beyond the 8 GB in-memory cap
 - Page-index (footer-only) pruning for 2.0 native-stats files without a
   covering column (per-feature selection needs the bbox column today)

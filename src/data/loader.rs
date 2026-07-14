@@ -1041,6 +1041,22 @@ fn process_batch(
         return batch.num_rows();
     };
 
+    // GeoArrow: bulk path — one linear reprojection pass over the whole
+    // coordinate buffer, features emitted straight from the arrow offsets.
+    if let GeomCol::Ga(ga) = &get {
+        return super::geoarrow::emit_bulk(
+            ga,
+            batch.num_rows(),
+            &|i| map.global(i),
+            tr,
+            display,
+            mb,
+            items,
+            bad,
+            &mut |global, b| grow_rg_box(rg_boxes, rg_of(global, rg_starts), b),
+        );
+    }
+
     for row in 0..batch.num_rows() {
         if get.is_null(row) {
             continue;

@@ -194,6 +194,8 @@ pub struct MeshBuilder {
     chunks: HashMap<(i64, i64), ChunkMesh>,
     tess: FillTessellator,
     scratch: VertexBuffers<[f32; 2], u32>,
+    /// Reused LOD decimation buffer (one allocation per builder, not per ring).
+    lod_scratch: Vec<geo_types::Coord<f64>>,
     pub bounds: [f64; 4],
     pub kind: GeomKind,
     pub fill_errors: usize,
@@ -205,6 +207,7 @@ impl Default for MeshBuilder {
             chunks: HashMap::new(),
             tess: FillTessellator::new(),
             scratch: VertexBuffers::new(),
+            lod_scratch: Vec::new(),
             bounds: [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
             kind: GeomKind::Unknown,
             fill_errors: 0,
@@ -326,6 +329,50 @@ impl MeshBuilder {
         chunk.point_refs.push(fref);
     }
 
+    // ------------------------------------------------------------------
+    // Slice entry points (bulk GeoArrow path — no geo-types intermediate).
+    // The caller is responsible for expanding bounds via `expand_feature`.
+    // ------------------------------------------------------------------
+
+    pub(crate) fn expand_feature(&mut self, bbox: [f64; 4]) {
+        expand(&mut self.bounds, bbox);
+    }
+
+    pub(crate) fn add_point_xy(&mut self, x: f64, y: f64, fref: FeatureRef) {
+        self.kind = self.kind.merge(GeomKind::Point);
+        let bbox = [x, y, x, y];
+        let chunk = self.chunk_for(bbox);
+        let o = chunk.origin;
+        chunk.point_instances.push(local(o, x, y));
+        chunk.point_refs.push(fref);
+    }
+
+    /// MultiPoint: every coordinate is one point instance of the feature.
+    pub(crate) fn add_points_world(
+        &mut self,
+        pts: &[geo_types::Coord<f64>],
+        bbox: [f64; 4],
+        fref: FeatureRef,
+    ) {
+        self.kind = self.kind.merge(GeomKind::Point);
+        let chunk = self.chunk_for(bbox);
+        let o = chunk.origin;
+        for p in pts {
+            chunk.point_instances.push(local(o, p.x, p.y));
+            chunk.point_refs.push(fref);
+        }
+    }
+
+    pub(crate) fn add_polyline_world(
+        &mut self,
+        pts: &[geo_types::Coord<f64>],
+        bbox: [f64; 4],
+        closed: bool,
+    ) {
+        self.kind = self.kind.merge(GeomKind::Line);
+        self.add_polyline(pts, bbox, closed);
+    }
+
     fn add_linestring(&mut self, ls: &LineString<f64>, bbox: [f64; 4]) {
         self.add_polyline(&ls.0, bbox, false);
     }
@@ -347,7 +394,7 @@ impl MeshBuilder {
             chunk.lines[0].segments.push([a[0], a[1], b[0], b[1]]);
             chunk.lines[0].extents.push(extent);
         }
-        let mut kept: Vec<geo_types::Coord<f64>> = Vec::new();
+        let mut kept = std::mem::take(&mut self.lod_scratch);
         for (lvl, &tol) in LINE_LOD_TOLERANCE.iter().enumerate() {
             if (extent as f64) < tol * BUILD_CUTOFF_FACTOR {
                 continue; // could never pass the 4 px draw cutoff from here
@@ -365,35 +412,61 @@ impl MeshBuilder {
                 chunk.lines[1 + lvl].extents.push(extent);
             }
         }
+        self.lod_scratch = kept;
     }
 
     fn add_polygon(&mut self, poly: &Polygon<f64>, bbox: [f64; 4]) {
+        let rings: Vec<&[geo_types::Coord<f64>]> = std::iter::once(poly.exterior())
+            .chain(poly.interiors())
+            .map(|r| r.0.as_slice())
+            .collect();
+        self.add_polygon_parts(&rings, bbox);
+    }
+
+    /// Rings of one polygon (first = exterior), coordinates in world space.
+    /// Ring winding is normalized here (exterior CCW, holes CW): real-world
+    /// parcel data has mixed winding, and the non-zero fill rule needs
+    /// consistency to fill correctly.
+    pub(crate) fn add_polygon_parts(
+        &mut self,
+        rings: &[&[geo_types::Coord<f64>]],
+        bbox: [f64; 4],
+    ) {
+        self.kind = self.kind.merge(GeomKind::Polygon);
         let origin = {
             let chunk = self.chunk_for(bbox);
             chunk.origin
         };
 
-        // Normalize ring orientation (exterior CCW, holes CW): real-world
-        // parcel data has mixed winding, and the non-zero fill rule needs
-        // consistency to fill correctly.
-        use geo::orient::{Direction, Orient};
-        let poly = poly.orient(Direction::Default);
-        let poly = &poly;
-
         // Fill via lyon, in chunk-local coordinates.
         let mut path = Path::builder();
         let mut any = false;
-        for ring in std::iter::once(poly.exterior()).chain(poly.interiors()) {
-            if ring.0.len() < 4 {
+        for (ri, ring) in rings.iter().enumerate() {
+            if ring.len() < 4 {
                 continue;
             }
-            let first = local(origin, ring.0[0].x, ring.0[0].y);
-            path.begin(lpoint(first[0] * TESS_SCALE, first[1] * TESS_SCALE));
-            for c in &ring.0[1..ring.0.len() - 1] {
-                let p = local(origin, c.x, c.y);
-                path.line_to(lpoint(p[0] * TESS_SCALE, p[1] * TESS_SCALE));
+            // Shoelace winding; rings carry the duplicate closing point.
+            let n = ring.len() - 1;
+            let mut area2 = 0.0f64;
+            for w in ring.windows(2) {
+                area2 += w[0].x * w[1].y - w[1].x * w[0].y;
             }
-            path.end(true);
+            let want_ccw = ri == 0;
+            let emit = |path: &mut lyon::path::path::Builder, idx: &mut dyn Iterator<Item = usize>| {
+                let first = idx.next().expect("ring has vertices");
+                let p = local(origin, ring[first].x, ring[first].y);
+                path.begin(lpoint(p[0] * TESS_SCALE, p[1] * TESS_SCALE));
+                for i in idx {
+                    let p = local(origin, ring[i].x, ring[i].y);
+                    path.line_to(lpoint(p[0] * TESS_SCALE, p[1] * TESS_SCALE));
+                }
+                path.end(true);
+            };
+            if (area2 > 0.0) == want_ccw {
+                emit(&mut path, &mut (0..n));
+            } else {
+                emit(&mut path, &mut (0..n).rev());
+            }
             any = true;
         }
         if any {
@@ -428,8 +501,8 @@ impl MeshBuilder {
         }
 
         // Outlines as line segments (with LODs).
-        for ring in std::iter::once(poly.exterior()).chain(poly.interiors()) {
-            self.add_polyline(&ring.0, bbox, true);
+        for ring in rings {
+            self.add_polyline(ring, bbox, true);
         }
     }
 

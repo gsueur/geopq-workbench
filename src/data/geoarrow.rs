@@ -281,6 +281,143 @@ impl<'a> GeomCol<'a> {
 }
 
 // ---------------------------------------------------------------------
+// Bulk loading path
+// ---------------------------------------------------------------------
+
+impl<'a> GaCol<'a> {
+    /// Innermost coordinate span of one row (walks all list levels).
+    fn coord_span(&self, i: usize) -> std::ops::Range<usize> {
+        let mut r = i..i + 1;
+        for l in &self.lists {
+            let o = l.value_offsets();
+            r = o[r.start] as usize..o[r.end] as usize;
+        }
+        r
+    }
+}
+
+/// Bulk-load one GeoArrow batch: reproject the entire coordinate buffer in
+/// a single linear pass (no per-feature geometry allocation), then emit
+/// features into the mesh builder straight from the arrow offsets.
+///
+/// Transform failures become NaN coordinates and fail the per-feature
+/// world-bbox check (counted in `bad`). `raw_bbox(global_row, bbox)` gets
+/// each feature's data-CRS bbox for row-group stats accumulation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_bulk(
+    ga: &GaCol,
+    rows: usize,
+    global_of: &dyn Fn(usize) -> u64,
+    tr: &super::crs::BulkTransformer,
+    display: &super::crs::DisplayCrs,
+    mb: &mut super::geometry::MeshBuilder,
+    items: &mut Vec<super::layer::PickItem>,
+    bad: &mut usize,
+    raw_bbox: &mut dyn FnMut(u64, [f64; 4]),
+) -> usize {
+    use super::geometry::FeatureRef;
+    use super::layer::PickItem;
+
+    let (xs, ys) = (ga.coords.x.values(), ga.coords.y.values());
+    let n = xs.len().min(ys.len());
+    let mut world: Vec<Coord<f64>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let (mut x, mut y) = (xs[i], ys[i]);
+        if tr.apply(&mut x, &mut y) {
+            let w = display.world_from_projected(x, y);
+            world.push(Coord { x: w[0], y: w[1] });
+        } else {
+            world.push(Coord {
+                x: f64::NAN,
+                y: f64::NAN,
+            });
+        }
+    }
+
+    let mut ring_refs: Vec<&[Coord<f64>]> = Vec::new();
+    for i in 0..rows {
+        if ga.top.is_null(i) {
+            continue;
+        }
+        let span = ga.coord_span(i);
+        if span.is_empty() {
+            continue;
+        }
+        let global = global_of(i);
+        let fref = FeatureRef {
+            index: global as u32,
+        };
+
+        // Data-CRS bbox for row-group stats.
+        let mut rb = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        for c in span.clone() {
+            rb = [rb[0].min(xs[c]), rb[1].min(ys[c]), rb[2].max(xs[c]), rb[3].max(ys[c])];
+        }
+        if rb[0].is_finite() && rb[3].is_finite() {
+            raw_bbox(global, rb);
+        }
+
+        // World bbox; NaN anywhere in the feature ⇒ projection failed.
+        let mut wb = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        for c in &world[span.clone()] {
+            wb = [wb[0].min(c.x), wb[1].min(c.y), wb[2].max(c.x), wb[3].max(c.y)];
+        }
+        if !(wb[0].is_finite() && wb[1].is_finite() && wb[2].is_finite() && wb[3].is_finite()) {
+            *bad += 1;
+            continue;
+        }
+
+        mb.expand_feature(wb);
+        let mut needs_rtree = true;
+        match ga.enc {
+            GeomEncoding::Wkb => unreachable!(),
+            GeomEncoding::Point => {
+                mb.add_point_xy(world[span.start].x, world[span.start].y, fref);
+                needs_rtree = false;
+            }
+            GeomEncoding::MultiPoint => {
+                mb.add_points_world(&world[span.clone()], wb, fref);
+                needs_rtree = false;
+            }
+            GeomEncoding::LineString => {
+                mb.add_polyline_world(&world[span.clone()], wb, false);
+            }
+            GeomEncoding::MultiLineString => {
+                for part in GaCol::range(ga.lists[0], i) {
+                    let s = GaCol::range(ga.lists[1], part);
+                    mb.add_polyline_world(&world[s], wb, false);
+                }
+            }
+            GeomEncoding::Polygon => {
+                ring_refs.clear();
+                for ring in GaCol::range(ga.lists[0], i) {
+                    let s = GaCol::range(ga.lists[1], ring);
+                    ring_refs.push(&world[s]);
+                }
+                mb.add_polygon_parts(&ring_refs, wb);
+            }
+            GeomEncoding::MultiPolygon => {
+                for poly in GaCol::range(ga.lists[0], i) {
+                    ring_refs.clear();
+                    for ring in GaCol::range(ga.lists[1], poly) {
+                        let s = GaCol::range(ga.lists[2], ring);
+                        ring_refs.push(&world[s]);
+                    }
+                    mb.add_polygon_parts(&ring_refs, wb);
+                }
+            }
+        }
+        if needs_rtree {
+            items.push(PickItem {
+                bbox: wb,
+                feature: fref,
+            });
+        }
+    }
+    rows
+}
+
+// ---------------------------------------------------------------------
 // Write side
 // ---------------------------------------------------------------------
 

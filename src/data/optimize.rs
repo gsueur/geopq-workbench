@@ -1184,12 +1184,45 @@ mod tests {
             assert_eq!((min.x, min.y), (gx, gy), "id {id}");
         }
 
-        // Loader tessellates it end to end.
+        // Loader tessellates it end to end (bulk GeoArrow path)...
         let display = crate::data::crs::DisplayCrs::hobo_dyer();
         let (geom, rows_n, bad) =
             crate::data::loader::build_geometry_for_test(&store, &_crs, &display).unwrap();
         assert_eq!((rows_n, bad), (5000, 0));
         assert_eq!(geom.kind, crate::data::geometry::GeomKind::Polygon);
+
+        // ...and produces the same mesh as the per-feature WKB path on the
+        // same shapes: identical tessellated area, segments and pick items.
+        let mesh_stats = |g: &crate::data::layer::LayerGeometry| {
+            let mut area = 0.0f64;
+            let mut segs = 0usize;
+            for c in g.chunks.iter() {
+                for t in c.fill_indices.chunks_exact(3) {
+                    let a = c.fill_vertices[t[0] as usize];
+                    let b = c.fill_vertices[t[1] as usize];
+                    let d = c.fill_vertices[t[2] as usize];
+                    area += 0.5
+                        * ((b[0] - a[0]) as f64 * (d[1] - a[1]) as f64
+                            - (d[0] - a[0]) as f64 * (b[1] - a[1]) as f64)
+                            .abs();
+                }
+                segs += c.lines[0].segments.len();
+            }
+            (area, segs, g.rtree.size())
+        };
+        let (src_store, src_crs, _i, _r) =
+            crate::data::loader::open_store_for_test(&src).unwrap();
+        assert_eq!(src_store.encoding, GeomEncoding::Wkb);
+        let (geom_wkb, _rows, _bad) =
+            crate::data::loader::build_geometry_for_test(&src_store, &src_crs, &display)
+                .unwrap();
+        let (a_ga, s_ga, r_ga) = mesh_stats(&geom);
+        let (a_wkb, s_wkb, r_wkb) = mesh_stats(&geom_wkb);
+        assert_eq!((s_ga, r_ga), (s_wkb, r_wkb), "segment / pick-item counts");
+        assert!(
+            (a_ga - a_wkb).abs() <= a_wkb * 1e-9,
+            "tessellated area differs: {a_ga} vs {a_wkb}"
+        );
     }
 
     /// The covering bbox leaves must be written in small pages so the page
