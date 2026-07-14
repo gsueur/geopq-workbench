@@ -4,8 +4,10 @@ use parquet::arrow::arrow_reader::{
     ArrowReaderOptions, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowSelection,
     RowSelector,
 };
+use parquet::file::metadata::PageIndexPolicy;
 use parquet::arrow::ProjectionMask;
 
+use super::geoarrow::{GeomCol, GeomEncoding};
 use super::source::Source;
 
 /// GeoParquet 1.1 covering bbox column: a root struct with four float
@@ -32,6 +34,8 @@ pub struct FeatureStore {
     pub schema: SchemaRef,
     /// Covering bbox column, when the file has one (per-feature pruning).
     pub covering: Option<CoveringCol>,
+    /// Geometry column encoding (WKB or a GeoArrow native encoding).
+    pub encoding: GeomEncoding,
     /// Rows per row group, in file order.
     rg_rows: Vec<u64>,
     /// Cumulative start row of each row group (len = rg_rows.len() + 1).
@@ -44,6 +48,7 @@ impl FeatureStore {
         geom_col: usize,
         schema: SchemaRef,
         covering: Option<CoveringCol>,
+        encoding: GeomEncoding,
         rg_rows: Vec<u64>,
     ) -> Self {
         let mut rg_starts = Vec::with_capacity(rg_rows.len() + 1);
@@ -58,6 +63,7 @@ impl FeatureStore {
             geom_col,
             schema,
             covering,
+            encoding,
             rg_rows,
             rg_starts,
         }
@@ -87,7 +93,8 @@ impl FeatureStore {
         // Page index (when the file has one) turns range reads into exact
         // per-page fetches and lets row selections skip page IO entirely —
         // essential for remote sources.
-        let options = ArrowReaderOptions::new().with_page_index(true);
+        let options =
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
         let mut builder = ParquetRecordBatchReaderBuilder::try_new_with_options(reader, options)
             .map_err(|e| format!("not a parquet file: {e}"))?
             .with_row_groups(vec![group])
@@ -127,7 +134,8 @@ impl FeatureStore {
             return Ok(Vec::new());
         }
         let reader = self.source.open()?;
-        let options = ArrowReaderOptions::new().with_page_index(true);
+        let options =
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
         let mut builder = ParquetRecordBatchReaderBuilder::try_new_with_options(reader, options)
             .map_err(|e| format!("not a parquet file: {e}"))?;
 
@@ -184,20 +192,24 @@ impl FeatureStore {
         batches.map_err(|e| format!("parquet decode error: {e}"))
     }
 
-    /// Fetch the WKB geometry bytes for the given rows (sorted, unique).
-    /// Returns (row, wkb) pairs in ascending row order.
-    pub fn fetch_wkb(&self, rows_sorted: &[u32]) -> Result<Vec<(u32, Option<Vec<u8>>)>, String> {
+    /// Fetch and decode the geometries of the given rows (sorted, unique),
+    /// whatever the column encoding. Returns (row, geometry) pairs in
+    /// ascending row order; None for null/undecodable geometries.
+    pub fn fetch_geoms(
+        &self,
+        rows_sorted: &[u32],
+    ) -> Result<Vec<(u32, Option<geo_types::Geometry<f64>>)>, String> {
         let batches = self.fetch(rows_sorted, Some(&[self.geom_col]))?;
         let mut out = Vec::with_capacity(rows_sorted.len());
         let mut it = rows_sorted.iter();
         for batch in &batches {
             let col = batch.column(0);
-            let Some(bin) = super::loader::BinCol::new(col.as_ref()) else {
-                return Err("geometry column is not binary".into());
+            let Some(geoms) = GeomCol::new(col.as_ref(), self.encoding) else {
+                return Err("geometry column does not match its declared encoding".into());
             };
             for i in 0..batch.num_rows() {
                 let row = *it.next().ok_or("row/batch count mismatch")?;
-                out.push((row, bin.value(i).map(|b| b.to_vec())));
+                out.push((row, geoms.geometry(i)));
             }
         }
         Ok(out)
@@ -239,7 +251,8 @@ mod tests {
             .collect();
         assert!(rg_rows.len() > 1, "fixture should have several row groups");
         let geom_col = schema.index_of("geometry").unwrap();
-        let store = FeatureStore::new(source, geom_col, schema, None, rg_rows);
+        let store =
+            FeatureStore::new(source, geom_col, schema, None, GeomEncoding::Wkb, rg_rows);
         assert_eq!(store.total_rows(), 1_000_000);
 
         // Rows spread across row groups, including group boundaries.
@@ -264,12 +277,14 @@ mod tests {
             }
         }
 
-        // WKB fetch: every requested row decodes to a point.
-        let wkbs = store.fetch_wkb(&rows).unwrap();
-        assert_eq!(wkbs.len(), rows.len());
-        for (row, wkb) in wkbs {
-            let g = crate::data::loader::decode_wkb(&wkb.expect("non-null")).unwrap();
-            assert!(matches!(g, geo_types::Geometry::Point(_)), "row {row}");
+        // Geometry fetch: every requested row decodes to a point.
+        let geoms = store.fetch_geoms(&rows).unwrap();
+        assert_eq!(geoms.len(), rows.len());
+        for (row, g) in geoms {
+            assert!(
+                matches!(g.expect("non-null"), geo_types::Geometry::Point(_)),
+                "row {row}"
+            );
         }
     }
 }

@@ -14,6 +14,7 @@ use rstar::RTree;
 use serde_json::Value;
 
 use super::crs::{BulkTransformer, Crs, DisplayCrs};
+use super::geoarrow::{GeomCol, GeomEncoding};
 use super::geometry::{FeatureRef, MeshBuilder};
 use super::info::{summarize_geo_meta, ColumnInfo, FileInfo};
 use super::layer::{GroupLoad, LayerGeometry, LoadStats, PickItem, RgBboxes, VectorLayer};
@@ -467,6 +468,7 @@ fn open_store(source: &Source) -> Result<StoreOpen, String> {
 
     let schema = builder.schema().clone();
 
+    let mut encoding = GeomEncoding::Wkb;
     let (geom_name, crs) = match &geo_meta {
         Some(meta) => {
             let primary = meta
@@ -476,12 +478,9 @@ fn open_store(source: &Source) -> Result<StoreOpen, String> {
                 .to_string();
             let col_meta = meta.get("columns").and_then(|c| c.get(&primary));
             if let Some(cm) = col_meta {
-                let encoding = cm.get("encoding").and_then(Value::as_str).unwrap_or("WKB");
-                if !encoding.eq_ignore_ascii_case("wkb") {
-                    return Err(format!(
-                        "geometry encoding '{encoding}' not supported yet (only WKB)"
-                    ));
-                }
+                let enc = cm.get("encoding").and_then(Value::as_str).unwrap_or("WKB");
+                encoding = GeomEncoding::parse(enc)
+                    .ok_or_else(|| format!("geometry encoding '{enc}' not supported"))?;
             }
             let crs = Crs::from_geoparquet_crs(col_meta.and_then(|c| c.get("crs")))?;
             (primary, crs)
@@ -586,11 +585,12 @@ fn open_store(source: &Source) -> Result<StoreOpen, String> {
         geo: summarize_geo_meta(geo_meta.as_ref(), &geom_name, &crs.name, has_native_geometry),
     };
 
-    let rg_meta_boxes = rg_bboxes_from_metadata(&builder, geo_meta.as_ref(), geom_leaf, &geom_name);
+    let rg_meta_boxes =
+        rg_bboxes_from_metadata(&builder, geo_meta.as_ref(), geom_leaf, &geom_name, encoding);
     let covering = covering_column(geo_meta.as_ref(), &geom_name, &schema);
 
     Ok((
-        FeatureStore::new(source.clone(), geom_col, schema, covering, rg_rows),
+        FeatureStore::new(source.clone(), geom_col, schema, covering, encoding, rg_rows),
         crs,
         info,
         rg_meta_boxes,
@@ -638,8 +638,29 @@ fn rg_bboxes_from_metadata(
     geo_meta: Option<&Value>,
     geom_leaf: Option<usize>,
     primary: &str,
+    encoding: GeomEncoding,
 ) -> Option<(String, Vec<[f64; 4]>)> {
     let meta = builder.metadata();
+
+    // Statistics helper over any leaf column.
+    let stat_f64 = |rg: &parquet::file::metadata::RowGroupMetaData,
+                    idx: usize,
+                    want_max: bool|
+     -> Option<f64> {
+        use parquet::file::statistics::Statistics;
+        let st = rg.columns().get(idx)?.statistics()?;
+        match st {
+            Statistics::Double(s) => {
+                let v = if want_max { s.max_opt() } else { s.min_opt() }?;
+                Some(*v)
+            }
+            Statistics::Float(s) => {
+                let v = if want_max { s.max_opt() } else { s.min_opt() }?;
+                Some(*v as f64)
+            }
+            _ => None,
+        }
+    };
 
     // 1. Native geospatial statistics on the geometry column chunks
     // (leaf-indexed, not arrow-root-indexed).
@@ -660,60 +681,72 @@ fn rg_bboxes_from_metadata(
     }
 
     // 2. GeoParquet 1.1 covering bbox columns: column-chunk min/max stats.
-    let covering = geo_meta?
-        .get("columns")?
-        .get(primary)?
-        .get("covering")?
-        .get("bbox")?;
-    let leaf_path = |part: &str| -> Option<usize> {
-        let arr = covering.get(part)?.as_array()?;
-        let path: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
-        let dotted = path.join(".");
-        builder
-            .parquet_schema()
-            .columns()
+    let covering_boxes = || -> Option<Vec<[f64; 4]>> {
+        let covering = geo_meta?
+            .get("columns")?
+            .get(primary)?
+            .get("covering")?
+            .get("bbox")?;
+        let leaf_path = |part: &str| -> Option<usize> {
+            let arr = covering.get(part)?.as_array()?;
+            let path: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
+            let dotted = path.join(".");
+            builder
+                .parquet_schema()
+                .columns()
+                .iter()
+                .position(|c| c.path().string() == dotted)
+        };
+        let (xmin_i, ymin_i, xmax_i, ymax_i) = (
+            leaf_path("xmin")?,
+            leaf_path("ymin")?,
+            leaf_path("xmax")?,
+            leaf_path("ymax")?,
+        );
+        meta.row_groups()
             .iter()
-            .position(|c| c.path().string() == dotted)
+            .map(|rg| {
+                Some([
+                    stat_f64(rg, xmin_i, false)?,
+                    stat_f64(rg, ymin_i, false)?,
+                    stat_f64(rg, xmax_i, true)?,
+                    stat_f64(rg, ymax_i, true)?,
+                ])
+            })
+            .collect()
     };
-    let (xmin_i, ymin_i, xmax_i, ymax_i) = (
-        leaf_path("xmin")?,
-        leaf_path("ymin")?,
-        leaf_path("xmax")?,
-        leaf_path("ymax")?,
-    );
-    let stat_f64 = |rg: &parquet::file::metadata::RowGroupMetaData,
-                    idx: usize,
-                    want_max: bool|
-     -> Option<f64> {
-        use parquet::file::statistics::Statistics;
-        let st = rg.columns().get(idx)?.statistics()?;
-        match st {
-            Statistics::Double(s) => {
-                let v = if want_max { s.max_opt() } else { s.min_opt() }?;
-                Some(*v)
-            }
-            Statistics::Float(s) => {
-                let v = if want_max { s.max_opt() } else { s.min_opt() }?;
-                Some(*v as f64)
-            }
-            _ => None,
-        }
+    if let Some(boxes) = covering_boxes().filter(|b| !b.is_empty()) {
+        return Some(("covering column statistics (GeoParquet 1.1)".into(), boxes));
+    }
+
+    // 3. GeoArrow encodings: the x/y coordinate leaves carry ordinary
+    // min/max statistics — a bbox per row group for free.
+    if encoding.is_wkb() {
+        return None;
+    }
+    let coord_leaf = |axis: &str| -> Option<usize> {
+        builder.parquet_schema().columns().iter().position(|c| {
+            let parts = c.path().parts();
+            parts.first().map(String::as_str) == Some(primary)
+                && parts.last().map(String::as_str) == Some(axis)
+        })
     };
+    let (x_i, y_i) = (coord_leaf("x")?, coord_leaf("y")?);
     let boxes: Option<Vec<[f64; 4]>> = meta
         .row_groups()
         .iter()
         .map(|rg| {
             Some([
-                stat_f64(rg, xmin_i, false)?,
-                stat_f64(rg, ymin_i, false)?,
-                stat_f64(rg, xmax_i, true)?,
-                stat_f64(rg, ymax_i, true)?,
+                stat_f64(rg, x_i, false)?,
+                stat_f64(rg, y_i, false)?,
+                stat_f64(rg, x_i, true)?,
+                stat_f64(rg, y_i, true)?,
             ])
         })
         .collect();
     boxes
         .filter(|b| !b.is_empty())
-        .map(|b| ("covering column statistics (GeoParquet 1.1)".into(), b))
+        .map(|b| ("coordinate column statistics (GeoArrow)".into(), b))
 }
 
 /// Average number of other boxes each box intersects.
@@ -794,6 +827,7 @@ fn build_geometry(
 
     let source = store.source.clone();
     let covering = store.covering.clone();
+    let encoding = store.encoding;
     let err_ref = &stream_error;
     let resolved_ref = &resolved;
     let starts = rg_starts;
@@ -882,8 +916,8 @@ fn build_geometry(
             let mut rg_boxes: std::collections::HashMap<u32, [f64; 4]> = Default::default();
             let tr = BulkTransformer::new(crs, display);
             let rows = process_batch(
-                &batch, &map, &tr, display, &mut mb, &mut items, &mut bad, rg_starts,
-                &mut rg_boxes,
+                &batch, &map, encoding, &tr, display, &mut mb, &mut items, &mut bad,
+                rg_starts, &mut rg_boxes,
             );
             if let Some((handle, job)) = progress {
                 let d = done.fetch_add(rows, Ordering::Relaxed) + rows;
@@ -991,6 +1025,7 @@ fn grow_rg_box(
 fn process_batch(
     batch: &RecordBatch,
     map: &RowMap,
+    encoding: GeomEncoding,
     tr: &BulkTransformer,
     display: &DisplayCrs,
     mb: &mut MeshBuilder,
@@ -1001,22 +1036,23 @@ fn process_batch(
 ) -> usize {
     // The loader projects the read down to the geometry column.
     let col = batch.column(0);
-    let Some(get) = BinCol::new(col.as_ref()) else {
+    let Some(get) = GeomCol::new(col.as_ref(), encoding) else {
         *bad += batch.num_rows();
         return batch.num_rows();
     };
 
     for row in 0..batch.num_rows() {
-        let Some(buf) = get.value(row) else {
+        if get.is_null(row) {
             continue;
-        };
+        }
         let global = map.global(row);
         let fref = FeatureRef {
             index: global as u32,
         };
 
-        // Fast path: 2D WKB point, no per-feature geo allocation.
-        if let Some((x, y)) = parse_wkb_point_2d(buf) {
+        // Fast path: 2D point (WKB parse or GeoArrow coordinate read), no
+        // per-feature geo allocation.
+        if let Some((x, y)) = get.point2(row) {
             grow_rg_box(rg_boxes, rg_of(global, rg_starts), [x, y, x, y]);
             let (mut px, mut py) = (x, y);
             if !tr.apply(&mut px, &mut py) {
@@ -1029,7 +1065,7 @@ fn process_batch(
             continue;
         }
 
-        match decode_wkb(buf) {
+        match get.geometry(row) {
             Some(mut geom) => {
                 {
                     use geo::BoundingRect;
@@ -1248,13 +1284,12 @@ mod tess_validation {
         let total = store.total_rows() as u32;
         let step = (total / 20_000).max(1);
         let rows: Vec<u32> = (0..total).step_by(step as usize).collect();
-        let wkbs = store.fetch_wkb(&rows).unwrap();
+        let geoms = store.fetch_geoms(&rows).unwrap();
 
         let mut checked = 0usize;
         let mut mismatches: Vec<(u32, f64, f64)> = Vec::new();
-        for (row, wkb) in wkbs {
-            let Some(wkb) = wkb else { continue };
-            let Some(geom) = decode_wkb(&wkb) else { continue };
+        for (row, geom) in geoms {
+            let Some(geom) = geom else { continue };
             let true_area = match &geom {
                 geo_types::Geometry::Polygon(_) | geo_types::Geometry::MultiPolygon(_) => {
                     geom.unsigned_area()
@@ -1417,10 +1452,10 @@ mod pruning_tests {
             .collect();
         picked.sort_unstable();
         picked.dedup();
-        let wkbs = store.fetch_wkb(&picked).unwrap();
-        for (row, wkb) in wkbs {
+        let geoms = store.fetch_geoms(&picked).unwrap();
+        for (row, geom) in geoms {
             use geo::BoundingRect;
-            let geom = decode_wkb(&wkb.expect("non-null")).unwrap();
+            let geom = geom.expect("non-null");
             let b = geom.bounding_rect().unwrap();
             assert!(
                 b.min().x <= rect[2]

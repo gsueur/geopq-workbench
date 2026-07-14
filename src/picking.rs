@@ -5,7 +5,6 @@ use rstar::AABB;
 use crate::data::crs::{transform_point, BulkTransformer, DisplayCrs};
 use crate::data::geometry::FeatureRef;
 use crate::data::layer::VectorLayer;
-use crate::data::loader::decode_wkb;
 
 /// A picked feature.
 #[derive(Clone)]
@@ -38,14 +37,13 @@ pub fn feature_world_geom(
     f: FeatureRef,
     display: &DisplayCrs,
 ) -> Option<Geometry<f64>> {
-    let wkb = layer
+    let geom = layer
         .store
-        .fetch_wkb(&[f.index])
+        .fetch_geoms(&[f.index])
         .ok()?
         .into_iter()
         .next()?
         .1?;
-    let geom = decode_wkb(&wkb)?;
     Some(to_world_geom(geom, layer, display))
 }
 
@@ -149,17 +147,14 @@ pub fn pick(
 
         // One batched read for all candidate geometries.
         let rows: Vec<u32> = candidates.iter().map(|f| f.index).collect();
-        let Ok(wkbs) = layer.store.fetch_wkb(&rows) else {
+        let Ok(geoms) = layer.store.fetch_geoms(&rows) else {
             continue;
         };
 
         // Test later rows first: they draw on top.
         let mut hit: Option<(FeatureRef, Geometry<f64>)> = None;
-        for (row, wkb) in wkbs.into_iter().rev() {
-            let Some(wkb) = wkb else { continue };
-            let Some(geom) = decode_wkb(&wkb) else {
-                continue;
-            };
+        for (row, geom) in geoms.into_iter().rev() {
+            let Some(geom) = geom else { continue };
             let is_hit = match &geom {
                 Geometry::Polygon(_)
                 | Geometry::MultiPolygon(_)

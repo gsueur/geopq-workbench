@@ -2,12 +2,18 @@
 //!
 //! Rewrites a GeoParquet file spatially sorted (Hilbert curve over feature
 //! bbox centers) with tuned row groups, so that per-row-group bboxes become
-//! compact and metadata-based pruning works. Output is either:
+//! compact and metadata-based pruning works. Output is one of:
 //!
-//! - **GeoParquet 1.1**: WKB column + `geo` metadata + `bbox` covering
+//! - **GeoParquet 1.1 (WKB)**: WKB column + `geo` metadata + `bbox` covering
 //!   struct column (per-row-group min/max column statistics drive pruning).
+//! - **GeoParquet 1.1 (GeoArrow)**: geometry as nested coordinate arrays
+//!   (single geometry family; singles promote to their multi variant) — the
+//!   x/y leaves carry ordinary parquet statistics, so any reader prunes
+//!   without covering support.
 //! - **GeoParquet 2.0**: parquet-native `GEOMETRY` logical type; the writer
 //!   computes native geospatial statistics per column chunk (bbox + types).
+//!
+//! Geometry transcodes in any direction (WKB ↔ GeoArrow).
 //!
 //! Bloom filters found on source columns are reproduced on the output, or
 //! can be added to all attribute columns.
@@ -32,7 +38,7 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
 use serde_json::{json, Value};
 
-use super::loader::{decode_wkb, parse_wkb_point_2d, BinCol};
+use super::geoarrow::{self, GaBuilder, GeomCol, GeomEncoding};
 use super::source::Source;
 
 /// Refuse in-memory rewrites beyond this uncompressed size.
@@ -48,6 +54,9 @@ const BBOX_LEAF_PAGE_BYTES: usize = 32 * 1024;
 pub enum GpVersion {
     /// WKB + `geo` metadata + covering bbox column.
     V1_1,
+    /// GeoArrow native coordinate arrays (single geometry family; singles
+    /// promote to their multi variant).
+    V1_1GeoArrow,
     /// Parquet-native GEOMETRY logical type + geospatial statistics.
     V2_0,
 }
@@ -56,6 +65,7 @@ impl GpVersion {
     pub fn label(&self) -> &'static str {
         match self {
             GpVersion::V1_1 => "GeoParquet 1.1 (WKB + covering bbox)",
+            GpVersion::V1_1GeoArrow => "GeoParquet 1.1 (GeoArrow coordinate arrays)",
             GpVersion::V2_0 => "GeoParquet 2.0 (native GEOMETRY + geo stats)",
         }
     }
@@ -205,6 +215,12 @@ pub fn optimize(
     let geom_idx = src_schema
         .index_of(&primary)
         .map_err(|_| format!("geometry column '{primary}' not found"))?;
+    let src_encoding = geo_meta
+        .as_ref()
+        .and_then(|m| m.get("columns")?.get(&primary)?.get("encoding")?.as_str())
+        .map(|e| GeomEncoding::parse(e).ok_or_else(|| format!("encoding '{e}' not supported")))
+        .transpose()?
+        .unwrap_or_default();
 
     // CRS, best source first: geo metadata PROJJSON, then the GEOMETRY
     // logical type's crs string (2.0 sources), then the caller's hint.
@@ -268,7 +284,7 @@ pub fn optimize(
     let mut geom_types: HashSet<&'static str> = HashSet::new();
     for res in reader {
         let batch = res.map_err(|e| format!("parquet decode error: {e}"))?;
-        scan_bboxes(&batch, geom_idx, &mut row_bboxes, &mut geom_types)?;
+        scan_bboxes(&batch, geom_idx, src_encoding, &mut row_bboxes, &mut geom_types)?;
         batches.push(batch);
         progress(
             0.02 + 0.48 * (row_bboxes.len() as f32 / total_rows.max(1) as f32),
@@ -315,6 +331,25 @@ pub fn optimize(
         order.sort_by_key(|&i| codes[i as usize]);
     }
 
+    // --- geometry output form ---
+    let geom_out: GeomOut = match opts.version {
+        GpVersion::V1_1GeoArrow => {
+            let target = geoarrow::target_encoding(geom_types.iter().copied())?;
+            if target == src_encoding {
+                GeomOut::PassThrough
+            } else {
+                GeomOut::ToGa(target)
+            }
+        }
+        GpVersion::V1_1 | GpVersion::V2_0 if !src_encoding.is_wkb() => GeomOut::ToWkb,
+        _ => GeomOut::PassThrough,
+    };
+    let out_encoding = match (&geom_out, opts.version) {
+        (GeomOut::ToGa(t), _) => *t,
+        (GeomOut::PassThrough, GpVersion::V1_1GeoArrow) => src_encoding,
+        _ => GeomEncoding::Wkb,
+    };
+
     // --- output schema ---
     let write_covering = opts.covering;
     let drop_covering = write_covering.then_some(src_covering_root.as_deref()).flatten();
@@ -328,6 +363,17 @@ pub fn optimize(
         }
         let mut field = f.as_ref().clone();
         if i == geom_idx {
+            // Rebuild the geometry field per the output form, then apply
+            // version-specific typing.
+            match &geom_out {
+                GeomOut::ToGa(t) => {
+                    field = Field::new(f.name(), geoarrow::data_type(*t), true);
+                }
+                GeomOut::ToWkb => {
+                    field = Field::new(f.name(), DataType::Binary, true);
+                }
+                GeomOut::PassThrough => {}
+            }
             match opts.version {
                 GpVersion::V2_0 => {
                     let crs_str = crs_value.as_ref().map(|v| match v {
@@ -339,10 +385,10 @@ pub fn optimize(
                         .try_with_extension_type(parquet_geospatial::WkbType::new(Some(md)))
                         .map_err(|e| format!("cannot tag geometry column: {e}"))?;
                 }
-                GpVersion::V1_1 => {
+                GpVersion::V1_1 | GpVersion::V1_1GeoArrow => {
                     // A native-GEOMETRY source propagates its extension type
                     // through the arrow schema; strip it so an explicit 1.1
-                    // export is a plain BYTE_ARRAY WKB column (max reader
+                    // export carries no logical type (max reader
                     // compatibility — the point of choosing 1.1).
                     let mut md = field.metadata().clone();
                     md.remove("ARROW:extension:name");
@@ -441,7 +487,8 @@ pub fn optimize(
     // `geo` is rebuilt; other source key-value metadata passes through.
     writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
         "geo".to_string(),
-        build_geo_meta(opts, &primary, crs_value.as_ref(), &geom_types, file_bbox).to_string(),
+        build_geo_meta(opts, &primary, crs_value.as_ref(), &geom_types, out_encoding, file_bbox)
+            .to_string(),
     ));
     for entry in kv.iter().filter(|kv| kv.key != "geo" && kv.key != "ARROW:schema") {
         writer.append_key_value_metadata(entry.clone());
@@ -466,6 +513,10 @@ pub fn optimize(
     let batch_refs: Vec<&RecordBatch> = batches.iter().collect();
 
     let chunk_rows = opts.row_group_size.min(READ_BATCH);
+    let out_geom_pos = kept_src_indices
+        .iter()
+        .position(|&i| i == geom_idx)
+        .ok_or("geometry column dropped from output")?;
     let mut written = 0usize;
     for chunk in order.chunks(chunk_rows) {
         let indices: Vec<(usize, usize)> = chunk.iter().map(|&r| locate(r)).collect();
@@ -475,6 +526,10 @@ pub fn optimize(
             .iter()
             .map(|&i| gathered.column(i).clone())
             .collect();
+        if !matches!(geom_out, GeomOut::PassThrough) {
+            cols[out_geom_pos] =
+                transcode_geometry(cols[out_geom_pos].as_ref(), src_encoding, &geom_out)?;
+        }
         if write_covering {
             cols.push(build_bbox_column(chunk, &row_bboxes, &bbox_fields));
         }
@@ -518,18 +573,71 @@ pub fn optimize(
     })
 }
 
+/// How the geometry column is rewritten.
+enum GeomOut {
+    /// Values move with the row gather unchanged.
+    PassThrough,
+    /// Decode (WKB or GeoArrow) and re-encode as WKB bytes.
+    ToWkb,
+    /// Decode and rebuild as GeoArrow coordinate arrays.
+    ToGa(GeomEncoding),
+}
+
+/// Re-encode one gathered geometry column.
+fn transcode_geometry(
+    col: &dyn arrow::array::Array,
+    src_encoding: GeomEncoding,
+    out: &GeomOut,
+) -> Result<ArrayRef, String> {
+    let geoms =
+        GeomCol::new(col, src_encoding).ok_or("geometry column does not match its encoding")?;
+    match out {
+        GeomOut::PassThrough => unreachable!(),
+        GeomOut::ToGa(target) => {
+            let mut b = GaBuilder::new(*target);
+            for i in 0..col.len() {
+                b.push(geoms.geometry(i).as_ref())?;
+            }
+            Ok(b.finish())
+        }
+        GeomOut::ToWkb => {
+            let opts = wkb::writer::WriteOptions::default();
+            let mut buf: Vec<u8> = Vec::new();
+            let values: Vec<Option<Vec<u8>>> = (0..col.len())
+                .map(|i| -> Result<Option<Vec<u8>>, String> {
+                    let Some(g) = geoms.geometry(i) else {
+                        return Ok(None);
+                    };
+                    buf.clear();
+                    wkb::writer::write_geometry(&mut buf, &g, &opts)
+                        .map_err(|e| format!("WKB encode: {e}"))?;
+                    Ok(Some(buf.clone()))
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(Arc::new(arrow::array::BinaryArray::from_iter(values)))
+        }
+    }
+}
+
 /// GeoParquet `geo` file metadata for the output.
 fn build_geo_meta(
     opts: &OptimizeOptions,
     primary: &str,
     crs: Option<&Value>,
     geom_types: &HashSet<&'static str>,
+    out_encoding: GeomEncoding,
     file_bbox: Option<[f64; 4]>,
 ) -> Value {
-    let mut types: Vec<&str> = geom_types.iter().copied().collect();
-    types.sort_unstable();
+    // GeoArrow columns store exactly one type (singles promoted).
+    let types: Vec<&str> = if out_encoding.is_wkb() {
+        let mut t: Vec<&str> = geom_types.iter().copied().collect();
+        t.sort_unstable();
+        t
+    } else {
+        vec![out_encoding.geometry_type_name()]
+    };
     let mut col = json!({
-        "encoding": "WKB",
+        "encoding": out_encoding.geo_name(),
         "geometry_types": types,
     });
     if let Some(c) = crs {
@@ -546,7 +654,7 @@ fn build_geo_meta(
     }
     json!({
         "version": match opts.version {
-            GpVersion::V1_1 => "1.1.0",
+            GpVersion::V1_1 | GpVersion::V1_1GeoArrow => "1.1.0",
             GpVersion::V2_0 => "2.0.0",
         },
         "primary_column": primary,
@@ -601,23 +709,25 @@ fn guess_geom_column(schema: &Schema) -> Option<String> {
 fn scan_bboxes(
     batch: &RecordBatch,
     geom_idx: usize,
+    encoding: GeomEncoding,
     out: &mut Vec<Option<[f64; 4]>>,
     geom_types: &mut HashSet<&'static str>,
 ) -> Result<(), String> {
     use geo::BoundingRect;
     let col = batch.column(geom_idx);
-    let bin = BinCol::new(col.as_ref()).ok_or("geometry column is not binary")?;
+    let geoms = GeomCol::new(col.as_ref(), encoding)
+        .ok_or("geometry column does not match its declared encoding")?;
     for i in 0..batch.num_rows() {
-        let Some(buf) = bin.value(i) else {
+        if geoms.is_null(i) {
             out.push(None);
             continue;
-        };
-        if let Some((x, y)) = parse_wkb_point_2d(buf) {
+        }
+        if let Some((x, y)) = geoms.point2(i) {
             geom_types.insert("Point");
             out.push((x.is_finite() && y.is_finite()).then_some([x, y, x, y]));
             continue;
         }
-        match decode_wkb(buf) {
+        match geoms.geometry(i) {
             Some(geom) => {
                 geom_types.insert(geom_type_name(&geom));
                 out.push(geom.bounding_rect().map(|r| {
@@ -709,6 +819,7 @@ fn hilbert_xy2d(order: u32, mut x: u32, mut y: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::loader::parse_wkb_point_2d;
     use arrow::array::{BinaryArray, Int64Array, StringArray};
     use parquet::file::properties::WriterProperties;
 
@@ -784,23 +895,28 @@ mod tests {
     }
 
     /// Names must stay attached to their geometry after reordering.
+    /// Names must stay attached to their geometry after reordering,
+    /// whatever the geometry encoding.
     fn assert_rows_consistent(path: &std::path::PathBuf) {
+        use geo::BoundingRect;
         let (store, _crs, _info, _rg) =
             crate::data::loader::open_store_for_test(path).unwrap();
         let rows: Vec<u32> = (0..store.total_rows() as u32).step_by(997).collect();
+        let geoms = store.fetch_geoms(&rows).unwrap();
         let batches = store.fetch(&rows, None).unwrap();
+        let mut names: Vec<String> = Vec::new();
         for batch in batches {
-            let geom = batch.column(batch.schema().index_of("geometry").unwrap()).clone();
-            let names = batch.column(batch.schema().index_of("name").unwrap()).clone();
-            let bin = BinaryArray::from(geom.to_data());
-            let names = StringArray::from(names.to_data());
-            for i in 0..batch.num_rows() {
-                let (x, y) = parse_wkb_point_2d(bin.value(i)).unwrap();
-                let side = 200usize; // matches write_scrambled(40_000)
-                let gx = (x / 10.0 * side as f64).round() as usize;
-                let gy = (y / 10.0 * side as f64).round() as usize;
-                assert_eq!(names.value(i), format!("cell_{gx}_{gy}"));
-            }
+            let col = batch.column(batch.schema().index_of("name").unwrap()).clone();
+            let arr = StringArray::from(col.to_data());
+            names.extend((0..batch.num_rows()).map(|i| arr.value(i).to_string()));
+        }
+        assert_eq!(names.len(), geoms.len());
+        for ((_, g), name) in geoms.iter().zip(&names) {
+            let c = g.as_ref().unwrap().bounding_rect().unwrap().min();
+            let side = 200usize; // matches write_scrambled(40_000)
+            let gx = (c.x / 10.0 * side as f64).round() as usize;
+            let gy = (c.y / 10.0 * side as f64).round() as usize;
+            assert_eq!(name, &format!("cell_{gx}_{gy}"));
         }
     }
 
@@ -924,6 +1040,158 @@ mod tests {
         assert!(info11.geo.version_label.contains("1.1"), "{}", info11.geo.version_label);
     }
 
+    /// GeoArrow points: WKB → coordinate arrays, loader reads them, and the
+    /// x/y leaf statistics replace covering/geo stats as the pruning source.
+    #[test]
+    fn geoarrow_points_roundtrip() {
+        let dir = std::env::temp_dir().join("geopq_optimize_ga_pts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = write_scrambled(40_000, &dir);
+        let dst = dir.join("out_ga.parquet");
+        let opts = OptimizeOptions {
+            version: GpVersion::V1_1GeoArrow,
+            row_group_size: 2048,
+            covering: false, // force the coordinate-stats pruning source
+            ..Default::default()
+        };
+        let report = optimize(&Source::Local(src.clone()), &dst, &opts, None, &|_, _| {}).unwrap();
+        assert_eq!(report.rows, 40_000);
+        assert!(
+            report.overlap_frac_after() < 0.25,
+            "sorted: {}",
+            report.overlap_frac_after()
+        );
+
+        let (store, crs, info, rg_meta) = crate::data::loader::open_store_for_test(&dst).unwrap();
+        assert_eq!(crs.epsg, Some(2154));
+        assert_eq!(store.encoding, GeomEncoding::Point);
+        assert_eq!(info.geo.encoding, "point");
+        let (source, boxes) = rg_meta.expect("rg bboxes from coordinate stats");
+        assert!(source.contains("coordinate"), "{source}");
+        assert_eq!(boxes.len(), report.rg_after);
+        assert_rows_consistent(&dst);
+
+        // Loader builds it: same rows, Point kind, and the mesh path used
+        // the GeoArrow fast path (no WKB anywhere).
+        let display = crate::data::crs::DisplayCrs::hobo_dyer();
+        let (geom, rows, bad) =
+            crate::data::loader::build_geometry_for_test(&store, &crs, &display).unwrap();
+        assert_eq!((rows, bad), (40_000, 0));
+        assert_eq!(geom.kind, crate::data::geometry::GeomKind::Point);
+
+        // And back: GeoArrow → plain 1.1 WKB.
+        let dst_back = dir.join("back_wkb.parquet");
+        let opts_back = OptimizeOptions {
+            row_group_size: 2048,
+            ..Default::default()
+        };
+        optimize(&Source::Local(dst.clone()), &dst_back, &opts_back, None, &|_, _| {}).unwrap();
+        let (store_b, _crs, info_b, _rg) =
+            crate::data::loader::open_store_for_test(&dst_back).unwrap();
+        assert_eq!(store_b.encoding, GeomEncoding::Wkb);
+        assert!(info_b.geo.encoding.starts_with("WKB"), "{}", info_b.geo.encoding);
+        assert_rows_consistent(&dst_back);
+    }
+
+    /// GeoArrow polygons with single→multi promotion: a WKB source mixing
+    /// Polygon and MultiPolygon becomes one multipolygon-encoded column.
+    #[test]
+    fn geoarrow_polygon_promotion() {
+        use geo_types::{polygon, Geometry, MultiPolygon};
+        let dir = std::env::temp_dir().join("geopq_optimize_ga_poly");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // WKB source: squares on a grid, every 5th row a MultiPolygon.
+        let n = 5000usize;
+        let square = |x0: f64, y0: f64| {
+            polygon![(x: x0, y: y0), (x: x0 + 1.0, y: y0), (x: x0 + 1.0, y: y0 + 1.0), (x: x0, y: y0 + 1.0), (x: x0, y: y0)]
+        };
+        let stride = n / 2 + 1;
+        let (mut wkbs, mut ids) = (Vec::new(), Vec::new());
+        let wopts = wkb::writer::WriteOptions::default();
+        for k in 0..n {
+            let i = (k * stride) % n;
+            let (gx, gy) = ((i % 71) as f64 * 2.0 - 71.0, (i / 71) as f64 * 1.2);
+            let g: Geometry<f64> = if i % 5 == 0 {
+                MultiPolygon(vec![square(gx, gy), square(gx + 1.5, gy + 1.5)]).into()
+            } else {
+                square(gx, gy).into()
+            };
+            let mut buf = Vec::new();
+            wkb::writer::write_geometry(&mut buf, &g, &wopts).unwrap();
+            wkbs.push(buf);
+            ids.push(i as i64);
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(wkbs.iter())),
+                Arc::new(Int64Array::from(ids)),
+            ],
+        )
+        .unwrap();
+        let src = dir.join("poly_src.parquet");
+        let mut w = ArrowWriter::try_new(File::create(&src).unwrap(), schema, None).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            serde_json::json!({
+                "version": "1.0.0", "primary_column": "geometry",
+                "columns": {"geometry": {"encoding": "WKB", "geometry_types": ["Polygon", "MultiPolygon"]}},
+            })
+            .to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let dst = dir.join("poly_ga.parquet");
+        let opts = OptimizeOptions {
+            version: GpVersion::V1_1GeoArrow,
+            row_group_size: 1024,
+            ..Default::default()
+        };
+        optimize(&Source::Local(src.clone()), &dst, &opts, None, &|_, _| {}).unwrap();
+
+        let (store, _crs, info, rg_meta) =
+            crate::data::loader::open_store_for_test(&dst).unwrap();
+        assert_eq!(store.encoding, GeomEncoding::MultiPolygon);
+        assert_eq!(info.geo.encoding, "multipolygon");
+        assert_eq!(info.geo.geometry_types, vec!["MultiPolygon".to_string()]);
+        // Covering written by default → per-feature selection still works.
+        assert!(store.covering.is_some());
+        let (source, _boxes) = rg_meta.unwrap();
+        assert!(source.contains("covering"), "{source}");
+
+        // Every geometry survives promotion: id encodes the grid slot, so
+        // the bbox min corner must match the id-derived square origin.
+        use geo::BoundingRect;
+        let rows: Vec<u32> = (0..5000u32).step_by(97).collect();
+        let geoms = store.fetch_geoms(&rows).unwrap();
+        let batches = store.fetch(&rows, Some(&[1])).unwrap();
+        let mut ids: Vec<i64> = Vec::new();
+        for b in &batches {
+            let a = Int64Array::from(b.column(0).to_data());
+            ids.extend((0..b.num_rows()).map(|i| a.value(i)));
+        }
+        for ((_, g), id) in geoms.iter().zip(&ids) {
+            let g = g.as_ref().unwrap();
+            assert!(matches!(g, Geometry::MultiPolygon(_)), "promoted to multi");
+            let min = g.bounding_rect().unwrap().min();
+            let (gx, gy) = ((id % 71) as f64 * 2.0 - 71.0, (id / 71) as f64 * 1.2);
+            assert_eq!((min.x, min.y), (gx, gy), "id {id}");
+        }
+
+        // Loader tessellates it end to end.
+        let display = crate::data::crs::DisplayCrs::hobo_dyer();
+        let (geom, rows_n, bad) =
+            crate::data::loader::build_geometry_for_test(&store, &_crs, &display).unwrap();
+        assert_eq!((rows_n, bad), (5000, 0));
+        assert_eq!(geom.kind, crate::data::geometry::GeomKind::Polygon);
+    }
+
     /// The covering bbox leaves must be written in small pages so the page
     /// index (ColumnIndex/OffsetIndex) prunes below row-group granularity.
     #[test]
@@ -938,7 +1206,7 @@ mod tests {
         assert_eq!(report.rg_after, 150_000_usize.div_ceil(65_536));
 
         let options = parquet::arrow::arrow_reader::ArrowReaderOptions::new()
-            .with_page_index(true);
+            .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional);
         let b = ParquetRecordBatchReaderBuilder::try_new_with_options(
             File::open(&dst).unwrap(),
             options,
@@ -963,6 +1231,60 @@ mod tests {
         let locs = offset_index[0][leaf_idx("bbox.xmin")].page_locations();
         assert_eq!(locs[0].first_row_index, 0);
         assert!(locs[1].first_row_index > 0);
+    }
+
+    /// WKB vs GeoArrow decode speed on the real fixtures, opt-in:
+    /// cargo test --release geoarrow_speed -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn geoarrow_speed() {
+        let dir = std::env::temp_dir().join("geopq_ga_speed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let display = crate::data::crs::DisplayCrs::hobo_dyer();
+        let mut bench = |label: &str, fixture: &str| {
+            let src = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/"))
+                .join(fixture);
+            if !src.exists() {
+                eprintln!("{label}: fixture missing, skipping");
+                return;
+            }
+            // Matched pair: same codec, order, row groups, no covering —
+            // the only difference is the geometry encoding.
+            let base = OptimizeOptions {
+                hilbert_sort: false,
+                covering: false,
+                ..Default::default()
+            };
+            let wkb = dir.join(format!("{label}_wkb.parquet"));
+            let ga = dir.join(format!("{label}_ga.parquet"));
+            optimize(&Source::Local(src.clone()), &wkb, &base, None, &|_, _| {}).unwrap();
+            let opts = OptimizeOptions {
+                version: GpVersion::V1_1GeoArrow,
+                ..base
+            };
+            optimize(&Source::Local(src.clone()), &ga, &opts, None, &|_, _| {}).unwrap();
+            let mut time = |path: &std::path::PathBuf| {
+                let (store, crs, _i, _r) =
+                    crate::data::loader::open_store_for_test(path).unwrap();
+                let t = std::time::Instant::now();
+                let (_g, rows, _b) =
+                    crate::data::loader::build_geometry_for_test(&store, &crs, &display)
+                        .unwrap();
+                (t.elapsed().as_millis(), rows)
+            };
+            let size = |p: &std::path::PathBuf| std::fs::metadata(p).unwrap().len() / (1 << 20);
+            let (wkb_ms, rows) = time(&wkb);
+            let (ga_ms, rows2) = time(&ga);
+            assert_eq!(rows, rows2);
+            eprintln!(
+                "{label}: {rows} rows — load: WKB {wkb_ms} ms vs GeoArrow {ga_ms} ms ({:.2}x) — size: {} MB vs {} MB",
+                wkb_ms as f64 / ga_ms as f64,
+                size(&wkb),
+                size(&ga),
+            );
+        };
+        bench("points_3m75", "points_3m75.parquet");
+        bench("parcels", "parcels_hilbert.parquet");
     }
 
     /// Real-file benchmark, opt-in:

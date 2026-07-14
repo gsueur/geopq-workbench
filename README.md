@@ -29,10 +29,13 @@ Fixture-dependent tests self-skip when the files are absent.
 
 ## Features
 
-- **GeoParquet 1.0 / 1.1 / 2.0**: `geo` metadata (primary column, WKB encoding,
-  PROJJSON CRS); 2.0 files with native GEOMETRY logical types are detected and
-  load through the WKB path. Files without `geo` metadata fall back to a
-  guessed WKB column + CRS84. GeoArrow-native 1.1 encodings not yet supported.
+- **GeoParquet 1.0 / 1.1 / 2.0**: `geo` metadata (primary column, PROJJSON
+  CRS); 2.0 files with native GEOMETRY logical types are detected and load
+  through the WKB path; GeoArrow-native 1.1 encodings ("point",
+  "multipolygon", ... — nested coordinate arrays) load through a dedicated
+  accessor, with per-row-group bboxes derived from the x/y coordinate
+  column statistics when no covering/geo stats exist. Files without `geo`
+  metadata fall back to a guessed WKB column + CRS84.
 - **File info panel**: per-layer Info button — detected GeoParquet version,
   encoding, CRS, metadata bbox, covering/edges, column types + compression,
   row-group layout, raw `geo` JSON with copy.
@@ -73,9 +76,17 @@ Fixture-dependent tests self-skip when the files are absent.
   - **GeoParquet 1.1**: plain WKB column (native GEOMETRY logical types from
     2.0 sources are stripped for reader compatibility) + `bbox` covering
     struct column, so covering column statistics drive pruning;
+  - **GeoParquet 1.1 (GeoArrow)**: geometry as raw coordinate arrays
+    (requires a single geometry family; Polygon rows promote into a
+    multipolygon column, etc.). The x/y leaves get ordinary parquet
+    statistics, so any engine prunes with zero geo-awareness; GDAL reads
+    the output natively. Measured in this viewer (matched codec/order):
+    points load 1.17x faster than WKB, polygons are parity (tessellation
+    dominates), files ~7-8% larger.
   - **GeoParquet 2.0**: parquet-native GEOMETRY logical type (CRS carried in
     the type), with native geospatial statistics written per row group — no
     covering column needed, smaller file.
+  Geometry transcodes in any direction (WKB ↔ GeoArrow ↔ native type).
   The covering bbox leaves are written in small (~4k-row) pages with
   dictionary encoding off, so the parquet page index (ColumnIndex/
   OffsetIndex) prunes well below row-group granularity in any reader.
@@ -129,7 +140,8 @@ deep zoom stays jitter-free.
 
 ## Roadmap ideas
 
-- Native GeoArrow encodings (`geoarrow.point` etc.) without WKB decode
+- Bulk column-level reprojection straight into tessellation for GeoArrow
+  sources (skip per-feature geo-types allocation)
 - Streaming (external-sort) optimize for files beyond the 8 GB in-memory cap
 - Page-index (footer-only) pruning for 2.0 native-stats files without a
   covering column (per-feature selection needs the bbox column today)

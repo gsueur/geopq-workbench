@@ -912,6 +912,21 @@ impl ViewerApp {
                         o.opts.covering = true;
                     }
                     if ui
+                        .radio(
+                            o.opts.version == GpVersion::V1_1GeoArrow,
+                            GpVersion::V1_1GeoArrow.label(),
+                        )
+                        .on_hover_text(
+                            "Geometry as raw coordinate arrays: fastest decode, x/y column\n\
+                             statistics prune for free. Needs a single geometry family\n\
+                             (singles are promoted to their multi variant).",
+                        )
+                        .clicked()
+                    {
+                        o.opts.version = GpVersion::V1_1GeoArrow;
+                        o.opts.covering = true;
+                    }
+                    if ui
                         .radio(o.opts.version == GpVersion::V2_0, GpVersion::V2_0.label())
                         .on_hover_text(
                             "Native geo statistics replace the covering column for pruning;\n\
@@ -1597,7 +1612,7 @@ pub(crate) fn build_rg_overlay(
     const N: usize = 16;
     for b in boxes {
         let mut ring: Vec<geo_types::Coord<f64>> = Vec::with_capacity(4 * N + 1);
-        let mut push = |x: f64, y: f64, ring: &mut Vec<geo_types::Coord<f64>>| {
+        let push = |x: f64, y: f64, ring: &mut Vec<geo_types::Coord<f64>>| {
             let (mut px, mut py) = (x, y);
             if tr.apply(&mut px, &mut py) {
                 let w = display.world_from_projected(px, py);
