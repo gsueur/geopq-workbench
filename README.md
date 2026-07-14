@@ -12,7 +12,7 @@ at vsync.
 ## Run
 
 ```bash
-cargo run --release [file.parquet ...]
+cargo run --release [file.parquet | https://host/file.parquet ...]
 ```
 
 Or drag & drop `.parquet` files onto the window / use **Open…**.
@@ -42,6 +42,18 @@ Fixture-dependent tests self-skip when the files are absent.
   (1.1), or computed during the load stream (1.0/untagged) — plus an
   average-overlap clustering metric that tells you whether the file would
   benefit from a spatial-order rewrite.
+- **Remote GeoParquet over HTTP range requests**: open an `https://` URL
+  (toolbar "URL…" button, or as a CLI argument) — the footer, metadata and
+  page indexes are fetched with bounded range requests, and the same
+  pruning stack below then applies over the network: a 304 MB GeoParquet
+  2.0 file (2.7M MA buildings) opens in ~1.3 s, and a city-scale viewport
+  (307k buildings, 6 of 53 row groups via native geo statistics) renders
+  after ~5 s of parallel per-group range requests. Sequential reads use
+  growing bounded windows (256 KB → 8 MB) instead of open-ended ranges;
+  files with a page index get exact per-page fetches. Lazy attributes and
+  picking work identically (each click is a small ranged read). Note:
+  opening a remote file while zoomed out to the whole extent legitimately
+  downloads all row groups — zoom in first for large files.
 - **Row-group + per-feature pruning on load**: when metadata bboxes exist,
   only row groups intersecting the viewport are decoded — and inside the
   surviving groups of a covering-column (1.1) file, a cheap scan of the four
@@ -101,6 +113,7 @@ Fixture-dependent tests self-skip when the files are absent.
 |---|---|
 | `data/loader.rs` | streaming parquet read, `geo` metadata, WKB decode (fast path for 2D points), rayon-parallel build |
 | `data/store.rs` | `FeatureStore`: lazy row fetch (attributes, WKB) via row-group/RowSelection reads |
+| `data/source.rs` | local file / HTTP range-request `ChunkReader` (windowed sequential reads, exact page fetches) |
 | `data/optimize.rs` | Hilbert-sort rewrite to GeoParquet 1.1 (covering) or 2.0 (native GEOMETRY + geo stats), bloom filters |
 | `data/crs.rs` | PROJJSON → EPSG → proj4rs; native Winkel Tripel; `DisplayCrs` maps projected coords to normalized world space |
 | `data/geometry.rs` | lyon fill tessellation, line segments, points, accumulated into spatial chunks with per-chunk f64 origins (f32 GPU precision at deep zoom) |
@@ -121,7 +134,7 @@ deep zoom stays jitter-free.
 - Page-index (footer-only) pruning for 2.0 native-stats files without a
   covering column (per-feature selection needs the bbox column today)
 - Zoom-dependent coastline detail (embed 1:110m + fetch 1:10m on demand)
-- HTTP range-request streaming of remote GeoParquet (row-group pyramids)
+- Overview/pyramid levels for zoomed-out views of huge remote files
 - Data-driven styling (color by attribute, graduated/categorical)
 - Zoom-dependent decimation / LOD for very dense line/polygon layers
 - Attribute table view + filtering (DataFusion over the parquet file)

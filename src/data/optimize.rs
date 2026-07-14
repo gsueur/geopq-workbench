@@ -33,6 +33,7 @@ use parquet::schema::types::ColumnPath;
 use serde_json::{json, Value};
 
 use super::loader::{decode_wkb, parse_wkb_point_2d, BinCol};
+use super::source::Source;
 
 /// Refuse in-memory rewrites beyond this uncompressed size.
 const MAX_IN_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -160,7 +161,7 @@ impl OptimizeReport {
 /// source has no usable CRS metadata (e.g. the already-loaded layer's CRS).
 /// `progress(frac, stage)` is called from the worker thread.
 pub fn optimize(
-    src: &Path,
+    src: &Source,
     dst: &Path,
     opts: &OptimizeOptions,
     epsg_hint: Option<u32>,
@@ -169,8 +170,7 @@ pub fn optimize(
     let t0 = std::time::Instant::now();
     progress(0.0, "reading metadata");
 
-    let file = File::open(src).map_err(|e| format!("cannot open file: {e}"))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+    let builder = ParquetRecordBatchReaderBuilder::try_new(src.open()?)
         .map_err(|e| format!("not a parquet file: {e}"))?;
     let src_schema = builder.schema().clone();
     let meta = builder.metadata().clone();
@@ -212,7 +212,7 @@ pub fn optimize(
         .as_ref()
         .and_then(|m| m.get("columns")?.get(&primary)?.get("crs").cloned())
         .filter(|v| !v.is_null())
-        .or_else(|| logical_type_crs(&meta, geom_idx))
+        .or_else(|| logical_type_crs(&meta, &primary))
         .or_else(|| {
             epsg_hint.filter(|&e| e != 4326).map(|e| {
                 json!({"id": {"authority": "EPSG", "code": e}})
@@ -257,8 +257,7 @@ pub fn optimize(
     // --- read everything, scanning geometry bboxes as batches arrive ---
     progress(0.02, "reading rows");
     let total_rows = fmd.num_rows().max(0) as usize;
-    let file = File::open(src).map_err(|e| format!("cannot open file: {e}"))?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+    let reader = ParquetRecordBatchReaderBuilder::try_new(src.open()?)
         .map_err(|e| format!("not a parquet file: {e}"))?
         .with_batch_size(READ_BATCH)
         .build()
@@ -507,7 +506,7 @@ pub fn optimize(
 
     Ok(OptimizeReport {
         rows: rows as u64,
-        size_before: std::fs::metadata(src).map(|m| m.len()).unwrap_or(0),
+        size_before: src.size(),
         size_after: std::fs::metadata(dst).map(|m| m.len()).unwrap_or(0),
         rg_before,
         rg_after: rg_after_rows.len(),
@@ -556,12 +555,19 @@ fn build_geo_meta(
 }
 
 /// CRS string recorded in a GEOMETRY/GEOGRAPHY logical type (2.0 sources).
+/// Looks the geometry column up by name: parquet leaf indices don't line up
+/// with arrow root indices once nested columns exist.
 fn logical_type_crs(
     meta: &parquet::file::metadata::ParquetMetaData,
-    geom_idx: usize,
+    geom_name: &str,
 ) -> Option<Value> {
     use parquet::basic::LogicalType;
-    let col = meta.row_groups().first()?.columns().get(geom_idx)?;
+    let col = meta
+        .row_groups()
+        .first()?
+        .columns()
+        .iter()
+        .find(|c| c.column_descr().path().parts().first().map(String::as_str) == Some(geom_name))?;
     let crs = match col.column_descr().logical_type_ref() {
         Some(LogicalType::Geometry(g)) => g.crs.clone(),
         Some(LogicalType::Geography(g)) => g.crs.clone(),
@@ -809,7 +815,7 @@ mod tests {
             row_group_size: 2048,
             ..Default::default()
         };
-        let report = optimize(&src, &dst, &opts, None, &|_, _| {}).unwrap();
+        let report = optimize(&Source::Local(src.clone()), &dst, &opts, None, &|_, _| {}).unwrap();
         assert_eq!(report.rows, 40_000);
         assert_eq!(report.rg_after, 40_000_usize.div_ceil(2048));
         // Scrambled input: every row group spans the full extent. Sorted
@@ -849,7 +855,7 @@ mod tests {
             bloom: BloomMode::AllAttributes,
             ..Default::default()
         };
-        let report = optimize(&src, &dst, &opts, None, &|_, _| {}).unwrap();
+        let report = optimize(&Source::Local(src.clone()), &dst, &opts, None, &|_, _| {}).unwrap();
         assert_eq!(report.rows, 40_000);
         let mut bloom = report.bloom_columns.clone();
         bloom.sort();
@@ -900,7 +906,7 @@ mod tests {
             row_group_size: 2048,
             ..Default::default()
         };
-        optimize(&dst, &dst11, &opts11, None, &|_, _| {}).unwrap();
+        optimize(&Source::Local(dst.clone()), &dst11, &opts11, None, &|_, _| {}).unwrap();
         let b = ParquetRecordBatchReaderBuilder::try_new(File::open(&dst11).unwrap()).unwrap();
         let geom = b.metadata().row_groups()[0]
             .columns()
@@ -926,7 +932,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let src = write_scrambled(150_000, &dir);
         let dst = dir.join("out_pages.parquet");
-        let report = optimize(&src, &dst, &OptimizeOptions::default(), None, &|_, _| {}).unwrap();
+        let report =
+            optimize(&Source::Local(src.clone()), &dst, &OptimizeOptions::default(), None, &|_, _| {})
+                .unwrap();
         assert_eq!(report.rg_after, 150_000_usize.div_ceil(65_536));
 
         let options = parquet::arrow::arrow_reader::ArrowReaderOptions::new()
@@ -973,7 +981,7 @@ mod tests {
                 covering: version == GpVersion::V1_1,
                 ..Default::default()
             };
-            let report = optimize(&src, &dst, &opts, None, &|_, _| {}).unwrap();
+            let report = optimize(&Source::Local(src.clone()), &dst, &opts, None, &|_, _| {}).unwrap();
             eprintln!("{report:#?}");
             eprintln!(
                 "overlap fraction: {:.0}% -> {:.0}%",

@@ -1955,6 +1955,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "bytemuck",
+ "bytes",
  "crs-definitions",
  "eframe",
  "egui_extras",

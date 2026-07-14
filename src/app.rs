@@ -7,6 +7,7 @@ use eframe::egui::{self, Color32, RichText};
 use eframe::egui_wgpu;
 
 use crate::data::crs::{world_to_lonlat, BulkTransformer, Crs, DisplayCrs, DisplayKind};
+use crate::data::source::Source;
 use crate::data::geometry::MeshBuilder;
 use crate::data::layer::{palette_color, VectorLayer};
 use crate::data::loader::{self, LoadMsg, LoaderHandle};
@@ -22,7 +23,7 @@ const COASTLINE_KEY: u64 = u64::MAX - 2;
 const RG_OVERLAY_BASE: u64 = 1 << 62;
 
 struct LoadingJob {
-    path: PathBuf,
+    label: String,
     frac: f32,
     stage: String,
 }
@@ -36,7 +37,7 @@ enum OptMsg {
 /// State of the per-layer "Optimize" export dialog (one at a time).
 struct OptimizeState {
     layer_name: String,
-    src: PathBuf,
+    src: Source,
     epsg: Option<u32>,
     opts: crate::data::optimize::OptimizeOptions,
     running: bool,
@@ -90,6 +91,8 @@ pub struct ViewerApp {
 
     errors: Vec<String>,
     show_errors: bool,
+    /// URL entry dialog content (Some = dialog open).
+    url_input: Option<String>,
     info_open: Option<u64>,
     /// Layer generations whose CPU-side fill/line arrays were freed after
     /// GPU upload (points are kept for picking).
@@ -99,7 +102,7 @@ pub struct ViewerApp {
 }
 
 impl ViewerApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<Source>) -> Self {
         let rs = cc
             .wgpu_render_state
             .as_ref()
@@ -148,6 +151,7 @@ impl ViewerApp {
             last_view_world: [-10.0, -10.0, 10.0, 10.0],
             errors: Vec::new(),
             show_errors: false,
+            url_input: None,
             info_open: None,
             stripped: HashSet::new(),
             epsg_input: String::new(),
@@ -159,7 +163,7 @@ impl ViewerApp {
         app
     }
 
-    fn enqueue_load(&mut self, path: PathBuf, ctx: &egui::Context) {
+    fn enqueue_load(&mut self, source: Source, ctx: &egui::Context) {
         let job = self.next_job;
         self.next_job += 1;
         let layer_id = self.next_layer_id;
@@ -169,7 +173,7 @@ impl ViewerApp {
         self.loading.insert(
             job,
             LoadingJob {
-                path: path.clone(),
+                label: source.label(),
                 frac: 0.0,
                 stage: "queued".into(),
             },
@@ -181,7 +185,7 @@ impl ViewerApp {
             },
             job,
             layer_id,
-            path,
+            source,
             self.display.clone(),
             color,
             self.last_view_world,
@@ -255,9 +259,9 @@ impl ViewerApp {
                         }
                     }
                 }
-                LoadMsg::Failed { job, path, error } => {
+                LoadMsg::Failed { job, source, error } => {
                     self.loading.remove(&job);
-                    self.push_error(format!("{}: {error}", path.display()));
+                    self.push_error(format!("{source}: {error}"));
                 }
             }
         }
@@ -409,9 +413,12 @@ impl ViewerApp {
                     .pick_files()
                 {
                     for p in paths {
-                        self.enqueue_load(p, &ctx);
+                        self.enqueue_load(Source::Local(p), &ctx);
                     }
                 }
+            }
+            if ui.button("🌐 URL…").clicked() && self.url_input.is_none() {
+                self.url_input = Some(String::new());
             }
             if ui
                 .add_enabled(!self.layers.is_empty(), egui::Button::new("🌍 Fit all"))
@@ -512,10 +519,7 @@ impl ViewerApp {
                             .desired_width(140.0)
                             .text(format!(
                                 "{} — {}",
-                                job.path
-                                    .file_name()
-                                    .map(|s| s.to_string_lossy().into_owned())
-                                    .unwrap_or_default(),
+                                job.label.rsplit('/').next().unwrap_or(&job.label),
                                 job.stage
                             )),
                     );
@@ -552,7 +556,7 @@ impl ViewerApp {
                             l.style.color = c;
                         }
                         ui.label(RichText::new(&l.name).strong())
-                            .on_hover_text(l.path.display().to_string());
+                            .on_hover_text(l.store.source.label());
                     });
                     ui.horizontal(|ui| {
                         ui.label(
@@ -703,7 +707,7 @@ impl ViewerApp {
                 if let Some(l) = self.layers.iter().find(|l| l.id == id) {
                     self.optimize = Some(OptimizeState {
                         layer_name: l.name.clone(),
-                        src: l.path.clone(),
+                        src: l.store.source.clone(),
                         epsg: l.crs.epsg,
                         opts: Default::default(),
                         running: false,
@@ -751,6 +755,41 @@ impl ViewerApp {
                     }
                 }
             }
+        }
+    }
+
+    fn url_window(&mut self, ctx: &egui::Context) {
+        let Some(url) = &mut self.url_input else { return };
+        let mut open = true;
+        let mut submit: Option<String> = None;
+        egui::Window::new("Open URL")
+            .id(egui::Id::new("open_url"))
+            .open(&mut open)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.label("GeoParquet over HTTP(S) — needs range-request support:");
+                let edit = ui.add(
+                    egui::TextEdit::singleline(url)
+                        .hint_text("https://example.com/data.parquet")
+                        .desired_width(f32::INFINITY),
+                );
+                let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                ui.add_space(4.0);
+                let valid = url.starts_with("http://") || url.starts_with("https://");
+                if ui
+                    .add_enabled(valid, egui::Button::new("Open"))
+                    .clicked()
+                    || (enter && valid)
+                {
+                    submit = Some(url.trim().to_string());
+                }
+            });
+        if let Some(u) = submit {
+            // Length probe + load run in the loader thread.
+            self.enqueue_load(Source::Remote { url: u, len: 0 }, ctx);
+            self.url_input = None;
+        } else if !open {
+            self.url_input = None;
         }
     }
 
@@ -933,16 +972,14 @@ impl ViewerApp {
                             .animate(true),
                     );
                 } else if ui.button("Export…").clicked() {
-                    let stem = o
-                        .src
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "layer".into());
+                    let stem = o.src.name();
                     let mut dialog = rfd::FileDialog::new()
                         .set_file_name(format!("{stem}_optimized.parquet"))
                         .add_filter("GeoParquet", &["parquet"]);
-                    if let Some(dir) = o.src.parent() {
-                        dialog = dialog.set_directory(dir);
+                    if let Source::Local(p) = &o.src {
+                        if let Some(dir) = p.parent() {
+                            dialog = dialog.set_directory(dir);
+                        }
                     }
                     if let Some(dst) = dialog.save_file() {
                         start = Some(dst);
@@ -957,7 +994,7 @@ impl ViewerApp {
             self.start_optimize(dst, ctx);
         }
         if let Some(p) = load_result {
-            self.enqueue_load(p, ctx);
+            self.enqueue_load(Source::Local(p), ctx);
             close = true;
         }
         // Keep the worker's state visible: ignore window close while running.
@@ -1041,7 +1078,11 @@ impl ViewerApp {
                             ui.label(v);
                             ui.end_row();
                         };
-                        row(ui, "path", layer.path.display().to_string());
+                        row(
+                            ui,
+                            if layer.store.source.is_remote() { "url" } else { "path" },
+                            layer.store.source.label(),
+                        );
                         row(ui, "file size", fmt_bytes(info.file_size));
                         row(ui, "rows", info.rows.to_string());
                         row(
@@ -1715,7 +1756,7 @@ impl eframe::App for ViewerApp {
                 .collect()
         });
         for p in dropped {
-            self.enqueue_load(p, &ctx);
+            self.enqueue_load(Source::Local(p), &ctx);
         }
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
@@ -1733,6 +1774,7 @@ impl eframe::App for ViewerApp {
         self.errors_window(&ctx);
         self.info_window(&ctx);
         self.optimize_window(&ctx);
+        self.url_window(&ctx);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.map_panel(ui));

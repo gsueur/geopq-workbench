@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use eframe::egui::Color32;
@@ -151,8 +150,7 @@ pub struct VectorLayer {
     /// renderer knows to re-upload GPU buffers.
     pub generation: u64,
     pub name: String,
-    pub path: PathBuf,
-    /// Lazy row access to the source file (attributes, WKB, rebuilds).
+    /// Lazy row access to the source file/URL (attributes, WKB, rebuilds).
     pub store: Arc<FeatureStore>,
     pub crs: Crs,
     /// Geometry sections: index 0 from the initial load, later entries from

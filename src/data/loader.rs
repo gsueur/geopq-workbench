@@ -1,5 +1,3 @@
-use std::fs::File;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -19,6 +17,7 @@ use super::crs::{BulkTransformer, Crs, DisplayCrs};
 use super::geometry::{FeatureRef, MeshBuilder};
 use super::info::{summarize_geo_meta, ColumnInfo, FileInfo};
 use super::layer::{GroupLoad, LayerGeometry, LoadStats, PickItem, RgBboxes, VectorLayer};
+use super::source::Source;
 use super::store::{CoveringCol, FeatureStore};
 
 const BATCH_SIZE: usize = 64 * 1024;
@@ -52,7 +51,7 @@ pub enum LoadMsg {
     },
     Failed {
         job: u64,
-        path: PathBuf,
+        source: String,
         error: String,
     },
 }
@@ -173,7 +172,7 @@ pub fn complement_ranges(ranges: &[(u32, u32)], len: u32) -> Vec<(u32, u32)> {
 /// features intersecting `rect`. None when the file has no usable covering
 /// column (caller falls back to the whole group).
 fn covering_select(
-    path: &PathBuf,
+    source: &Source,
     covering: Option<&CoveringCol>,
     group: u32,
     rect: [f64; 4],
@@ -183,7 +182,7 @@ fn covering_select(
         return Ok(None);
     };
     let reader = FeatureStore::open_reader_for_group(
-        path,
+        source,
         group as usize,
         BATCH_SIZE,
         None,
@@ -238,14 +237,29 @@ pub fn spawn_load(
     handle: LoaderHandle,
     job: u64,
     layer_id: u64,
-    path: PathBuf,
+    source: Source,
     display: DisplayCrs,
     color: eframe::egui::Color32,
     view_world: [f64; 4],
 ) {
     std::thread::spawn(move || {
         let t0 = Instant::now();
-        match open_store(&path) {
+        // Resolve URLs (content-length probe) off the UI thread.
+        let source = match &source {
+            Source::Remote { url, len: 0 } => match Source::remote(url) {
+                Ok(s) => s,
+                Err(e) => {
+                    handle.send(LoadMsg::Failed {
+                        job,
+                        source: source.label(),
+                        error: e,
+                    });
+                    return;
+                }
+            },
+            _ => source,
+        };
+        match open_store(&source) {
             Ok((store, crs, info, rg_meta)) => {
                 let store = Arc::new(store);
                 let n_rg = store.rg_starts().len().saturating_sub(1);
@@ -260,7 +274,7 @@ pub fn spawn_load(
                 if groups.len() < n_rg {
                     log::info!(
                         "{}: row-group pruning {} -> {} groups",
-                        path.display(),
+                        source.label(),
                         n_rg,
                         groups.len()
                     );
@@ -314,10 +328,7 @@ pub fn spawn_load(
                             rows,
                             bad_geoms: bad,
                         };
-                        let name = path
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "layer".into());
+                        let name = source.name();
                         log::info!(
                             "loaded {name}: {rows} features in {} ms",
                             t0.elapsed().as_millis()
@@ -326,7 +337,6 @@ pub fn spawn_load(
                             id: layer_id,
                             generation: 0,
                             name,
-                            path,
                             store,
                             crs,
                             sections: vec![geometry],
@@ -344,14 +354,14 @@ pub fn spawn_load(
                     }
                     Err(e) => handle.send(LoadMsg::Failed {
                         job,
-                        path,
+                        source: source.label(),
                         error: e,
                     }),
                 }
             }
             Err(e) => handle.send(LoadMsg::Failed {
                 job,
-                path,
+                source: source.label(),
                 error: e,
             }),
         }
@@ -393,7 +403,7 @@ pub fn spawn_rebuild(
             }),
             Err(e) => handle.send(LoadMsg::Failed {
                 job: u64::MAX,
-                path: store.path.clone(),
+                source: store.source.label(),
                 error: format!("projection rebuild failed: {e}"),
             }),
         }
@@ -423,7 +433,7 @@ pub fn spawn_append(
             }),
             Err(e) => handle.send(LoadMsg::Failed {
                 job: u64::MAX,
-                path: store.path.clone(),
+                source: store.source.label(),
                 error: format!("row append failed: {e}"),
             }),
         }
@@ -438,9 +448,8 @@ type StoreOpen = (
     Option<(String, Vec<[f64; 4]>)>,
 );
 
-fn open_store(path: &PathBuf) -> Result<StoreOpen, String> {
-    let file = File::open(path).map_err(|e| format!("cannot open file: {e}"))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+fn open_store(source: &Source) -> Result<StoreOpen, String> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(source.open()?)
         .map_err(|e| format!("not a parquet file: {e}"))?;
 
     // GeoParquet "geo" key-value metadata.
@@ -519,24 +528,33 @@ fn open_store(path: &PathBuf) -> Result<StoreOpen, String> {
     let meta = builder.metadata();
     let fmd = meta.file_metadata();
     let pq_columns = builder.parquet_schema().columns();
+    // Arrow root index != parquet leaf index once nested columns exist:
+    // resolve each root to its first leaf by path root name.
+    let leaf_of_root = |name: &str| -> Option<usize> {
+        pq_columns
+            .iter()
+            .position(|c| c.path().parts().first().map(String::as_str) == Some(name))
+    };
+    let geom_leaf = leaf_of_root(&geom_name);
     let mut has_native_geometry = false;
     let columns: Vec<ColumnInfo> = schema
         .fields()
         .iter()
         .enumerate()
         .map(|(i, field)| {
-            let logical = pq_columns.get(i).and_then(|c| {
-                c.logical_type_ref().map(|lt| format!("{lt:?}"))
+            let leaf = leaf_of_root(field.name());
+            let logical = leaf.and_then(|l| {
+                pq_columns[l].logical_type_ref().map(|lt| format!("{lt:?}"))
             });
-            if let Some(l) = &logical {
-                if l.starts_with("Geometry") || l.starts_with("Geography") {
-                    has_native_geometry = true;
+            if i == geom_col {
+                if let Some(l) = &logical {
+                    if l.starts_with("Geometry") || l.starts_with("Geography") {
+                        has_native_geometry = true;
+                    }
                 }
             }
-            let compression = meta
-                .row_groups()
-                .first()
-                .and_then(|rg| rg.columns().get(i))
+            let compression = leaf
+                .and_then(|l| meta.row_groups().first().and_then(|rg| rg.columns().get(l)))
                 .map(|c| format!("{}", c.compression()))
                 .unwrap_or_else(|| "?".into());
             ColumnInfo {
@@ -555,7 +573,7 @@ fn open_store(path: &PathBuf) -> Result<StoreOpen, String> {
         )
     });
     let info = FileInfo {
-        file_size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        file_size: source.size(),
         parquet_format_version: fmd.version(),
         created_by: fmd.created_by().map(String::from),
         rows: total_rows as u64,
@@ -568,11 +586,11 @@ fn open_store(path: &PathBuf) -> Result<StoreOpen, String> {
         geo: summarize_geo_meta(geo_meta.as_ref(), &geom_name, &crs.name, has_native_geometry),
     };
 
-    let rg_meta_boxes = rg_bboxes_from_metadata(&builder, geo_meta.as_ref(), geom_col, &geom_name);
+    let rg_meta_boxes = rg_bboxes_from_metadata(&builder, geo_meta.as_ref(), geom_leaf, &geom_name);
     let covering = covering_column(geo_meta.as_ref(), &geom_name, &schema);
 
     Ok((
-        FeatureStore::new(path.clone(), geom_col, schema, covering, rg_rows),
+        FeatureStore::new(source.clone(), geom_col, schema, covering, rg_rows),
         crs,
         info,
         rg_meta_boxes,
@@ -616,23 +634,25 @@ fn covering_column(
 /// parquet native geospatial statistics (GeoParquet 2.0), then GeoParquet
 /// 1.1 `covering` bbox-column statistics. Returns (source label, boxes).
 fn rg_bboxes_from_metadata(
-    builder: &ParquetRecordBatchReaderBuilder<File>,
+    builder: &ParquetRecordBatchReaderBuilder<super::source::SourceReader>,
     geo_meta: Option<&Value>,
-    geom_col: usize,
+    geom_leaf: Option<usize>,
     primary: &str,
 ) -> Option<(String, Vec<[f64; 4]>)> {
     let meta = builder.metadata();
 
-    // 1. Native geospatial statistics on the geometry column chunks.
-    let native: Option<Vec<[f64; 4]>> = meta
-        .row_groups()
-        .iter()
-        .map(|rg| {
-            let stats = rg.columns().get(geom_col)?.geo_statistics()?;
-            let b = stats.bounding_box()?;
-            Some([b.get_xmin(), b.get_ymin(), b.get_xmax(), b.get_ymax()])
-        })
-        .collect();
+    // 1. Native geospatial statistics on the geometry column chunks
+    // (leaf-indexed, not arrow-root-indexed).
+    let native: Option<Vec<[f64; 4]>> = geom_leaf.and_then(|leaf| {
+        meta.row_groups()
+            .iter()
+            .map(|rg| {
+                let stats = rg.columns().get(leaf)?.geo_statistics()?;
+                let b = stats.bounding_box()?;
+                Some([b.get_xmin(), b.get_ymin(), b.get_xmax(), b.get_ymax()])
+            })
+            .collect()
+    });
     if let Some(boxes) = native {
         if !boxes.is_empty() {
             return Some(("parquet geospatial statistics".into(), boxes));
@@ -772,14 +792,15 @@ fn build_geometry(
         .max(1);
     let done = AtomicUsize::new(0);
 
-    let path = store.path.clone();
+    let source = store.source.clone();
     let covering = store.covering.clone();
     let err_ref = &stream_error;
     let resolved_ref = &resolved;
     let starts = rg_starts;
-    // Batches from a multi-group reader can span groups, so read one group
-    // at a time; batches still fan out to all cores via par_bridge.
-    let stream = sel.into_iter().flat_map(move |job| {
+    // One task per group: group reads run concurrently (essential for
+    // remote sources, where each group is a series of range requests) and
+    // the flattened batches then tessellate in parallel.
+    let per_group = move |job: GroupSel| -> Vec<(RowMap, RecordBatch)> {
         let g = job.group();
         let start = starts[g as usize];
         let group_rows = (starts[g as usize + 1] - start) as u32;
@@ -787,7 +808,7 @@ fn build_geometry(
         let (ranges, state): (Option<Vec<(u32, u32)>>, GroupLoad) = match &job {
             GroupSel::All(_) => (None, GroupLoad::Full),
             GroupSel::Ranges(_, r) => (Some(r.clone()), GroupLoad::Full),
-            GroupSel::Rect(_, rect) => match covering_select(&path, covering.as_ref(), g, *rect) {
+            GroupSel::Rect(_, rect) => match covering_select(&source, covering.as_ref(), g, *rect) {
                 Ok(Some(r)) if r == [(0, group_rows)] => (None, GroupLoad::Full),
                 Ok(Some(r)) => (
                     Some(r.clone()),
@@ -817,7 +838,7 @@ fn build_geometry(
             None
         } else {
             match FeatureStore::open_reader_for_group(
-                &path,
+                &source,
                 g as usize,
                 BATCH_SIZE,
                 ranges.as_deref(),
@@ -830,27 +851,30 @@ fn build_geometry(
                 }
             }
         };
-        reader
-            .into_iter()
-            .flatten()
-            .scan(0usize, move |consumed, res| match res {
+        let mut out = Vec::new();
+        let mut consumed = 0usize;
+        for res in reader.into_iter().flatten() {
+            match res {
                 Ok(batch) => {
                     let map = match &sparse {
-                        None => RowMap::Contiguous(start + *consumed as u64),
-                        Some(rows) => RowMap::Sparse(rows.clone(), *consumed),
+                        None => RowMap::Contiguous(start + consumed as u64),
+                        Some(rows) => RowMap::Sparse(rows.clone(), consumed),
                     };
-                    *consumed += batch.num_rows();
-                    Some((map, batch))
+                    consumed += batch.num_rows();
+                    out.push((map, batch));
                 }
                 Err(e) => {
                     *err_ref.lock().unwrap() = Some(e.to_string());
-                    None
+                    break;
                 }
-            })
-    });
+            }
+        }
+        out
+    };
 
-    let (builder, items, rows, bad, rg_boxes) = stream
-        .par_bridge()
+    let (builder, items, rows, bad, rg_boxes) = sel
+        .into_par_iter()
+        .flat_map(per_group)
         .map(|(map, batch)| {
             let mut mb = MeshBuilder::default();
             let mut items: Vec<PickItem> = Vec::new();
@@ -911,7 +935,7 @@ fn build_geometry(
     if builder.fill_errors > 0 {
         log::warn!(
             "{}: {} polygons failed tessellation (rendered outline-only)",
-            store.path.display(),
+            store.source.label(),
             builder.fill_errors
         );
     }
@@ -1127,10 +1151,13 @@ pub(crate) fn parse_wkb_point_2d(buf: &[u8]) -> Option<(f64, f64)> {
 
 /// Test-only re-exports for headless benchmarks.
 #[cfg(test)]
-pub fn open_store_for_test(
-    path: &PathBuf,
-) -> Result<StoreOpen, String> {
-    open_store(path)
+pub fn open_store_for_test(path: &std::path::PathBuf) -> Result<StoreOpen, String> {
+    open_store(&Source::Local(path.clone()))
+}
+
+#[cfg(test)]
+pub fn open_store_for_test_source(source: &Source) -> Result<StoreOpen, String> {
+    open_store(source)
 }
 
 /// All groups of a store, unselected.
@@ -1173,7 +1200,7 @@ mod rg_bbox_tests {
             eprintln!("fixture missing, skipping");
             return;
         }
-        let (store, crs, _info, rg_meta) = open_store(&path).unwrap();
+        let (store, crs, _info, rg_meta) = open_store(&Source::Local(path)).unwrap();
         // DuckDB spatial output: no covering, no native geo stats expected.
         assert!(store.covering.is_none());
         let display = crate::data::crs::DisplayCrs::hobo_dyer();
@@ -1216,7 +1243,8 @@ mod tess_validation {
         let Ok(path) = std::env::var("GEOPQ_BENCH_FILE") else {
             return;
         };
-        let (store, _crs, _info, _rg) = open_store(&path.clone().into()).unwrap();
+        let (store, _crs, _info, _rg) =
+            open_store(&Source::Local(path.clone().into())).unwrap();
         let total = store.total_rows() as u32;
         let step = (total / 20_000).max(1);
         let rows: Vec<u32> = (0..total).step_by(step as usize).collect();
@@ -1303,7 +1331,7 @@ mod pruning_tests {
             eprintln!("fixture missing, skipping");
             return;
         }
-        let (store, crs, _info, rg_meta) = open_store(&path).unwrap();
+        let (store, crs, _info, rg_meta) = open_store(&Source::Local(path)).unwrap();
         assert_eq!(crs.epsg, Some(26986));
         let (source, boxes) = rg_meta.expect("covering stats detected");
         assert!(source.contains("covering"), "{source}");
@@ -1424,6 +1452,123 @@ mod pruning_tests {
         let selected: u32 = ranges.iter().map(|(s, e)| e - s).sum();
         assert_eq!(rows_c as u32, n - selected);
         assert!(matches!(resolved_c[0].1, GroupLoad::Full));
+    }
+
+    /// Remote loading over HTTP range requests must produce exactly the
+    /// same result as the local path, while downloading only a fraction of
+    /// the file (footer + covering column + selected geometry rows).
+    #[test]
+    fn remote_range_requests_match_local() {
+        let path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/parcels_hilbert.parquet"
+        ));
+        if !path.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        let server = crate::data::source::testserver::spawn(path.clone());
+        let remote = Source::remote(&server.url).unwrap();
+        assert_eq!(remote.size(), file_len);
+        let local = Source::Local(path);
+
+        // Identical metadata read.
+        let (store_r, crs_r, info_r, rg_meta_r) = open_store(&remote).unwrap();
+        let (store_l, crs_l, _info, rg_meta_l) = open_store(&local).unwrap();
+        assert_eq!(crs_r.epsg, crs_l.epsg);
+        assert_eq!(info_r.rows, 1_886_414);
+        let (_, boxes_r) = rg_meta_r.expect("covering stats over http");
+        let (_, boxes_l) = rg_meta_l.unwrap();
+        assert_eq!(boxes_r, boxes_l);
+        assert!(store_r.covering.is_some());
+
+        // Same viewport-selected build, local vs remote.
+        let rect = [230_000.0, 895_000.0, 240_000.0, 905_000.0];
+        let sel = intersecting_rgs(&boxes_r, rect);
+        assert!(!sel.is_empty());
+        let display = crate::data::crs::DisplayCrs::hobo_dyer();
+        let jobs = |_: ()| -> Vec<GroupSel> {
+            sel.iter().map(|&g| GroupSel::Rect(g, rect)).collect()
+        };
+        let (_g, rows_r, bad_r, _rg, _res) =
+            build_geometry(&store_r, &crs_r, &display, None, jobs(())).unwrap();
+        let (_g, rows_l, bad_l, _rg, _res) =
+            build_geometry(&store_l, &crs_l, &display, None, jobs(())).unwrap();
+        assert_eq!((rows_r, bad_r), (rows_l, bad_l));
+        assert!(rows_r > 0);
+
+        // Lazy attribute fetch over http.
+        let row = store_r.rg_starts()[sel[0] as usize] as u32;
+        let batch = store_r.fetch_row(row).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        // The point of range requests: a small fraction of the file moved.
+        let served = server.bytes_served.load(std::sync::atomic::Ordering::SeqCst);
+        let requests = server.requests.load(std::sync::atomic::Ordering::SeqCst);
+        eprintln!(
+            "remote load: {} of {} bytes ({:.1}%), {} requests, {} rows",
+            served,
+            file_len,
+            served as f64 / file_len as f64 * 100.0,
+            requests,
+            rows_r
+        );
+        assert!(
+            served < file_len / 2,
+            "expected partial download: {served} of {file_len}"
+        );
+    }
+
+    /// Live remote benchmark, opt-in:
+    /// GEOPQ_REMOTE_URL=https://... cargo test --release remote_live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn remote_live() {
+        let Ok(url) = std::env::var("GEOPQ_REMOTE_URL") else {
+            return;
+        };
+        let t0 = std::time::Instant::now();
+        let source = Source::remote(&url).unwrap();
+        eprintln!("size: {} bytes", source.size());
+        let (store, crs, info, rg_meta) = open_store(&source).unwrap();
+        eprintln!(
+            "opened in {} ms: {} rows, {} row groups, {} — covering: {}",
+            t0.elapsed().as_millis(),
+            info.rows,
+            info.row_groups,
+            info.geo.version_label,
+            store.covering.is_some(),
+        );
+        let Some((meta_src, boxes)) = rg_meta else {
+            eprintln!("no metadata bboxes — no pruning possible");
+            return;
+        };
+        eprintln!("rg bboxes: {} ({meta_src})", boxes.len());
+
+        // A small viewport: 2% of the extent around the densest area is
+        // unknown; just take the center of the first box.
+        let b = boxes[0];
+        let (cx, cy) = ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
+        let u = boxes.iter().fold(b, |a, x| {
+            [a[0].min(x[0]), a[1].min(x[1]), a[2].max(x[2]), a[3].max(x[3])]
+        });
+        let (dx, dy) = ((u[2] - u[0]) * 0.01, (u[3] - u[1]) * 0.01);
+        let rect = [cx - dx, cy - dy, cx + dx, cy + dy];
+        let sel = intersecting_rgs(&boxes, rect);
+        eprintln!("viewport {rect:?}: {} of {} row groups", sel.len(), boxes.len());
+
+        let t1 = std::time::Instant::now();
+        let jobs: Vec<GroupSel> = sel.iter().map(|&g| GroupSel::Rect(g, rect)).collect();
+        let display = crate::data::crs::DisplayCrs::hobo_dyer();
+        let (geometry, rows, bad, _rg, _res) =
+            build_geometry(&store, &crs, &display, None, jobs).unwrap();
+        eprintln!(
+            "loaded {rows} features ({bad} bad) in {} ms, {} chunks",
+            t1.elapsed().as_millis(),
+            geometry.chunks.len()
+        );
+        assert!(!geometry.chunks.is_empty() || rows == 0);
     }
 
     #[test]

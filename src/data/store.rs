@@ -1,12 +1,12 @@
-use std::fs::File;
-use std::path::PathBuf;
-
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::{
-    ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
+    ArrowReaderOptions, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowSelection,
+    RowSelector,
 };
 use parquet::arrow::ProjectionMask;
+
+use super::source::Source;
 
 /// GeoParquet 1.1 covering bbox column: a root struct with four float
 /// children giving each feature's bbox in the data CRS.
@@ -25,7 +25,7 @@ pub struct CoveringCol {
 /// (attribute panel, exact pick tests, projection rebuilds). Fetches select
 /// only the row groups and pages containing the requested rows.
 pub struct FeatureStore {
-    pub path: PathBuf,
+    pub source: Source,
     /// Index of the geometry column in the arrow schema.
     pub geom_col: usize,
     #[allow(dead_code)]
@@ -40,7 +40,7 @@ pub struct FeatureStore {
 
 impl FeatureStore {
     pub fn new(
-        path: PathBuf,
+        source: Source,
         geom_col: usize,
         schema: SchemaRef,
         covering: Option<CoveringCol>,
@@ -54,7 +54,7 @@ impl FeatureStore {
             rg_starts.push(acc);
         }
         Self {
-            path,
+            source,
             geom_col,
             schema,
             covering,
@@ -77,14 +77,18 @@ impl FeatureStore {
     /// non-overlapping); None reads the whole group. `columns`: arrow root
     /// field indices to project, or None for all.
     pub fn open_reader_for_group(
-        path: &PathBuf,
+        source: &Source,
         group: usize,
         batch_size: usize,
         ranges: Option<&[(u32, u32)]>,
         columns: Option<&[usize]>,
     ) -> Result<ParquetRecordBatchReader, String> {
-        let file = File::open(path).map_err(|e| format!("cannot open file: {e}"))?;
-        let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        let reader = source.open()?;
+        // Page index (when the file has one) turns range reads into exact
+        // per-page fetches and lets row selections skip page IO entirely —
+        // essential for remote sources.
+        let options = ArrowReaderOptions::new().with_page_index(true);
+        let mut builder = ParquetRecordBatchReaderBuilder::try_new_with_options(reader, options)
             .map_err(|e| format!("not a parquet file: {e}"))?
             .with_row_groups(vec![group])
             .with_batch_size(batch_size);
@@ -122,8 +126,9 @@ impl FeatureStore {
         if rows_sorted.is_empty() {
             return Ok(Vec::new());
         }
-        let file = File::open(&self.path).map_err(|e| format!("cannot open file: {e}"))?;
-        let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        let reader = self.source.open()?;
+        let options = ArrowReaderOptions::new().with_page_index(true);
+        let mut builder = ParquetRecordBatchReaderBuilder::try_new_with_options(reader, options)
             .map_err(|e| format!("not a parquet file: {e}"))?;
 
         if let Some(cols) = columns {
@@ -215,7 +220,7 @@ mod tests {
     /// Validates row-group selection math against a real multi-row-group file.
     #[test]
     fn fetch_rows_across_row_groups() {
-        let path = PathBuf::from(concat!(
+        let path = std::path::PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/testdata/points_1m_wgs84.parquet"
         ));
@@ -223,8 +228,8 @@ mod tests {
             eprintln!("fixture missing, skipping");
             return;
         }
-        let file = File::open(&path).unwrap();
-        let b = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let source = Source::Local(path);
+        let b = ParquetRecordBatchReaderBuilder::try_new(source.open().unwrap()).unwrap();
         let schema = b.schema().clone();
         let rg_rows: Vec<u64> = b
             .metadata()
@@ -234,7 +239,7 @@ mod tests {
             .collect();
         assert!(rg_rows.len() > 1, "fixture should have several row groups");
         let geom_col = schema.index_of("geometry").unwrap();
-        let store = FeatureStore::new(path, geom_col, schema, None, rg_rows);
+        let store = FeatureStore::new(source, geom_col, schema, None, rg_rows);
         assert_eq!(store.total_rows(), 1_000_000);
 
         // Rows spread across row groups, including group boundaries.

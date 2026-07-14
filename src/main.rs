@@ -9,7 +9,17 @@ use eframe::egui;
 
 fn main() -> eframe::Result {
     env_logger::init();
-    let files: Vec<std::path::PathBuf> = std::env::args().skip(1).map(Into::into).collect();
+    // Args: local paths or http(s) URLs.
+    let files: Vec<data::source::Source> = std::env::args()
+        .skip(1)
+        .map(|a| {
+            if a.starts_with("http://") || a.starts_with("https://") {
+                data::source::Source::Remote { url: a, len: 0 }
+            } else {
+                data::source::Source::Local(a.into())
+            }
+        })
+        .collect();
 
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
