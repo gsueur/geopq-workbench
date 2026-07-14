@@ -1,0 +1,3 @@
+/target
+/testdata/*.parquet
+.DS_Store
