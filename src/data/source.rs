@@ -16,10 +16,17 @@ use parquet::file::reader::{ChunkReader, Length};
 
 const USER_AGENT: &str = concat!("geopq-viewer/", env!("CARGO_PKG_VERSION"));
 
-/// Shared agent: connection pooling across range requests.
+/// Shared agent: connection pooling across range requests. HTTP error
+/// statuses come back as responses (not `Err`), so callers can read
+/// headers like `x-amz-bucket-region` from 301/403 answers.
 fn http_agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(ureq::Agent::new_with_defaults)
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into()
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -27,28 +34,68 @@ pub enum Source {
     Local(PathBuf),
     /// HTTP(S) with range requests. `len` is resolved once at open.
     Remote { url: String, len: u64 },
+    /// s3://bucket/key, read through a (pre)signed HTTPS URL resolved at
+    /// open from the selected `~/.aws` profile / environment credentials
+    /// (anonymous for public buckets). Empty `url` = unresolved.
+    S3 {
+        uri: String,
+        profile: Option<String>,
+        url: String,
+        len: u64,
+    },
 }
 
 impl Source {
     /// Resolve a URL into a source (fetches the content length; verifies
     /// the server answers). Network call — run off the UI thread.
+    #[cfg(test)]
     pub fn remote(url: &str) -> Result<Source, String> {
-        let len = remote_len(url)?;
-        Ok(Source::Remote {
+        Source::Remote {
             url: url.to_string(),
-            len,
-        })
+            len: 0,
+        }
+        .resolve()
+    }
+
+    /// Resolve credentials/length as needed (no-op when already resolved).
+    /// Network + credential-file reads — run off the UI thread.
+    pub fn resolve(self) -> Result<Source, String> {
+        match self {
+            Source::Remote { url, len: 0 } => {
+                let len = remote_len(&url)?;
+                Ok(Source::Remote { url, len })
+            }
+            Source::S3 {
+                uri,
+                profile,
+                url,
+                ..
+            } if url.is_empty() => {
+                let url = aws::presign(&uri, profile.as_deref())?;
+                let len = remote_len(&url)
+                    .map_err(|e| format!("{uri}: {}", redact_presign(&e)))?;
+                Ok(Source::S3 {
+                    uri,
+                    profile,
+                    url,
+                    len,
+                })
+            }
+            other => Ok(other),
+        }
     }
 
     pub fn is_remote(&self) -> bool {
-        matches!(self, Source::Remote { .. })
+        !matches!(self, Source::Local(_))
     }
 
-    /// Full path or URL, for tooltips and error messages.
+    /// Full path / URL / S3 URI, for tooltips and error messages (never
+    /// the presigned URL — it embeds a signed access grant).
     pub fn label(&self) -> String {
         match self {
             Source::Local(p) => p.display().to_string(),
             Source::Remote { url, .. } => url.clone(),
+            Source::S3 { uri, .. } => uri.clone(),
         }
     }
 
@@ -59,7 +106,7 @@ impl Source {
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "layer".into()),
-            Source::Remote { url, .. } => url
+            Source::Remote { url, .. } | Source::S3 { uri: url, .. } => url
                 .split('/')
                 .next_back()
                 .filter(|s| !s.is_empty())
@@ -71,7 +118,7 @@ impl Source {
     pub fn size(&self) -> u64 {
         match self {
             Source::Local(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
-            Source::Remote { len, .. } => *len,
+            Source::Remote { len, .. } | Source::S3 { len, .. } => *len,
         }
     }
 
@@ -88,10 +135,273 @@ impl Source {
                     len,
                 })
             }
-            Source::Remote { url, len } => Ok(SourceReader {
+            Source::Remote { url, len } | Source::S3 { url, len, .. } => Ok(SourceReader {
                 inner: Inner::Remote { url: url.clone() },
                 len: *len,
             }),
+        }
+    }
+}
+
+/// Keep signed query parameters out of error strings.
+fn redact_presign(msg: &str) -> String {
+    match msg.find("?X-Amz") {
+        Some(i) => format!("{}?<presigned>", &msg[..i]),
+        None => msg.to_string(),
+    }
+}
+
+/// AWS credential/profile handling and S3 presigning. Kept deliberately
+/// small: static keys (+ optional session token) from `~/.aws` files or
+/// the environment, region from profile/env/bucket probe, anonymous
+/// fallback for public buckets. No SSO/IMDS credential providers.
+pub mod aws {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    fn aws_dir() -> PathBuf {
+        std::env::var_os("AWS_SHARED_CREDENTIALS_FILE")
+            .map(|f| PathBuf::from(f).parent().map(Path::to_path_buf).unwrap_or_default())
+            .or_else(|| dirs_home().map(|h| h.join(".aws")))
+            .unwrap_or_default()
+    }
+
+    fn dirs_home() -> Option<PathBuf> {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+
+    /// Minimal INI parser: `[section]` + `key = value` lines.
+    fn ini(path: &Path) -> HashMap<String, HashMap<String, String>> {
+        let mut out: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return out;
+        };
+        let mut section = String::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                continue;
+            }
+            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                // config file uses "[profile x]", credentials file "[x]".
+                section = name.trim().trim_start_matches("profile ").trim().to_string();
+            } else if let Some((k, v)) = line.split_once('=') {
+                out.entry(section.clone())
+                    .or_default()
+                    .insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            }
+        }
+        out
+    }
+
+    /// Profile names available in `~/.aws/{credentials,config}` (for the UI).
+    pub fn profiles() -> Vec<String> {
+        let dir = aws_dir();
+        let mut names: Vec<String> = ini(&dir.join("credentials"))
+            .into_keys()
+            .chain(ini(&dir.join("config")).into_keys())
+            .filter(|n| !n.is_empty())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    struct Creds {
+        key: String,
+        secret: String,
+        token: Option<String>,
+    }
+
+    /// Static credentials for a profile (or the environment / default
+    /// profile when none is selected). None = anonymous.
+    fn credentials(profile: Option<&str>) -> Option<Creds> {
+        let from_files = |name: &str| -> Option<Creds> {
+            let dir = aws_dir();
+            let mut merged = ini(&dir.join("config"));
+            for (sec, kv) in ini(&dir.join("credentials")) {
+                merged.entry(sec).or_default().extend(kv);
+            }
+            let s = merged.get(name)?;
+            Some(Creds {
+                key: s.get("aws_access_key_id")?.clone(),
+                secret: s.get("aws_secret_access_key")?.clone(),
+                token: s.get("aws_session_token").cloned(),
+            })
+        };
+        if let Some(p) = profile {
+            return from_files(p);
+        }
+        if let (Ok(key), Ok(secret)) = (
+            std::env::var("AWS_ACCESS_KEY_ID"),
+            std::env::var("AWS_SECRET_ACCESS_KEY"),
+        ) {
+            return Some(Creds {
+                key,
+                secret,
+                token: std::env::var("AWS_SESSION_TOKEN").ok(),
+            });
+        }
+        let name = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".into());
+        from_files(&name)
+    }
+
+    /// Region for a profile, falling back to env, then a bucket-location
+    /// probe (`x-amz-bucket-region` is present even on 403/301 answers),
+    /// then us-east-1.
+    fn region(profile: Option<&str>, bucket: &str) -> String {
+        let dir = aws_dir();
+        let files_region = |name: &str| -> Option<String> {
+            let config = ini(&dir.join("config"));
+            let creds = ini(&dir.join("credentials"));
+            config
+                .get(name)
+                .and_then(|s| s.get("region").cloned())
+                .or_else(|| creds.get(name).and_then(|s| s.get("region").cloned()))
+        };
+        if let Some(r) = profile.and_then(files_region) {
+            return r;
+        }
+        if let Ok(r) = std::env::var("AWS_REGION").or_else(|_| std::env::var("AWS_DEFAULT_REGION")) {
+            return r;
+        }
+        if profile.is_none() {
+            let name = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".into());
+            if let Some(r) = files_region(&name) {
+                return r;
+            }
+        }
+        // Probe: any response carries the bucket's region header.
+        if let Ok(res) = super::http_agent()
+            .head(&format!("https://{bucket}.s3.amazonaws.com/"))
+            .header("User-Agent", super::USER_AGENT)
+            .call()
+        {
+            if let Some(r) = super::header(&res, "x-amz-bucket-region") {
+                return r;
+            }
+        }
+        "us-east-1".into()
+    }
+
+    /// Turn `s3://bucket/key` into a GET URL: presigned when credentials
+    /// exist, plain virtual-host URL for anonymous/public access.
+    /// `AWS_ENDPOINT_URL` switches to a custom endpoint (path-style).
+    pub fn presign(uri: &str, profile: Option<&str>) -> Result<String, String> {
+        let rest = uri
+            .strip_prefix("s3://")
+            .ok_or_else(|| format!("not an s3:// URI: {uri}"))?;
+        let (bucket, key) = rest
+            .split_once('/')
+            .filter(|(b, k)| !b.is_empty() && !k.is_empty())
+            .ok_or_else(|| format!("expected s3://bucket/key, got {uri}"))?;
+
+        let creds = credentials(profile);
+        if profile.is_some() && creds.is_none() {
+            return Err(format!(
+                "profile '{}' has no static credentials in ~/.aws",
+                profile.unwrap()
+            ));
+        }
+        let region = region(profile, bucket);
+        // Custom endpoints (MinIO, Wasabi, ...): env override first, then
+        // the profile's endpoint_url key (AWS CLI v2 convention).
+        let endpoint_env = std::env::var("AWS_ENDPOINT_URL").ok().or_else(|| {
+            let name = profile
+                .map(str::to_string)
+                .or_else(|| std::env::var("AWS_PROFILE").ok())
+                .unwrap_or_else(|| "default".into());
+            let dir = aws_dir();
+            let config = ini(&dir.join("config"));
+            let creds_file = ini(&dir.join("credentials"));
+            config
+                .get(&name)
+                .and_then(|s| s.get("endpoint_url").cloned())
+                .or_else(|| creds_file.get(&name).and_then(|s| s.get("endpoint_url").cloned()))
+        });
+        let (endpoint, style) = match &endpoint_env {
+            Some(e) => (e.clone(), rusty_s3::UrlStyle::Path),
+            None => (
+                format!("https://s3.{region}.amazonaws.com"),
+                rusty_s3::UrlStyle::VirtualHost,
+            ),
+        };
+
+        match creds {
+            None => {
+                // Anonymous: plain object URL.
+                Ok(match &endpoint_env {
+                    Some(e) => format!("{}/{bucket}/{key}", e.trim_end_matches('/')),
+                    None => format!("https://{bucket}.s3.{region}.amazonaws.com/{key}"),
+                })
+            }
+            Some(c) => {
+                use rusty_s3::S3Action;
+                let endpoint = endpoint
+                    .parse()
+                    .map_err(|e| format!("bad S3 endpoint: {e}"))?;
+                let b = rusty_s3::Bucket::new(endpoint, style, bucket.to_string(), region)
+                    .map_err(|e| format!("bad S3 bucket: {e}"))?;
+                let rc = match &c.token {
+                    Some(t) => rusty_s3::Credentials::new_with_token(&c.key, &c.secret, t),
+                    None => rusty_s3::Credentials::new(&c.key, &c.secret),
+                };
+                // Temporary credentials expire; long-lived keys allow up
+                // to 7 days of presign validity.
+                let expiry = if c.token.is_some() {
+                    Duration::from_secs(6 * 3600)
+                } else {
+                    Duration::from_secs(6 * 24 * 3600)
+                };
+                Ok(b.get_object(Some(&rc), key).sign(expiry).to_string())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn ini_parses_profiles_and_config_prefix() {
+            let dir = std::env::temp_dir().join("geopq_awstest");
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = dir.join("ini");
+            std::fs::write(
+                &p,
+                "[default]\naws_access_key_id = AKIA1\n\n[profile geo]\nregion = eu-west-3\n; comment\n",
+            )
+            .unwrap();
+            let m = super::ini(&p);
+            assert_eq!(m["default"]["aws_access_key_id"], "AKIA1");
+            assert_eq!(m["geo"]["region"], "eu-west-3");
+        }
+
+        #[test]
+        fn presign_shape() {
+            // Uses explicit env-independent parts: build via rusty_s3 directly
+            // mirrors presign()'s signed branch.
+            use rusty_s3::S3Action;
+            let b = rusty_s3::Bucket::new(
+                "https://s3.eu-west-3.amazonaws.com".parse().unwrap(),
+                rusty_s3::UrlStyle::VirtualHost,
+                "my-bucket",
+                "eu-west-3",
+            )
+            .unwrap();
+            let c = rusty_s3::Credentials::new("AKIAEXAMPLE", "secret");
+            let url = b
+                .get_object(Some(&c), "path/to/data.parquet")
+                .sign(std::time::Duration::from_secs(3600))
+                .to_string();
+            assert!(url.starts_with("https://my-bucket.s3.eu-west-3.amazonaws.com/path/to/data.parquet?"));
+            assert!(url.contains("X-Amz-Signature="));
+            assert!(url.contains("X-Amz-Expires=3600"));
+        }
+
+        #[test]
+        fn s3_uri_validation() {
+            assert!(super::presign("s3://bucket-only", None).is_err());
+            assert!(super::presign("http://x/y", None).is_err());
         }
     }
 }
@@ -104,9 +414,13 @@ fn remote_len(url: &str) -> Result<u64, String> {
         .header("User-Agent", USER_AGENT)
         .call();
     if let Ok(res) = head {
-        if let Some(len) = header(&res, "content-length").and_then(|v| v.parse::<u64>().ok()) {
-            if len > 0 {
-                return Ok(len);
+        // Error answers also carry a Content-Length (their body's); only a
+        // 200 tells us the object size.
+        if res.status() == 200 {
+            if let Some(len) = header(&res, "content-length").and_then(|v| v.parse::<u64>().ok()) {
+                if len > 0 {
+                    return Ok(len);
+                }
             }
         }
     }
@@ -148,34 +462,41 @@ enum Inner {
 /// One bounded range request, fully read.
 fn fetch_range(url: &str, start: u64, end_inclusive: u64) -> PqResult<Vec<u8>> {
     let expect = (end_inclusive - start + 1) as usize;
+    log::trace!("range GET {start}..={end_inclusive} ({expect} B)");
     let res = http_agent()
         .get(url)
         .header("User-Agent", USER_AGENT)
         .header("Range", &format!("bytes={start}-{end_inclusive}"))
         .call()
         .map_err(|e| ParquetError::General(format!("range request failed: {e}")))?;
-    match res.status().as_u16() {
-        206 => {}
+    let ranged = match res.status().as_u16() {
+        206 => true,
         // Whole-file answer is only usable from offset 0.
-        200 if start == 0 => {}
+        200 if start == 0 => false,
         s => {
             return Err(ParquetError::General(format!(
                 "server rejected range request ({s})"
             )))
         }
-    }
+    };
+    // Read one byte beyond the expected length: observing the body's EOF
+    // is what lets the agent return the connection to its pool — capping
+    // exactly at `expect` closes the connection and forces a new TLS
+    // handshake per request (~1 s each against S3).
+    let cap = expect as u64 + u64::from(ranged);
     let mut buf = Vec::with_capacity(expect);
     let read = res
         .into_body()
         .into_reader()
-        .take(expect as u64)
+        .take(cap)
         .read_to_end(&mut buf)
         .map_err(|e| ParquetError::General(format!("range read: {e}")))?;
-    if read != expect {
+    if read < expect || (ranged && read != expect) {
         return Err(ParquetError::EOF(format!(
             "expected {expect} bytes at offset {start}, got {read}"
         )));
     }
+    buf.truncate(expect);
     Ok(buf)
 }
 

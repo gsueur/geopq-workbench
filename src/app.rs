@@ -91,8 +91,9 @@ pub struct ViewerApp {
 
     errors: Vec<String>,
     show_errors: bool,
-    /// URL entry dialog content (Some = dialog open).
-    url_input: Option<String>,
+    /// URL entry dialog (Some = dialog open): text, selected AWS
+    /// profile, and the profiles discovered in ~/.aws.
+    url_input: Option<(String, Option<String>, Vec<String>)>,
     info_open: Option<u64>,
     /// Layer generations whose CPU-side fill/line arrays were freed after
     /// GPU upload (points are kept for picking).
@@ -418,7 +419,8 @@ impl ViewerApp {
                 }
             }
             if ui.button("🌐 URL…").clicked() && self.url_input.is_none() {
-                self.url_input = Some(String::new());
+                self.url_input =
+                    Some((String::new(), None, crate::data::source::aws::profiles()));
             }
             if ui
                 .add_enabled(!self.layers.is_empty(), egui::Button::new("🌍 Fit all"))
@@ -759,34 +761,66 @@ impl ViewerApp {
     }
 
     fn url_window(&mut self, ctx: &egui::Context) {
-        let Some(url) = &mut self.url_input else { return };
+        let Some((url, profile, profiles)) = &mut self.url_input else { return };
         let mut open = true;
-        let mut submit: Option<String> = None;
+        let mut submit: Option<Source> = None;
         egui::Window::new("Open URL")
             .id(egui::Id::new("open_url"))
             .open(&mut open)
-            .default_width(420.0)
+            .default_width(440.0)
             .show(ctx, |ui| {
-                ui.label("GeoParquet over HTTP(S) — needs range-request support:");
+                ui.label("GeoParquet over HTTP(S) (needs range requests) or s3://bucket/key:");
                 let edit = ui.add(
                     egui::TextEdit::singleline(url)
-                        .hint_text("https://example.com/data.parquet")
+                        .hint_text("https://host/data.parquet · s3://bucket/key.parquet")
                         .desired_width(f32::INFINITY),
                 );
                 let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let is_s3 = url.starts_with("s3://");
+                if is_s3 {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("AWS profile:");
+                        let current = profile
+                            .clone()
+                            .unwrap_or_else(|| "(auto: env / default)".into());
+                        egui::ComboBox::from_id_salt("aws_profile")
+                            .selected_text(current)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(profile, None, "(auto: env / default)");
+                                for p in profiles.iter() {
+                                    ui.selectable_value(profile, Some(p.clone()), p);
+                                }
+                            });
+                    })
+                    .response
+                    .on_hover_text(
+                        "Static credentials from ~/.aws/credentials.
+                         Public buckets work anonymously with (auto).",
+                    );
+                }
                 ui.add_space(4.0);
-                let valid = url.starts_with("http://") || url.starts_with("https://");
-                if ui
-                    .add_enabled(valid, egui::Button::new("Open"))
-                    .clicked()
+                let valid =
+                    url.starts_with("http://") || url.starts_with("https://") || is_s3;
+                if ui.add_enabled(valid, egui::Button::new("Open")).clicked()
                     || (enter && valid)
                 {
-                    submit = Some(url.trim().to_string());
+                    let text = url.trim().to_string();
+                    submit = Some(if is_s3 {
+                        Source::S3 {
+                            uri: text,
+                            profile: profile.clone(),
+                            url: String::new(),
+                            len: 0,
+                        }
+                    } else {
+                        Source::Remote { url: text, len: 0 }
+                    });
                 }
             });
-        if let Some(u) = submit {
-            // Length probe + load run in the loader thread.
-            self.enqueue_load(Source::Remote { url: u, len: 0 }, ctx);
+        if let Some(src) = submit {
+            // Length probe / presign run in the loader thread.
+            self.enqueue_load(src, ctx);
             self.url_input = None;
         } else if !open {
             self.url_input = None;

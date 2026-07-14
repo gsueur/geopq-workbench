@@ -8,7 +8,10 @@ use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use geo::MapCoordsInPlace;
 use geo_traits::to_geo::ToGeoGeometry;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
+use parquet::file::metadata::PageIndexPolicy;
 use rayon::prelude::*;
 use rstar::RTree;
 use serde_json::Value;
@@ -174,6 +177,7 @@ pub fn complement_ranges(ranges: &[(u32, u32)], len: u32) -> Vec<(u32, u32)> {
 /// column (caller falls back to the whole group).
 fn covering_select(
     source: &Source,
+    meta: &ArrowReaderMetadata,
     covering: Option<&CoveringCol>,
     group: u32,
     rect: [f64; 4],
@@ -184,6 +188,7 @@ fn covering_select(
     };
     let reader = FeatureStore::open_reader_for_group(
         source,
+        meta,
         group as usize,
         BATCH_SIZE,
         None,
@@ -245,20 +250,19 @@ pub fn spawn_load(
 ) {
     std::thread::spawn(move || {
         let t0 = Instant::now();
-        // Resolve URLs (content-length probe) off the UI thread.
-        let source = match &source {
-            Source::Remote { url, len: 0 } => match Source::remote(url) {
-                Ok(s) => s,
-                Err(e) => {
-                    handle.send(LoadMsg::Failed {
-                        job,
-                        source: source.label(),
-                        error: e,
-                    });
-                    return;
-                }
-            },
-            _ => source,
+        // Resolve URLs / S3 credentials (content-length probe, presign)
+        // off the UI thread.
+        let label = source.label();
+        let source = match source.resolve() {
+            Ok(s) => s,
+            Err(e) => {
+                handle.send(LoadMsg::Failed {
+                    job,
+                    source: label,
+                    error: e,
+                });
+                return;
+            }
         };
         match open_store(&source) {
             Ok((store, crs, info, rg_meta)) => {
@@ -450,8 +454,13 @@ type StoreOpen = (
 );
 
 fn open_store(source: &Source) -> Result<StoreOpen, String> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(source.open()?)
+    // Load the footer exactly once (with the page index when present);
+    // every reader over this file reuses it.
+    let reader = source.open()?;
+    let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
+    let arrow_meta = ArrowReaderMetadata::load(&reader, options)
         .map_err(|e| format!("not a parquet file: {e}"))?;
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(reader, arrow_meta.clone());
 
     // GeoParquet "geo" key-value metadata.
     let kv = builder
@@ -590,7 +599,15 @@ fn open_store(source: &Source) -> Result<StoreOpen, String> {
     let covering = covering_column(geo_meta.as_ref(), &geom_name, &schema);
 
     Ok((
-        FeatureStore::new(source.clone(), geom_col, schema, covering, encoding, rg_rows),
+        FeatureStore::new(
+            source.clone(),
+            arrow_meta,
+            geom_col,
+            schema,
+            covering,
+            encoding,
+            rg_rows,
+        ),
         crs,
         info,
         rg_meta_boxes,
@@ -826,6 +843,7 @@ fn build_geometry(
     let done = AtomicUsize::new(0);
 
     let source = store.source.clone();
+    let arrow_meta = store.meta.clone();
     let covering = store.covering.clone();
     let encoding = store.encoding;
     let err_ref = &stream_error;
@@ -842,21 +860,23 @@ fn build_geometry(
         let (ranges, state): (Option<Vec<(u32, u32)>>, GroupLoad) = match &job {
             GroupSel::All(_) => (None, GroupLoad::Full),
             GroupSel::Ranges(_, r) => (Some(r.clone()), GroupLoad::Full),
-            GroupSel::Rect(_, rect) => match covering_select(&source, covering.as_ref(), g, *rect) {
-                Ok(Some(r)) if r == [(0, group_rows)] => (None, GroupLoad::Full),
-                Ok(Some(r)) => (
-                    Some(r.clone()),
-                    GroupLoad::Rows {
-                        ranges: r,
-                        rect: *rect,
-                    },
-                ),
-                Ok(None) => (None, GroupLoad::Full),
-                Err(e) => {
-                    *err_ref.lock().unwrap() = Some(e);
-                    (Some(vec![]), GroupLoad::None)
+            GroupSel::Rect(_, rect) => {
+                match covering_select(&source, &arrow_meta, covering.as_ref(), g, *rect) {
+                    Ok(Some(r)) if r == [(0, group_rows)] => (None, GroupLoad::Full),
+                    Ok(Some(r)) => (
+                        Some(r.clone()),
+                        GroupLoad::Rows {
+                            ranges: r,
+                            rect: *rect,
+                        },
+                    ),
+                    Ok(None) => (None, GroupLoad::Full),
+                    Err(e) => {
+                        *err_ref.lock().unwrap() = Some(e);
+                        (Some(vec![]), GroupLoad::None)
+                    }
                 }
-            },
+            }
         };
         resolved_ref.lock().unwrap().push((g, state));
         // Global rows of the selection, for sparse batches.
@@ -873,6 +893,7 @@ fn build_geometry(
         } else {
             match FeatureStore::open_reader_for_group(
                 &source,
+                &arrow_meta,
                 g as usize,
                 BATCH_SIZE,
                 ranges.as_deref(),
@@ -1579,8 +1600,20 @@ mod pruning_tests {
         let Ok(url) = std::env::var("GEOPQ_REMOTE_URL") else {
             return;
         };
+        let _ = env_logger::try_init();
         let t0 = std::time::Instant::now();
-        let source = Source::remote(&url).unwrap();
+        let source = if url.starts_with("s3://") {
+            Source::S3 {
+                uri: url,
+                profile: std::env::var("GEOPQ_AWS_PROFILE").ok(),
+                url: String::new(),
+                len: 0,
+            }
+            .resolve()
+            .unwrap()
+        } else {
+            Source::remote(&url).unwrap()
+        };
         eprintln!("size: {} bytes", source.size());
         let (store, crs, info, rg_meta) = open_store(&source).unwrap();
         eprintln!(
@@ -1597,15 +1630,24 @@ mod pruning_tests {
         };
         eprintln!("rg bboxes: {} ({meta_src})", boxes.len());
 
-        // A small viewport: 2% of the extent around the densest area is
-        // unknown; just take the center of the first box.
-        let b = boxes[0];
-        let (cx, cy) = ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
-        let u = boxes.iter().fold(b, |a, x| {
-            [a[0].min(x[0]), a[1].min(x[1]), a[2].max(x[2]), a[3].max(x[3])]
-        });
-        let (dx, dy) = ((u[2] - u[0]) * 0.01, (u[3] - u[1]) * 0.01);
-        let rect = [cx - dx, cy - dy, cx + dx, cy + dy];
+        // Viewport: GEOPQ_VIEWPORT="xmin,ymin,xmax,ymax" (data CRS), or a
+        // small default around the first row group's center.
+        let rect: [f64; 4] = match std::env::var("GEOPQ_VIEWPORT") {
+            Ok(v) => {
+                let p: Vec<f64> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                assert_eq!(p.len(), 4, "GEOPQ_VIEWPORT needs 4 numbers");
+                [p[0], p[1], p[2], p[3]]
+            }
+            Err(_) => {
+                let b = boxes[0];
+                let (cx, cy) = ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
+                let u = boxes.iter().fold(b, |a, x| {
+                    [a[0].min(x[0]), a[1].min(x[1]), a[2].max(x[2]), a[3].max(x[3])]
+                });
+                let (dx, dy) = ((u[2] - u[0]) * 0.01, (u[3] - u[1]) * 0.01);
+                [cx - dx, cy - dy, cx + dx, cy + dy]
+            }
+        };
         let sel = intersecting_rgs(&boxes, rect);
         eprintln!("viewport {rect:?}: {} of {} row groups", sel.len(), boxes.len());
 

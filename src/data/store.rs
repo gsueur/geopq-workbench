@@ -1,10 +1,9 @@
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::{
-    ArrowReaderOptions, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowSelection,
+    ArrowReaderMetadata, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowSelection,
     RowSelector,
 };
-use parquet::file::metadata::PageIndexPolicy;
 use parquet::arrow::ProjectionMask;
 
 use super::geoarrow::{GeomCol, GeomEncoding};
@@ -28,6 +27,10 @@ pub struct CoveringCol {
 /// only the row groups and pages containing the requested rows.
 pub struct FeatureStore {
     pub source: Source,
+    /// Parsed parquet footer (schema + metadata + page index), loaded once
+    /// at open: every reader is built from this instead of re-reading the
+    /// footer — essential for remote sources, whose footers can be MBs.
+    pub meta: ArrowReaderMetadata,
     /// Index of the geometry column in the arrow schema.
     pub geom_col: usize,
     #[allow(dead_code)]
@@ -43,8 +46,10 @@ pub struct FeatureStore {
 }
 
 impl FeatureStore {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         source: Source,
+        meta: ArrowReaderMetadata,
         geom_col: usize,
         schema: SchemaRef,
         covering: Option<CoveringCol>,
@@ -60,6 +65,7 @@ impl FeatureStore {
         }
         Self {
             source,
+            meta,
             geom_col,
             schema,
             covering,
@@ -84,19 +90,14 @@ impl FeatureStore {
     /// field indices to project, or None for all.
     pub fn open_reader_for_group(
         source: &Source,
+        meta: &ArrowReaderMetadata,
         group: usize,
         batch_size: usize,
         ranges: Option<&[(u32, u32)]>,
         columns: Option<&[usize]>,
     ) -> Result<ParquetRecordBatchReader, String> {
         let reader = source.open()?;
-        // Page index (when the file has one) turns range reads into exact
-        // per-page fetches and lets row selections skip page IO entirely —
-        // essential for remote sources.
-        let options =
-            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
-        let mut builder = ParquetRecordBatchReaderBuilder::try_new_with_options(reader, options)
-            .map_err(|e| format!("not a parquet file: {e}"))?
+        let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(reader, meta.clone())
             .with_row_groups(vec![group])
             .with_batch_size(batch_size);
         if let Some(cols) = columns {
@@ -134,10 +135,8 @@ impl FeatureStore {
             return Ok(Vec::new());
         }
         let reader = self.source.open()?;
-        let options =
-            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
-        let mut builder = ParquetRecordBatchReaderBuilder::try_new_with_options(reader, options)
-            .map_err(|e| format!("not a parquet file: {e}"))?;
+        let mut builder =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(reader, self.meta.clone());
 
         if let Some(cols) = columns {
             let mask = ProjectionMask::roots(
@@ -241,7 +240,12 @@ mod tests {
             return;
         }
         let source = Source::Local(path);
-        let b = ParquetRecordBatchReaderBuilder::try_new(source.open().unwrap()).unwrap();
+        let meta = ArrowReaderMetadata::load(
+            &source.open().unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        let b = ParquetRecordBatchReaderBuilder::new_with_metadata(source.open().unwrap(), meta.clone());
         let schema = b.schema().clone();
         let rg_rows: Vec<u64> = b
             .metadata()
@@ -252,7 +256,7 @@ mod tests {
         assert!(rg_rows.len() > 1, "fixture should have several row groups");
         let geom_col = schema.index_of("geometry").unwrap();
         let store =
-            FeatureStore::new(source, geom_col, schema, None, GeomEncoding::Wkb, rg_rows);
+            FeatureStore::new(source, meta, geom_col, schema, None, GeomEncoding::Wkb, rg_rows);
         assert_eq!(store.total_rows(), 1_000_000);
 
         // Rows spread across row groups, including group boundaries.

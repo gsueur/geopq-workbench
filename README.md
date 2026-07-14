@@ -45,8 +45,9 @@ Fixture-dependent tests self-skip when the files are absent.
   (1.1), or computed during the load stream (1.0/untagged) — plus an
   average-overlap clustering metric that tells you whether the file would
   benefit from a spatial-order rewrite.
-- **Remote GeoParquet over HTTP range requests**: open an `https://` URL
-  (toolbar "URL…" button, or as a CLI argument) — the footer, metadata and
+- **Remote GeoParquet over HTTP range requests and S3**: open an
+  `https://` URL or `s3://bucket/key` (toolbar "URL…" button, or as a CLI
+  argument) — the footer, metadata and
   page indexes are fetched with bounded range requests, and the same
   pruning stack below then applies over the network: a 304 MB GeoParquet
   2.0 file (2.7M MA buildings) opens in ~1.3 s, and a city-scale viewport
@@ -54,9 +55,20 @@ Fixture-dependent tests self-skip when the files are absent.
   after ~5 s of parallel per-group range requests. Sequential reads use
   growing bounded windows (256 KB → 8 MB) instead of open-ended ranges;
   files with a page index get exact per-page fetches. Lazy attributes and
-  picking work identically (each click is a small ranged read). Note:
-  opening a remote file while zoomed out to the whole extent legitimately
-  downloads all row groups — zoom in first for large files.
+  picking work identically (each click is a small ranged read). The parquet
+  footer is parsed once and shared by every reader (remote footers can be
+  MBs), and response bodies are fully drained so the connection pool
+  actually pools (a missing EOF read cost a TLS handshake per range
+  request — 3× slower against S3). For `s3://`: pick an AWS profile from
+  `~/.aws` in the dialog (static keys + session tokens; per-profile
+  `endpoint_url` for MinIO/Wasabi-style services; `AWS_ENDPOINT_URL`
+  respected), or leave on auto — env credentials, then the default
+  profile, then anonymous for public buckets (validated against Overture's
+  518 MB building parts: open ~2 s, one covering-pruned row group and
+  ~10k buildings in ~8 s). Layers display the `s3://` URI, never the
+  presigned URL. Note: opening a remote file while zoomed out to the whole
+  extent legitimately downloads all row groups — zoom in first for large
+  files.
 - **Row-group + per-feature pruning on load**: when metadata bboxes exist,
   only row groups intersecting the viewport are decoded — and inside the
   surviving groups of a covering-column (1.1) file, a cheap scan of the four
@@ -128,7 +140,7 @@ Fixture-dependent tests self-skip when the files are absent.
 |---|---|
 | `data/loader.rs` | streaming parquet read, `geo` metadata, WKB decode (fast path for 2D points), rayon-parallel build |
 | `data/store.rs` | `FeatureStore`: lazy row fetch (attributes, WKB) via row-group/RowSelection reads |
-| `data/source.rs` | local file / HTTP range-request `ChunkReader` (windowed sequential reads, exact page fetches) |
+| `data/source.rs` | local file / HTTP / S3 `ChunkReader` (windowed range reads, presigned S3 URLs, ~/.aws profiles) |
 | `data/optimize.rs` | Hilbert-sort rewrite to GeoParquet 1.1 (covering) or 2.0 (native GEOMETRY + geo stats), bloom filters |
 | `data/crs.rs` | PROJJSON → EPSG → proj4rs; native Winkel Tripel; `DisplayCrs` maps projected coords to normalized world space |
 | `data/geometry.rs` | lyon fill tessellation, line segments, points, accumulated into spatial chunks with per-chunk f64 origins (f32 GPU precision at deep zoom) |

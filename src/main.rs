@@ -15,6 +15,13 @@ fn main() -> eframe::Result {
         .map(|a| {
             if a.starts_with("http://") || a.starts_with("https://") {
                 data::source::Source::Remote { url: a, len: 0 }
+            } else if a.starts_with("s3://") {
+                data::source::Source::S3 {
+                    uri: a,
+                    profile: std::env::var("AWS_PROFILE").ok(),
+                    url: String::new(),
+                    len: 0,
+                }
             } else {
                 data::source::Source::Local(a.into())
             }
