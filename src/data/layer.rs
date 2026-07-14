@@ -33,9 +33,26 @@ pub struct RgBboxes {
     pub source: String,
     pub boxes: Vec<[f64; 4]>,
     /// Average number of *other* row-group boxes each box intersects.
-    /// ~0 = spatially well clustered (pushdown prunes well); large = the
-    /// file would benefit from a spatial-order rewrite.
+    /// Raw counts aren't comparable across row-group counts; judge
+    /// clustering with [`Self::overlap_frac`].
     pub avg_overlap: f64,
+}
+
+impl RgBboxes {
+    /// Overlap as a fraction of the possible overlaps (0 = disjoint boxes,
+    /// 1 = every box intersects every other). Comparable across row-group
+    /// counts, unlike the raw average. Reference points: Hilbert-sorted
+    /// 65k-row groups land at 13–25% (adjacent groups necessarily touch),
+    /// attribute-ordered data ~35%, spatially random data ~100%.
+    pub fn overlap_frac(&self) -> f64 {
+        self.avg_overlap / (self.boxes.len().max(2) - 1) as f64
+    }
+
+    /// Heuristic: would a spatial-order rewrite (or finer row groups)
+    /// improve pruning?
+    pub fn poorly_clustered(&self) -> bool {
+        self.overlap_frac() > 0.3
+    }
 }
 
 #[derive(Clone, Debug)]

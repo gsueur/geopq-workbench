@@ -601,12 +601,13 @@ impl ViewerApp {
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut l.style.show_rg_bboxes, "RG bboxes")
                                 .on_hover_text(format!(
-                                    "{} row groups — source: {}\navg overlap ×{:.1} {}",
+                                    "{} row groups — source: {}\navg overlap ×{:.1} = {:.0}% of possible {}",
                                     rg.boxes.len(),
                                     rg.source,
                                     rg.avg_overlap,
-                                    if rg.avg_overlap > 4.0 {
-                                        "(poorly clustered: consider a spatial-order rewrite)"
+                                    rg.overlap_frac() * 100.0,
+                                    if rg.poorly_clustered() {
+                                        "(poorly clustered: consider Optimize…)"
                                     } else {
                                         "(well clustered)"
                                     }
@@ -970,12 +971,13 @@ impl ViewerApp {
                                 ui,
                                 "row-group bboxes",
                                 format!(
-                                    "{} boxes — {} — avg overlap ×{:.1} {}",
+                                    "{} boxes — {} — avg overlap ×{:.1} = {:.0}% of possible {}",
                                     rg.boxes.len(),
                                     rg.source,
                                     rg.avg_overlap,
-                                    if rg.avg_overlap > 4.0 {
-                                        "→ consider a spatial-order rewrite"
+                                    rg.overlap_frac() * 100.0,
+                                    if rg.poorly_clustered() {
+                                        "→ consider Optimize…"
                                     } else {
                                         "(well clustered)"
                                     }
