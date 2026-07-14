@@ -575,7 +575,8 @@ impl ViewerApp {
         egui::ScrollArea::vertical().show(ui, |ui| {
             // Top-most layer first in the list.
             let rebuilding = &self.rebuilding;
-            for l in self.layers.iter_mut().rev() {
+            let n_layers = self.layers.len();
+            for (idx, l) in self.layers.iter_mut().enumerate().rev() {
                 let is_rebuilding = rebuilding.contains(&l.id);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -611,14 +612,24 @@ impl ViewerApp {
                         }
                         ui.label(RichText::new(&l.name).strong())
                             .on_hover_text(l.store.source.label());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("⏷").on_hover_text("move down").clicked() {
-                                reorder = Some((l.id, -1));
-                            }
-                            if ui.small_button("⏶").on_hover_text("move up").clicked() {
-                                reorder = Some((l.id, 1));
-                            }
-                        });
+                        if n_layers > 1 {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    // Vec order is draw order: last = top-most.
+                                    if idx > 0
+                                        && ui.small_button("⏷").on_hover_text("move down").clicked()
+                                    {
+                                        reorder = Some((l.id, -1));
+                                    }
+                                    if idx + 1 < n_layers
+                                        && ui.small_button("⏶").on_hover_text("move up").clicked()
+                                    {
+                                        reorder = Some((l.id, 1));
+                                    }
+                                },
+                            );
+                        }
                     });
                     ui.horizontal(|ui| {
                         ui.label(
