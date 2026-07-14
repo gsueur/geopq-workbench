@@ -235,7 +235,7 @@ impl ViewerApp {
                     generation,
                     geometry,
                     rows,
-                    loaded_rgs,
+                    loaded,
                 } => {
                     self.appending.remove(&layer_id);
                     if let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) {
@@ -243,11 +243,15 @@ impl ViewerApp {
                             log::info!(
                                 "{}: appended {} row groups ({rows} features)",
                                 l.name,
-                                loaded_rgs.len()
+                                loaded.len()
                             );
                             l.sections.push(geometry);
                             l.feature_count += rows;
-                            l.loaded_rgs.extend(loaded_rgs);
+                            for (g, st) in loaded {
+                                if let Some(slot) = l.loaded.get_mut(g as usize) {
+                                    *slot = st;
+                                }
+                            }
                         }
                     }
                 }
@@ -302,7 +306,7 @@ impl ViewerApp {
                 l.store.clone(),
                 l.crs.clone(),
                 self.display.clone(),
-                l.loaded_rgs.clone(),
+                l.loaded.clone(),
             );
         }
         if self.layers.is_empty() {
@@ -310,9 +314,13 @@ impl ViewerApp {
         }
     }
 
-    /// Load row groups that entered the viewport of partially loaded layers.
+    /// Load rows that entered the viewport of partially loaded layers:
+    /// unseen row groups get a per-feature viewport selection; groups whose
+    /// earlier selection no longer covers the viewport are completed
+    /// (complement rows) and become Full.
     fn refine_partial_layers(&mut self, ctx: &egui::Context) {
-        use std::collections::HashSet as HS;
+        use crate::data::layer::GroupLoad;
+        use crate::data::loader::{complement_ranges, GroupSel};
         let view = self.last_view_world;
         for l in &self.layers {
             if !l.is_partial()
@@ -326,15 +334,32 @@ impl ViewerApp {
             let Some(rect) = loader::viewport_to_data_bbox(view, &self.display, &l.crs) else {
                 continue;
             };
-            let loaded: HS<u32> = l.loaded_rgs.iter().copied().collect();
-            let needed: Vec<u32> = loader::intersecting_rgs(&rg.boxes, rect)
-                .into_iter()
-                .filter(|g| !loaded.contains(g))
-                .collect();
-            if needed.is_empty() {
+            let starts = l.store.rg_starts();
+            let mut jobs: Vec<GroupSel> = Vec::new();
+            for g in loader::intersecting_rgs(&rg.boxes, rect) {
+                let gb = rg.boxes[g as usize];
+                // The part of the viewport this group can contribute to.
+                let need = [
+                    rect[0].max(gb[0]),
+                    rect[1].max(gb[1]),
+                    rect[2].min(gb[2]),
+                    rect[3].min(gb[3]),
+                ];
+                match &l.loaded[g as usize] {
+                    GroupLoad::Full => {}
+                    GroupLoad::None => jobs.push(GroupSel::Rect(g, rect)),
+                    st @ GroupLoad::Rows { ranges, .. } => {
+                        if !st.covers(need) {
+                            let n = (starts[g as usize + 1] - starts[g as usize]) as u32;
+                            jobs.push(GroupSel::Ranges(g, complement_ranges(ranges, n)));
+                        }
+                    }
+                }
+            }
+            if jobs.is_empty() {
                 continue;
             }
-            log::info!("{}: refining with {} row groups", l.name, needed.len());
+            log::info!("{}: refining with {} row groups", l.name, jobs.len());
             self.appending.insert(l.id);
             loader::spawn_append(
                 LoaderHandle {
@@ -346,7 +371,7 @@ impl ViewerApp {
                 l.store.clone(),
                 l.crs.clone(),
                 self.display.clone(),
-                needed,
+                jobs,
             );
         }
     }
@@ -580,14 +605,25 @@ impl ViewerApp {
                     });
                     if l.is_partial() {
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!(
+                            let partial = l.partial_rgs();
+                            let text = if partial > 0 {
+                                format!(
+                                    "partial: {}/{} row groups full, {} viewport-filtered",
+                                    l.full_rgs(),
+                                    l.total_rgs(),
+                                    partial
+                                )
+                            } else {
+                                format!(
                                     "partial: {}/{} row groups loaded",
-                                    l.loaded_rgs.len(),
+                                    l.full_rgs(),
                                     l.total_rgs()
-                                ))
-                                .color(Color32::from_rgb(242, 140, 26))
-                                .small(),
+                                )
+                            };
+                            ui.label(
+                                RichText::new(text)
+                                    .color(Color32::from_rgb(242, 140, 26))
+                                    .small(),
                             );
                             if ui.small_button("Load all").clicked() {
                                 load_all = Some(l.id);
@@ -679,13 +715,24 @@ impl ViewerApp {
             }
         }
         if let Some(id) = load_all {
+            use crate::data::layer::GroupLoad;
+            use crate::data::loader::{complement_ranges, GroupSel};
             let ctx = ui.ctx().clone();
             if let Some(l) = self.layers.iter().find(|l| l.id == id) {
                 if !self.appending.contains(&id) {
-                    let loaded: std::collections::HashSet<u32> =
-                        l.loaded_rgs.iter().copied().collect();
-                    let missing: Vec<u32> = (0..l.total_rgs() as u32)
-                        .filter(|g| !loaded.contains(g))
+                    let starts = l.store.rg_starts();
+                    let missing: Vec<GroupSel> = l
+                        .loaded
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(g, st)| match st {
+                            GroupLoad::Full => None,
+                            GroupLoad::None => Some(GroupSel::All(g as u32)),
+                            GroupLoad::Rows { ranges, .. } => {
+                                let n = (starts[g + 1] - starts[g]) as u32;
+                                Some(GroupSel::Ranges(g as u32, complement_ranges(ranges, n)))
+                            }
+                        })
                         .collect();
                     if !missing.is_empty() {
                         self.appending.insert(id);

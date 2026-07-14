@@ -42,14 +42,19 @@ Fixture-dependent tests self-skip when the files are absent.
   (1.1), or computed during the load stream (1.0/untagged) — plus an
   average-overlap clustering metric that tells you whether the file would
   benefit from a spatial-order rewrite.
-- **Row-group pruning on load**: when metadata bboxes exist, only row groups
-  intersecting the viewport are decoded; panning/zooming out streams the
-  missing groups in the background (debounced, appended as sections without
-  re-uploading loaded geometry). Projection switches consolidate sections.
-  Layer panel shows "partial: N/M row groups" with a Load-all button.
-  Global row indices are preserved, so picking/attributes work on partial
-  layers. Fixture: `testdata/parcels_hilbert.parquet` (Hilbert-sorted, 1.1
-  covering).
+- **Row-group + per-feature pruning on load**: when metadata bboxes exist,
+  only row groups intersecting the viewport are decoded — and inside the
+  surviving groups of a covering-column (1.1) file, a cheap scan of the four
+  bbox leaves builds an exact RowSelection so only viewport-intersecting
+  features are decoded (verified row-for-row identical to the equivalent SQL
+  predicate). Only the geometry column is read at load; attributes stay
+  lazy. Panning/zooming streams missing rows in the background (debounced):
+  unseen groups get a viewport selection, already-selected groups are
+  completed with their complement rows (no duplicates). Projection switches
+  consolidate sections; the layer panel shows full/viewport-filtered group
+  counts with a Load-all button. Global row indices are preserved, so
+  picking/attributes work on partial layers. Fixture:
+  `testdata/parcels_hilbert.parquet` (Hilbert-sorted, 1.1 covering).
 - **Optimize / export**: per-layer "Optimize…" rewrites any loaded file as a
   pruning-friendly GeoParquet — features Hilbert-sorted by bbox center, tuned
   row-group size, zstd/snappy — in your choice of:
@@ -59,6 +64,9 @@ Fixture-dependent tests self-skip when the files are absent.
   - **GeoParquet 2.0**: parquet-native GEOMETRY logical type (CRS carried in
     the type), with native geospatial statistics written per row group — no
     covering column needed, smaller file.
+  The covering bbox leaves are written in small (~4k-row) pages with
+  dictionary encoding off, so the parquet page index (ColumnIndex/
+  OffsetIndex) prunes well below row-group granularity in any reader.
   Bloom filters found on source columns are reproduced (or added to all
   string/integer attribute columns, or dropped). The report shows size,
   row-group count and the bbox-overlap metric before/after, and the result
@@ -110,6 +118,8 @@ deep zoom stays jitter-free.
 
 - Native GeoArrow encodings (`geoarrow.point` etc.) without WKB decode
 - Streaming (external-sort) optimize for files beyond the 8 GB in-memory cap
+- Page-index (footer-only) pruning for 2.0 native-stats files without a
+  covering column (per-feature selection needs the bbox column today)
 - Zoom-dependent coastline detail (embed 1:110m + fetch 1:10m on demand)
 - HTTP range-request streaming of remote GeoParquet (row-group pyramids)
 - Data-driven styling (color by attribute, graduated/categorical)

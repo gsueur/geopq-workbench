@@ -989,7 +989,7 @@ mod tests {
         camera.fit(geometry.bounds_world, [w as f32, h as f32], 20.0);
 
         // Row-group bbox overlay (computed source for this fixture).
-        let (_g2, _r2, _b2, rg_boxes) =
+        let (_g2, _r2, _b2, rg_boxes, _resolved) =
             crate::data::loader::build_geometry_for_test_full(&store, &crs, &display).unwrap();
         let rg_overlay = crate::app::build_rg_overlay(&crs, &display, &rg_boxes).0;
         let cb = MapCallback {

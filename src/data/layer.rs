@@ -55,6 +55,37 @@ impl RgBboxes {
     }
 }
 
+/// Decode state of one row group.
+#[derive(Clone, Debug, Default)]
+pub enum GroupLoad {
+    /// Nothing decoded.
+    #[default]
+    None,
+    /// Per-feature selection: only rows whose covering bbox intersected
+    /// `rect` (data CRS) were decoded; `ranges` are the group-relative
+    /// [start, end) row spans that cover them.
+    Rows { ranges: Vec<(u32, u32)>, rect: [f64; 4] },
+    /// Whole group decoded.
+    Full,
+}
+
+impl GroupLoad {
+    pub fn is_full(&self) -> bool {
+        matches!(self, GroupLoad::Full)
+    }
+
+    /// Does the loaded state already cover features intersecting `rect`?
+    pub fn covers(&self, rect: [f64; 4]) -> bool {
+        match self {
+            GroupLoad::None => false,
+            GroupLoad::Full => true,
+            GroupLoad::Rows { rect: r, .. } => {
+                r[0] <= rect[0] && r[1] <= rect[1] && r[2] >= rect[2] && r[3] >= rect[3]
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LayerStyle {
     pub visible: bool,
@@ -135,8 +166,8 @@ pub struct VectorLayer {
     /// Row-group spatial extents (data CRS); None only if nothing could be
     /// derived (e.g. zero-row file).
     pub rg_bboxes: Option<RgBboxes>,
-    /// Row groups currently decoded into sections.
-    pub loaded_rgs: Vec<u32>,
+    /// Decode state per row group (len = row groups in the file).
+    pub loaded: Vec<GroupLoad>,
 }
 
 impl VectorLayer {
@@ -164,11 +195,22 @@ impl VectorLayer {
     }
 
     pub fn total_rgs(&self) -> usize {
-        self.rg_bboxes.as_ref().map(|r| r.boxes.len()).unwrap_or(0)
+        self.loaded.len()
+    }
+
+    pub fn full_rgs(&self) -> usize {
+        self.loaded.iter().filter(|g| g.is_full()).count()
+    }
+
+    /// Row groups with per-feature (viewport rect) selection only.
+    pub fn partial_rgs(&self) -> usize {
+        self.loaded
+            .iter()
+            .filter(|g| matches!(g, GroupLoad::Rows { .. }))
+            .count()
     }
 
     pub fn is_partial(&self) -> bool {
-        let total = self.total_rgs();
-        total > 0 && self.loaded_rgs.len() < total
+        self.loaded.iter().any(|g| !g.is_full())
     }
 }

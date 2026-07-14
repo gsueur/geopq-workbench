@@ -39,6 +39,9 @@ const MAX_IN_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const READ_BATCH: usize = 64 * 1024;
 /// Hilbert curve order: 2^16 cells per axis.
 const HILBERT_ORDER: u32 = 16;
+/// Uncompressed page-size cap for covering bbox leaves: ~4096 f64 rows per
+/// page, so the page index can prune well below row-group granularity.
+const BBOX_LEAF_PAGE_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GpVersion {
@@ -368,6 +371,20 @@ pub fn optimize(
         .set_max_row_group_row_count(Some(opts.row_group_size))
         .set_statistics_enabled(EnabledStatistics::Page)
         .set_created_by(format!("geopq-viewer {}", env!("CARGO_PKG_VERSION")));
+    if write_covering {
+        // Small pages on the bbox leaves (~4k rows at 8 B/value) give the
+        // page index sub-row-group granularity, so readers can prune at
+        // page level instead of whole row groups. Dictionary encoding is
+        // disabled there: coordinates are mostly unique (no dict win) and
+        // the page-size cap applies to the encoded size, which tiny dict
+        // indices would defeat. Other columns keep the defaults.
+        for leaf in ["xmin", "ymin", "xmax", "ymax"] {
+            let path = ColumnPath::new(vec!["bbox".into(), leaf.into()]);
+            props = props
+                .set_column_data_page_size_limit(path.clone(), BBOX_LEAF_PAGE_BYTES)
+                .set_column_dictionary_enabled(path, false);
+        }
+    }
     let mut bloom_columns: Vec<String> = Vec::new();
     match opts.bloom {
         BloomMode::Preserve => {
@@ -899,6 +916,45 @@ mod tests {
             crate::data::loader::open_store_for_test(&dst11).unwrap();
         assert_eq!(crs11.epsg, Some(2154));
         assert!(info11.geo.version_label.contains("1.1"), "{}", info11.geo.version_label);
+    }
+
+    /// The covering bbox leaves must be written in small pages so the page
+    /// index (ColumnIndex/OffsetIndex) prunes below row-group granularity.
+    #[test]
+    fn bbox_leaves_get_fine_grained_pages() {
+        let dir = std::env::temp_dir().join("geopq_optimize_pages");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = write_scrambled(150_000, &dir);
+        let dst = dir.join("out_pages.parquet");
+        let report = optimize(&src, &dst, &OptimizeOptions::default(), None, &|_, _| {}).unwrap();
+        assert_eq!(report.rg_after, 150_000_usize.div_ceil(65_536));
+
+        let options = parquet::arrow::arrow_reader::ArrowReaderOptions::new()
+            .with_page_index(true);
+        let b = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            File::open(&dst).unwrap(),
+            options,
+        )
+        .unwrap();
+        let leaf_idx = |name: &str| {
+            b.parquet_schema()
+                .columns()
+                .iter()
+                .position(|c| c.path().string() == name)
+                .unwrap_or_else(|| panic!("leaf {name} not found"))
+        };
+        let offset_index = b.metadata().offset_index().expect("offset index written");
+        // First (full 65k-row) group: expect ~16 pages per bbox leaf
+        // (65536 rows / ~4096 rows per 32 KB page), and far fewer for a
+        // default-page-size column like the geometry.
+        for leaf in ["bbox.xmin", "bbox.ymin", "bbox.xmax", "bbox.ymax"] {
+            let pages = offset_index[0][leaf_idx(leaf)].page_locations().len();
+            assert!(pages >= 8, "{leaf}: {pages} pages, expected fine-grained");
+        }
+        // Sanity: page row ranges are recoverable via first_row_index.
+        let locs = offset_index[0][leaf_idx("bbox.xmin")].page_locations();
+        assert_eq!(locs[0].first_row_index, 0);
+        assert!(locs[1].first_row_index > 0);
     }
 
     /// Real-file benchmark, opt-in:
