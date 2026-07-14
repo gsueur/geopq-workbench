@@ -1606,6 +1606,7 @@ mod pruning_tests {
             Source::S3 {
                 uri: url,
                 profile: std::env::var("GEOPQ_AWS_PROFILE").ok(),
+                endpoint: std::env::var("GEOPQ_S3_ENDPOINT").ok(),
                 url: String::new(),
                 len: 0,
             }

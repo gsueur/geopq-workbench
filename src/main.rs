@@ -19,6 +19,7 @@ fn main() -> eframe::Result {
                 data::source::Source::S3 {
                     uri: a,
                     profile: std::env::var("AWS_PROFILE").ok(),
+                    endpoint: None,
                     url: String::new(),
                     len: 0,
                 }

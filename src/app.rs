@@ -92,8 +92,8 @@ pub struct ViewerApp {
     errors: Vec<String>,
     show_errors: bool,
     /// URL entry dialog (Some = dialog open): text, selected AWS
-    /// profile, and the profiles discovered in ~/.aws.
-    url_input: Option<(String, Option<String>, Vec<String>)>,
+    /// profile, discovered profiles, and custom S3 endpoint.
+    url_input: Option<(String, Option<String>, Vec<String>, String)>,
     info_open: Option<u64>,
     /// Layer generations whose CPU-side fill/line arrays were freed after
     /// GPU upload (points are kept for picking).
@@ -419,8 +419,12 @@ impl ViewerApp {
                 }
             }
             if ui.button("🌐 URL…").clicked() && self.url_input.is_none() {
-                self.url_input =
-                    Some((String::new(), None, crate::data::source::aws::profiles()));
+                self.url_input = Some((
+                    String::new(),
+                    None,
+                    crate::data::source::aws::profiles(),
+                    String::new(),
+                ));
             }
             if ui
                 .add_enabled(!self.layers.is_empty(), egui::Button::new("🌍 Fit all"))
@@ -761,7 +765,7 @@ impl ViewerApp {
     }
 
     fn url_window(&mut self, ctx: &egui::Context) {
-        let Some((url, profile, profiles)) = &mut self.url_input else { return };
+        let Some((url, profile, profiles, endpoint)) = &mut self.url_input else { return };
         let mut open = true;
         let mut submit: Option<Source> = None;
         egui::Window::new("Open URL")
@@ -779,6 +783,20 @@ impl ViewerApp {
                 let is_s3 = url.starts_with("s3://");
                 if is_s3 {
                     ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Endpoint:");
+                        ui.add(
+                            egui::TextEdit::singleline(endpoint)
+                                .hint_text("(AWS) · s3.example.com · https://minio:9000")
+                                .desired_width(f32::INFINITY),
+                        );
+                    })
+                    .response
+                    .on_hover_text(
+                        "S3-compatible endpoint (path-style requests).\n\
+                         Leave empty for AWS; profile endpoint_url and\n\
+                         AWS_ENDPOINT_URL are also honored.",
+                    );
                     ui.horizontal(|ui| {
                         ui.label("AWS profile:");
                         let current = profile
@@ -807,9 +825,11 @@ impl ViewerApp {
                 {
                     let text = url.trim().to_string();
                     submit = Some(if is_s3 {
+                        let ep = endpoint.trim();
                         Source::S3 {
                             uri: text,
                             profile: profile.clone(),
+                            endpoint: (!ep.is_empty()).then(|| ep.to_string()),
                             url: String::new(),
                             len: 0,
                         }

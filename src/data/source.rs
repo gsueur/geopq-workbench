@@ -36,10 +36,12 @@ pub enum Source {
     Remote { url: String, len: u64 },
     /// s3://bucket/key, read through a (pre)signed HTTPS URL resolved at
     /// open from the selected `~/.aws` profile / environment credentials
-    /// (anonymous for public buckets). Empty `url` = unresolved.
+    /// (anonymous for public buckets). `endpoint` targets S3-compatible
+    /// services (path-style); None = AWS. Empty `url` = unresolved.
     S3 {
         uri: String,
         profile: Option<String>,
+        endpoint: Option<String>,
         url: String,
         len: u64,
     },
@@ -68,15 +70,17 @@ impl Source {
             Source::S3 {
                 uri,
                 profile,
+                endpoint,
                 url,
                 ..
             } if url.is_empty() => {
-                let url = aws::presign(&uri, profile.as_deref())?;
+                let url = aws::presign(&uri, profile.as_deref(), endpoint.as_deref())?;
                 let len = remote_len(&url)
                     .map_err(|e| format!("{uri}: {}", redact_presign(&e)))?;
                 Ok(Source::S3 {
                     uri,
                     profile,
+                    endpoint,
                     url,
                     len,
                 })
@@ -250,7 +254,7 @@ pub mod aws {
     /// Region for a profile, falling back to env, then a bucket-location
     /// probe (`x-amz-bucket-region` is present even on 403/301 answers),
     /// then us-east-1.
-    fn region(profile: Option<&str>, bucket: &str) -> String {
+    fn region(profile: Option<&str>, bucket: &str, custom_endpoint: bool) -> String {
         let dir = aws_dir();
         let files_region = |name: &str| -> Option<String> {
             let config = ini(&dir.join("config"));
@@ -272,7 +276,10 @@ pub mod aws {
                 return r;
             }
         }
-        // Probe: any response carries the bucket's region header.
+        // Probe (AWS only): any response carries the bucket's region header.
+        if custom_endpoint {
+            return "us-east-1".into();
+        }
         if let Ok(res) = super::http_agent()
             .head(&format!("https://{bucket}.s3.amazonaws.com/"))
             .header("User-Agent", super::USER_AGENT)
@@ -286,9 +293,14 @@ pub mod aws {
     }
 
     /// Turn `s3://bucket/key` into a GET URL: presigned when credentials
-    /// exist, plain virtual-host URL for anonymous/public access.
-    /// `AWS_ENDPOINT_URL` switches to a custom endpoint (path-style).
-    pub fn presign(uri: &str, profile: Option<&str>) -> Result<String, String> {
+    /// exist, plain URL for anonymous/public access. Endpoint priority:
+    /// explicit `endpoint` (UI field) > `AWS_ENDPOINT_URL` > the profile's
+    /// `endpoint_url`; custom endpoints use path-style requests.
+    pub fn presign(
+        uri: &str,
+        profile: Option<&str>,
+        endpoint: Option<&str>,
+    ) -> Result<String, String> {
         let rest = uri
             .strip_prefix("s3://")
             .ok_or_else(|| format!("not an s3:// URI: {uri}"))?;
@@ -304,10 +316,21 @@ pub mod aws {
                 profile.unwrap()
             ));
         }
-        let region = region(profile, bucket);
-        // Custom endpoints (MinIO, Wasabi, ...): env override first, then
-        // the profile's endpoint_url key (AWS CLI v2 convention).
-        let endpoint_env = std::env::var("AWS_ENDPOINT_URL").ok().or_else(|| {
+        // Custom endpoints (MinIO, Wasabi, ...): explicit field first,
+        // then env, then the profile's endpoint_url (AWS CLI v2 convention).
+        let normalize = |e: &str| -> String {
+            let e = e.trim().trim_end_matches('/');
+            if e.starts_with("http://") || e.starts_with("https://") {
+                e.to_string()
+            } else {
+                format!("https://{e}")
+            }
+        };
+        let endpoint_env = endpoint
+            .filter(|e| !e.trim().is_empty())
+            .map(normalize)
+            .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok().map(|e| normalize(&e)))
+            .or_else(|| {
             let name = profile
                 .map(str::to_string)
                 .or_else(|| std::env::var("AWS_PROFILE").ok())
@@ -315,11 +338,15 @@ pub mod aws {
             let dir = aws_dir();
             let config = ini(&dir.join("config"));
             let creds_file = ini(&dir.join("credentials"));
-            config
-                .get(&name)
-                .and_then(|s| s.get("endpoint_url").cloned())
-                .or_else(|| creds_file.get(&name).and_then(|s| s.get("endpoint_url").cloned()))
-        });
+                config
+                    .get(&name)
+                    .and_then(|s| s.get("endpoint_url").cloned())
+                    .or_else(|| {
+                        creds_file.get(&name).and_then(|s| s.get("endpoint_url").cloned())
+                    })
+                    .map(|e| normalize(&e))
+            });
+        let region = region(profile, bucket, endpoint_env.is_some());
         let (endpoint, style) = match &endpoint_env {
             Some(e) => (e.clone(), rusty_s3::UrlStyle::Path),
             None => (
@@ -400,8 +427,8 @@ pub mod aws {
 
         #[test]
         fn s3_uri_validation() {
-            assert!(super::presign("s3://bucket-only", None).is_err());
-            assert!(super::presign("http://x/y", None).is_err());
+            assert!(super::presign("s3://bucket-only", None, None).is_err());
+            assert!(super::presign("http://x/y", None, None).is_err());
         }
     }
 }

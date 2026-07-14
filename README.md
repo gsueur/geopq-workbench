@@ -60,9 +60,10 @@ Fixture-dependent tests self-skip when the files are absent.
   MBs), and response bodies are fully drained so the connection pool
   actually pools (a missing EOF read cost a TLS handshake per range
   request — 3× slower against S3). For `s3://`: pick an AWS profile from
-  `~/.aws` in the dialog (static keys + session tokens; per-profile
-  `endpoint_url` for MinIO/Wasabi-style services; `AWS_ENDPOINT_URL`
-  respected), or leave on auto — env credentials, then the default
+  `~/.aws` in the dialog (static keys + session tokens), and optionally a
+  custom S3-compatible endpoint (path-style; e.g. `s3.example.com` or
+  `https://minio:9000` — per-profile `endpoint_url` and
+  `AWS_ENDPOINT_URL` are honored too), or leave on auto — env credentials, then the default
   profile, then anonymous for public buckets (validated against Overture's
   518 MB building parts: open ~2 s, one covering-pruned row group and
   ~10k buildings in ~8 s). Layers display the `s3://` URI, never the
