@@ -235,6 +235,41 @@ pub(crate) fn run_row_filter(layer: &SqlLayer, predicate: &str) -> Result<Filter
     })
 }
 
+/// Distinct-value count per column (partition-field candidates in the
+/// export dialog). One scan, all aggregates at once. Blocking — call from
+/// a worker thread.
+pub fn distinct_counts(
+    layer: &SqlLayer,
+    columns: &[String],
+) -> Result<std::collections::HashMap<String, usize>, String> {
+    if columns.is_empty() {
+        return Ok(Default::default());
+    }
+    let aggs = columns
+        .iter()
+        .map(|c| format!("count(distinct \"{}\")", c.to_lowercase()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let out = run_query(
+        &format!("select {aggs} from {}", layer.table),
+        std::slice::from_ref(layer),
+    )?;
+    let mut map = std::collections::HashMap::new();
+    for (i, c) in columns.iter().enumerate() {
+        if let Some(a) = out
+            .batch
+            .column(i)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+        {
+            if a.len() > 0 {
+                map.insert(c.clone(), a.value(0).max(0) as usize);
+            }
+        }
+    }
+    Ok(map)
+}
+
 #[cfg(test)]
 pub fn run_query_for_test(query: &str, layers: &[SqlLayer]) -> Result<QueryOutput, String> {
     run_query(query, layers)

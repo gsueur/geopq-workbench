@@ -106,6 +106,16 @@ Fixture-dependent tests self-skip when the files are absent.
   Geometry transcodes in any direction (WKB ↔ GeoArrow ↔ native type).
   A "viewport only" option exports just the features intersecting the
   current map viewport (bbox-based, metadata bbox shrinks accordingly).
+  **Derived columns**: an `h3_r{n}` UInt64 cell column (centroid-based,
+  resolution picker — pure-Rust h3o) and admin attribution from any loaded
+  boundary polygon layer (state, county, ... via centroid point-in-polygon,
+  R-tree accelerated, cross-CRS). **Partitioned output** per the OGC
+  distribution guidance: hive directories by chosen fields
+  (`state=MA/part-0.parquet`, live distinct-count next to each candidate
+  field, partition columns path-only) or adaptive H3 cells that split until
+  each file is under a row target (balanced, non-overlapping — for datasets
+  with no natural key). Every partition file keeps the full treatment:
+  Hilbert order, covering, bloom filters, per-file `geo` bbox.
   The covering bbox leaves are written in small (~4k-row) pages with
   dictionary encoding off, so the parquet page index (ColumnIndex/
   OffsetIndex) prunes well below row-group granularity in any reader.
@@ -164,6 +174,14 @@ Fixture-dependent tests self-skip when the files are absent.
   headers. Results with geometry export to a temp GeoParquet and load back
   as regular layers (whole result or checked rows only), carrying the
   source layer's CRS.
+- **Layer filters**: a persistent SQL predicate per layer (⋮ → Filter…) —
+  the working subset, not a query: only matching rows are decoded, shown,
+  picked and queried until cleared. The predicate runs through the SQL
+  engine (spatial predicates pruned via row-group/page statistics, so a
+  location filter on a huge remote file reads only the relevant groups),
+  survives projection switches, and persists in saved contexts. The dialog
+  has column-name autocomplete and a Test button (validates + counts
+  matches without touching the layer; Apply reuses the tested result).
 - **Attributes, lazily**: click a feature → highlight + a floating attribute
   window (upper right, draggable — the map never resizes). Values are
   fetched from the parquet file on demand (row-group + page selection via
@@ -211,6 +229,7 @@ deep zoom stays jitter-free.
 
 - Overview/pyramid levels for zoomed-out views of huge remote files (a
   remote open at world zoom legitimately downloads everything today)
+- Load a hive-partitioned dataset directory back as a single layer
 - Streaming (external-sort) optimize for files beyond the 8 GB in-memory cap
 - Page-index (footer-only) pruning for 2.0 native-stats files without a
   covering column (per-feature selection needs the bbox column today)

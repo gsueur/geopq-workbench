@@ -35,10 +35,21 @@ enum OptMsg {
     Progress(f32, String),
     Done(Box<crate::data::optimize::OptimizeReport>, PathBuf),
     Failed(String),
+    /// Distinct-value counts for partition-field candidates.
+    Cardinalities(std::collections::HashMap<String, usize>),
 }
 
 /// State of the per-layer "Optimize" export dialog (one at a time).
+/// Partition mode chosen in the optimize dialog.
+#[derive(PartialEq, Clone, Copy)]
+enum PartMode {
+    None,
+    Fields,
+    AdaptiveH3,
+}
+
 struct OptimizeState {
+    layer_id: u64,
     layer_name: String,
     src: Source,
     epsg: Option<u32>,
@@ -50,6 +61,16 @@ struct OptimizeState {
     progress: (f32, String),
     report: Option<(crate::data::optimize::OptimizeReport, PathBuf)>,
     error: Option<String>,
+    /// Admin attribution: boundary layer + its value column + output name.
+    admin_layer: Option<u64>,
+    admin_column: String,
+    admin_out: String,
+    part_mode: PartMode,
+    part_fields: Vec<String>,
+    adaptive_target: usize,
+    /// Distinct counts per candidate partition field (computed on demand).
+    cardinalities: Option<std::collections::HashMap<String, usize>>,
+    card_pending: bool,
 }
 
 pub struct ViewerApp {
@@ -1326,6 +1347,7 @@ impl ViewerApp {
             if !already_running {
                 if let Some(l) = self.layers.iter().find(|l| l.id == id) {
                     self.optimize = Some(OptimizeState {
+                        layer_id: l.id,
                         layer_name: l.name.clone(),
                         src: l.store.source.clone(),
                         epsg: l.crs.epsg,
@@ -1336,6 +1358,14 @@ impl ViewerApp {
                         progress: (0.0, String::new()),
                         report: None,
                         error: None,
+                        admin_layer: None,
+                        admin_column: String::new(),
+                        admin_out: "admin".into(),
+                        part_mode: PartMode::None,
+                        part_fields: Vec::new(),
+                        adaptive_target: 1_000_000,
+                        cardinalities: None,
+                        card_pending: false,
                     });
                 }
             }
@@ -1589,6 +1619,10 @@ impl ViewerApp {
                     o.running = false;
                     o.error = Some(e);
                 }
+                OptMsg::Cardinalities(c) => {
+                    o.cardinalities = Some(c);
+                    o.card_pending = false;
+                }
             }
         }
     }
@@ -1611,7 +1645,42 @@ impl ViewerApp {
         } else {
             None
         };
+        // Partition plan from the dialog state.
+        use crate::data::partition::{AdminJoinSpec, PartitionBy};
+        o.opts.partition = match o.part_mode {
+            PartMode::None => PartitionBy::None,
+            PartMode::Fields => {
+                if o.part_fields.is_empty() {
+                    o.running = false;
+                    o.error = Some("select at least one partition field".into());
+                    return;
+                }
+                PartitionBy::Fields(o.part_fields.clone())
+            }
+            PartMode::AdaptiveH3 => PartitionBy::AdaptiveH3 {
+                target_rows: o.adaptive_target,
+                max_res: 10,
+            },
+        };
+        if o.admin_layer.is_some() && o.admin_column.is_empty() {
+            o.running = false;
+            o.error = Some("pick the boundary layer's value column".into());
+            return;
+        }
+        let admin_sel = (o.admin_layer, o.admin_column.clone(), o.admin_out.clone());
         let (src, opts, epsg) = (o.src.clone(), o.opts.clone(), o.epsg);
+        let admin: Option<AdminJoinSpec> = admin_sel
+            .0
+            .and_then(|id| self.layers.iter().find(|l| l.id == id))
+            .map(|bl| AdminJoinSpec {
+                out_name: {
+                    let n = admin_sel.2.trim();
+                    if n.is_empty() { "admin".into() } else { n.to_string() }
+                },
+                store: Arc::clone(&bl.store),
+                value_column: admin_sel.1.clone(),
+                crs: bl.crs.clone(),
+            });
         let tx = self.opt_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
@@ -1619,7 +1688,7 @@ impl ViewerApp {
                 let _ = tx.send(OptMsg::Progress(f, s.to_string()));
                 ctx.request_repaint();
             };
-            let msg = match crate::data::optimize::optimize(&src, &dst, &opts, epsg, &progress) {
+            let msg = match crate::data::optimize::optimize(&src, &dst, &opts, epsg, admin.as_ref(), &progress) {
                 Ok(r) => OptMsg::Done(Box::new(r), dst),
                 Err(e) => OptMsg::Failed(e),
             };
@@ -1630,11 +1699,82 @@ impl ViewerApp {
 
     fn optimize_window(&mut self, ctx: &egui::Context) {
         use crate::data::optimize::{BloomMode, Codec, GpVersion};
+        // Gathered before the dialog borrow: partition-field candidates of
+        // the exported layer and polygon layers usable for admin joins.
+        let (candidates, other_layers) = match &self.optimize {
+            Some(o) => {
+                let candidates: Vec<String> = self
+                    .layers
+                    .iter()
+                    .find(|l| l.id == o.layer_id)
+                    .map(|l| {
+                        l.store
+                            .schema
+                            .fields()
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, f)| {
+                                *i != l.store.geom_col
+                                    && f.name() != "bbox"
+                                    && matches!(
+                                        f.data_type(),
+                                        arrow::datatypes::DataType::Utf8
+                                            | arrow::datatypes::DataType::LargeUtf8
+                                            | arrow::datatypes::DataType::Utf8View
+                                            | arrow::datatypes::DataType::Boolean
+                                            | arrow::datatypes::DataType::Int8
+                                            | arrow::datatypes::DataType::Int16
+                                            | arrow::datatypes::DataType::Int32
+                                            | arrow::datatypes::DataType::Int64
+                                            | arrow::datatypes::DataType::UInt8
+                                            | arrow::datatypes::DataType::UInt16
+                                            | arrow::datatypes::DataType::UInt32
+                                            | arrow::datatypes::DataType::UInt64
+                                            | arrow::datatypes::DataType::Date32
+                                            | arrow::datatypes::DataType::Date64
+                                    )
+                            })
+                            .map(|(_, f)| f.name().clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let others: Vec<(u64, String, Vec<String>)> = self
+                    .layers
+                    .iter()
+                    .filter(|l| {
+                        l.id != o.layer_id
+                            && matches!(l.kind(), crate::data::geometry::GeomKind::Polygon)
+                    })
+                    .map(|l| {
+                        let cols = l
+                            .store
+                            .schema
+                            .fields()
+                            .iter()
+                            .filter(|f| {
+                                matches!(
+                                    f.data_type(),
+                                    arrow::datatypes::DataType::Utf8
+                                        | arrow::datatypes::DataType::LargeUtf8
+                                        | arrow::datatypes::DataType::Utf8View
+                                )
+                            })
+                            .map(|f| f.name().clone())
+                            .collect();
+                        (l.id, l.name.clone(), cols)
+                    })
+                    .collect();
+                (candidates, others)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
         let Some(o) = &mut self.optimize else { return };
+        let layer_id = o.layer_id;
         let mut open = true;
         let mut start: Option<PathBuf> = None;
         let mut load_result: Option<PathBuf> = None;
         let mut close = false;
+        let mut want_cards = false;
         egui::Window::new(format!("Optimize — {}", o.layer_name))
             .id(egui::Id::new("optimize_dialog"))
             .open(&mut open)
@@ -1654,6 +1794,9 @@ impl ViewerApp {
                         };
                         row(ui, "format", rep.version_label.clone());
                         row(ui, "rows", fmt_count(rep.rows as usize));
+                        if rep.files > 1 {
+                            row(ui, "files", format!("{} (partitioned)", rep.files));
+                        }
                         row(
                             ui,
                             "size",
@@ -1688,7 +1831,7 @@ impl ViewerApp {
                     });
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Load as layer").clicked() {
+                        if rep.files <= 1 && ui.button("Load as layer").clicked() {
                             load_result = Some(path.clone());
                         }
                         if ui.button("Close").clicked() {
@@ -1776,6 +1919,205 @@ impl ViewerApp {
                         .on_hover_text(
                             "Export only features intersecting the current map viewport",
                         );
+
+                    ui.separator();
+                    // --- derived columns ---
+                    ui.horizontal(|ui| {
+                        let mut on = o.opts.h3_resolution.is_some();
+                        if ui
+                            .checkbox(&mut on, "H3 cell column")
+                            .on_hover_text(
+                                "Add an h3_r{n} UInt64 column: the H3 cell of each \
+                                 feature's centroid (joins/aggregations, or a \
+                                 partition key below)",
+                            )
+                            .changed()
+                        {
+                            o.opts.h3_resolution = on.then_some(8);
+                        }
+                        if let Some(res) = o.opts.h3_resolution {
+                            let mut r = res;
+                            egui::ComboBox::from_id_salt("opt_h3res")
+                                .selected_text(format!(
+                                    "r{res} ({})",
+                                    crate::data::partition::h3_res_hint(res)
+                                ))
+                                .width(170.0)
+                                .show_ui(ui, |ui| {
+                                    for cand in 0..=12u8 {
+                                        ui.selectable_value(
+                                            &mut r,
+                                            cand,
+                                            format!(
+                                                "r{cand} ({})",
+                                                crate::data::partition::h3_res_hint(cand)
+                                            ),
+                                        );
+                                    }
+                                });
+                            o.opts.h3_resolution = Some(r);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Admin column:")
+                            .on_hover_text(
+                                "Attribute each feature from a boundary polygon layer \
+                                 (state, county, ...) by centroid point-in-polygon — \
+                                 load the boundaries as a layer first",
+                            );
+                        let current = o
+                            .admin_layer
+                            .and_then(|id| other_layers.iter().find(|(i, _, _)| *i == id))
+                            .map(|(_, n, _)| n.clone())
+                            .unwrap_or_else(|| "none".into());
+                        egui::ComboBox::from_id_salt("opt_admin_layer")
+                            .selected_text(current)
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(o.admin_layer.is_none(), "none").clicked()
+                                {
+                                    o.admin_layer = None;
+                                }
+                                for (id, name, _) in &other_layers {
+                                    if ui
+                                        .selectable_label(o.admin_layer == Some(*id), name)
+                                        .clicked()
+                                    {
+                                        o.admin_layer = Some(*id);
+                                        o.admin_column.clear();
+                                    }
+                                }
+                            });
+                        if other_layers.is_empty() {
+                            ui.label(
+                                RichText::new("(load a boundary polygon layer)")
+                                    .weak()
+                                    .small(),
+                            );
+                        }
+                    });
+                    if let Some(aid) = o.admin_layer {
+                        if let Some((_, _, cols)) =
+                            other_layers.iter().find(|(i, _, _)| *i == aid)
+                        {
+                            ui.horizontal(|ui| {
+                                ui.label("  value:");
+                                egui::ComboBox::from_id_salt("opt_admin_col")
+                                    .selected_text(if o.admin_column.is_empty() {
+                                        "pick column…".into()
+                                    } else {
+                                        o.admin_column.clone()
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        for c in cols {
+                                            ui.selectable_value(
+                                                &mut o.admin_column,
+                                                c.clone(),
+                                                c,
+                                            );
+                                        }
+                                    });
+                                ui.label("as");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut o.admin_out)
+                                        .desired_width(90.0),
+                                );
+                            });
+                        }
+                    }
+
+                    // --- partitioning ---
+                    ui.separator();
+                    ui.label(RichText::new("Partition output").strong());
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut o.part_mode, PartMode::None, "single file");
+                        ui.radio_value(&mut o.part_mode, PartMode::Fields, "by fields")
+                            .on_hover_text(
+                                "Hive directories (field=value/part-0.parquet); \
+                                 partition columns live in the path only",
+                            );
+                        ui.radio_value(&mut o.part_mode, PartMode::AdaptiveH3, "adaptive H3")
+                            .on_hover_text(
+                                "Split centroid H3 cells until each file is under the \
+                                 row target — balanced, non-overlapping spatial \
+                                 partitions when no natural field exists",
+                            );
+                    });
+                    match o.part_mode {
+                        PartMode::None => {}
+                        PartMode::Fields => {
+                            if o.cardinalities.is_none() && !o.card_pending {
+                                o.card_pending = true;
+                                want_cards = true;
+                            }
+                            let mut derived: Vec<String> = Vec::new();
+                            if let Some(r) = o.opts.h3_resolution {
+                                derived.push(format!("h3_r{r}"));
+                            }
+                            if o.admin_layer.is_some() {
+                                let n = o.admin_out.trim();
+                                derived.push(if n.is_empty() { "admin".into() } else { n.into() });
+                            }
+                            for name in derived.iter().chain(candidates.iter()) {
+                                let mut on = o.part_fields.contains(name);
+                                let card = o
+                                    .cardinalities
+                                    .as_ref()
+                                    .and_then(|m| m.get(name))
+                                    .map(|c| format!("{c} distinct"))
+                                    .unwrap_or_else(|| {
+                                        if derived.contains(name) {
+                                            "derived".into()
+                                        } else if o.card_pending {
+                                            "counting…".into()
+                                        } else {
+                                            String::new()
+                                        }
+                                    });
+                                let warn = o
+                                    .cardinalities
+                                    .as_ref()
+                                    .and_then(|m| m.get(name))
+                                    .is_some_and(|&c| c > 500);
+                                let label = format!("{name}  ({card})");
+                                let text = if warn {
+                                    RichText::new(label).color(Color32::from_rgb(230, 130, 60))
+                                } else {
+                                    RichText::new(label)
+                                };
+                                if ui.checkbox(&mut on, text).changed() {
+                                    if on {
+                                        o.part_fields.push(name.clone());
+                                    } else {
+                                        o.part_fields.retain(|f| f != name);
+                                    }
+                                }
+                            }
+                            if !o.part_fields.is_empty() {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "dirs: {}",
+                                        o.part_fields
+                                            .iter()
+                                            .map(|f| format!("{f}=…"))
+                                            .collect::<Vec<_>>()
+                                            .join("/")
+                                    ))
+                                    .weak()
+                                    .small(),
+                                );
+                            }
+                        }
+                        PartMode::AdaptiveH3 => {
+                            ui.horizontal(|ui| {
+                                ui.label("target rows per file:");
+                                ui.add(
+                                    egui::DragValue::new(&mut o.adaptive_target)
+                                        .range(10_000..=10_000_000)
+                                        .speed(10_000),
+                                );
+                            });
+                        }
+                    }
                 });
 
                 ui.add_space(6.0);
@@ -1787,16 +2129,24 @@ impl ViewerApp {
                     );
                 } else if ui.button("Export…").clicked() {
                     let stem = o.src.name();
-                    let mut dialog = rfd::FileDialog::new()
-                        .set_file_name(format!("{stem}_optimized.parquet"))
-                        .add_filter("GeoParquet", &["parquet"]);
+                    let stem = stem.trim_end_matches(".parquet");
+                    let mut dialog = rfd::FileDialog::new();
                     if let Source::Local(p) = &o.src {
                         if let Some(dir) = p.parent() {
                             dialog = dialog.set_directory(dir);
                         }
                     }
-                    if let Some(dst) = dialog.save_file() {
-                        start = Some(dst);
+                    if o.part_mode == PartMode::None {
+                        if let Some(dst) = dialog
+                            .set_file_name(format!("{stem}_optimized.parquet"))
+                            .add_filter("GeoParquet", &["parquet"])
+                            .save_file()
+                        {
+                            start = Some(dst);
+                        }
+                    } else if let Some(dir) = dialog.pick_folder() {
+                        // Dataset root inside the chosen folder.
+                        start = Some(dir.join(format!("{stem}_partitioned")));
                     }
                 }
                 if let Some(e) = &o.error {
@@ -1804,6 +2154,28 @@ impl ViewerApp {
                     ui.colored_label(Color32::from_rgb(230, 80, 80), e);
                 }
             });
+        // Count distinct values of the partition candidates (one scan, on
+        // a worker thread) the first time "by fields" is selected.
+        if want_cards {
+            match self.sql_layer_of(layer_id) {
+                Some(sl) => {
+                    let cols = candidates.clone();
+                    let tx = self.opt_tx.clone();
+                    let egui_ctx = ctx.clone();
+                    std::thread::spawn(move || {
+                        let counts =
+                            crate::sql::engine::distinct_counts(&sl, &cols).unwrap_or_default();
+                        let _ = tx.send(OptMsg::Cardinalities(counts));
+                        egui_ctx.request_repaint();
+                    });
+                }
+                None => {
+                    if let Some(o) = &mut self.optimize {
+                        o.card_pending = false;
+                    }
+                }
+            }
+        }
         if let Some(dst) = start {
             self.start_optimize(dst, ctx);
         }

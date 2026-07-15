@@ -34,6 +34,7 @@ wkt = "0.14"
 tokio = { version = "1.52.3", features = ["rt"] }
 async-trait = "0.1.89"
 futures = "0.3.32"
+h3o = "0.10.0"
 
 [dev-dependencies]
 pollster = "1.0.1"

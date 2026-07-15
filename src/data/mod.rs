@@ -7,5 +7,6 @@ pub mod layer;
 pub mod loader;
 pub mod national;
 pub mod optimize;
+pub mod partition;
 pub mod source;
 pub mod store;

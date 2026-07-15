@@ -128,6 +128,10 @@ pub struct OptimizeOptions {
     pub bloom: BloomMode,
     /// Export only features whose bbox intersects this rect (data CRS).
     pub filter_rect: Option<[f64; 4]>,
+    /// Add an `h3_r{n}` UInt64 cell column (centroid-based).
+    pub h3_resolution: Option<u8>,
+    /// Split the output into hive directories / adaptive H3 cells.
+    pub partition: super::partition::PartitionBy,
 }
 
 impl Default for OptimizeOptions {
@@ -140,6 +144,8 @@ impl Default for OptimizeOptions {
             covering: true,
             bloom: BloomMode::Preserve,
             filter_rect: None,
+            h3_resolution: None,
+            partition: super::partition::PartitionBy::None,
         }
     }
 }
@@ -157,6 +163,8 @@ pub struct OptimizeReport {
     pub bloom_columns: Vec<String>,
     pub version_label: String,
     pub elapsed_ms: u64,
+    /// Output files written (1 unless partitioned).
+    pub files: usize,
 }
 
 impl OptimizeReport {
@@ -178,6 +186,7 @@ pub fn optimize(
     dst: &Path,
     opts: &OptimizeOptions,
     epsg_hint: Option<u32>,
+    admin: Option<&super::partition::AdminJoinSpec>,
     progress: &dyn Fn(f32, &str),
 ) -> Result<OptimizeReport, String> {
     let t0 = std::time::Instant::now();
@@ -351,6 +360,81 @@ pub fn optimize(
         order.sort_by_key(|&i| codes[i as usize]);
     }
 
+    // --- derived columns + partition plan ---
+    use super::partition::{self, PartitionBy};
+    let part_fields: Vec<String> = match &opts.partition {
+        PartitionBy::Fields(f) if f.is_empty() => {
+            return Err("partitioning by fields: none selected".into())
+        }
+        PartitionBy::Fields(f) => f.clone(),
+        _ => Vec::new(),
+    };
+    let h3_name = opts.h3_resolution.map(|r| format!("h3_r{r}"));
+    let need_lonlat = opts.h3_resolution.is_some()
+        || matches!(opts.partition, PartitionBy::AdaptiveH3 { .. });
+    let data_crs = if need_lonlat || admin.is_some() {
+        Some(
+            super::crs::Crs::from_geoparquet_crs(crs_value.as_ref())
+                .map_err(|e| format!("H3/admin needs a resolvable CRS: {e}"))?,
+        )
+    } else {
+        None
+    };
+    progress(0.53, "computing derived columns");
+    let lonlat: Option<Vec<Option<(f64, f64)>>> = need_lonlat.then(|| {
+        partition::centroids_in(&row_bboxes, data_crs.as_ref().unwrap(), &super::crs::Crs::wgs84())
+    });
+    let h3_vals: Option<Vec<Option<u64>>> = match (opts.h3_resolution, &lonlat) {
+        (Some(res), Some(ll)) => Some(partition::h3_cells(ll, res)?),
+        _ => None,
+    };
+    let admin_vals: Option<Vec<Option<String>>> = match admin {
+        Some(spec) => {
+            let cb = partition::centroids_in(&row_bboxes, data_crs.as_ref().unwrap(), &spec.crs);
+            Some(partition::admin_join(spec, &cb)?)
+        }
+        None => None,
+    };
+    // Per-row string values for each hive partition field.
+    let field_values: Vec<(String, Vec<Option<String>>)> = part_fields
+        .iter()
+        .map(|name| -> Result<(String, Vec<Option<String>>), String> {
+            if Some(name.as_str()) == h3_name.as_deref() {
+                let vals = h3_vals
+                    .as_ref()
+                    .ok_or("internal: h3 partition field without h3 column")?
+                    .iter()
+                    .map(|v| {
+                        v.and_then(|v| h3o::CellIndex::try_from(v).ok())
+                            .map(|c| c.to_string())
+                    })
+                    .collect();
+                return Ok((name.clone(), vals));
+            }
+            if Some(name.as_str()) == admin.map(|a| a.out_name.as_str()) {
+                return Ok((name.clone(), admin_vals.clone().unwrap_or_default()));
+            }
+            let idx = src_schema
+                .index_of(name)
+                .map_err(|_| format!("partition field '{name}' not found"))?;
+            if idx == geom_idx {
+                return Err("cannot partition by the geometry column".into());
+            }
+            use arrow::util::display::{ArrayFormatter, FormatOptions};
+            let fopts = FormatOptions::default().with_display_error(true);
+            let mut vals: Vec<Option<String>> = Vec::with_capacity(rows);
+            for b in &batches {
+                let col = b.column(idx);
+                let f = ArrayFormatter::try_new(col.as_ref(), &fopts)
+                    .map_err(|e| format!("partition field '{name}': {e}"))?;
+                for i in 0..b.num_rows() {
+                    vals.push((!col.is_null(i)).then(|| f.value(i).to_string()));
+                }
+            }
+            Ok((name.clone(), vals))
+        })
+        .collect::<Result<_, _>>()?;
+
     // --- geometry output form ---
     let geom_out: GeomOut = match opts.version {
         GpVersion::V1_1GeoArrow => {
@@ -378,6 +462,8 @@ pub fn optimize(
     for (i, f) in src_schema.fields().iter().enumerate() {
         if Some(f.name().as_str()) == drop_covering
             || (write_covering && f.name() == "bbox" && i != geom_idx)
+            // Hive convention: partition columns live in the path only.
+            || (part_fields.iter().any(|p| p == f.name()) && i != geom_idx)
         {
             continue;
         }
@@ -427,29 +513,23 @@ pub fn optimize(
     if write_covering {
         fields.push(Field::new("bbox", DataType::Struct(bbox_fields.clone()), true));
     }
+    // Derived columns (skipped when hive uses them as path-only keys).
+    let write_h3 = h3_name
+        .as_deref()
+        .filter(|n| !part_fields.iter().any(|p| p == n));
+    if let Some(n) = write_h3 {
+        fields.push(Field::new(n, DataType::UInt64, true));
+    }
+    let write_admin = admin
+        .map(|a| a.out_name.as_str())
+        .filter(|n| !part_fields.iter().any(|p| p == n));
+    if let Some(n) = write_admin {
+        fields.push(Field::new(n, DataType::Utf8, true));
+    }
 
     let out_schema = Arc::new(Schema::new(fields));
 
-    // --- writer properties ---
-    let mut props = WriterProperties::builder()
-        .set_compression(opts.codec.compression())
-        .set_max_row_group_row_count(Some(opts.row_group_size))
-        .set_statistics_enabled(EnabledStatistics::Page)
-        .set_created_by(format!("geopq-viewer {}", env!("CARGO_PKG_VERSION")));
-    if write_covering {
-        // Small pages on the bbox leaves (~4k rows at 8 B/value) give the
-        // page index sub-row-group granularity, so readers can prune at
-        // page level instead of whole row groups. Dictionary encoding is
-        // disabled there: coordinates are mostly unique (no dict win) and
-        // the page-size cap applies to the encoded size, which tiny dict
-        // indices would defeat. Other columns keep the defaults.
-        for leaf in ["xmin", "ymin", "xmax", "ymax"] {
-            let path = ColumnPath::new(vec!["bbox".into(), leaf.into()]);
-            props = props
-                .set_column_data_page_size_limit(path.clone(), BBOX_LEAF_PAGE_BYTES)
-                .set_column_dictionary_enabled(path, false);
-        }
-    }
+    // --- writer properties (rebuilt per output file) ---
     let mut bloom_columns: Vec<String> = Vec::new();
     match opts.bloom {
         BloomMode::Preserve => {
@@ -457,10 +537,13 @@ pub fn optimize(
                 if parts.first().map(String::as_str) == drop_covering {
                     continue; // rebuilt bbox column gets no bloom filter
                 }
+                if parts
+                    .first()
+                    .is_some_and(|r| part_fields.iter().any(|p| p == r))
+                {
+                    continue; // partition columns are path-only
+                }
                 bloom_columns.push(parts.join("."));
-                props = props
-                    .set_column_bloom_filter_enabled(ColumnPath::new(parts.clone()), true)
-                    .set_column_bloom_filter_fpp(ColumnPath::new(parts.clone()), 0.01);
             }
         }
         BloomMode::AllAttributes => {
@@ -488,32 +571,62 @@ pub fn optimize(
                         | DataType::Date64
                 );
                 if eligible {
-                    let path = ColumnPath::new(vec![f.name().clone()]);
                     bloom_columns.push(f.name().clone());
-                    props = props
-                        .set_column_bloom_filter_enabled(path.clone(), true)
-                        .set_column_bloom_filter_fpp(path, 0.01);
                 }
             }
         }
         BloomMode::None => {}
     }
+    let src_bloom_paths: Vec<Vec<String>> = match opts.bloom {
+        BloomMode::Preserve => bloom_columns
+            .iter()
+            .map(|c| c.split('.').map(str::to_string).collect())
+            .collect(),
+        _ => bloom_columns.iter().map(|c| vec![c.clone()]).collect(),
+    };
+    let make_props = || {
+        let mut props = WriterProperties::builder()
+            .set_compression(opts.codec.compression())
+            .set_max_row_group_row_count(Some(opts.row_group_size))
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .set_created_by(format!("geopq-viewer {}", env!("CARGO_PKG_VERSION")));
+        if write_covering {
+            // Small pages on the bbox leaves (~4k rows at 8 B/value) give
+            // the page index sub-row-group granularity, so readers can
+            // prune at page level instead of whole row groups. Dictionary
+            // encoding is disabled there: coordinates are mostly unique
+            // (no dict win) and the page-size cap applies to the encoded
+            // size, which tiny dict indices would defeat.
+            for leaf in ["xmin", "ymin", "xmax", "ymax"] {
+                let path = ColumnPath::new(vec!["bbox".into(), leaf.into()]);
+                props = props
+                    .set_column_data_page_size_limit(path.clone(), BBOX_LEAF_PAGE_BYTES)
+                    .set_column_dictionary_enabled(path, false);
+            }
+        }
+        for parts in &src_bloom_paths {
+            props = props
+                .set_column_bloom_filter_enabled(ColumnPath::new(parts.clone()), true)
+                .set_column_bloom_filter_fpp(ColumnPath::new(parts.clone()), 0.01);
+        }
+        props.build()
+    };
+
+    // --- partition plan ---
+    let parts: Vec<(String, Vec<u32>)> = match &opts.partition {
+        PartitionBy::None => vec![(String::new(), order.clone())],
+        PartitionBy::Fields(_) => partition::split_by_fields(&order, &field_values)?,
+        PartitionBy::AdaptiveH3 { target_rows, max_res } => partition::split_adaptive_h3(
+            &order,
+            lonlat.as_ref().ok_or("internal: adaptive H3 without centroids")?,
+            (*target_rows).max(1),
+            *max_res,
+        )?,
+    };
+    let partitioned = !matches!(opts.partition, PartitionBy::None);
 
     // --- write, gathering rows in sorted order ---
     progress(0.55, "writing");
-    let out_file = File::create(dst).map_err(|e| format!("cannot create output: {e}"))?;
-    let mut writer = ArrowWriter::try_new(out_file, out_schema.clone(), Some(props.build()))
-        .map_err(|e| format!("writer init: {e}"))?;
-    // `geo` is rebuilt; other source key-value metadata passes through.
-    writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
-        "geo".to_string(),
-        build_geo_meta(opts, &primary, crs_value.as_ref(), &geom_types, out_encoding, file_bbox)
-            .to_string(),
-    ));
-    for entry in kv.iter().filter(|kv| kv.key != "geo" && kv.key != "ARROW:schema") {
-        writer.append_key_value_metadata(entry.clone());
-    }
-
     // Global row index -> (batch, offset in batch).
     let mut batch_starts: Vec<usize> = Vec::with_capacity(batches.len() + 1);
     let mut acc = 0usize;
@@ -531,65 +644,103 @@ pub fn optimize(
         (bi, row - batch_starts[bi])
     };
     let batch_refs: Vec<&RecordBatch> = batches.iter().collect();
-
     let chunk_rows = opts.row_group_size.min(READ_BATCH);
     let out_geom_pos = kept_src_indices
         .iter()
         .position(|&i| i == geom_idx)
         .ok_or("geometry column dropped from output")?;
-    let mut written = 0usize;
-    for chunk in order.chunks(chunk_rows) {
-        let indices: Vec<(usize, usize)> = chunk.iter().map(|&r| locate(r)).collect();
-        let gathered = interleave_record_batch(&batch_refs, &indices)
-            .map_err(|e| format!("gather failed: {e}"))?;
-        let mut cols: Vec<ArrayRef> = kept_src_indices
-            .iter()
-            .map(|&i| gathered.column(i).clone())
-            .collect();
-        if !matches!(geom_out, GeomOut::PassThrough) {
-            cols[out_geom_pos] =
-                transcode_geometry(cols[out_geom_pos].as_ref(), src_encoding, &geom_out)?;
-        }
-        if write_covering {
-            cols.push(build_bbox_column(chunk, &row_bboxes, &bbox_fields));
-        }
-        let out = RecordBatch::try_new(out_schema.clone(), cols)
-            .map_err(|e| format!("batch assembly failed: {e}"))?;
-        writer.write(&out).map_err(|e| format!("write failed: {e}"))?;
-        written += chunk.len();
-        progress(0.55 + 0.45 * (written as f32 / written_rows as f32), "writing");
-    }
-    let closed = writer.close().map_err(|e| format!("finalize failed: {e}"))?;
 
-    // --- report ---
-    let rg_after_rows: Vec<usize> = closed
-        .row_groups()
-        .iter()
-        .map(|rg| rg.num_rows().max(0) as usize)
-        .collect();
-    let overlap_after = {
-        let mut boxes = Vec::with_capacity(rg_after_rows.len());
+    // One file per partition; everything (covering, bloom, ordering, geo
+    // metadata with per-file bbox) applies inside each file.
+    let mut size_after = 0u64;
+    let mut rg_after_boxes: Vec<[f64; 4]> = Vec::new();
+    let mut rg_after = 0usize;
+    let mut written = 0usize;
+    for (rel, part_order) in &parts {
+        let path = if partitioned {
+            let dir = dst.join(rel);
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+            dir.join("part-0.parquet")
+        } else {
+            dst.to_path_buf()
+        };
+        let part_bbox =
+            union_bboxes(part_order.iter().filter_map(|&r| row_bboxes[r as usize].as_ref()));
+        let out_file =
+            File::create(&path).map_err(|e| format!("cannot create output: {e}"))?;
+        let mut writer = ArrowWriter::try_new(out_file, out_schema.clone(), Some(make_props()))
+            .map_err(|e| format!("writer init: {e}"))?;
+        // `geo` is rebuilt; other source key-value metadata passes through.
+        writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            build_geo_meta(opts, &primary, crs_value.as_ref(), &geom_types, out_encoding, part_bbox)
+                .to_string(),
+        ));
+        for entry in kv.iter().filter(|kv| kv.key != "geo" && kv.key != "ARROW:schema") {
+            writer.append_key_value_metadata(entry.clone());
+        }
+
+        for chunk in part_order.chunks(chunk_rows) {
+            let indices: Vec<(usize, usize)> = chunk.iter().map(|&r| locate(r)).collect();
+            let gathered = interleave_record_batch(&batch_refs, &indices)
+                .map_err(|e| format!("gather failed: {e}"))?;
+            let mut cols: Vec<ArrayRef> = kept_src_indices
+                .iter()
+                .map(|&i| gathered.column(i).clone())
+                .collect();
+            if !matches!(geom_out, GeomOut::PassThrough) {
+                cols[out_geom_pos] =
+                    transcode_geometry(cols[out_geom_pos].as_ref(), src_encoding, &geom_out)?;
+            }
+            if write_covering {
+                cols.push(build_bbox_column(chunk, &row_bboxes, &bbox_fields));
+            }
+            if write_h3.is_some() {
+                let vals = h3_vals.as_ref().unwrap();
+                cols.push(Arc::new(arrow::array::UInt64Array::from_iter(
+                    chunk.iter().map(|&r| vals[r as usize]),
+                )));
+            }
+            if write_admin.is_some() {
+                let vals = admin_vals.as_ref().unwrap();
+                cols.push(Arc::new(arrow::array::StringArray::from_iter(
+                    chunk.iter().map(|&r| vals[r as usize].clone()),
+                )));
+            }
+            let out = RecordBatch::try_new(out_schema.clone(), cols)
+                .map_err(|e| format!("batch assembly failed: {e}"))?;
+            writer.write(&out).map_err(|e| format!("write failed: {e}"))?;
+            written += chunk.len();
+            progress(0.55 + 0.45 * (written as f32 / written_rows.max(1) as f32), "writing");
+        }
+        let closed = writer.close().map_err(|e| format!("finalize failed: {e}"))?;
+
         let mut off = 0usize;
-        for n in &rg_after_rows {
-            boxes.extend(union_bboxes(
-                order[off..off + n].iter().flat_map(|&r| &row_bboxes[r as usize]),
+        for rg in closed.row_groups() {
+            let n = rg.num_rows().max(0) as usize;
+            rg_after_boxes.extend(union_bboxes(
+                part_order[off..off + n].iter().flat_map(|&r| &row_bboxes[r as usize]),
             ));
             off += n;
+            rg_after += 1;
         }
-        super::loader::bbox_overlap_metric(&boxes)
-    };
+        size_after += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    }
+    let overlap_after = super::loader::bbox_overlap_metric(&rg_after_boxes);
 
     Ok(OptimizeReport {
         rows: written_rows as u64,
         size_before: src.size(),
-        size_after: std::fs::metadata(dst).map(|m| m.len()).unwrap_or(0),
+        size_after,
         rg_before,
-        rg_after: rg_after_rows.len(),
+        rg_after,
         overlap_before,
         overlap_after,
         bloom_columns,
         version_label: opts.version.label().into(),
         elapsed_ms: t0.elapsed().as_millis() as u64,
+        files: parts.len(),
     })
 }
 
@@ -842,6 +993,205 @@ mod tests {
     use arrow::array::{BinaryArray, Int64Array, StringArray};
     use parquet::file::properties::WriterProperties;
 
+    /// Partitioned exports: hive fields (incl. an admin join column),
+    /// adaptive H3, and the H3 cell column — every partition file must be
+    /// a loadable GeoParquet with the partition columns path-only.
+    #[test]
+    fn partitioned_export_roundtrips() {
+        use crate::data::partition::{AdminJoinSpec, PartitionBy};
+        let dir = std::env::temp_dir().join("geopq_optimize_partition");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Four spatial clusters, one per "quad" value (EPSG:2154 meters,
+        // clusters ~500 km apart so H3 splits them cleanly).
+        let quads = ["A", "B", "C", "D"];
+        let centers = [
+            (200_000.0, 6_200_000.0),
+            (700_000.0, 6_200_000.0),
+            (200_000.0, 6_700_000.0),
+            (700_000.0, 6_700_000.0),
+        ];
+        let n_per = 1000usize;
+        let (mut wkbs, mut ids, mut quad_vals) = (Vec::new(), Vec::new(), Vec::new());
+        for (q, (cx, cy)) in quads.iter().zip(centers) {
+            for i in 0..n_per {
+                let (dx, dy) = ((i % 32) as f64 * 50.0, (i / 32) as f64 * 50.0);
+                wkbs.push(wkb_point(cx + dx, cy + dy));
+                ids.push((quad_vals.len()) as i64);
+                quad_vals.push(q.to_string());
+            }
+        }
+        let geo = serde_json::json!({
+            "version": "1.0.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {
+                "encoding": "WKB", "geometry_types": ["Point"],
+                "crs": {"id": {"authority": "EPSG", "code": 2154}},
+            }},
+        });
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("quad", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(wkbs.iter())),
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(quad_vals)),
+            ],
+        )
+        .unwrap();
+        let src = dir.join("clusters.parquet");
+        let mut w =
+            ArrowWriter::try_new(File::create(&src).unwrap(), schema, None).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        // --- hive partition by the quad column ---
+        let dst = dir.join("by_quad");
+        let opts = OptimizeOptions {
+            row_group_size: 2048,
+            partition: PartitionBy::Fields(vec!["quad".into()]),
+            ..Default::default()
+        };
+        let rep =
+            optimize(&Source::Local(src.clone()), &dst, &opts, None, None, &|_, _| {}).unwrap();
+        assert_eq!(rep.files, 4);
+        assert_eq!(rep.rows, 4 * n_per as u64);
+        for q in quads {
+            let f = dst.join(format!("quad={q}")).join("part-0.parquet");
+            let (store, crs, _, _) = crate::data::loader::open_store_for_test(&f).unwrap();
+            assert_eq!(store.total_rows(), n_per as u64, "quad={q}");
+            assert_eq!(crs.epsg, Some(2154));
+            assert!(
+                store.schema.index_of("quad").is_err(),
+                "partition column must be path-only"
+            );
+            assert!(store.covering.is_some(), "covering survives partitioning");
+        }
+
+        // --- adaptive H3 + H3 column ---
+        let dst2 = dir.join("adaptive");
+        let opts2 = OptimizeOptions {
+            row_group_size: 2048,
+            h3_resolution: Some(7),
+            partition: PartitionBy::AdaptiveH3 { target_rows: 1500, max_res: 10 },
+            ..Default::default()
+        };
+        let rep2 =
+            optimize(&Source::Local(src.clone()), &dst2, &opts2, None, None, &|_, _| {}).unwrap();
+        assert!(rep2.files >= 4, "clusters must split: {} files", rep2.files);
+        let mut total = 0u64;
+        for entry in std::fs::read_dir(&dst2).unwrap() {
+            let d = entry.unwrap().path();
+            assert!(d.file_name().unwrap().to_str().unwrap().starts_with("h3="));
+            let f = d.join("part-0.parquet");
+            let (store, _, _, _) = crate::data::loader::open_store_for_test(&f).unwrap();
+            total += store.total_rows();
+            let idx = store.schema.index_of("h3_r7").expect("h3 column present");
+            assert_eq!(
+                store.schema.field(idx).data_type(),
+                &DataType::UInt64
+            );
+            // Values are valid H3 cells at res 7.
+            let rows: Vec<u32> = (0..store.total_rows().min(5) as u32).collect();
+            let b = store.fetch(&rows, Some(&[idx])).unwrap();
+            let col = b[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .unwrap();
+            for i in 0..col.len() {
+                let cell = h3o::CellIndex::try_from(col.value(i)).expect("valid cell");
+                assert_eq!(u8::from(cell.resolution()), 7);
+            }
+        }
+        assert_eq!(total, 4 * n_per as u64);
+
+        // --- admin join, partitioned by the joined column ---
+        // Two boundary polygons splitting the clusters west/east.
+        let mut poly_wkbs: Vec<Vec<u8>> = Vec::new();
+        for (x0, x1) in [(0.0, 450_000.0), (450_000.0, 1_000_000.0)] {
+            let poly = geo_types::Polygon::new(
+                geo_types::LineString::from(vec![
+                    (x0, 6_000_000.0),
+                    (x1, 6_000_000.0),
+                    (x1, 7_000_000.0),
+                    (x0, 7_000_000.0),
+                    (x0, 6_000_000.0),
+                ]),
+                vec![],
+            );
+            let mut buf = Vec::new();
+            wkb::writer::write_geometry(
+                &mut buf,
+                &geo_types::Geometry::Polygon(poly),
+                &wkb::writer::WriteOptions::default(),
+            )
+            .unwrap();
+            poly_wkbs.push(buf);
+        }
+        let bschema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("zone", DataType::Utf8, false),
+        ]));
+        let bbatch = RecordBatch::try_new(
+            bschema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(poly_wkbs.iter())),
+                Arc::new(StringArray::from(vec!["west", "east"])),
+            ],
+        )
+        .unwrap();
+        let bounds = dir.join("zones.parquet");
+        let mut w =
+            ArrowWriter::try_new(File::create(&bounds).unwrap(), bschema, None).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        ));
+        w.write(&bbatch).unwrap();
+        w.close().unwrap();
+        let (bstore, bcrs, _, _) = crate::data::loader::open_store_for_test(&bounds).unwrap();
+        let admin = AdminJoinSpec {
+            out_name: "zone".into(),
+            store: Arc::new(bstore),
+            value_column: "zone".into(),
+            crs: bcrs,
+        };
+
+        let dst3 = dir.join("by_zone");
+        let opts3 = OptimizeOptions {
+            row_group_size: 2048,
+            partition: PartitionBy::Fields(vec!["zone".into()]),
+            ..Default::default()
+        };
+        let rep3 = optimize(
+            &Source::Local(src.clone()),
+            &dst3,
+            &opts3,
+            None,
+            Some(&admin),
+            &|_, _| {},
+        )
+        .unwrap();
+        assert_eq!(rep3.files, 2, "west/east");
+        for (zone, expect) in [("west", 2 * n_per as u64), ("east", 2 * n_per as u64)] {
+            let f = dst3.join(format!("zone={zone}")).join("part-0.parquet");
+            let (store, _, _, _) = crate::data::loader::open_store_for_test(&f).unwrap();
+            assert_eq!(store.total_rows(), expect, "zone={zone}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn wkb_point(x: f64, y: f64) -> Vec<u8> {
         let mut b = vec![1u8, 1, 0, 0, 0];
         b.extend_from_slice(&x.to_le_bytes());
@@ -950,7 +1300,7 @@ mod tests {
             row_group_size: 2048,
             ..Default::default()
         };
-        let report = optimize(&Source::Local(src.clone()), &dst, &opts, None, &|_, _| {}).unwrap();
+        let report = optimize(&Source::Local(src.clone()), &dst, &opts, None, None, &|_, _| {}).unwrap();
         assert_eq!(report.rows, 40_000);
         assert_eq!(report.rg_after, 40_000_usize.div_ceil(2048));
         // Scrambled input: every row group spans the full extent. Sorted
@@ -990,7 +1340,7 @@ mod tests {
             bloom: BloomMode::AllAttributes,
             ..Default::default()
         };
-        let report = optimize(&Source::Local(src.clone()), &dst, &opts, None, &|_, _| {}).unwrap();
+        let report = optimize(&Source::Local(src.clone()), &dst, &opts, None, None, &|_, _| {}).unwrap();
         assert_eq!(report.rows, 40_000);
         let mut bloom = report.bloom_columns.clone();
         bloom.sort();
@@ -1041,7 +1391,7 @@ mod tests {
             row_group_size: 2048,
             ..Default::default()
         };
-        optimize(&Source::Local(dst.clone()), &dst11, &opts11, None, &|_, _| {}).unwrap();
+        optimize(&Source::Local(dst.clone()), &dst11, &opts11, None, None, &|_, _| {}).unwrap();
         let b = ParquetRecordBatchReaderBuilder::try_new(File::open(&dst11).unwrap()).unwrap();
         let geom = b.metadata().row_groups()[0]
             .columns()
@@ -1074,7 +1424,7 @@ mod tests {
             filter_rect: Some(rect),
             ..Default::default()
         };
-        let report = optimize(&Source::Local(src.clone()), &dst, &opts, None, &|_, _| {}).unwrap();
+        let report = optimize(&Source::Local(src.clone()), &dst, &opts, None, None, &|_, _| {}).unwrap();
         let quarter = 40_000 / 4;
         assert!(
             (report.rows as i64 - quarter as i64).unsigned_abs() < 500,
@@ -1096,6 +1446,7 @@ mod tests {
                 ..Default::default()
             },
             None,
+            None,
             &|_, _| {},
         )
         .unwrap_err();
@@ -1116,7 +1467,7 @@ mod tests {
             covering: false, // force the coordinate-stats pruning source
             ..Default::default()
         };
-        let report = optimize(&Source::Local(src.clone()), &dst, &opts, None, &|_, _| {}).unwrap();
+        let report = optimize(&Source::Local(src.clone()), &dst, &opts, None, None, &|_, _| {}).unwrap();
         assert_eq!(report.rows, 40_000);
         assert!(
             report.overlap_frac_after() < 0.25,
@@ -1161,7 +1512,7 @@ mod tests {
             row_group_size: 2048,
             ..Default::default()
         };
-        optimize(&Source::Local(dst.clone()), &dst_back, &opts_back, None, &|_, _| {}).unwrap();
+        optimize(&Source::Local(dst.clone()), &dst_back, &opts_back, None, None, &|_, _| {}).unwrap();
         let (store_b, _crs, info_b, _rg) =
             crate::data::loader::open_store_for_test(&dst_back).unwrap();
         assert_eq!(store_b.encoding, GeomEncoding::Wkb);
@@ -1229,7 +1580,7 @@ mod tests {
             row_group_size: 1024,
             ..Default::default()
         };
-        optimize(&Source::Local(src.clone()), &dst, &opts, None, &|_, _| {}).unwrap();
+        optimize(&Source::Local(src.clone()), &dst, &opts, None, None, &|_, _| {}).unwrap();
 
         let (store, _crs, info, rg_meta) =
             crate::data::loader::open_store_for_test(&dst).unwrap();
@@ -1310,7 +1661,7 @@ mod tests {
         let src = write_scrambled(150_000, &dir);
         let dst = dir.join("out_pages.parquet");
         let report =
-            optimize(&Source::Local(src.clone()), &dst, &OptimizeOptions::default(), None, &|_, _| {})
+            optimize(&Source::Local(src.clone()), &dst, &OptimizeOptions::default(), None, None, &|_, _| {})
                 .unwrap();
         assert_eq!(report.rg_after, 150_000_usize.div_ceil(65_536));
 
@@ -1366,12 +1717,12 @@ mod tests {
             };
             let wkb = dir.join(format!("{label}_wkb.parquet"));
             let ga = dir.join(format!("{label}_ga.parquet"));
-            optimize(&Source::Local(src.clone()), &wkb, &base, None, &|_, _| {}).unwrap();
+            optimize(&Source::Local(src.clone()), &wkb, &base, None, None, &|_, _| {}).unwrap();
             let opts = OptimizeOptions {
                 version: GpVersion::V1_1GeoArrow,
                 ..base
             };
-            optimize(&Source::Local(src.clone()), &ga, &opts, None, &|_, _| {}).unwrap();
+            optimize(&Source::Local(src.clone()), &ga, &opts, None, None, &|_, _| {}).unwrap();
             let time = |path: &std::path::PathBuf| {
                 let (store, crs, _i, _r) =
                     crate::data::loader::open_store_for_test(path).unwrap();
@@ -1412,7 +1763,7 @@ mod tests {
                 covering: version == GpVersion::V1_1,
                 ..Default::default()
             };
-            let report = optimize(&Source::Local(src.clone()), &dst, &opts, None, &|_, _| {}).unwrap();
+            let report = optimize(&Source::Local(src.clone()), &dst, &opts, None, None, &|_, _| {}).unwrap();
             eprintln!("{report:#?}");
             eprintln!(
                 "overlap fraction: {:.0}% -> {:.0}%",
