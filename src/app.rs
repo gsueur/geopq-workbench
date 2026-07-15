@@ -494,6 +494,81 @@ impl ViewerApp {
     // UI
     // ------------------------------------------------------------------
 
+    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        egui::containers::menu::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("File", |ui| {
+                if ui.button("📂 Open…").clicked() {
+                    if let Some(paths) = rfd::FileDialog::new()
+                        .add_filter("GeoParquet", &["parquet", "geoparquet", "pq"])
+                        .pick_files()
+                    {
+                        for p in paths {
+                            self.enqueue_load(Source::Local(p), &ctx);
+                        }
+                    }
+                }
+                if ui.button("🌐 Open URL…").clicked() && self.url_input.is_none() {
+                    self.url_input = Some((
+                        String::new(),
+                        None,
+                        crate::data::source::aws::profiles(),
+                        String::new(),
+                    ));
+                }
+                ui.separator();
+                if ui
+                    .button("💾 Save context…")
+                    .on_hover_text("Save layers, styles, camera and projection to a JSON file")
+                    .clicked()
+                {
+                    self.save_context();
+                }
+                if ui
+                    .button("📥 Load context…")
+                    .on_hover_text("Restore a saved context (replaces current layers)")
+                    .clicked()
+                {
+                    self.load_context(&ctx);
+                }
+            });
+            ui.menu_button("View", |ui| {
+                if ui
+                    .add_enabled(!self.layers.is_empty(), egui::Button::new("🌍 Fit all layers"))
+                    .clicked()
+                {
+                    self.pending_fit = true;
+                }
+                ui.separator();
+                ui.checkbox(&mut self.show_graticule, "Graticule");
+                ui.checkbox(&mut self.show_coastline, "Coastline");
+                ui.menu_button("Basemap", |ui| {
+                    if !self.display.is_mercator() {
+                        ui.label(
+                            RichText::new("tiles render in Web Mercator only").weak().small(),
+                        );
+                    }
+                    for (i, s) in TILE_SOURCES.iter().enumerate() {
+                        ui.selectable_value(&mut self.basemap, Some(i), s.name);
+                    }
+                    ui.selectable_value(&mut self.basemap, None, "None");
+                });
+                ui.separator();
+                ui.checkbox(&mut self.sql.open, "SQL console");
+            });
+            ui.menu_button("Help", |ui| {
+                if ui.button("ST_* function reference").clicked() {
+                    self.sql.open_with_help();
+                }
+                ui.label(
+                    RichText::new(concat!("geopq-viewer ", env!("CARGO_PKG_VERSION")))
+                        .weak()
+                        .small(),
+                );
+            });
+        });
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
@@ -506,12 +581,6 @@ impl ViewerApp {
                         self.enqueue_load(Source::Local(p), &ctx);
                     }
                 }
-            }
-            if ui.button("💾 Save ctx…").on_hover_text("Save layers, styles, camera and projection to a JSON context file").clicked() {
-                self.save_context();
-            }
-            if ui.button("📥 Load ctx…").on_hover_text("Restore a saved context (replaces current layers)").clicked() {
-                self.load_context(&ctx);
             }
             if ui.button("🌐 URL…").clicked() && self.url_input.is_none() {
                 self.url_input = Some((
@@ -529,32 +598,13 @@ impl ViewerApp {
             }
             ui.toggle_value(&mut self.sql.open, "🖩 SQL")
                 .on_hover_text("Query loaded layers with SQL (ST_* spatial functions)");
+        });
+    }
 
-            ui.separator();
-
-            ui.label("Basemap:");
-            let basemap_enabled = self.display.is_mercator();
-            ui.add_enabled_ui(basemap_enabled, |ui| {
-                let current = self
-                    .basemap
-                    .map(|i| TILE_SOURCES[i].name)
-                    .unwrap_or("None");
-                egui::ComboBox::from_id_salt("basemap")
-                    .selected_text(current)
-                    .show_ui(ui, |ui| {
-                        for (i, s) in TILE_SOURCES.iter().enumerate() {
-                            ui.selectable_value(&mut self.basemap, Some(i), s.name);
-                        }
-                        ui.selectable_value(&mut self.basemap, None, "None");
-                    });
-            });
-            if !basemap_enabled {
-                ui.label(RichText::new("(EPSG:3857 only)").weak().small());
-            }
-
-            ui.separator();
-
-            ui.label("Projection:");
+    /// Projection picker (status bar): built-ins, national grids, EPSG entry.
+    fn projection_selector(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        {
             let is_hobo = self.display.name.starts_with("Hobo");
             let is_wintri = self.display.kind == DisplayKind::WinkelTripel;
             let is_4326 = self.display.kind == DisplayKind::Plain && self.display.crs.epsg == Some(4326);
@@ -630,55 +680,34 @@ impl ViewerApp {
                             }
                         }
                     }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.epsg_input)
+                                .hint_text("EPSG code…")
+                                .desired_width(80.0),
+                        );
+                        let apply = ui.button("Apply").clicked()
+                            || (resp.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                        if apply {
+                            match self.epsg_input.trim().parse::<u32>() {
+                                Ok(code) => match DisplayCrs::from_epsg(code) {
+                                    Ok(d) => pick = Some(d),
+                                    Err(e) => self.push_error(e),
+                                },
+                                Err(_) => self.push_error("invalid EPSG code".into()),
+                            }
+                        }
+                    });
                 });
-            ui.add(
-                egui::TextEdit::singleline(&mut self.epsg_input)
-                    .hint_text("EPSG…")
-                    .desired_width(56.0),
-            );
-            if ui.button("Apply").clicked() {
-                match self.epsg_input.trim().parse::<u32>() {
-                    Ok(code) => match DisplayCrs::from_epsg(code) {
-                        Ok(d) => pick = Some(d),
-                        Err(e) => self.push_error(e),
-                    },
-                    Err(_) => self.push_error("invalid EPSG code".into()),
-                }
-            }
             if let Some(d) = pick {
                 self.auto_projection = picked_auto;
                 self.set_display(d, &ctx);
             } else if picked_auto {
                 self.auto_projection = true;
             }
-
-            ui.separator();
-            ui.checkbox(&mut self.show_graticule, "Graticule");
-            ui.checkbox(&mut self.show_coastline, "Coastline");
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !self.errors.is_empty() {
-                    let btn = egui::Button::new(
-                        RichText::new(format!("⚠ {}", self.errors.len()))
-                            .color(Color32::from_rgb(220, 60, 60)),
-                    );
-                    if ui.add(btn).clicked() {
-                        self.show_errors = !self.show_errors;
-                    }
-                }
-                for job in self.loading.values() {
-                    ui.add(
-                        egui::ProgressBar::new(job.frac)
-                            .desired_width(140.0)
-                            .text(format!(
-                                "{} — {}",
-                                job.label.rsplit('/').next().unwrap_or(&job.label),
-                                job.stage
-                            )),
-                    );
-                }
-            });
-        });
+        }
     }
 
     fn layers_panel(&mut self, ui: &mut egui::Ui) {
@@ -737,24 +766,78 @@ impl ViewerApp {
                         }
                         ui.label(RichText::new(&l.name).strong())
                             .on_hover_text(l.store.source.label());
-                        if n_layers > 1 {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    // Vec order is draw order: last = top-most.
-                                    if idx > 0
-                                        && ui.small_button("⏷").on_hover_text("move down").clicked()
-                                    {
-                                        reorder = Some((l.id, -1));
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.menu_button("⋮", |ui| {
+                                    if ui.button("Info…").clicked() {
+                                        info_open = Some(l.id);
                                     }
-                                    if idx + 1 < n_layers
-                                        && ui.small_button("⏶").on_hover_text("move up").clicked()
+                                    if ui
+                                        .button("Optimize…")
+                                        .on_hover_text(
+                                            "Rewrite as a spatially sorted GeoParquet 1.1 or \
+                                             2.0 file (Hilbert order, covering bbox / native \
+                                             geo stats, bloom filters)",
+                                        )
+                                        .clicked()
                                     {
-                                        reorder = Some((l.id, 1));
+                                        optimize_open = Some(l.id);
                                     }
-                                },
-                            );
-                        }
+                                    if l.is_partial() && ui.button("Load all row groups").clicked()
+                                    {
+                                        load_all = Some(l.id);
+                                    }
+                                    if n_layers > 1 {
+                                        ui.separator();
+                                        // Vec order is draw order: last = top-most.
+                                        if idx + 1 < n_layers && ui.button("⏶ Move up").clicked()
+                                        {
+                                            reorder = Some((l.id, 1));
+                                        }
+                                        if idx > 0 && ui.button("⏷ Move down").clicked() {
+                                            reorder = Some((l.id, -1));
+                                        }
+                                    }
+                                    if let Some(rg) = &l.rg_bboxes {
+                                        ui.separator();
+                                        ui.checkbox(&mut l.style.show_rg_bboxes, "RG bboxes")
+                                            .on_hover_text(format!(
+                                                "{} row groups — source: {}\navg overlap \
+                                                 ×{:.1} = {:.0}% of possible {}",
+                                                rg.boxes.len(),
+                                                rg.source,
+                                                rg.avg_overlap,
+                                                rg.overlap_frac() * 100.0,
+                                                if rg.poorly_clustered() {
+                                                    "(poorly clustered: consider Optimize…)"
+                                                } else {
+                                                    "(well clustered)"
+                                                }
+                                            ));
+                                    }
+                                    ui.separator();
+                                    if ui.button("Remove layer").clicked() {
+                                        remove = Some(l.id);
+                                    }
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "read {} ms · build {} ms",
+                                            l.stats.read_ms, l.stats.build_ms
+                                        ))
+                                        .weak()
+                                        .small(),
+                                    );
+                                });
+                                if ui
+                                    .small_button("🔍")
+                                    .on_hover_text("Zoom to layer")
+                                    .clicked()
+                                {
+                                    fit_to = Some(l.bounds_world());
+                                }
+                            },
+                        );
                     });
                     ui.horizontal(|ui| {
                         ui.label(
@@ -835,52 +918,6 @@ impl ViewerApp {
                             }
                         });
                     }
-                    if let Some(rg) = &l.rg_bboxes {
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut l.style.show_rg_bboxes, "RG bboxes")
-                                .on_hover_text(format!(
-                                    "{} row groups — source: {}\navg overlap ×{:.1} = {:.0}% of possible {}",
-                                    rg.boxes.len(),
-                                    rg.source,
-                                    rg.avg_overlap,
-                                    rg.overlap_frac() * 100.0,
-                                    if rg.poorly_clustered() {
-                                        "(poorly clustered: consider Optimize…)"
-                                    } else {
-                                        "(well clustered)"
-                                    }
-                                ));
-                        });
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.small_button("Zoom to").clicked() {
-                            fit_to = Some(l.bounds_world());
-                        }
-                        if ui.small_button("Info").clicked() {
-                            info_open = Some(l.id);
-                        }
-                        if ui
-                            .small_button("Optimize…")
-                            .on_hover_text(
-                                "Rewrite as a spatially sorted GeoParquet 1.1 or 2.0 file\n\
-                                 (Hilbert order, covering bbox / native geo stats, bloom filters)",
-                            )
-                            .clicked()
-                        {
-                            optimize_open = Some(l.id);
-                        }
-                        if ui.small_button("Remove").clicked() {
-                            remove = Some(l.id);
-                        }
-                        ui.label(
-                            RichText::new(format!(
-                                "read {} ms · build {} ms",
-                                l.stats.read_ms, l.stats.build_ms
-                            ))
-                            .weak()
-                            .small(),
-                        );
-                    });
                 });
                 ui.add_space(4.0);
             }
@@ -1550,16 +1587,6 @@ impl ViewerApp {
         };
         let geom_col = layer.store.geom_col;
         let layer_name = layer.name.clone();
-        let mut open = true;
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.heading("Feature");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("✕").clicked() {
-                    open = false;
-                }
-            });
-        });
         ui.label(
             RichText::new(format!("{layer_name} · row {}", sel.feature.index))
                 .weak()
@@ -1596,9 +1623,6 @@ impl ViewerApp {
             None => {
                 ui.label(RichText::new("attributes unavailable (see Problems)").weak());
             }
-        }
-        if !open {
-            self.select(None);
         }
     }
 
@@ -1637,6 +1661,7 @@ impl ViewerApp {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.projection_selector(ui);
                 ui.monospace(format!("z {:.2}", self.camera.zoom));
                 let pending = self.tiles.pending_count();
                 if pending > 0 {
@@ -1648,6 +1673,27 @@ impl ViewerApp {
                 }
                 let dt = ui.ctx().input(|i| i.unstable_dt);
                 ui.monospace(format!("{:.1} ms", dt * 1000.0));
+                if !self.errors.is_empty() {
+                    let btn = egui::Button::new(
+                        RichText::new(format!("⚠ {}", self.errors.len()))
+                            .color(Color32::from_rgb(220, 60, 60)),
+                    );
+                    if ui.add(btn).clicked() {
+                        self.show_errors = !self.show_errors;
+                    }
+                }
+                for job in self.loading.values() {
+                    ui.add(
+                        egui::ProgressBar::new(job.frac)
+                            .desired_width(220.0)
+                            .text(format!(
+                                "{} — {} {:.0}%",
+                                job.label.rsplit('/').next().unwrap_or(&job.label),
+                                job.stage,
+                                job.frac * 100.0
+                            )),
+                    );
+                }
             });
         });
     }
@@ -2145,6 +2191,7 @@ impl eframe::App for ViewerApp {
             self.enqueue_load(Source::Local(p), &ctx);
         }
 
+        egui::Panel::top("menubar").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         self.sql.poll();
@@ -2183,10 +2230,23 @@ impl eframe::App for ViewerApp {
             .default_size(260.0)
             .show(ui, |ui| self.layers_panel(ui));
         if self.selection.is_some() {
-            egui::Panel::right("attributes")
+            // Floating over the map (upper right) instead of a side panel:
+            // opening it must not resize the viewport.
+            let map_corner =
+                ui.available_rect_before_wrap().right_top() + egui::vec2(-12.0, 12.0);
+            let mut open = true;
+            egui::Window::new("Feature")
+                .id(egui::Id::new("feature_attrs"))
+                .open(&mut open)
+                .pivot(egui::Align2::RIGHT_TOP)
+                .default_pos(map_corner)
+                .default_width(300.0)
                 .resizable(true)
-                .default_size(300.0)
-                .show(ui, |ui| self.attributes_panel(ui));
+                .collapsible(false)
+                .show(&ctx, |ui| self.attributes_panel(ui));
+            if !open {
+                self.select(None);
+            }
         }
         self.errors_window(&ctx);
         self.info_window(&ctx);

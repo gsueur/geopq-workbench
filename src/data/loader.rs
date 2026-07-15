@@ -299,6 +299,11 @@ pub fn spawn_load(
         // Resolve URLs / S3 credentials (content-length probe, presign)
         // off the UI thread.
         let label = source.label();
+        handle.send(LoadMsg::Progress {
+            job,
+            frac: 0.0,
+            stage: "resolving source".into(),
+        });
         let source = match source.resolve() {
             Ok(s) => s,
             Err(e) => {
@@ -310,6 +315,11 @@ pub fn spawn_load(
                 return;
             }
         };
+        handle.send(LoadMsg::Progress {
+            job,
+            frac: 0.02,
+            stage: "reading file metadata".into(),
+        });
         match open_store(&source) {
             Ok((store, crs, info, rg_meta)) => {
                 let store = Arc::new(store);
@@ -1018,10 +1028,12 @@ fn build_geometry(
             );
             if let Some((handle, job)) = progress {
                 let d = done.fetch_add(rows, Ordering::Relaxed) + rows;
+                // The parallel decode+tessellate pass is ~70% of a load;
+                // chunking and the pick index follow single-threaded.
                 handle.send(LoadMsg::Progress {
                     job,
-                    frac: (d as f32 / total as f32).min(1.0),
-                    stage: "building geometry".into(),
+                    frac: 0.70 * (d as f32 / total as f32).min(1.0),
+                    stage: "decoding & tessellating".into(),
                 });
             }
             (mb, items, rows, bad, rg_boxes)
@@ -1071,7 +1083,21 @@ fn build_geometry(
         );
     }
     let bad = bad + builder.fill_errors;
+    if let Some((handle, job)) = progress {
+        handle.send(LoadMsg::Progress {
+            job,
+            frac: 0.78,
+            stage: "chunking meshes".into(),
+        });
+    }
     let chunks = builder.finish();
+    if let Some((handle, job)) = progress {
+        handle.send(LoadMsg::Progress {
+            job,
+            frac: 0.90,
+            stage: "building pick index".into(),
+        });
+    }
     let rtree = RTree::bulk_load(items);
 
     let mut rg_vec: Vec<[f64; 4]> = Vec::new();

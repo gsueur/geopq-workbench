@@ -96,6 +96,12 @@ impl SqlConsole {
         self.running.is_some()
     }
 
+    /// Open the console with the ST_* reference visible (Help menu).
+    pub fn open_with_help(&mut self) {
+        self.open = true;
+        self.show_help = true;
+    }
+
     /// Drain finished queries. Call every frame before the panel.
     pub fn poll(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
