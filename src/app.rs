@@ -1586,6 +1586,7 @@ impl ViewerApp {
             return;
         };
         let geom_col = layer.store.geom_col;
+        let encoding = layer.store.encoding;
         let layer_name = layer.name.clone();
         ui.label(
             RichText::new(format!("{layer_name} · row {}", sel.feature.index))
@@ -1606,7 +1607,12 @@ impl ViewerApp {
                                 ui.label(RichText::new(field.name()).strong());
                                 if i == geom_col {
                                     ui.label(
-                                        RichText::new(geom_summary(batch, geom_col)).weak(),
+                                        RichText::new(geom_summary(
+                                            batch,
+                                            geom_col,
+                                            encoding,
+                                        ))
+                                        .weak(),
                                     );
                                 } else {
                                     let col = batch.column(i);
@@ -2086,10 +2092,15 @@ fn resolve_style(s: &crate::data::layer::LayerStyle) -> DrawStyle {
     }
 }
 
-fn geom_summary(batch: &arrow::record_batch::RecordBatch, geom_col: usize) -> String {
-    let wkb = crate::data::loader::BinCol::new(batch.column(geom_col).as_ref())
-        .and_then(|b| b.value(0).map(|v| v.to_vec()));
-    match wkb.and_then(|w| crate::data::loader::decode_wkb(&w)) {
+fn geom_summary(
+    batch: &arrow::record_batch::RecordBatch,
+    geom_col: usize,
+    encoding: crate::data::geoarrow::GeomEncoding,
+) -> String {
+    // Encoding-aware accessor: WKB and GeoArrow nested arrays alike.
+    let geom = crate::data::geoarrow::GeomCol::new(batch.column(geom_col).as_ref(), encoding)
+        .and_then(|g| g.geometry(0));
+    match geom {
         Some(g) => {
             use geo::CoordsIter;
             let n = g.coords_count();

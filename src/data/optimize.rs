@@ -1141,6 +1141,20 @@ mod tests {
         assert_eq!((rows, bad), (40_000, 0));
         assert_eq!(geom.kind, crate::data::geometry::GeomKind::Point);
 
+        // Attribute-panel path: a full-row fetch must expose the geometry
+        // through the encoding-aware accessor (regression: the panel
+        // assumed WKB and showed "<invalid>" on GeoArrow layers).
+        let row = store.fetch_row(7).unwrap();
+        let g = crate::data::geoarrow::GeomCol::new(
+            row.column(store.geom_col).as_ref(),
+            store.encoding,
+        )
+        .and_then(|g| g.geometry(0));
+        assert!(
+            matches!(g, Some(geo_types::Geometry::Point(_))),
+            "geometry accessible from a full-row fetch"
+        );
+
         // And back: GeoArrow → plain 1.1 WKB.
         let dst_back = dir.join("back_wkb.parquet");
         let opts_back = OptimizeOptions {
