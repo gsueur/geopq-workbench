@@ -162,6 +162,7 @@ mod tests {
             table: "t".into(),
             store: Arc::new(store),
             crs,
+            rg_bboxes: None,
         }];
         let out = run_query_for_test(
             "select st_centroid(geometry) geometry, st_area(geometry) a from t limit 100",

@@ -6,6 +6,14 @@
 //! parallelize the scan. The geometry column is always exposed as plain
 //! WKB `Binary`, whatever the file's native encoding, so the ST_* UDFs see
 //! a single representation.
+//!
+//! Spatial predicate pushdown: `st_intersects/within/contains/dwithin`
+//! filters against a literal geometry (constant-folded from
+//! `st_makeenvelope`, `st_geomfromtext`, ...) are turned into a bbox that
+//! prunes row groups via their metadata bboxes and, on covering-column
+//! files, rows via the bbox-leaf scan — the same machinery as viewport
+//! loading. Pushdown is *inexact*: DataFusion re-applies the exact
+//! predicate on the surviving rows.
 
 use std::fmt;
 use std::sync::Arc;
@@ -15,10 +23,10 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{DataFusionError, Result as DfResult};
+use datafusion::common::{DataFusionError, Result as DfResult, ScalarValue};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -29,6 +37,7 @@ use datafusion::physical_plan::{
 use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 
 use crate::data::geoarrow::{GeomCol, GeomEncoding};
+use crate::data::loader::{covering_select, decode_wkb, intersecting_rgs};
 use crate::data::store::FeatureStore;
 
 const BATCH_SIZE: usize = 8192;
@@ -39,10 +48,14 @@ pub struct LayerTable {
     /// Table schema: the file's arrow schema with the geometry field
     /// normalized to nullable `Binary` (WKB).
     schema: SchemaRef,
+    /// Per-row-group bboxes (data CRS, index-aligned with the file's row
+    /// groups) when the layer's metadata provides them; enables group
+    /// pruning for pushed-down spatial predicates.
+    rg_bboxes: Option<Arc<Vec<[f64; 4]>>>,
 }
 
 impl LayerTable {
-    pub fn new(store: Arc<FeatureStore>) -> Self {
+    pub fn new(store: Arc<FeatureStore>, rg_bboxes: Option<Arc<Vec<[f64; 4]>>>) -> Self {
         // Column names are lowercased so unquoted SQL identifiers (which
         // DataFusion normalizes to lowercase) match files with uppercase
         // or mixed-case columns; collisions get _2, _3, ... suffixes.
@@ -65,7 +78,15 @@ impl LayerTable {
             })
             .collect();
         let schema = Arc::new(Schema::new(fields));
-        Self { store, schema }
+        Self {
+            store,
+            schema,
+            rg_bboxes,
+        }
+    }
+
+    fn geom_name(&self) -> &str {
+        self.schema.field(self.store.geom_col).name()
     }
 }
 
@@ -85,11 +106,29 @@ impl TableProvider for LayerTable {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DfResult<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|f| {
+                if filter_bbox(f, self.geom_name()).is_some() {
+                    // We only prune candidates; the exact predicate must
+                    // still run on the surviving rows.
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
+    }
+
     async fn scan(
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let projection: Vec<usize> = match projection {
@@ -111,10 +150,55 @@ impl TableProvider for LayerTable {
             .iter()
             .position(|&c| c == self.store.geom_col);
 
-        let n_groups = self.store.rg_starts().len().saturating_sub(1).max(1);
+        let n_groups = self.store.rg_starts().len().saturating_sub(1);
+
+        // Spatial pushdown: intersect the bboxes of every applicable
+        // filter, then prune groups (metadata bboxes) and rows (covering
+        // bbox-leaf scan) exactly like a viewport load.
+        let bbox = filters
+            .iter()
+            .filter_map(|f| filter_bbox(f, self.geom_name()))
+            .reduce(|a, b| [a[0].max(b[0]), a[1].max(b[1]), a[2].min(b[2]), a[3].min(b[3])]);
+
+        let parts: Vec<GroupPart> = match bbox {
+            Some(r) if r[0] <= r[2] && r[1] <= r[3] => {
+                let groups: Vec<u32> = match &self.rg_bboxes {
+                    Some(b) => intersecting_rgs(b, r),
+                    None => (0..n_groups as u32).collect(),
+                };
+                groups
+                    .into_iter()
+                    .filter_map(|g| {
+                        match covering_select(
+                            &self.store.source,
+                            &self.store.meta,
+                            self.store.covering.as_ref(),
+                            g,
+                            r,
+                        ) {
+                            Ok(Some(ranges)) if ranges.is_empty() => None, // no rows hit
+                            Ok(ranges) => Some(Ok(GroupPart {
+                                group: g as usize,
+                                ranges,
+                            })),
+                            Err(e) => Some(Err(DataFusionError::Execution(e))),
+                        }
+                    })
+                    .collect::<DfResult<_>>()?
+            }
+            // Contradictory bbox (empty intersection): scan nothing.
+            Some(_) => Vec::new(),
+            None => (0..n_groups)
+                .map(|g| GroupPart {
+                    group: g,
+                    ranges: None,
+                })
+                .collect(),
+        };
+
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&out_schema)),
-            Partitioning::UnknownPartitioning(n_groups),
+            Partitioning::UnknownPartitioning(parts.len().max(1)),
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
@@ -124,9 +208,78 @@ impl TableProvider for LayerTable {
             read_cols,
             reorder,
             geom_read_idx,
+            parts,
             properties: Arc::new(properties),
         }))
     }
+}
+
+/// One scan partition: a row group, optionally narrowed to row ranges by
+/// the covering bbox-leaf scan.
+#[derive(Clone, Debug)]
+struct GroupPart {
+    group: usize,
+    ranges: Option<Vec<(u32, u32)>>,
+}
+
+/// The pruning bbox implied by one pushed-down filter, if any: a spatial
+/// predicate relating the geometry column to a literal WKB geometry.
+/// Conjunctions recurse; any other shape yields None.
+fn filter_bbox(expr: &Expr, geom_name: &str) -> Option<[f64; 4]> {
+    match expr {
+        Expr::BinaryExpr(b) if b.op == datafusion::logical_expr::Operator::And => {
+            let l = filter_bbox(&b.left, geom_name);
+            let r = filter_bbox(&b.right, geom_name);
+            match (l, r) {
+                (Some(a), Some(b)) => {
+                    Some([a[0].max(b[0]), a[1].max(b[1]), a[2].min(b[2]), a[3].min(b[3])])
+                }
+                (one, None) | (None, one) => one,
+            }
+        }
+        Expr::ScalarFunction(f) => {
+            let name = f.func.name();
+            let spatial = matches!(
+                name,
+                "st_intersects" | "st_within" | "st_contains" | "st_dwithin"
+            );
+            if !spatial {
+                return None;
+            }
+            // One side must be the geometry column, the other a literal.
+            let (a, b) = (f.args.first()?, f.args.get(1)?);
+            let lit = if is_geom_column(a, geom_name) {
+                literal_geom_bbox(b)?
+            } else if is_geom_column(b, geom_name) {
+                literal_geom_bbox(a)?
+            } else {
+                return None;
+            };
+            let pad = if name == "st_dwithin" {
+                match f.args.get(2)? {
+                    Expr::Literal(ScalarValue::Float64(Some(d)), _) => d.abs(),
+                    _ => return None,
+                }
+            } else {
+                0.0
+            };
+            Some([lit[0] - pad, lit[1] - pad, lit[2] + pad, lit[3] + pad])
+        }
+        _ => None,
+    }
+}
+
+fn is_geom_column(expr: &Expr, geom_name: &str) -> bool {
+    matches!(expr, Expr::Column(c) if c.name == geom_name)
+}
+
+fn literal_geom_bbox(expr: &Expr) -> Option<[f64; 4]> {
+    use geo::BoundingRect;
+    let Expr::Literal(ScalarValue::Binary(Some(bytes)), _) = expr else {
+        return None;
+    };
+    let r = decode_wkb(bytes)?.bounding_rect()?;
+    Some([r.min().x, r.min().y, r.max().x, r.max().y])
 }
 
 /// Physical scan: partition N streams row group N from the store.
@@ -139,6 +292,9 @@ struct LayerScanExec {
     reorder: Vec<usize>,
     /// Position of the geometry column in the decoded batch, if projected.
     geom_read_idx: Option<usize>,
+    /// Row groups (with optional row ranges) surviving predicate pushdown;
+    /// one partition each.
+    parts: Vec<GroupPart>,
     properties: Arc<PlanProperties>,
 }
 
@@ -150,11 +306,13 @@ impl fmt::Debug for LayerScanExec {
 
 impl DisplayAs for LayerScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        let ranged = self.parts.iter().filter(|p| p.ranges.is_some()).count();
         write!(
             f,
-            "LayerScanExec: {} ({} row groups)",
+            "LayerScanExec: {} ({} of {} row groups, {ranged} row-pruned)",
             self.store.source.name(),
-            self.properties.partitioning.partition_count()
+            self.parts.len(),
+            self.store.rg_starts().len().saturating_sub(1),
         )
     }
 }
@@ -186,7 +344,7 @@ impl ExecutionPlan for LayerScanExec {
     ) -> DfResult<SendableRecordBatchStream> {
         let iter = GroupIter {
             store: Arc::clone(&self.store),
-            group: partition,
+            part: self.parts.get(partition).cloned(),
             out_schema: Arc::clone(&self.out_schema),
             read_cols: self.read_cols.clone(),
             reorder: self.reorder.clone(),
@@ -205,7 +363,9 @@ impl ExecutionPlan for LayerScanExec {
 /// opened lazily on the first pull so planning never touches the network.
 struct GroupIter {
     store: Arc<FeatureStore>,
-    group: usize,
+    /// None when the scan has zero partitions (empty file or contradictory
+    /// pushdown): the single mandatory partition yields nothing.
+    part: Option<GroupPart>,
     out_schema: SchemaRef,
     read_cols: Vec<usize>,
     reorder: Vec<usize>,
@@ -216,17 +376,19 @@ struct GroupIter {
 
 impl GroupIter {
     fn next_inner(&mut self) -> Result<Option<RecordBatch>, String> {
-        // Files can have zero row groups; the single partition is empty.
-        if self.group >= self.store.rg_starts().len().saturating_sub(1) {
+        let Some(part) = &self.part else {
+            return Ok(None);
+        };
+        if part.group >= self.store.rg_starts().len().saturating_sub(1) {
             return Ok(None);
         }
         if self.reader.is_none() {
             self.reader = Some(FeatureStore::open_reader_for_group(
                 &self.store.source,
                 &self.store.meta,
-                self.group,
+                part.group,
                 BATCH_SIZE,
-                None,
+                part.ranges.as_deref(),
                 Some(&self.read_cols),
             )?);
         }
@@ -297,4 +459,98 @@ fn normalize_geometry(col: &dyn Array, encoding: GeomEncoding) -> Result<ArrayRe
         }
     }
     Ok(Arc::new(b.finish()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::loader::open_store_for_test;
+    use datafusion::logical_expr::col;
+    use datafusion::execution::FunctionRegistry;
+    use datafusion::prelude::SessionContext;
+
+    fn envelope_wkb(b: [f64; 4]) -> Vec<u8> {
+        let r = geo_types::Rect::new((b[0], b[1]), (b[2], b[3]));
+        let mut buf = Vec::new();
+        wkb::writer::write_geometry(
+            &mut buf,
+            &geo_types::Geometry::Polygon(r.to_polygon()),
+            &wkb::writer::WriteOptions::default(),
+        )
+        .unwrap();
+        buf
+    }
+
+    /// Pushing an st_intersects filter must prune row groups (metadata
+    /// bboxes) and rows (covering leaves) at plan time, and a contradictory
+    /// conjunction must plan an empty scan.
+    #[test]
+    fn spatial_filter_prunes_partitions() {
+        let path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/parcels_hilbert.parquet"
+        ));
+        if !path.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let (store, _crs, _info, rg_meta) = open_store_for_test(&path).unwrap();
+        let (_, boxes) = rg_meta.expect("hilbert fixture has metadata bboxes");
+        let n_groups = boxes.len();
+        let store = Arc::new(store);
+        assert!(store.covering.is_some(), "fixture has a covering column");
+        let table = LayerTable::new(Arc::clone(&store), Some(Arc::new(boxes.clone())));
+
+        let ctx = SessionContext::new();
+        crate::sql::udf::register_all(&ctx);
+        let st_intersects = ctx.udf("st_intersects").unwrap();
+        let state = ctx.state();
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+
+        // A small window around the center of the first row group.
+        let b0 = boxes[0];
+        let (cx, cy) = ((b0[0] + b0[2]) / 2.0, (b0[1] + b0[3]) / 2.0);
+        let (dx, dy) = ((b0[2] - b0[0]) * 0.05, (b0[3] - b0[1]) * 0.05);
+        let small = [cx - dx, cy - dy, cx + dx, cy + dy];
+        let filter = st_intersects.call(vec![
+            col("geometry"),
+            Expr::Literal(ScalarValue::Binary(Some(envelope_wkb(small))), None),
+        ]);
+
+        // Pushdown is advertised as inexact.
+        let support = table.supports_filters_pushdown(&[&filter]).unwrap();
+        assert_eq!(support, vec![TableProviderFilterPushDown::Inexact]);
+
+        let plan = rt
+            .block_on(table.scan(&state, None, std::slice::from_ref(&filter), None))
+            .unwrap();
+        let scan = plan.downcast_ref::<LayerScanExec>().unwrap();
+        assert!(
+            !scan.parts.is_empty() && scan.parts.len() < n_groups,
+            "small window must prune groups: {} of {n_groups}",
+            scan.parts.len()
+        );
+        assert!(
+            scan.parts.iter().any(|p| p.ranges.is_some()),
+            "covering file must row-prune surviving groups"
+        );
+
+        // No filter: every group scans, no row selection.
+        let plan = rt.block_on(table.scan(&state, None, &[], None)).unwrap();
+        let scan = plan.downcast_ref::<LayerScanExec>().unwrap();
+        assert_eq!(scan.parts.len(), n_groups);
+        assert!(scan.parts.iter().all(|p| p.ranges.is_none()));
+
+        // Two disjoint windows AND-ed: contradictory, nothing to scan.
+        let far = [b0[0] - 1e6, b0[1] - 1e6, b0[0] - 9e5, b0[1] - 9e5];
+        let f2 = st_intersects.call(vec![
+            col("geometry"),
+            Expr::Literal(ScalarValue::Binary(Some(envelope_wkb(far))), None),
+        ]);
+        let plan = rt
+            .block_on(table.scan(&state, None, &[filter, f2], None))
+            .unwrap();
+        let scan = plan.downcast_ref::<LayerScanExec>().unwrap();
+        assert!(scan.parts.is_empty(), "disjoint bboxes scan nothing");
+    }
 }

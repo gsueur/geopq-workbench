@@ -115,10 +115,20 @@ pub fn summarize_geo_meta(
                         info.bbox = Some([v[0], v[1], v[2], v[3]]);
                     }
                 }
-                if col.get("covering").is_some() {
-                    info.covering = Some(
-                        serde_json::to_string(col.get("covering").unwrap()).unwrap_or_default(),
-                    );
+                if let Some(cov) = col.get("covering") {
+                    // Human summary instead of the raw JSON: the column the
+                    // four bbox leaves live in (per spec a struct column
+                    // referenced as ["<column>", "<field>"]).
+                    let col_name = cov
+                        .get("bbox")
+                        .and_then(|b| b.get("xmin"))
+                        .and_then(Value::as_array)
+                        .and_then(|p| p.first())
+                        .and_then(Value::as_str)
+                        .unwrap_or("?");
+                    info.covering = Some(format!(
+                        "per-feature bbox struct \"{col_name}\" (drives row/page pruning)"
+                    ));
                 }
                 if let Some(e) = col.get("edges").and_then(Value::as_str) {
                     info.edges = Some(e.to_string());

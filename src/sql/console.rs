@@ -11,6 +11,10 @@ use eframe::egui::{self, RichText};
 use egui_extras::{Column, TableBuilder};
 
 use super::engine::{self, QueryOutput, SqlLayer, SqlMsg, MAX_RESULT_ROWS};
+
+/// Above this many checked rows the map highlight is skipped: decoding and
+/// meshing every geometry happens on the UI thread.
+const MAX_HIGHLIGHT_ROWS: usize = 20_000;
 use super::{export, udf};
 use crate::data::crs::Crs;
 use crate::data::layer::VectorLayer;
@@ -202,19 +206,26 @@ impl SqlConsole {
             let copied_recently = self
                 .copied_at
                 .is_some_and(|t| ui.input(|i| i.time) - t < 2.0);
+            let total = out.total_rows;
             ui.horizontal(|ui| {
                 ui.label(RichText::new(status).weak().small());
                 if let Some(gname) = geom_name {
                     export = ui
-                        .button("🗺 Add as layer")
+                        .button(format!("🗺 Result as layer ({total} rows)"))
                         .on_hover_text(format!(
-                            "Write the result ({gname} as geometry) to a temporary \
-                             GeoParquet and load it on the map"
+                            "Write the whole result grid — exactly the {total} rows \
+                             shown here, after any LIMIT/truncation — to a temporary \
+                             GeoParquet ({gname} as geometry) and load it on the map"
                         ))
                         .clicked();
                 }
                 if n_sel > 0 {
                     ui.label(RichText::new(format!("{n_sel} checked")).small());
+                    if n_sel > MAX_HIGHLIGHT_ROWS {
+                        ui.label(
+                            RichText::new("(too many to highlight on map)").weak().small(),
+                        );
+                    }
                     copy_tsv = ui
                         .button("📋 Copy TSV")
                         .on_hover_text(
@@ -224,7 +235,7 @@ impl SqlConsole {
                         .clicked();
                     if has_geom {
                         export_sel = ui
-                            .button("🗺 Checked as layer")
+                            .button(format!("🗺 Checked as layer ({n_sel})"))
                             .on_hover_text(
                                 "Write only the checked rows to a temporary \
                                  GeoParquet and load them on the map",
@@ -289,6 +300,11 @@ impl SqlConsole {
         let Some((_, crs)) = out.geom.clone() else {
             return ConsoleAction::ClearSelection;
         };
+        // Select-all on a huge result must not freeze the UI decoding
+        // every geometry; the selection still works for TSV/export.
+        if self.selected_rows.len() > MAX_HIGHLIGHT_ROWS {
+            return ConsoleAction::ClearSelection;
+        }
         let geoms: Vec<geo_types::Geometry<f64>> = self
             .selected_rows
             .iter()
@@ -422,6 +438,15 @@ impl SqlConsole {
                 table,
                 store: Arc::clone(&l.store),
                 crs: l.crs.clone(),
+                // Only index-aligned boxes can prune: partial viewport
+                // loads compute boxes for a subset of groups.
+                rg_bboxes: l
+                    .rg_bboxes
+                    .as_ref()
+                    .filter(|r| {
+                        r.boxes.len() == l.store.rg_starts().len().saturating_sub(1)
+                    })
+                    .map(|r| Arc::new(r.boxes.clone())),
             })
             .collect();
         let id = self.next_id;
@@ -652,7 +677,25 @@ fn results_table(
     builder
         .columns(Column::auto().at_least(60.0).clip(true), n_cols)
         .header(20.0, |mut header| {
-            header.col(|_| {});
+            header.col(|ui| {
+                // Select all / none; shows the mixed state when partial.
+                let n_sel = selected.len();
+                let mut all = n_sel == out.total_rows && out.total_rows > 0;
+                if ui
+                    .add(
+                        egui::Checkbox::without_text(&mut all)
+                            .indeterminate(n_sel > 0 && n_sel < out.total_rows),
+                    )
+                    .on_hover_text("Check / uncheck all rows")
+                    .changed()
+                {
+                    selected.clear();
+                    if all {
+                        selected.extend(0..out.total_rows);
+                    }
+                    ev.toggled = true;
+                }
+            });
             if has_geom {
                 header.col(|_| {});
             }

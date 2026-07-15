@@ -144,19 +144,44 @@ Fixture-dependent tests self-skip when the files are absent.
   rendered through the active projection (toggleable).
 - **Basemaps**: Carto Light/Dark/Voyager, OSM raster tiles with LRU cache and
   ancestor fallback while loading (EPSG:3857 only).
-- **Attributes, lazily**: click a feature → highlight + full attribute panel.
-  Values are fetched from the parquet file on demand (row-group + page
-  selection via `FeatureStore`), nothing is cached in RAM. Picking uses an
-  R-tree over line/polygon bboxes, chunk-local scans for points, and an exact
-  geometry test in the data CRS.
+- **SQL console** (toolbar "SQL", pure Rust — no DuckDB): query loaded layers
+  with DataFusion plus our own ST_* spatial UDFs (19 functions: measures,
+  predicates, constructors, buffer/simplify/convexhull/centroid, WKT
+  conversions — WKB in/out on geo-types). Two modes, TablePlus-style:
+  **Browse** (table picker + WHERE bar + limit, Enter applies) and **Query**
+  (free-form SQL, Ctrl+Enter). Layer tables stream row groups through the
+  same `FeatureStore`/range-request stack as map loading — local, HTTP and
+  S3 layers all queryable — with projection pushdown, GeoArrow geometry
+  normalized to WKB, and column names lowercased so unquoted identifiers
+  match any file. **Spatial predicate pushdown**: `st_intersects /
+  st_within / st_contains / st_dwithin` against a literal geometry
+  (`st_makeenvelope(...)`, `st_geomfromtext(...)` — constant-folded) prune
+  row groups via metadata bboxes and rows via the covering bbox-leaf scan,
+  then DataFusion re-applies the exact predicate (verified row-identical to
+  the unpruned scan). The results grid: checkbox per row builds a
+  highlighted map selection, a magnifier zooms to a feature, any cell click
+  copies its full value (geometry as WKT), checked rows copy as TSV with
+  headers. Results with geometry export to a temp GeoParquet and load back
+  as regular layers (whole result or checked rows only), carrying the
+  source layer's CRS.
+- **Attributes, lazily**: click a feature → highlight + a floating attribute
+  window (upper right, draggable — the map never resizes). Values are
+  fetched from the parquet file on demand (row-group + page selection via
+  `FeatureStore`), nothing is cached in RAM. Picking uses an R-tree over
+  line/polygon bboxes, chunk-local scans for points, and an exact geometry
+  test in the data CRS.
 - **Styling**: per-layer fill/point color, separate border/line color (auto-derived
   dark shade by default, ↺ resets), opacity, fill opacity, line width, point
-  radius; layers reorder with ▲▼ (list order = draw order).
-- **Session context**: "Save ctx…" writes layers (sources incl. remote URLs and
-  s3 URIs + profile/endpoint — never presigned URLs), styles, order, camera,
-  projection and toggles to a JSON file; "Load ctx…" restores it, re-resolving
-  credentials and re-pruning against the restored viewport.
-- **Status bar**: cursor in WGS84 + display CRS, zoom, frame time, feature counts.
+  radius; per-layer menu for info/optimize/reorder/remove (list order =
+  draw order) with an inline zoom-to-layer button.
+- **Session context**: File → "Save context…" writes layers (sources incl.
+  remote URLs and s3 URIs + profile/endpoint — never presigned URLs), styles,
+  order, camera, projection and toggles to a JSON file; "Load context…"
+  restores it, re-resolving credentials and re-pruning against the restored
+  viewport.
+- **Status bar**: cursor in WGS84 + display CRS, projection picker (built-ins,
+  national grids, EPSG entry), zoom, frame time, feature counts, load
+  progress with per-stage percentages, error badge.
 
 ## Architecture
 
@@ -171,7 +196,11 @@ Fixture-dependent tests self-skip when the files are absent.
 | `map/renderer.rs` | wgpu pipelines (fill / SDF lines / SDF points / tiles), per-chunk dynamic uniform offsets, drawn inside egui's render pass |
 | `map/tiles.rs` | XYZ fetch worker pool, tile cache, ancestor fallback |
 | `picking.rs` | R-tree candidates → exact test in data CRS |
-| `app.rs` | egui UI: toolbar, layer panel, attribute panel, status bar |
+| `sql/table.rs` | DataFusion `TableProvider` over `FeatureStore` (partition per row group, projection + spatial predicate pushdown) |
+| `sql/udf.rs` | ST_* scalar UDFs on geo-types, WKB in/out |
+| `sql/engine.rs` | session per query on a worker thread, result cap, geometry detection |
+| `sql/console.rs` + `sql/export.rs` | console UI (browse/query, results grid) and result → GeoParquet export |
+| `app.rs` | egui UI: menu bar, toolbar, layer panel, floating attributes, status bar |
 
 Rendering happens in normalized "world" space (`[0,1]²` slippy convention for
 Mercator). Vertices are stored as f32 offsets from per-chunk f64 origins, and
@@ -180,12 +209,18 @@ deep zoom stays jitter-free.
 
 ## Roadmap ideas
 
+- Overview/pyramid levels for zoomed-out views of huge remote files (a
+  remote open at world zoom legitimately downloads everything today)
 - Streaming (external-sort) optimize for files beyond the 8 GB in-memory cap
 - Page-index (footer-only) pruning for 2.0 native-stats files without a
   covering column (per-feature selection needs the bbox column today)
-- Zoom-dependent coastline detail (embed 1:110m + fetch 1:10m on demand)
-- Overview/pyramid levels for zoomed-out views of huge remote files
+- SQL: `st_transform` (proj4rs), polygon set ops (`st_union` /
+  `st_intersection` via geo bool_ops), aggregates (`st_extent`,
+  `st_collect`), query history, save result to a chosen path
 - Data-driven styling (color by attribute, graduated/categorical)
 - Zoom-dependent decimation / LOD for very dense line/polygon layers
-- Attribute table view + filtering (DataFusion over the parquet file)
+- Zoom-dependent coastline detail (embed 1:110m + fetch 1:10m on demand)
+- Basemap tiles warped to non-Mercator projections
 - Label rendering from attribute columns
+- GeoParquet 1.1 `edges: spherical`; 2.0 CRS read from the GEOMETRY
+  logical type when `geo` metadata is absent

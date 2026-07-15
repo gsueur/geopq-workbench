@@ -220,7 +220,7 @@ pub fn complement_ranges(ranges: &[(u32, u32)], len: u32) -> Vec<(u32, u32)> {
 /// Scan a group's covering bbox leaves and return the row ranges of
 /// features intersecting `rect`. None when the file has no usable covering
 /// column (caller falls back to the whole group).
-fn covering_select(
+pub(crate) fn covering_select(
     source: &Source,
     meta: &ArrowReaderMetadata,
     covering: Option<&CoveringCol>,

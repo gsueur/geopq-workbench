@@ -27,6 +27,8 @@ pub struct SqlLayer {
     pub table: String,
     pub store: Arc<FeatureStore>,
     pub crs: Crs,
+    /// Metadata row-group bboxes (index-aligned), for predicate pushdown.
+    pub rg_bboxes: Option<Arc<Vec<[f64; 4]>>>,
 }
 
 #[derive(Debug)]
@@ -104,8 +106,11 @@ fn run_query(query: &str, layers: &[SqlLayer]) -> Result<QueryOutput, String> {
     let ctx = SessionContext::new_with_config(config);
     udf::register_all(&ctx);
     for l in layers {
-        ctx.register_table(l.table.as_str(), Arc::new(LayerTable::new(Arc::clone(&l.store))))
-            .map_err(|e| format!("register {}: {e}", l.table))?;
+        ctx.register_table(
+            l.table.as_str(),
+            Arc::new(LayerTable::new(Arc::clone(&l.store), l.rg_bboxes.clone())),
+        )
+        .map_err(|e| format!("register {}: {e}", l.table))?;
     }
 
     let (schema, batches, total_rows, truncated) = rt.block_on(async {
@@ -218,11 +223,12 @@ mod tests {
             eprintln!("fixture {name} missing, skipping");
             return None;
         }
-        let (store, crs, _info, _bbox) = open_store_for_test(&path).unwrap();
+        let (store, crs, _info, rg_meta) = open_store_for_test(&path).unwrap();
         Some(vec![SqlLayer {
             table: "t".into(),
             store: Arc::new(store),
             crs,
+            rg_bboxes: rg_meta.map(|(_, boxes)| Arc::new(boxes)),
         }])
     }
 
@@ -324,6 +330,49 @@ mod tests {
         assert_eq!(bt, "MultiPolygon");
     }
 
+    /// Pushed-down spatial filters must return row-identical results to the
+    /// same predicate evaluated without pruning (defeated via an OR the
+    /// extractor doesn't handle), and fewer than all rows.
+    #[test]
+    fn pushdown_matches_full_scan() {
+        let Some(layers) = fixture("parcels_hilbert.parquet") else {
+            return;
+        };
+        if layers[0].rg_bboxes.is_none() {
+            eprintln!("fixture has no metadata bboxes, skipping");
+            return;
+        }
+        // A window around the first row group's center (data CRS).
+        let b = layers[0].rg_bboxes.as_ref().unwrap()[0];
+        let (cx, cy) = ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
+        let (dx, dy) = ((b[2] - b[0]) * 0.1, (b[3] - b[1]) * 0.1);
+        let env = format!(
+            "st_makeenvelope({}, {}, {}, {})",
+            cx - dx,
+            cy - dy,
+            cx + dx,
+            cy + dy
+        );
+        let count = |pred: &str| -> i64 {
+            let out = run_query(&format!("select count(*) c from t where {pred}"), &layers)
+                .unwrap();
+            use arrow::array::Int64Array;
+            out.batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        let pushed = count(&format!("st_intersects(geometry, {env})"));
+        let control = count(&format!(
+            "st_intersects(geometry, {env}) or geometry is null"
+        ));
+        let total = layers[0].store.total_rows() as i64;
+        assert_eq!(pushed, control, "pruning must not drop matching rows");
+        assert!(pushed > 0 && pushed < total, "window count: {pushed}/{total}");
+    }
+
     #[test]
     fn uppercase_columns_are_queryable_lowercase() {
         use arrow::array::{BinaryBuilder, StringArray};
@@ -362,6 +411,7 @@ mod tests {
             table: "t".into(),
             store: Arc::new(store),
             crs,
+            rg_bboxes: None,
         }];
         // Unquoted lowercase identifier reaches the uppercase file column.
         let out = run_query(

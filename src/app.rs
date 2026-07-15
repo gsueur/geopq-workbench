@@ -769,7 +769,7 @@ impl ViewerApp {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                ui.menu_button("⋮", |ui| {
+                                ui.menu_button("☰", |ui| {
                                     if ui.button("Info…").clicked() {
                                         info_open = Some(l.id);
                                     }
@@ -1258,17 +1258,17 @@ impl ViewerApp {
                             ui,
                             "size",
                             format!(
-                                "{} → {}",
+                                "{} ➡ {}",
                                 fmt_bytes(rep.size_before),
                                 fmt_bytes(rep.size_after)
                             ),
                         );
-                        row(ui, "row groups", format!("{} → {}", rep.rg_before, rep.rg_after));
+                        row(ui, "row groups", format!("{} ➡ {}", rep.rg_before, rep.rg_after));
                         row(
                             ui,
                             "rg bbox overlap",
                             format!(
-                                "×{:.1} → ×{:.1} ({:.0}% → {:.0}% of possible)",
+                                "×{:.1} ➡ ×{:.1} ({:.0}% ➡ {:.0}% of possible)",
                                 rep.overlap_before,
                                 rep.overlap_after,
                                 rep.overlap_frac_before() * 100.0,
@@ -1475,7 +1475,7 @@ impl ViewerApp {
                                     rg.avg_overlap,
                                     rg.overlap_frac() * 100.0,
                                     if rg.poorly_clustered() {
-                                        "→ consider Optimize…"
+                                        "(poorly clustered: consider Optimize…)"
                                     } else {
                                         "(well clustered)"
                                     }
