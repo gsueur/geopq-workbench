@@ -68,7 +68,9 @@ Fixture-dependent tests self-skip when the files are absent.
   Geomermaids Parquetry (OSM North
   America: 101 regions × 16 themes, daily snapshots) is preconfigured;
   add or remove repositories in the dialog (persisted in
-  `~/.config/geopq-viewer/repositories.json`).
+  `~/.config/geopq-viewer/repositories.json`). Discovered dataset lists
+  are cached across sessions (`repo_cache.json`, "cached N h ago" shown
+  in the dialog); the ⟳ button clears the cache and re-discovers.
 - **File info panel**: per-layer Info button — detected GeoParquet version,
   encoding, CRS, metadata bbox, covering/edges, column types + compression,
   row-group layout, raw `geo` JSON with copy.

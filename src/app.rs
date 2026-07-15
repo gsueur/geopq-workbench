@@ -186,6 +186,8 @@ struct RepoBrowser {
     selected: Option<(usize, Option<Result<crate::data::repo::Manifest, String>>)>,
     /// Themes ticked for loading in the selected dataset.
     checked: std::collections::HashSet<String>,
+    /// Unix seconds the dataset list was cached at (None = fetched live).
+    cache_age: Option<u64>,
     /// Add-repository row (name, base URL).
     add: (String, String),
     /// Drops stale async results after repo/snapshot switches.
@@ -194,7 +196,12 @@ struct RepoBrowser {
 
 enum RepoMsg {
     Snapshots(u64, Result<Vec<crate::data::repo::Snapshot>, String>),
-    Datasets(u64, Result<Vec<crate::data::repo::Dataset>, String>),
+    /// Dataset list + the cache timestamp it came from (None = live fetch).
+    Datasets(
+        u64,
+        Result<Vec<crate::data::repo::Dataset>, String>,
+        Option<u64>,
+    ),
     Manifest(u64, Result<crate::data::repo::Manifest, String>),
 }
 
@@ -1395,17 +1402,6 @@ impl ViewerApp {
                                     {
                                         load_all = Some(l.id);
                                     }
-                                    if n_layers > 1 {
-                                        ui.separator();
-                                        // Vec order is draw order: last = top-most.
-                                        if idx + 1 < n_layers && ui.button("⏶ Move up").clicked()
-                                        {
-                                            reorder = Some((l.id, 1));
-                                        }
-                                        if idx > 0 && ui.button("⏷ Move down").clicked() {
-                                            reorder = Some((l.id, -1));
-                                        }
-                                    }
                                     if let Some(rg) = &l.rg_bboxes {
                                         ui.separator();
                                         ui.checkbox(&mut l.style.show_rg_bboxes, "RG bboxes")
@@ -1442,6 +1438,29 @@ impl ViewerApp {
                                     .clicked()
                                 {
                                     fit_to = Some(l.bounds_world());
+                                }
+                                // Vec order is draw order: last = top-most.
+                                if n_layers > 1 {
+                                    if ui
+                                        .add_enabled(
+                                            idx > 0,
+                                            egui::Button::new("⏷").small(),
+                                        )
+                                        .on_hover_text("Move down")
+                                        .clicked()
+                                    {
+                                        reorder = Some((l.id, -1));
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            idx + 1 < n_layers,
+                                            egui::Button::new("⏶").small(),
+                                        )
+                                        .on_hover_text("Move up")
+                                        .clicked()
+                                    {
+                                        reorder = Some((l.id, 1));
+                                    }
                                 }
                             },
                         );
@@ -1778,20 +1797,23 @@ impl ViewerApp {
             country: String::new(),
             selected: None,
             checked: Default::default(),
+            cache_age: None,
             add: (String::new(), String::new()),
             generation: 0,
         });
-        self.repo_refetch(ctx);
+        self.repo_refetch(ctx, false);
     }
 
     /// (Re)fetch snapshots + datasets for the browser's current repository
-    /// and snapshot, dropping any stale in-flight results.
-    fn repo_refetch(&mut self, ctx: &egui::Context) {
+    /// and snapshot, dropping any stale in-flight results. Discovery uses
+    /// the on-disk cache unless `force` clears and re-probes.
+    fn repo_refetch(&mut self, ctx: &egui::Context, force: bool) {
         let Some(b) = &mut self.repo_browser else { return };
         b.generation += 1;
         b.datasets = None;
         b.selected = None;
         b.checked.clear();
+        b.cache_age = None;
         let generation = b.generation;
         let base = b.repos[b.sel_repo].url.trim_end_matches('/').to_string();
         let snapshot = b.snapshots[b.sel_snapshot].path.clone();
@@ -1802,10 +1824,19 @@ impl ViewerApp {
                 generation,
                 crate::data::repo::fetch_snapshots(&base),
             ));
-            let _ = tx.send(RepoMsg::Datasets(
-                generation,
-                crate::data::repo::discover_datasets(&base, &snapshot),
-            ));
+            if force {
+                crate::data::repo::clear_cached_datasets(&base, &snapshot);
+            } else if let Some((ds, at)) = crate::data::repo::cached_datasets(&base, &snapshot)
+            {
+                let _ = tx.send(RepoMsg::Datasets(generation, Ok(ds), Some(at)));
+                ctx.request_repaint();
+                return;
+            }
+            let res = crate::data::repo::discover_datasets(&base, &snapshot);
+            if let Ok(ds) = &res {
+                crate::data::repo::store_datasets(&base, &snapshot, ds);
+            }
+            let _ = tx.send(RepoMsg::Datasets(generation, res, None));
             ctx.request_repaint();
         });
     }
@@ -1843,7 +1874,10 @@ impl ViewerApp {
                         b.snapshots = snaps;
                     }
                 }
-                RepoMsg::Datasets(g, res) if g == b.generation => b.datasets = Some(res),
+                RepoMsg::Datasets(g, res, cached_at) if g == b.generation => {
+                    b.datasets = Some(res);
+                    b.cache_age = cached_at;
+                }
                 RepoMsg::Manifest(g, res) if g == b.generation => {
                     if let Some((_, m)) = &mut b.selected {
                         *m = Some(res);
@@ -1860,6 +1894,7 @@ impl ViewerApp {
         }
         let mut open = true;
         let mut refetch = false;
+        let mut force_refetch = false;
         let mut fetch_manifest: Option<usize> = None;
         let mut load: Vec<(String, String)> = Vec::new(); // (url, layer name)
 
@@ -1899,8 +1934,22 @@ impl ViewerApp {
                         if b.sel_snapshot != before {
                             refetch = true;
                         }
-                        if ui.button("⟳").on_hover_text("Refresh").clicked() {
-                            refetch = true;
+                        if ui
+                            .button("⟳")
+                            .on_hover_text("Clear the cached dataset list and re-discover")
+                            .clicked()
+                        {
+                            force_refetch = true;
+                        }
+                        if let Some(at) = b.cache_age {
+                            ui.label(
+                                RichText::new(format!(
+                                    "cached {}",
+                                    crate::data::repo::age_label(at)
+                                ))
+                                .weak()
+                                .small(),
+                            );
                         }
                     });
                     ui.separator();
@@ -2190,8 +2239,8 @@ impl ViewerApp {
                 });
         }
 
-        if refetch {
-            self.repo_refetch(ctx);
+        if refetch || force_refetch {
+            self.repo_refetch(ctx, force_refetch);
         }
         if let Some(i) = fetch_manifest {
             self.repo_fetch_manifest(i, ctx);

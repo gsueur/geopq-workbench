@@ -138,7 +138,7 @@ pub fn fetch_snapshots(base: &str) -> Result<Vec<Snapshot>, String> {
     Ok(out)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Dataset {
     /// ISO-style code ("US-AR"), for layer naming.
     pub code: String,
@@ -146,6 +146,87 @@ pub struct Dataset {
     pub name: String,
     /// Folder path under the snapshot ("country=US/state=US-AR").
     pub path: String,
+}
+
+/// `~/.config/geopq-viewer/repo_cache.json`: discovered dataset lists per
+/// (repository, snapshot) — discovery probes ~100 URLs, worth keeping
+/// across sessions.
+fn cache_file() -> Option<PathBuf> {
+    config_file().map(|p| p.with_file_name("repo_cache.json"))
+}
+
+#[derive(Serialize, Deserialize)]
+struct CacheEntry {
+    /// Unix seconds at fetch time.
+    fetched_at: u64,
+    datasets: Vec<Dataset>,
+}
+
+fn cache_key(base: &str, snapshot: &str) -> String {
+    format!("{base}|{snapshot}")
+}
+
+fn read_cache() -> std::collections::HashMap<String, CacheEntry> {
+    cache_file()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_cache(cache: &std::collections::HashMap<String, CacheEntry>) {
+    let Some(path) = cache_file() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string(cache) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Cached dataset list with its age, if any.
+pub fn cached_datasets(base: &str, snapshot: &str) -> Option<(Vec<Dataset>, u64)> {
+    let e = read_cache().remove(&cache_key(base, snapshot))?;
+    Some((e.datasets, e.fetched_at))
+}
+
+pub fn store_datasets(base: &str, snapshot: &str, datasets: &[Dataset]) {
+    let mut cache = read_cache();
+    cache.insert(
+        cache_key(base, snapshot),
+        CacheEntry {
+            fetched_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            datasets: datasets.to_vec(),
+        },
+    );
+    write_cache(&cache);
+}
+
+pub fn clear_cached_datasets(base: &str, snapshot: &str) {
+    let mut cache = read_cache();
+    if cache.remove(&cache_key(base, snapshot)).is_some() {
+        write_cache(&cache);
+    }
+}
+
+/// "5 min ago" / "3 h ago" / "2 d ago" for the cache indicator.
+pub fn age_label(fetched_at: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let s = now.saturating_sub(fetched_at);
+    if s < 120 {
+        "just now".into()
+    } else if s < 7200 {
+        format!("{} min ago", s / 60)
+    } else if s < 172_800 {
+        format!("{} h ago", s / 3600)
+    } else {
+        format!("{} d ago", s / 86_400)
+    }
 }
 
 /// Dataset folders of a snapshot: from the repository's `index.json` when
