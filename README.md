@@ -69,7 +69,11 @@ Fixture-dependent tests self-skip when the files are absent.
   after ~5 s of parallel per-group range requests. Sequential reads use
   growing bounded windows (256 KB → 8 MB) instead of open-ended ranges;
   files with a page index get exact per-page fetches. Lazy attributes and
-  picking work identically (each click is a small ranged read). The parquet
+  picking work identically (each click is a small ranged read); the whole
+  pick pipeline (hit test + attribute row) runs off the UI thread with a
+  status-bar spinner, so a slow remote click never freezes the app, and
+  very wide schemas (time series in columns) fetch only the first 256
+  attribute columns for the info panel (noted in the panel). The parquet
   footer is parsed once and shared by every reader (remote footers can be
   MBs), and response bodies are fully drained so the connection pool
   actually pools (a missing EOF read cost a TLS handshake per range

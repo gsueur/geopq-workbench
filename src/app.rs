@@ -79,9 +79,11 @@ pub struct ViewerApp {
     layers: Vec<VectorLayer>,
     rebuilding: HashSet<u64>,
     selection: Option<Selection>,
-    /// Single-row record batch (all columns) for the selected feature,
-    /// fetched lazily from the layer's FeatureStore.
+    /// Single-row record batch for the selected feature, fetched lazily
+    /// from the layer's FeatureStore (capped to [`ATTR_COLS_CAP`] columns).
     selection_attrs: Option<arrow::record_batch::RecordBatch>,
+    /// (shown, total) when the attribute fetch was column-capped.
+    attrs_truncated: Option<(usize, usize)>,
     selection_generation: u64,
     highlight_chunks: Option<Arc<Vec<crate::data::geometry::ChunkMesh>>>,
     /// SQL checked-rows selection, rendered independently of the picked
@@ -151,6 +153,63 @@ pub struct ViewerApp {
     test_rx: Receiver<crate::sql::engine::FilterMsg>,
     /// Filters to apply once a context-restored layer finishes loading.
     pending_filters: HashMap<u64, String>,
+    /// Async feature picking (remote layers turn picks into network reads,
+    /// so the whole pipeline runs off the UI thread).
+    pick_tx: Sender<PickMsg>,
+    pick_rx: Receiver<PickMsg>,
+    /// Monotonic pick id; results from superseded jobs are dropped.
+    pick_job: u64,
+    /// A pick is in flight (status-bar spinner).
+    pick_pending: bool,
+}
+
+/// Cap on attribute columns fetched for the feature info panel. Wide
+/// files (time series in columns: thousands of fields) would otherwise
+/// need one range request per column chunk on remote sources.
+const ATTR_COLS_CAP: usize = 256;
+
+/// Result of an async pick job.
+struct PickMsg {
+    job: u64,
+    sel: Option<Selection>,
+    attrs: Option<arrow::record_batch::RecordBatch>,
+    /// (shown, total) when the attribute fetch was column-capped.
+    truncated: Option<(usize, usize)>,
+}
+
+/// Fetch the picked feature's attribute row, capping very wide schemas to
+/// the first [`ATTR_COLS_CAP`] columns (+ geometry). Worker-thread only.
+fn fetch_pick_attrs(
+    layers: &[picking::PickLayer],
+    s: &Selection,
+) -> (
+    Option<arrow::record_batch::RecordBatch>,
+    Option<(usize, usize)>,
+) {
+    let Some(l) = layers.iter().find(|l| l.id == s.layer_id) else {
+        return (None, None);
+    };
+    let total = l.store.schema.fields().len();
+    let (fetched, truncated) = if total > ATTR_COLS_CAP {
+        let mut cols: Vec<usize> = (0..ATTR_COLS_CAP).collect();
+        if l.store.geom_col >= ATTR_COLS_CAP {
+            cols.push(l.store.geom_col);
+        }
+        let n = cols.len();
+        (
+            l.store.fetch(&[s.feature.index], Some(&cols)),
+            Some((n, total)),
+        )
+    } else {
+        (l.store.fetch(&[s.feature.index], None), None)
+    };
+    match fetched {
+        Ok(batches) => (batches.into_iter().next(), truncated),
+        Err(e) => {
+            log::warn!("attribute fetch failed: {e}");
+            (None, None)
+        }
+    }
 }
 
 /// Editor for a layer's persistent SQL filter.
@@ -180,6 +239,7 @@ impl ViewerApp {
         let (opt_tx, opt_rx) = channel();
         let (filter_tx, filter_rx) = channel();
         let (test_tx, test_rx) = channel();
+        let (pick_tx, pick_rx) = channel();
         let display = DisplayCrs::hobo_dyer();
         let graticule_chunks = build_graticule(&display);
         let coastline_chunks = crate::data::coastline::build_coastline(&display);
@@ -190,6 +250,7 @@ impl ViewerApp {
             rebuilding: HashSet::new(),
             selection: None,
             selection_attrs: None,
+            attrs_truncated: None,
             selection_generation: 0,
             highlight_chunks: None,
             sql_highlight_chunks: None,
@@ -234,6 +295,10 @@ impl ViewerApp {
             test_tx,
             test_rx,
             pending_filters: HashMap::new(),
+            pick_tx,
+            pick_rx,
+            pick_job: 0,
+            pick_pending: false,
         };
         for f in files {
             app.enqueue_load(f, &cc.egui_ctx);
@@ -706,7 +771,7 @@ impl ViewerApp {
     /// geometry was already built in it by the loader).
     fn adopt_display_lite(&mut self, d: DisplayCrs) {
         self.display = d;
-        self.select(None);
+        self.clear_selection();
         self.graticule_chunks = build_graticule(&self.display);
         self.coastline_chunks = crate::data::coastline::build_coastline(&self.display);
         self.graticule_generation += 1;
@@ -829,23 +894,64 @@ impl ViewerApp {
         }
     }
 
-    fn select(&mut self, sel: Option<Selection>) {
+    /// Clear the picked feature and cancel any pick in flight.
+    fn clear_selection(&mut self) {
+        self.pick_job += 1;
+        self.pick_pending = false;
+        self.apply_pick(None, None, None);
+    }
+
+    /// Kick off an async pick: hit test + attribute fetch in a worker
+    /// thread (network reads on remote layers must never block the UI).
+    fn start_pick(&mut self, world: [f64; 2], tol: f64, ctx: &egui::Context) {
+        self.pick_job += 1;
+        let job = self.pick_job;
+        self.pick_pending = true;
+        let snaps: Vec<picking::PickLayer> =
+            self.layers.iter().map(picking::PickLayer::of).collect();
+        let display = self.display.clone();
+        let tx = self.pick_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let sel = picking::pick(&snaps, &display, world, tol);
+            let (attrs, truncated) = match &sel {
+                Some(s) => fetch_pick_attrs(&snaps, s),
+                None => (None, None),
+            };
+            let _ = tx.send(PickMsg {
+                job,
+                sel,
+                attrs,
+                truncated,
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_picks(&mut self) {
+        while let Ok(m) = self.pick_rx.try_recv() {
+            if m.job != self.pick_job {
+                continue; // superseded by a newer click / clear
+            }
+            self.pick_pending = false;
+            self.apply_pick(m.sel, m.attrs, m.truncated);
+        }
+    }
+
+    fn apply_pick(
+        &mut self,
+        sel: Option<Selection>,
+        attrs: Option<arrow::record_batch::RecordBatch>,
+        truncated: Option<(usize, usize)>,
+    ) {
         self.selection_generation += 1;
         self.highlight_chunks = sel.as_ref().map(|s| {
             let mut mb = MeshBuilder::default();
             mb.add(&s.world_geom, crate::data::geometry::FeatureRef::INVALID);
             Arc::new(mb.finish())
         });
-        self.selection_attrs = sel.as_ref().and_then(|s| {
-            let layer = self.layers.iter().find(|l| l.id == s.layer_id)?;
-            match layer.store.fetch_row(s.feature.index) {
-                Ok(batch) => Some(batch),
-                Err(e) => {
-                    log::warn!("attribute fetch failed: {e}");
-                    None
-                }
-            }
-        });
+        self.selection_attrs = attrs;
+        self.attrs_truncated = truncated;
         self.selection = sel;
     }
 
@@ -1349,7 +1455,7 @@ impl ViewerApp {
             self.layers.retain(|l| l.id != id);
             self.rebuilding.remove(&id);
             if self.selection.as_ref().map(|s| s.layer_id) == Some(id) {
-                self.select(None);
+                self.clear_selection();
             }
         }
         if let Some(b) = fit_to {
@@ -1513,7 +1619,7 @@ impl ViewerApp {
                 self.layers.clear();
                 self.rebuilding.clear();
                 self.appending.clear();
-                self.select(None);
+                self.clear_selection();
                 self.set_display(d, ctx);
             }
             Err(e) => {
@@ -2388,7 +2494,14 @@ impl ViewerApp {
         let Some(layer) = self.layers.iter().find(|l| l.id == sel.layer_id) else {
             return;
         };
-        let geom_col = layer.store.geom_col;
+        // The attribute batch may be column-capped, so locate the geometry
+        // by name instead of the store's schema index.
+        let geom_name = layer
+            .store
+            .schema
+            .field(layer.store.geom_col)
+            .name()
+            .clone();
         let encoding = layer.store.encoding;
         let layer_name = layer.name.clone();
         ui.label(
@@ -2396,6 +2509,17 @@ impl ViewerApp {
                 .weak()
                 .small(),
         );
+        if let Some((shown, total)) = self.attrs_truncated {
+            ui.label(
+                RichText::new(format!("showing {shown} of {total} columns"))
+                    .weak()
+                    .small(),
+            )
+            .on_hover_text(
+                "Very wide schema: fetching every column would need one \
+                 read per column chunk (slow on remote files)",
+            );
+        }
         ui.separator();
         match &self.selection_attrs {
             Some(batch) => {
@@ -2408,11 +2532,11 @@ impl ViewerApp {
                             let opts = FormatOptions::default().with_display_error(true);
                             for (i, field) in batch.schema().fields().iter().enumerate() {
                                 ui.label(RichText::new(field.name()).strong());
-                                if i == geom_col {
+                                if field.name() == &geom_name {
                                     ui.label(
                                         RichText::new(geom_summary(
                                             batch,
-                                            geom_col,
+                                            i,
                                             encoding,
                                         ))
                                         .weak(),
@@ -2468,6 +2592,10 @@ impl ViewerApp {
                     let (x, y) = self.display.projected_from_world(w);
                     ui.monospace(format!("| {x:.1}, {y:.1} ({})", self.display.crs.name));
                 }
+            }
+            if self.pick_pending {
+                ui.spinner();
+                ui.label(RichText::new("fetching feature…").weak());
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.projection_selector(ui);
@@ -2545,8 +2673,8 @@ impl ViewerApp {
         if response.clicked() {
             if let Some(w) = self.cursor_world {
                 let tol = 6.0 * ppp as f64 / self.camera.scale();
-                let sel = picking::pick(&self.layers, &self.display, w, tol);
-                self.select(sel);
+                let ctx = ui.ctx().clone();
+                self.start_pick(w, tol, &ctx);
             }
         }
 
@@ -3005,6 +3133,7 @@ impl eframe::App for ViewerApp {
         let ctx = ui.ctx().clone();
         self.poll_loader(&ctx);
         self.poll_optimizer();
+        self.poll_picks();
         self.strip_uploaded_cpu_meshes(frame);
 
         // Drag & drop.
@@ -3081,7 +3210,7 @@ impl eframe::App for ViewerApp {
                 .collapsible(false)
                 .show(&ctx, |ui| self.attributes_panel(ui));
             if !open {
-                self.select(None);
+                self.clear_selection();
             }
         }
         self.errors_window(&ctx);

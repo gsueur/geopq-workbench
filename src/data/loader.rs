@@ -1950,6 +1950,77 @@ mod pruning_tests {
         );
     }
 
+    /// Remote pick-latency probe, opt-in: what a map click costs on a
+    /// remote layer (candidate geometry fetch + full-row attribute fetch).
+    /// GEOPQ_PROBE_URI=s3://bucket/key [GEOPQ_PROBE_PROFILE=name] \
+    ///   cargo test --release remote_pick_probe -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn remote_pick_probe() {
+        let Ok(uri) = std::env::var("GEOPQ_PROBE_URI") else {
+            eprintln!("set GEOPQ_PROBE_URI");
+            return;
+        };
+        let src = if uri.starts_with("s3://") {
+            Source::S3 {
+                uri,
+                profile: std::env::var("GEOPQ_PROBE_PROFILE").ok(),
+                endpoint: None,
+                url: String::new(),
+                len: 0,
+            }
+        } else {
+            Source::Remote { url: uri, len: 0 }
+        };
+        let t0 = std::time::Instant::now();
+        let src = src.resolve().unwrap();
+        eprintln!(
+            "resolve: {} ms, {} MB",
+            t0.elapsed().as_millis(),
+            src.size() >> 20
+        );
+        let t0 = std::time::Instant::now();
+        let (store, _crs, info, _rg) = open_store(&src).unwrap();
+        let meta = store.fragments[0].meta.metadata();
+        eprintln!(
+            "open: {} ms; {} rows, {} groups ({}-{} rows), {} cols, page index: column={} offset={}",
+            t0.elapsed().as_millis(),
+            store.total_rows(),
+            info.row_groups,
+            info.rg_rows_min,
+            info.rg_rows_max,
+            info.columns.len(),
+            meta.column_index().is_some(),
+            meta.offset_index().is_some(),
+        );
+        let mid = (store.total_rows() / 2) as u32;
+        // Polygon pick path: one batched geometry read for candidates.
+        for n in [1u32, 50, 512] {
+            let rows: Vec<u32> = (mid..mid + n).collect();
+            let t0 = std::time::Instant::now();
+            let geoms = store.fetch_geoms(&rows).unwrap();
+            eprintln!(
+                "fetch_geoms({n} rows): {} ms ({} geoms)",
+                t0.elapsed().as_millis(),
+                geoms.len()
+            );
+        }
+        // Info panel: capped column fetch of one row (what a click costs).
+        let total = store.schema.fields().len();
+        let cap = 256.min(total);
+        let mut cols: Vec<usize> = (0..cap).collect();
+        if store.geom_col >= cap {
+            cols.push(store.geom_col);
+        }
+        let t0 = std::time::Instant::now();
+        let row = store.fetch(&[mid], Some(&cols)).unwrap();
+        eprintln!(
+            "fetch row, capped ({} of {total} cols): {} ms",
+            row[0].num_columns(),
+            t0.elapsed().as_millis()
+        );
+    }
+
     /// Local full-load benchmark, opt-in:
     /// cargo test --release local_load_bench -- --ignored --nocapture
     #[test]

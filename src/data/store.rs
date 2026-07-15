@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, StringArray};
+use bytes::Bytes;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use parquet::arrow::arrow_reader::{
@@ -341,15 +342,40 @@ impl FeatureStore {
             pos = pos_in_concat + 1;
         }
 
+        let selection = RowSelection::from(selectors);
+        let batch = local_rows.len().min(8192);
+
+        // Remote sources: without a page index the reader issues one
+        // sequential read per projected column chunk — hundreds of
+        // round trips on wide schemas. Prefetch the needed chunk byte
+        // ranges in a few coalesced range requests and serve the reader
+        // from memory instead.
+        if frag.source.is_remote() {
+            if let Some(cache) = prefetch_columns(frag, &groups, real)? {
+                return Self::read_selected(cache, frag, &groups, selection, batch, real);
+            }
+        }
         let reader = frag.source.open()?;
+        Self::read_selected(reader, frag, &groups, selection, batch, real)
+    }
+
+    /// Decode the selected rows from any byte source.
+    fn read_selected<R: parquet::file::reader::ChunkReader + 'static>(
+        reader: R,
+        frag: &Fragment,
+        groups: &[usize],
+        selection: RowSelection,
+        batch_size: usize,
+        real: &[usize],
+    ) -> Result<Vec<RecordBatch>, String> {
         let mut builder =
             ParquetRecordBatchReaderBuilder::new_with_metadata(reader, frag.meta.clone());
         let mask = ProjectionMask::roots(builder.parquet_schema(), real.iter().copied());
         builder = builder.with_projection(mask);
         let reader = builder
-            .with_row_groups(groups)
-            .with_row_selection(RowSelection::from(selectors))
-            .with_batch_size(local_rows.len().min(8192))
+            .with_row_groups(groups.to_vec())
+            .with_row_selection(selection)
+            .with_batch_size(batch_size)
             .build()
             .map_err(|e| format!("parquet read error: {e}"))?;
         let batches: Result<Vec<_>, _> = reader.collect();
@@ -379,13 +405,145 @@ impl FeatureStore {
         Ok(out)
     }
 
-    /// Fetch one full row (all columns) for the attribute panel.
+    /// Fetch one full row (all columns). The feature panel path caps very
+    /// wide schemas instead (see the app's fetch_pick_attrs).
+    #[allow(dead_code)] // exercised by tests; kept as the simple-row API
     pub fn fetch_row(&self, row: u32) -> Result<RecordBatch, String> {
         let batches = self.fetch(&[row], None)?;
         batches
             .into_iter()
             .next()
             .ok_or_else(|| format!("row {row} not found"))
+    }
+}
+
+/// Prefetch budget for coalesced remote reads; larger projections fall
+/// back to the streaming per-chunk path.
+const PREFETCH_MAX_BYTES: u64 = 128 * 1024 * 1024;
+/// Ranges closer than this merge into one request (a gap this size costs
+/// less to download than a fresh round trip).
+const PREFETCH_GAP: u64 = 1024 * 1024;
+
+/// The byte ranges of the projected columns' chunks in the chosen row
+/// groups, fetched with coalesced range requests. None when the plan
+/// exceeds [`PREFETCH_MAX_BYTES`].
+fn prefetch_columns(
+    frag: &Fragment,
+    groups: &[usize],
+    roots: &[usize],
+) -> Result<Option<Prefetched>, String> {
+    let pmd = frag.meta.metadata();
+    // Leaf column -> arrow root index (leaves of one root are adjacent).
+    let descr = pmd.file_metadata().schema_descr();
+    let mut root_of_leaf: Vec<usize> = Vec::with_capacity(descr.num_columns());
+    let mut last_root: Option<&str> = None;
+    let mut root_idx = 0usize;
+    for col in descr.columns() {
+        let root = col.path().parts()[0].as_str();
+        if last_root != Some(root) {
+            if last_root.is_some() {
+                root_idx += 1;
+            }
+            last_root = Some(root);
+        }
+        root_of_leaf.push(root_idx);
+    }
+    let want: std::collections::HashSet<usize> = roots.iter().copied().collect();
+
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for &g in groups {
+        for (leaf, col) in pmd.row_group(g).columns().iter().enumerate() {
+            if want.contains(&root_of_leaf[leaf]) {
+                let (offset, len) = col.byte_range();
+                ranges.push((offset, len));
+            }
+        }
+    }
+    ranges.sort_unstable();
+    let mut segments: Vec<(u64, u64)> = Vec::new(); // (offset, len)
+    for (o, l) in ranges {
+        match segments.last_mut() {
+            Some((so, sl)) if o <= *so + *sl + PREFETCH_GAP => {
+                *sl = (*sl).max(o + l - *so);
+            }
+            _ => segments.push((o, l)),
+        }
+    }
+    let total: u64 = segments.iter().map(|(_, l)| l).sum();
+    if total > PREFETCH_MAX_BYTES {
+        log::debug!("prefetch plan {total} B exceeds budget; streaming instead");
+        return Ok(None);
+    }
+
+    let reader = frag.source.open()?;
+    let len = parquet::file::reader::Length::len(&reader);
+    let mut fetched: Vec<(u64, Bytes)> = Vec::with_capacity(segments.len());
+    for (o, l) in segments {
+        let bytes = parquet::file::reader::ChunkReader::get_bytes(&reader, o, l as usize)
+            .map_err(|e| format!("prefetch failed: {e}"))?;
+        fetched.push((o, bytes));
+    }
+    log::debug!(
+        "prefetched {} segment(s), {} B for {} column roots",
+        fetched.len(),
+        total,
+        roots.len()
+    );
+    Ok(Some(Prefetched {
+        len,
+        segments: fetched,
+    }))
+}
+
+/// In-memory byte ranges of a remote file, served as a `ChunkReader`.
+/// Reads outside the prefetched segments error (the fetch plan covers
+/// every chunk the projected read can touch).
+struct Prefetched {
+    len: u64,
+    /// (file offset, bytes), sorted by offset, non-overlapping.
+    segments: Vec<(u64, Bytes)>,
+}
+
+impl Prefetched {
+    fn slice_from(&self, start: u64) -> Option<(usize, Bytes)> {
+        let i = self.segments.partition_point(|(o, _)| *o <= start);
+        let (o, b) = self.segments.get(i.checked_sub(1)?)?;
+        let off = (start - o) as usize;
+        (off <= b.len()).then(|| (i - 1, b.slice(off..)))
+    }
+}
+
+impl parquet::file::reader::Length for Prefetched {
+    fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+impl parquet::file::reader::ChunkReader for Prefetched {
+    type T = std::io::Cursor<Bytes>;
+
+    fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+        let (_, b) = self.slice_from(start).ok_or_else(|| {
+            parquet::errors::ParquetError::General(format!(
+                "read at {start} outside prefetched ranges"
+            ))
+        })?;
+        Ok(std::io::Cursor::new(b))
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
+        let (_, b) = self.slice_from(start).ok_or_else(|| {
+            parquet::errors::ParquetError::General(format!(
+                "read at {start} outside prefetched ranges"
+            ))
+        })?;
+        if b.len() < length {
+            return Err(parquet::errors::ParquetError::EOF(format!(
+                "prefetched segment too short at {start}: {} < {length}",
+                b.len()
+            )));
+        }
+        Ok(b.slice(..length))
     }
 }
 

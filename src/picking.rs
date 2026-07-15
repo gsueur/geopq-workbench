@@ -1,10 +1,13 @@
+use std::sync::Arc;
+
 use geo::{Contains, Distance, Euclidean, MapCoordsInPlace};
 use geo_types::{Geometry, Point};
-use rstar::AABB;
+use rstar::{RTree, AABB};
 
-use crate::data::crs::{transform_point, BulkTransformer, DisplayCrs};
-use crate::data::geometry::FeatureRef;
-use crate::data::layer::VectorLayer;
+use crate::data::crs::{transform_point, BulkTransformer, Crs, DisplayCrs};
+use crate::data::geometry::{ChunkMesh, FeatureRef};
+use crate::data::layer::{PickItem, VectorLayer};
+use crate::data::store::FeatureStore;
 
 /// A picked feature.
 #[derive(Clone)]
@@ -13,6 +16,33 @@ pub struct Selection {
     pub feature: FeatureRef,
     /// Geometry in current world coordinates (for highlight rendering).
     pub world_geom: Geometry<f64>,
+}
+
+/// Cheap snapshot of everything picking needs from a layer, so the whole
+/// pick (candidate reads, exact tests, attribute fetch) can run off the
+/// UI thread — on remote layers those are network reads.
+pub struct PickLayer {
+    pub id: u64,
+    pub visible: bool,
+    pub sections: Vec<(Arc<Vec<ChunkMesh>>, Arc<RTree<PickItem>>)>,
+    pub store: Arc<FeatureStore>,
+    pub crs: Crs,
+}
+
+impl PickLayer {
+    pub fn of(l: &VectorLayer) -> Self {
+        Self {
+            id: l.id,
+            visible: l.style.visible,
+            sections: l
+                .sections
+                .iter()
+                .map(|s| (Arc::clone(&s.chunks), Arc::clone(&s.rtree)))
+                .collect(),
+            store: Arc::clone(&l.store),
+            crs: l.crs.clone(),
+        }
+    }
 }
 
 /// Transform a geometry from a data CRS into world coordinates.
@@ -31,33 +61,18 @@ pub fn to_world_geom(
     geom
 }
 
-/// Fetch and decode one feature's geometry, in world coordinates.
-pub fn feature_world_geom(
-    layer: &VectorLayer,
-    f: FeatureRef,
-    display: &DisplayCrs,
-) -> Option<Geometry<f64>> {
-    let geom = layer
-        .store
-        .fetch_geoms(&[f.index])
-        .ok()?
-        .into_iter()
-        .next()?
-        .1?;
-    Some(to_world_geom(geom, &layer.crs, display))
-}
-
 /// Scan the point instances of chunks near the cursor. Points carry their
 /// FeatureRef inline (no R-tree entries), so this is the point pick path.
+/// Returns the hit and its world position (no data read needed).
 fn pick_point_in_chunks(
-    layer: &VectorLayer,
+    layer: &PickLayer,
     world: [f64; 2],
     tol_world: f64,
-) -> Option<FeatureRef> {
+) -> Option<(FeatureRef, [f64; 2])> {
     use crate::data::geometry::CHUNK_WORLD;
     let tol2 = tol_world * tol_world;
-    let mut best: Option<(f64, FeatureRef)> = None;
-    for chunk in layer.sections.iter().flat_map(|s| s.chunks.iter()) {
+    let mut best: Option<(f64, FeatureRef, [f64; 2])> = None;
+    for chunk in layer.sections.iter().flat_map(|(c, _)| c.iter()) {
         if chunk.point_instances.is_empty() {
             continue;
         }
@@ -75,38 +90,41 @@ fn pick_point_in_chunks(
             if !fref.is_valid() {
                 continue;
             }
-            let dx = o[0] + p[0] as f64 - world[0];
-            let dy = o[1] + p[1] as f64 - world[1];
+            let (px, py) = (o[0] + p[0] as f64, o[1] + p[1] as f64);
+            let (dx, dy) = (px - world[0], py - world[1]);
             let d2 = dx * dx + dy * dy;
-            if d2 <= tol2 && best.map(|(bd, _)| d2 < bd).unwrap_or(true) {
-                best = Some((d2, *fref));
+            if d2 <= tol2 && best.map(|(bd, _, _)| d2 < bd).unwrap_or(true) {
+                best = Some((d2, *fref, [px, py]));
             }
         }
     }
-    best.map(|(_, f)| f)
+    best.map(|(_, f, p)| (f, p))
 }
 
 /// Pick the topmost feature near a world-space point.
 ///
 /// `tol_world` is the pick tolerance in world units (derived from pixels).
+/// Remote layers turn the candidate reads into network requests — run this
+/// off the UI thread (see [`PickLayer`]).
 pub fn pick(
-    layers: &[VectorLayer],
+    layers: &[PickLayer],
     display: &DisplayCrs,
     world: [f64; 2],
     tol_world: f64,
 ) -> Option<Selection> {
     // Iterate top-most layer first.
     for layer in layers.iter().rev() {
-        if !layer.style.visible {
+        if !layer.visible {
             continue;
         }
-        // Points render on top of fills/lines; check them first.
-        if let Some(fref) = pick_point_in_chunks(layer, world, tol_world) {
-            let world_geom = feature_world_geom(layer, fref, display)?;
+        // Points render on top of fills/lines; check them first. The
+        // highlight comes straight from the rendered instance position —
+        // no geometry read.
+        if let Some((fref, pos)) = pick_point_in_chunks(layer, world, tol_world) {
             return Some(Selection {
                 layer_id: layer.id,
                 feature: fref,
-                world_geom,
+                world_geom: Geometry::Point(Point::new(pos[0], pos[1])),
             });
         }
 
@@ -117,8 +135,8 @@ pub fn pick(
         let mut candidates: Vec<FeatureRef> = layer
             .sections
             .iter()
-            .flat_map(|s| {
-                s.rtree
+            .flat_map(|(_, rtree)| {
+                rtree
                     .locate_in_envelope_intersecting(env)
                     .map(|item| item.feature)
             })
