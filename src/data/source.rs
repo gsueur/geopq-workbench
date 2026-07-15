@@ -32,6 +32,10 @@ fn http_agent() -> &'static ureq::Agent {
 #[derive(Clone, Debug)]
 pub enum Source {
     Local(PathBuf),
+    /// A local directory holding a (possibly hive-partitioned) multi-file
+    /// GeoParquet dataset. Opened as one layer; the store reads through
+    /// per-file `Local` sources, so `open()` is never valid on this.
+    Dir(PathBuf),
     /// HTTP(S) with range requests. `len` is resolved once at open.
     Remote { url: String, len: u64 },
     /// s3://bucket/key, read through a (pre)signed HTTPS URL resolved at
@@ -90,26 +94,30 @@ impl Source {
     }
 
     pub fn is_remote(&self) -> bool {
-        !matches!(self, Source::Local(_))
+        !matches!(self, Source::Local(_) | Source::Dir(_))
     }
 
     /// Full path / URL / S3 URI, for tooltips and error messages (never
     /// the presigned URL — it embeds a signed access grant).
     pub fn label(&self) -> String {
         match self {
-            Source::Local(p) => p.display().to_string(),
+            Source::Local(p) | Source::Dir(p) => p.display().to_string(),
             Source::Remote { url, .. } => url.clone(),
             Source::S3 { uri, .. } => uri.clone(),
         }
     }
 
-    /// Short display name (file stem / last URL segment).
+    /// Short display name (file stem / directory name / last URL segment).
     pub fn name(&self) -> String {
         match self {
             Source::Local(p) => p
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "layer".into()),
+            Source::Dir(p) => p
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "dataset".into()),
             Source::Remote { url, .. } | Source::S3 { uri: url, .. } => url
                 .split('/')
                 .next_back()
@@ -122,12 +130,17 @@ impl Source {
     pub fn size(&self) -> u64 {
         match self {
             Source::Local(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+            Source::Dir(_) => 0, // aggregated per fragment by the store
             Source::Remote { len, .. } | Source::S3 { len, .. } => *len,
         }
     }
 
     pub fn open(&self) -> Result<SourceReader, String> {
         match self {
+            Source::Dir(p) => Err(format!(
+                "{} is a dataset directory, not a file",
+                p.display()
+            )),
             Source::Local(p) => {
                 let f = File::open(p).map_err(|e| format!("cannot open file: {e}"))?;
                 let len = f

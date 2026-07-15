@@ -1,5 +1,8 @@
-use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
+use std::sync::Arc;
+
+use arrow::array::{ArrayRef, StringArray};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowSelection,
     RowSelector,
@@ -19,30 +22,53 @@ pub struct CoveringCol {
     pub children: [String; 4],
 }
 
-/// Lazy access to a GeoParquet file's rows.
-///
-/// Nothing but the schema and per-row-group row counts is kept in memory;
-/// attribute and geometry values are re-read from the file on demand
-/// (attribute panel, exact pick tests, projection rebuilds). Fetches select
-/// only the row groups and pages containing the requested rows.
-pub struct FeatureStore {
+/// One file of a (possibly multi-file) dataset: its own source and parquet
+/// footer, plus the hive partition-key values parsed from its path.
+pub struct Fragment {
     pub source: Source,
-    /// Parsed parquet footer (schema + metadata + page index), loaded once
-    /// at open: every reader is built from this instead of re-reading the
-    /// footer — essential for remote sources, whose footers can be MBs.
+    /// Parsed parquet footer of this file (schema + metadata + page index).
     pub meta: ArrowReaderMetadata,
+    /// Hive values for this file, aligned with the store's `part_cols`;
+    /// None = key absent from the path or the NULL partition.
+    pub part_values: Vec<Option<String>>,
+    /// First global row-group index of this fragment.
+    pub rg_offset: usize,
+    /// First global row of this fragment.
+    pub row_offset: u64,
+}
+
+/// Lazy access to a GeoParquet dataset's rows: a single file, or a
+/// directory of hive-partitioned files presented as one table.
+///
+/// Row groups and rows are addressed in a single global space spanning all
+/// fragments in path order — pruning, decode state, picking and SQL scans
+/// are unaware of file boundaries. Hive partition keys become virtual
+/// nullable Utf8 columns appended to the schema; their values live only in
+/// directory names, so fetches materialize them as constants per fragment.
+///
+/// Nothing but schemas and per-row-group row counts is kept in memory;
+/// attribute and geometry values are re-read from the files on demand.
+pub struct FeatureStore {
+    /// Display source: the file, or the dataset root directory.
+    pub source: Source,
+    /// Files in global order (exactly one for single-file layers).
+    pub fragments: Vec<Fragment>,
     /// Index of the geometry column in the arrow schema.
     pub geom_col: usize,
-    #[allow(dead_code)]
+    /// Base file schema plus one nullable Utf8 field per hive partition key.
     pub schema: SchemaRef,
-    /// Covering bbox column, when the file has one (per-feature pruning).
+    /// Covering bbox column, when the files have one (per-feature pruning).
     pub covering: Option<CoveringCol>,
     /// Geometry column encoding (WKB or a GeoArrow native encoding).
     pub encoding: GeomEncoding,
-    /// Rows per row group, in file order.
+    /// Hive partition-key column names, in schema order (appended last).
+    pub part_cols: Vec<String>,
+    /// Rows per row group, global order across fragments.
     rg_rows: Vec<u64>,
     /// Cumulative start row of each row group (len = rg_rows.len() + 1).
     rg_starts: Vec<u64>,
+    /// Fragment index of each global row group.
+    rg_frag: Vec<usize>,
 }
 
 impl FeatureStore {
@@ -56,22 +82,79 @@ impl FeatureStore {
         encoding: GeomEncoding,
         rg_rows: Vec<u64>,
     ) -> Self {
-        let mut rg_starts = Vec::with_capacity(rg_rows.len() + 1);
-        let mut acc = 0u64;
-        rg_starts.push(0);
-        for r in &rg_rows {
-            acc += r;
-            rg_starts.push(acc);
-        }
-        Self {
-            source,
+        let frag = Fragment {
+            source: source.clone(),
             meta,
+            part_values: Vec::new(),
+            rg_offset: 0,
+            row_offset: 0,
+        };
+        Self::from_fragments(
+            source,
+            vec![(frag, rg_rows)],
+            Vec::new(),
             geom_col,
             schema,
             covering,
             encoding,
+        )
+    }
+
+    /// Multi-file store: fragments in global order, each with its per-row-
+    /// group row counts. All fragments must share the base schema, CRS,
+    /// geometry column and encoding (validated by the opener).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_fragments(
+        source: Source,
+        frags: Vec<(Fragment, Vec<u64>)>,
+        part_cols: Vec<String>,
+        geom_col: usize,
+        base_schema: SchemaRef,
+        covering: Option<CoveringCol>,
+        encoding: GeomEncoding,
+    ) -> Self {
+        let mut fragments = Vec::with_capacity(frags.len());
+        let mut rg_rows: Vec<u64> = Vec::new();
+        let mut rg_frag: Vec<usize> = Vec::new();
+        let mut acc = 0u64;
+        for (i, (mut f, rows)) in frags.into_iter().enumerate() {
+            f.rg_offset = rg_rows.len();
+            f.row_offset = acc;
+            for r in rows {
+                rg_frag.push(i);
+                rg_rows.push(r);
+                acc += r;
+            }
+            fragments.push(f);
+        }
+        let mut rg_starts = Vec::with_capacity(rg_rows.len() + 1);
+        let mut s = 0u64;
+        rg_starts.push(0);
+        for r in &rg_rows {
+            s += r;
+            rg_starts.push(s);
+        }
+        let schema = if part_cols.is_empty() {
+            base_schema
+        } else {
+            let mut fields: Vec<Field> =
+                base_schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+            for name in &part_cols {
+                fields.push(Field::new(name, DataType::Utf8, true));
+            }
+            Arc::new(Schema::new_with_metadata(fields, base_schema.metadata().clone()))
+        };
+        Self {
+            source,
+            fragments,
+            geom_col,
+            schema,
+            covering,
+            encoding,
+            part_cols,
             rg_rows,
             rg_starts,
+            rg_frag,
         }
     }
 
@@ -84,48 +167,58 @@ impl FeatureStore {
         &self.rg_starts
     }
 
-    /// Open a reader over a single row group (row-group pruned loading).
+    /// Fields that exist in the files (schema fields before the virtual
+    /// partition columns).
+    pub fn base_fields(&self) -> usize {
+        self.schema.fields().len() - self.part_cols.len()
+    }
+
+    pub fn is_partitioned(&self) -> bool {
+        self.fragments.len() > 1
+    }
+
+    /// The fragment holding a global row group.
+    pub fn frag_of_group(&self, group: usize) -> &Fragment {
+        &self.fragments[self.rg_frag[group]]
+    }
+
+    /// Partition column `k`'s value for rows of a global row group.
+    pub fn part_value(&self, group: usize, k: usize) -> Option<&str> {
+        self.frag_of_group(group).part_values.get(k)?.as_deref()
+    }
+
+    /// Open a reader over one global row group (row-group pruned loading).
     /// `ranges`: group-relative [start, end) row spans to decode (sorted,
     /// non-overlapping); None reads the whole group. `columns`: arrow root
-    /// field indices to project, or None for all.
-    pub fn open_reader_for_group(
-        source: &Source,
-        meta: &ArrowReaderMetadata,
+    /// field indices to project (base fields only — virtual partition
+    /// columns don't exist in the files), or None for all base fields.
+    pub fn reader_for_group(
+        &self,
         group: usize,
         batch_size: usize,
         ranges: Option<&[(u32, u32)]>,
         columns: Option<&[usize]>,
     ) -> Result<ParquetRecordBatchReader, String> {
-        let reader = source.open()?;
-        let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(reader, meta.clone())
-            .with_row_groups(vec![group])
-            .with_batch_size(batch_size);
-        if let Some(cols) = columns {
-            let mask = ProjectionMask::roots(builder.parquet_schema(), cols.iter().copied());
-            builder = builder.with_projection(mask);
-        }
-        if let Some(ranges) = ranges {
-            let mut selectors: Vec<RowSelector> = Vec::with_capacity(ranges.len() * 2);
-            let mut pos = 0u32;
-            for &(start, end) in ranges {
-                debug_assert!(start >= pos && end > start, "sorted non-overlapping ranges");
-                if start > pos {
-                    selectors.push(RowSelector::skip((start - pos) as usize));
-                }
-                selectors.push(RowSelector::select((end - start) as usize));
-                pos = end;
-            }
-            builder = builder.with_row_selection(RowSelection::from(selectors));
-        }
-        builder
-            .build()
-            .map_err(|e| format!("parquet read error: {e}"))
+        debug_assert!(
+            columns.is_none_or(|c| c.iter().all(|&i| i < self.base_fields())),
+            "virtual partition columns cannot be read from files"
+        );
+        let frag = self.frag_of_group(group);
+        open_file_group_reader(
+            &frag.source,
+            &frag.meta,
+            group - frag.rg_offset,
+            batch_size,
+            ranges,
+            columns,
+        )
     }
 
     /// Fetch specific rows (global row indices, must be sorted and unique).
-    /// `columns`: arrow schema field indices to read, or None for all.
-    /// Returns the concatenated record batches; rows appear in ascending
-    /// row-index order matching the input.
+    /// `columns`: arrow schema field indices to read (virtual partition
+    /// columns allowed), or None for all. Returns record batches whose
+    /// schema is the projected fields in schema order; rows appear in
+    /// ascending row-index order matching the input.
     pub fn fetch(
         &self,
         rows_sorted: &[u32],
@@ -134,44 +227,112 @@ impl FeatureStore {
         if rows_sorted.is_empty() {
             return Ok(Vec::new());
         }
-        let reader = self.source.open()?;
-        let mut builder =
-            ParquetRecordBatchReaderBuilder::new_with_metadata(reader, self.meta.clone());
-
-        if let Some(cols) = columns {
-            let mask = ProjectionMask::roots(
-                builder.parquet_schema(),
-                cols.iter().copied(),
-            );
-            builder = builder.with_projection(mask);
+        if let Some(&last) = rows_sorted.last() {
+            if last as u64 >= self.total_rows() {
+                return Err(format!(
+                    "row {last} out of range ({} total)",
+                    self.total_rows()
+                ));
+            }
         }
+        let base = self.base_fields();
+        let cols: Vec<usize> = match columns {
+            Some(c) => {
+                let mut c = c.to_vec();
+                c.sort_unstable();
+                c.dedup();
+                c
+            }
+            None => (0..self.schema.fields().len()).collect(),
+        };
+        let real: Vec<usize> = cols.iter().copied().filter(|&i| i < base).collect();
+        let virt: Vec<usize> = cols.iter().copied().filter(|&i| i >= base).collect();
+        let out_schema = Arc::new(
+            self.schema
+                .project(&cols)
+                .map_err(|e| format!("projection: {e}"))?,
+        );
+
+        let mut out: Vec<RecordBatch> = Vec::new();
+        for (fi, frag) in self.fragments.iter().enumerate() {
+            let end = self
+                .fragments
+                .get(fi + 1)
+                .map(|f| f.row_offset)
+                .unwrap_or_else(|| self.total_rows());
+            let lo = rows_sorted.partition_point(|&r| (r as u64) < frag.row_offset);
+            let hi = rows_sorted.partition_point(|&r| (r as u64) < end);
+            if lo == hi {
+                continue;
+            }
+            let local: Vec<u32> = rows_sorted[lo..hi]
+                .iter()
+                .map(|&r| (r as u64 - frag.row_offset) as u32)
+                .collect();
+            let batches = self.fetch_from_fragment(fi, &local, &real)?;
+            for b in batches {
+                if virt.is_empty() && self.part_cols.is_empty() {
+                    out.push(b);
+                    continue;
+                }
+                let mut arrays: Vec<ArrayRef> = b.columns().to_vec();
+                for &v in &virt {
+                    let val = frag.part_values.get(v - base).and_then(|o| o.as_deref());
+                    arrays.push(Arc::new(StringArray::from(vec![val; b.num_rows()])));
+                }
+                let opts = RecordBatchOptions::new().with_row_count(Some(b.num_rows()));
+                out.push(
+                    RecordBatch::try_new_with_options(Arc::clone(&out_schema), arrays, &opts)
+                        .map_err(|e| format!("batch assembly: {e}"))?,
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetch rows of one fragment (fragment-local sorted row indices),
+    /// reading only the given base columns. `real` empty = no file read;
+    /// batches carry a row count only.
+    fn fetch_from_fragment(
+        &self,
+        fi: usize,
+        local_rows: &[u32],
+        real: &[usize],
+    ) -> Result<Vec<RecordBatch>, String> {
+        let frag = &self.fragments[fi];
+        if real.is_empty() {
+            // Virtual/part-only fetch: no file IO, just the row count.
+            let opts = RecordBatchOptions::new().with_row_count(Some(local_rows.len()));
+            let empty = Arc::new(Schema::empty());
+            return RecordBatch::try_new_with_options(empty, vec![], &opts)
+                .map(|b| vec![b])
+                .map_err(|e| format!("batch assembly: {e}"));
+        }
+
+        // Local row-group boundaries of this fragment.
+        let g_start = |g: usize| self.rg_starts[frag.rg_offset + g] - frag.row_offset;
+        let g_rows = |g: usize| self.rg_rows[frag.rg_offset + g];
 
         // Choose row groups and build a RowSelection relative to their
         // concatenation.
         let mut groups: Vec<usize> = Vec::new();
-        let mut group_offsets: Vec<u64> = Vec::new(); // start of group within chosen concat
+        let mut group_offsets: Vec<u64> = Vec::new();
         let mut chosen_rows = 0u64;
         let mut selectors: Vec<RowSelector> = Vec::new();
         let mut pos = 0u64;
-
-        for &row in rows_sorted {
+        for &row in local_rows {
             let row = row as u64;
-            if row >= self.total_rows() {
-                return Err(format!(
-                    "row {row} out of range ({} total)",
-                    self.total_rows()
-                ));
-            }
-            let g = match self.rg_starts.binary_search(&row) {
+            let global = row + frag.row_offset;
+            let g = match self.rg_starts.binary_search(&global) {
                 Ok(i) => i,
                 Err(i) => i - 1,
-            };
+            } - frag.rg_offset;
             if groups.last() != Some(&g) {
                 groups.push(g);
                 group_offsets.push(chosen_rows);
-                chosen_rows += self.rg_rows[g];
+                chosen_rows += g_rows(g);
             }
-            let pos_in_concat = group_offsets[groups.len() - 1] + (row - self.rg_starts[g]);
+            let pos_in_concat = group_offsets[groups.len() - 1] + (row - g_start(g));
             debug_assert!(pos_in_concat >= pos, "rows must be sorted unique");
             if pos_in_concat > pos {
                 selectors.push(RowSelector::skip((pos_in_concat - pos) as usize));
@@ -180,13 +341,17 @@ impl FeatureStore {
             pos = pos_in_concat + 1;
         }
 
+        let reader = frag.source.open()?;
+        let mut builder =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(reader, frag.meta.clone());
+        let mask = ProjectionMask::roots(builder.parquet_schema(), real.iter().copied());
+        builder = builder.with_projection(mask);
         let reader = builder
             .with_row_groups(groups)
             .with_row_selection(RowSelection::from(selectors))
-            .with_batch_size(rows_sorted.len().min(8192))
+            .with_batch_size(local_rows.len().min(8192))
             .build()
             .map_err(|e| format!("parquet read error: {e}"))?;
-
         let batches: Result<Vec<_>, _> = reader.collect();
         batches.map_err(|e| format!("parquet decode error: {e}"))
     }
@@ -224,9 +389,105 @@ impl FeatureStore {
     }
 }
 
+/// Open a reader over one row group of one file (the single-file primitive
+/// behind [`FeatureStore::reader_for_group`]).
+fn open_file_group_reader(
+    source: &Source,
+    meta: &ArrowReaderMetadata,
+    group: usize,
+    batch_size: usize,
+    ranges: Option<&[(u32, u32)]>,
+    columns: Option<&[usize]>,
+) -> Result<ParquetRecordBatchReader, String> {
+    let reader = source.open()?;
+    let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(reader, meta.clone())
+        .with_row_groups(vec![group])
+        .with_batch_size(batch_size);
+    if let Some(cols) = columns {
+        let mask = ProjectionMask::roots(builder.parquet_schema(), cols.iter().copied());
+        builder = builder.with_projection(mask);
+    }
+    if let Some(ranges) = ranges {
+        let mut selectors: Vec<RowSelector> = Vec::with_capacity(ranges.len() * 2);
+        let mut pos = 0u32;
+        for &(start, end) in ranges {
+            debug_assert!(start >= pos && end > start, "sorted non-overlapping ranges");
+            if start > pos {
+                selectors.push(RowSelector::skip((start - pos) as usize));
+            }
+            selectors.push(RowSelector::select((end - start) as usize));
+            pos = end;
+        }
+        builder = builder.with_row_selection(RowSelection::from(selectors));
+    }
+    builder
+        .build()
+        .map_err(|e| format!("parquet read error: {e}"))
+}
+
+/// Hive path parsing: `key=value` directory segments of a relative path.
+/// Values are percent-decoded; the Hive NULL sentinel maps to None.
+pub fn hive_segments(rel: &std::path::Path) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    let n = rel.components().count();
+    for (i, c) in rel.components().enumerate() {
+        if i + 1 == n {
+            break; // the file name itself
+        }
+        let seg = c.as_os_str().to_string_lossy();
+        let Some((k, v)) = seg.split_once('=') else {
+            continue;
+        };
+        if k.is_empty() {
+            continue;
+        }
+        let value = if v == super::partition::NULL_PARTITION {
+            None
+        } else {
+            Some(percent_decode(v))
+        };
+        out.push((k.to_string(), value));
+    }
+    out
+}
+
+fn percent_decode(v: &str) -> String {
+    let b = v.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(byte) = u8::from_str_radix(&v[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hive_segment_parsing() {
+        let segs = hive_segments(std::path::Path::new(
+            "state=New%20York/county=__HIVE_DEFAULT_PARTITION__/notakey/part-0.parquet",
+        ));
+        assert_eq!(
+            segs,
+            vec![
+                ("state".to_string(), Some("New York".to_string())),
+                ("county".to_string(), None),
+            ]
+        );
+        // A bare file has no segments.
+        assert!(hive_segments(std::path::Path::new("part-0.parquet")).is_empty());
+    }
 
     /// Validates row-group selection math against a real multi-row-group file.
     #[test]

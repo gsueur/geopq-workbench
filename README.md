@@ -12,10 +12,11 @@ at vsync.
 ## Run
 
 ```bash
-cargo run --release [file.parquet | https://host/file.parquet ...]
+cargo run --release [file.parquet | dataset_dir/ | https://host/file.parquet ...]
 ```
 
-Or drag & drop `.parquet` files onto the window / use **Open…**.
+Or drag & drop `.parquet` files (or a dataset directory) onto the window /
+use **Open…** / **Open folder…**.
 
 Test fixtures (DuckDB spatial) live in `testdata/` but are not committed
 (~600 MB, generated). Rebuild them with:
@@ -36,6 +37,19 @@ Fixture-dependent tests self-skip when the files are absent.
   accessor, with per-row-group bboxes derived from the x/y coordinate
   column statistics when no covering/geo stats exist. Files without `geo`
   metadata fall back to a guessed WKB column + CRS84.
+- **Hive-partitioned datasets as one layer**: open a directory (File →
+  Open folder…, drag & drop, or a CLI argument) holding a multi-file
+  GeoParquet dataset — including this viewer's own partitioned exports and
+  Overture-style `key=value` layouts. All files present as a single layer
+  with one global row-group space, so viewport pruning, refinement,
+  picking, layer filters and the SQL console work unchanged across file
+  boundaries. Hive path keys (`state=MA/…`) become virtual nullable Utf8
+  columns: visible in the info and feature panels, queryable and groupable
+  in SQL. Equality filters on them (`where state = 'MA'`) prune whole
+  files before any IO, and partition-column-only projections are answered
+  from metadata without touching the files. Files lacking per-row-group
+  bboxes fall back to their file-level `geo` bbox for pruning. All files
+  must share schema, CRS and geometry encoding.
 - **File info panel**: per-layer Info button — detected GeoParquet version,
   encoding, CRS, metadata bbox, covering/edges, column types + compression,
   row-group layout, raw `geo` JSON with copy.
@@ -229,7 +243,8 @@ deep zoom stays jitter-free.
 
 - Overview/pyramid levels for zoomed-out views of huge remote files (a
   remote open at world zoom legitimately downloads everything today)
-- Load a hive-partitioned dataset directory back as a single layer
+- Remote hive datasets (s3:// / https:// prefix listing; local dirs work)
+- Optimize over a multi-file dataset (single files only today)
 - Streaming (external-sort) optimize for files beyond the 8 GB in-memory cap
 - Page-index (footer-only) pruning for 2.0 native-stats files without a
   covering column (per-feature selection needs the bbox column today)

@@ -221,24 +221,15 @@ pub fn complement_ranges(ranges: &[(u32, u32)], len: u32) -> Vec<(u32, u32)> {
 /// features intersecting `rect`. None when the file has no usable covering
 /// column (caller falls back to the whole group).
 pub(crate) fn covering_select(
-    source: &Source,
-    meta: &ArrowReaderMetadata,
-    covering: Option<&CoveringCol>,
+    store: &FeatureStore,
     group: u32,
     rect: [f64; 4],
 ) -> Result<Option<Vec<(u32, u32)>>, String> {
     use arrow::array::{Array, Float64Array, StructArray};
-    let Some(cov) = covering else {
+    let Some(cov) = &store.covering else {
         return Ok(None);
     };
-    let reader = FeatureStore::open_reader_for_group(
-        source,
-        meta,
-        group as usize,
-        BATCH_SIZE,
-        None,
-        Some(&[cov.root]),
-    )?;
+    let reader = store.reader_for_group(group as usize, BATCH_SIZE, None, Some(&[cov.root]))?;
     let mut rows: Vec<u32> = Vec::new();
     let mut row = 0u32;
     for res in reader {
@@ -542,7 +533,256 @@ type StoreOpen = (
     Option<(String, Vec<[f64; 4]>)>,
 );
 
+/// One file's parsed metadata (no data read).
+struct FileOpen {
+    meta: ArrowReaderMetadata,
+    schema: arrow::datatypes::SchemaRef,
+    crs: Crs,
+    encoding: GeomEncoding,
+    geom_col: usize,
+    covering: Option<CoveringCol>,
+    rg_rows: Vec<u64>,
+    rg_boxes: Option<(String, Vec<[f64; 4]>)>,
+    info: FileInfo,
+}
+
 fn open_store(source: &Source) -> Result<StoreOpen, String> {
+    if let Source::Dir(dir) = source {
+        return open_dir_store(source, dir);
+    }
+    let f = open_file(source)?;
+    Ok((
+        FeatureStore::new(
+            source.clone(),
+            f.meta,
+            f.geom_col,
+            f.schema,
+            f.covering,
+            f.encoding,
+            f.rg_rows,
+        ),
+        f.crs,
+        f.info,
+        f.rg_boxes,
+    ))
+}
+
+/// All parquet files under a dataset directory, in stable path order.
+/// Hidden and sidecar entries (`.`/`_` prefixes, e.g. `_metadata`,
+/// `_SUCCESS`) are skipped.
+fn list_dataset_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        entries.sort();
+        for p in entries {
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if name.starts_with('.') || name.starts_with('_') {
+                continue;
+            }
+            if p.is_dir() {
+                walk(&p, out)?;
+            } else if matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("parquet" | "geoparquet" | "pq")
+            ) {
+                out.push(p);
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(dir, &mut out)?;
+    Ok(out)
+}
+
+/// Open a directory of (possibly hive-partitioned) GeoParquet files as one
+/// multi-fragment store. All files must share the schema, CRS, geometry
+/// column and encoding; hive `key=value` path segments become virtual
+/// partition columns.
+fn open_dir_store(source: &Source, dir: &std::path::Path) -> Result<StoreOpen, String> {
+    use super::store::{hive_segments, Fragment};
+
+    let files = list_dataset_files(dir)?;
+    if files.is_empty() {
+        return Err(format!("no .parquet files under {}", dir.display()));
+    }
+
+    // Hive keys, in first-appearance order across all paths.
+    let hive: Vec<Vec<(String, Option<String>)>> = files
+        .iter()
+        .map(|p| hive_segments(p.strip_prefix(dir).unwrap_or(p)))
+        .collect();
+    let mut part_cols: Vec<String> = Vec::new();
+    for segs in &hive {
+        for (k, _) in segs {
+            if !part_cols.iter().any(|c| c == k) {
+                part_cols.push(k.clone());
+            }
+        }
+    }
+
+    let short = |p: &std::path::Path| -> String {
+        p.strip_prefix(dir).unwrap_or(p).display().to_string()
+    };
+    let first = open_file(&Source::Local(files[0].clone()))
+        .map_err(|e| format!("{}: {e}", short(&files[0])))?;
+    // A hive key shadowed by a real column stays path-only.
+    part_cols.retain(|k| {
+        !first
+            .schema
+            .fields()
+            .iter()
+            .any(|f| f.name().eq_ignore_ascii_case(k))
+    });
+
+    let mut frags: Vec<(Fragment, Vec<u64>)> = Vec::with_capacity(files.len());
+    let mut boxes: Option<Vec<[f64; 4]>> = Some(Vec::new());
+    let mut box_source: Option<String> = None;
+    let mut info = first.info.clone();
+    info.files = files.len();
+    let mut total_rows = 0u64;
+
+    for (i, path) in files.iter().enumerate() {
+        let src = Source::Local(path.clone());
+        let f = if i == 0 {
+            // Reuse the already parsed first file (moved below).
+            None
+        } else {
+            Some(open_file(&src).map_err(|e| format!("{}: {e}", short(path)))?)
+        };
+        let f = match &f {
+            Some(f) => f,
+            None => &first,
+        };
+        if i > 0 {
+            schema_compatible(&first.schema, &f.schema)
+                .map_err(|e| format!("{}: {e}", short(path)))?;
+            if !f.crs.same_as(&first.crs) {
+                return Err(format!(
+                    "{}: CRS '{}' differs from the dataset's '{}'",
+                    short(path),
+                    f.crs.name,
+                    first.crs.name
+                ));
+            }
+            if f.encoding != first.encoding || f.geom_col != first.geom_col {
+                return Err(format!(
+                    "{}: geometry column/encoding differs from the dataset's",
+                    short(path)
+                ));
+            }
+            info.file_size += f.info.file_size;
+            info.rows += f.info.rows;
+            info.row_groups += f.info.row_groups;
+            info.rg_rows_min = info.rg_rows_min.min(f.info.rg_rows_min);
+            info.rg_rows_max = info.rg_rows_max.max(f.info.rg_rows_max);
+            info.compressed_bytes += f.info.compressed_bytes;
+            info.uncompressed_bytes += f.info.uncompressed_bytes;
+        }
+        total_rows += f.rg_rows.iter().sum::<u64>();
+
+        // Per-fragment row-group boxes; a file-level bbox from the geo
+        // metadata is a valid (coarse) fallback for all its groups.
+        if let Some(all) = &mut boxes {
+            match (&f.rg_boxes, f.info.geo.bbox) {
+                (Some((src_label, b)), _) => {
+                    all.extend_from_slice(b);
+                    if box_source.is_none() {
+                        box_source = Some(src_label.clone());
+                    }
+                }
+                (None, Some(b)) => {
+                    all.extend(std::iter::repeat_n(b, f.rg_rows.len()));
+                    if box_source.is_none() {
+                        box_source = Some("file-level geo bbox".into());
+                    }
+                }
+                (None, None) => boxes = None,
+            }
+        }
+
+        let part_values: Vec<Option<String>> = part_cols
+            .iter()
+            .map(|k| {
+                hive[i]
+                    .iter()
+                    .find(|(sk, _)| sk == k)
+                    .and_then(|(_, v)| v.clone())
+            })
+            .collect();
+        frags.push((
+            Fragment {
+                source: src,
+                meta: f.meta.clone(),
+                part_values,
+                rg_offset: 0,
+                row_offset: 0,
+            },
+            f.rg_rows.clone(),
+        ));
+    }
+    if total_rows >= u32::MAX as u64 {
+        return Err(format!(
+            "dataset has {total_rows} rows; max supported is {}",
+            u32::MAX - 1
+        ));
+    }
+    for k in &part_cols {
+        info.columns.push(ColumnInfo {
+            name: k.clone(),
+            arrow_type: "Utf8".into(),
+            compression: "(hive path)".into(),
+            logical: None,
+            is_geometry: false,
+        });
+    }
+
+    let rg_boxes = boxes
+        .filter(|b| !b.is_empty())
+        .map(|b| (box_source.unwrap_or_else(|| "mixed".into()), b));
+    let store = FeatureStore::from_fragments(
+        source.clone(),
+        frags,
+        part_cols,
+        first.geom_col,
+        first.schema,
+        first.covering,
+        first.encoding,
+    );
+    Ok((store, first.crs, info, rg_boxes))
+}
+
+/// Field-by-field schema equality (names and types; nullability may vary).
+fn schema_compatible(
+    base: &arrow::datatypes::SchemaRef,
+    other: &arrow::datatypes::SchemaRef,
+) -> Result<(), String> {
+    if base.fields().len() != other.fields().len() {
+        return Err(format!(
+            "schema has {} columns, dataset has {}",
+            other.fields().len(),
+            base.fields().len()
+        ));
+    }
+    for (a, b) in base.fields().iter().zip(other.fields()) {
+        if a.name() != b.name() || a.data_type() != b.data_type() {
+            return Err(format!(
+                "column '{}: {}' does not match the dataset's '{}: {}'",
+                b.name(),
+                b.data_type(),
+                a.name(),
+                a.data_type()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn open_file(source: &Source) -> Result<FileOpen, String> {
     // Load the footer exactly once (with the page index when present);
     // every reader over this file reuses it.
     let reader = source.open()?;
@@ -681,26 +921,24 @@ fn open_store(source: &Source) -> Result<StoreOpen, String> {
         uncompressed_bytes,
         columns,
         geo: summarize_geo_meta(geo_meta.as_ref(), &geom_name, &crs.name, has_native_geometry),
+        files: 1,
     };
 
-    let rg_meta_boxes =
+    let rg_boxes =
         rg_bboxes_from_metadata(&builder, geo_meta.as_ref(), geom_leaf, &geom_name, encoding);
     let covering = covering_column(geo_meta.as_ref(), &geom_name, &schema);
 
-    Ok((
-        FeatureStore::new(
-            source.clone(),
-            arrow_meta,
-            geom_col,
-            schema,
-            covering,
-            encoding,
-            rg_rows,
-        ),
+    Ok(FileOpen {
+        meta: arrow_meta,
+        schema,
         crs,
+        encoding,
+        geom_col,
+        covering,
+        rg_rows,
+        rg_boxes,
         info,
-        rg_meta_boxes,
-    ))
+    })
 }
 
 /// Resolve the GeoParquet 1.1 covering bbox column: a single root struct
@@ -931,9 +1169,6 @@ fn build_geometry(
         .max(1);
     let done = AtomicUsize::new(0);
 
-    let source = store.source.clone();
-    let arrow_meta = store.meta.clone();
-    let covering = store.covering.clone();
     let encoding = store.encoding;
     let err_ref = &stream_error;
     let resolved_ref = &resolved;
@@ -950,7 +1185,7 @@ fn build_geometry(
             GroupSel::All(_) => (None, GroupLoad::Full),
             GroupSel::Ranges(_, r) => (Some(r.clone()), GroupLoad::Full),
             GroupSel::Rect(_, rect) => {
-                match covering_select(&source, &arrow_meta, covering.as_ref(), g, *rect) {
+                match covering_select(store, g, *rect) {
                     Ok(Some(r)) if r == [(0, group_rows)] => (None, GroupLoad::Full),
                     Ok(Some(r)) => (
                         Some(r.clone()),
@@ -980,9 +1215,7 @@ fn build_geometry(
         let reader = if empty {
             None
         } else {
-            match FeatureStore::open_reader_for_group(
-                &source,
-                &arrow_meta,
+            match store.reader_for_group(
                 g as usize,
                 BATCH_SIZE,
                 ranges.as_deref(),
@@ -1832,5 +2065,169 @@ mod pruning_tests {
             rows_to_ranges([1u32, 2, 3, 7, 9, 10].into_iter()),
             vec![(1, 4), (7, 8), (9, 11)]
         );
+    }
+}
+
+#[cfg(test)]
+mod hive_tests {
+    use super::*;
+    use arrow::array::{BinaryArray, Int64Array, StringArray};
+    use arrow::datatypes::{Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use std::fs::File;
+
+    fn wkb_point(x: f64, y: f64) -> Vec<u8> {
+        let mut b = vec![1u8];
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&x.to_le_bytes());
+        b.extend_from_slice(&y.to_le_bytes());
+        b
+    }
+
+    /// One hive fragment: `n` points clustered at (cx, cy), ids from `id0`,
+    /// small row groups, file-level geo bbox (no covering column).
+    fn write_part(path: &std::path::Path, n: usize, id0: i64, cx: f64, cy: f64) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let geo = serde_json::json!({
+            "version": "1.0.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {
+                "encoding": "WKB",
+                "geometry_types": ["Point"],
+                "bbox": [cx - 1.0, cy - 1.0, cx + 1.0, cy + 1.0],
+            }},
+        });
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let wkbs: Vec<Vec<u8>> = (0..n)
+            .map(|i| wkb_point(cx + (i % 10) as f64 * 0.01, cy + (i / 10) as f64 * 0.01))
+            .collect();
+        let ids: Vec<i64> = (0..n as i64).map(|i| id0 + i).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(wkbs.iter())),
+                Arc::new(Int64Array::from(ids)),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder().set_max_row_group_row_count(Some(128)).build();
+        let mut w = ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(props)).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    #[test]
+    fn hive_dataset_loads_as_single_layer() {
+        let root = std::env::temp_dir().join("geopq_hive_open");
+        let _ = std::fs::remove_dir_all(&root);
+        // Path sort order: __HIVE... < east < west, so global rows follow.
+        write_part(
+            &root.join("state=__HIVE_DEFAULT_PARTITION__/part-0.parquet"),
+            100, 0, 0.0, 0.0,
+        );
+        write_part(&root.join("state=east/part-0.parquet"), 300, 100, 10.0, 45.0);
+        write_part(&root.join("state=west/part-0.parquet"), 200, 400, -10.0, 45.0);
+        // Sidecars and hidden files must be ignored.
+        std::fs::write(root.join("_SUCCESS"), b"").unwrap();
+        std::fs::write(root.join(".hidden.parquet"), b"junk").unwrap();
+
+        let (store, crs, info, rg_meta) = open_store(&Source::Dir(root.clone())).unwrap();
+        assert!(crs.is_latlong);
+        assert_eq!(store.fragments.len(), 3);
+        assert_eq!(store.total_rows(), 600);
+        assert_eq!(store.part_cols, vec!["state".to_string()]);
+        assert_eq!(info.files, 3);
+        let state_idx = store.schema.index_of("state").unwrap();
+        assert_eq!(store.schema.field(state_idx).data_type(), &DataType::Utf8);
+
+        // File-level geo bboxes back the per-group pruning boxes.
+        let (label, boxes) = rg_meta.expect("bbox fallback from geo metadata");
+        assert_eq!(boxes.len(), store.rg_starts().len() - 1);
+        assert!(label.contains("bbox"), "{label}");
+
+        // Fetches cross file boundaries; partition values are injected,
+        // with NULL for the Hive default partition.
+        let id_idx = store.schema.index_of("id").unwrap();
+        let rows = [0u32, 99, 100, 399, 400, 599];
+        let batches = store.fetch(&rows, Some(&[id_idx, state_idx])).unwrap();
+        let (mut ids, mut states): (Vec<i64>, Vec<Option<String>>) = (vec![], vec![]);
+        for b in &batches {
+            let idc = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let st = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..b.num_rows() {
+                ids.push(idc.value(i));
+                states.push((!st.is_null(i)).then(|| st.value(i).to_string()));
+            }
+        }
+        assert_eq!(ids, vec![0, 99, 100, 399, 400, 599]);
+        assert_eq!(
+            states,
+            vec![
+                None,
+                None,
+                Some("east".into()),
+                Some("east".into()),
+                Some("west".into()),
+                Some("west".into()),
+            ]
+        );
+
+        // Full-row fetch (attribute panel) exposes the partition value.
+        let row = store.fetch_row(150).unwrap();
+        let st = row
+            .column(row.schema().index_of("state").unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        assert_eq!(st.value(0), "east");
+
+        // Geometry decodes across the whole global row space.
+        let geoms = store.fetch_geoms(&rows).unwrap();
+        assert!(geoms.iter().all(|(_, g)| g.is_some()));
+
+        // SQL: the partition column is queryable, filterable and groupable.
+        use crate::sql::engine::{run_query_for_test, SqlLayer};
+        let layers = vec![SqlLayer {
+            table: "t".into(),
+            store: Arc::new(store),
+            crs,
+            rg_bboxes: Some(Arc::new(boxes)),
+        }];
+        let count = |q: &str| -> i64 {
+            let out = run_query_for_test(q, &layers).unwrap();
+            out.batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(count("select count(*) from t"), 600);
+        assert_eq!(count("select count(*) from t where state = 'east'"), 300);
+        assert_eq!(count("select count(*) from t where state is null"), 100);
+        assert_eq!(count("select count(distinct id) from t"), 600);
+        // Spatial pushdown through the file-level bbox fallback.
+        assert_eq!(
+            count(
+                "select count(*) from t \
+                 where st_intersects(geometry, st_makeenvelope(5, 40, 15, 50))"
+            ),
+            300
+        );
+        // Partition-column-only projection (no file columns read at all).
+        let out = run_query_for_test("select state from t", &layers).unwrap();
+        assert_eq!(out.total_rows, 600);
+        let out =
+            run_query_for_test("select state, count(*) c from t group by state", &layers).unwrap();
+        assert_eq!(out.total_rows, 3);
     }
 }

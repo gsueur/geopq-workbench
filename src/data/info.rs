@@ -48,6 +48,8 @@ pub struct FileInfo {
     pub uncompressed_bytes: u64,
     pub columns: Vec<ColumnInfo>,
     pub geo: GeoParquetInfo,
+    /// Files in the dataset (1 for a plain file, N for a directory).
+    pub files: usize,
 }
 
 pub fn fmt_bytes(b: u64) -> String {

@@ -117,6 +117,15 @@ impl LayerTable {
     fn geom_name(&self) -> &str {
         self.schema.field(self.store.geom_col).name()
     }
+
+    /// Table-schema names of the virtual hive partition columns (they sit
+    /// right after the base fields, before the row-index column).
+    fn part_field_names(&self) -> Vec<String> {
+        let base = self.store.base_fields();
+        (0..self.store.part_cols.len())
+            .map(|k| self.schema.field(base + k).name().clone())
+            .collect()
+    }
 }
 
 impl fmt::Debug for LayerTable {
@@ -139,10 +148,13 @@ impl TableProvider for LayerTable {
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
+        let part_names = self.part_field_names();
         Ok(filters
             .iter()
             .map(|f| {
-                if filter_bbox(f, self.geom_name()).is_some() {
+                let mut eq = Vec::new();
+                part_eq_constraints(f, &part_names, &mut eq);
+                if filter_bbox(f, self.geom_name()).is_some() || !eq.is_empty() {
                     // We only prune candidates; the exact predicate must
                     // still run on the surviving rows.
                     TableProviderFilterPushDown::Inexact
@@ -167,12 +179,14 @@ impl TableProvider for LayerTable {
         let out_schema = Arc::new(self.schema.project(&projection)?);
 
         // Columns are decoded in file order whatever the requested order;
-        // remember where each output column comes from — the decoded batch
-        // or the synthetic row-index (not a file column).
+        // remember where each output column comes from — the decoded batch,
+        // a hive partition value, or the synthetic row-index (the latter
+        // two are not file columns).
+        let base = self.store.base_fields();
         let mut read_cols: Vec<usize> = projection
             .iter()
             .copied()
-            .filter(|p| Some(*p) != self.row_index_field)
+            .filter(|&p| p < base)
             .collect();
         read_cols.sort_unstable();
         read_cols.dedup();
@@ -181,6 +195,8 @@ impl TableProvider for LayerTable {
             .map(|p| {
                 if Some(*p) == self.row_index_field {
                     ColSrc::RowIndex
+                } else if *p >= base {
+                    ColSrc::Part(*p - base)
                 } else {
                     ColSrc::Read(read_cols.binary_search(p).expect("projected col present"))
                 }
@@ -200,6 +216,19 @@ impl TableProvider for LayerTable {
             .filter_map(|f| filter_bbox(f, self.geom_name()))
             .reduce(|a, b| [a[0].max(b[0]), a[1].max(b[1]), a[2].min(b[2]), a[3].min(b[3])]);
 
+        // Hive partition pruning: equality constraints on partition
+        // columns skip whole files' row groups before any IO.
+        let part_names = self.part_field_names();
+        let mut part_eq: Vec<(usize, String)> = Vec::new();
+        for f in filters {
+            part_eq_constraints(f, &part_names, &mut part_eq);
+        }
+        let group_kept = |g: usize| {
+            part_eq
+                .iter()
+                .all(|(k, v)| self.store.part_value(g, *k) == Some(v.as_str()))
+        };
+
         let parts: Vec<GroupPart> = match bbox {
             Some(r) if r[0] <= r[2] && r[1] <= r[3] => {
                 let groups: Vec<u32> = match &self.rg_bboxes {
@@ -208,14 +237,9 @@ impl TableProvider for LayerTable {
                 };
                 groups
                     .into_iter()
+                    .filter(|&g| group_kept(g as usize))
                     .filter_map(|g| {
-                        match covering_select(
-                            &self.store.source,
-                            &self.store.meta,
-                            self.store.covering.as_ref(),
-                            g,
-                            r,
-                        ) {
+                        match covering_select(&self.store, g, r) {
                             Ok(Some(ranges)) if ranges.is_empty() => None, // no rows hit
                             Ok(ranges) => Some(Ok(GroupPart {
                                 group: g as usize,
@@ -229,6 +253,7 @@ impl TableProvider for LayerTable {
             // Contradictory bbox (empty intersection): scan nothing.
             Some(_) => Vec::new(),
             None => (0..n_groups)
+                .filter(|&g| group_kept(g))
                 .map(|g| GroupPart {
                     group: g,
                     ranges: None,
@@ -322,12 +347,40 @@ fn literal_geom_bbox(expr: &Expr) -> Option<[f64; 4]> {
     Some([r.min().x, r.min().y, r.max().x, r.max().y])
 }
 
+/// Equality constraints on hive partition columns implied by a filter:
+/// `col = 'literal'` conjuncts (both orders), recursing through AND.
+/// Anything else (OR, NOT, ...) contributes nothing — pruning must only
+/// ever use constraints the whole filter requires.
+fn part_eq_constraints(expr: &Expr, part_names: &[String], out: &mut Vec<(usize, String)>) {
+    match expr {
+        Expr::BinaryExpr(b) if b.op == datafusion::logical_expr::Operator::And => {
+            part_eq_constraints(&b.left, part_names, out);
+            part_eq_constraints(&b.right, part_names, out);
+        }
+        Expr::BinaryExpr(b) if b.op == datafusion::logical_expr::Operator::Eq => {
+            let col_lit = |a: &Expr, b: &Expr| -> Option<(usize, String)> {
+                let (Expr::Column(c), Expr::Literal(ScalarValue::Utf8(Some(v)), _)) = (a, b)
+                else {
+                    return None;
+                };
+                part_names.iter().position(|n| *n == c.name).map(|k| (k, v.clone()))
+            };
+            if let Some(c) = col_lit(&b.left, &b.right).or_else(|| col_lit(&b.right, &b.left)) {
+                out.push(c);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Physical scan: partition N streams row group N from the store.
 /// Where one output column comes from.
 #[derive(Clone, Copy, Debug)]
 enum ColSrc {
     /// Position in the decoded parquet batch.
     Read(usize),
+    /// Hive partition column `k`: constant per row group's fragment.
+    Part(usize),
     /// The synthetic global row index.
     RowIndex,
 }
@@ -402,6 +455,7 @@ impl ExecutionPlan for LayerScanExec {
             done: false,
             sel_cursor: (0, 0),
             consumed: 0,
+            synth_left: None,
         };
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.out_schema),
@@ -427,6 +481,8 @@ struct GroupIter {
     sel_cursor: (usize, u32),
     /// Rows emitted so far (contiguous case).
     consumed: u32,
+    /// Remaining rows to synthesize when no file columns are projected.
+    synth_left: Option<usize>,
 }
 
 impl GroupIter {
@@ -477,35 +533,56 @@ impl GroupIter {
         if part.group >= self.store.rg_starts().len().saturating_sub(1) {
             return Ok(None);
         }
-        if self.reader.is_none() {
-            self.reader = Some(FeatureStore::open_reader_for_group(
-                &self.store.source,
-                &self.store.meta,
-                part.group,
-                BATCH_SIZE,
-                part.ranges.as_deref(),
-                Some(&self.read_cols),
-            )?);
-        }
-        let Some(batch) = self.reader.as_mut().unwrap().next() else {
-            return Ok(None);
-        };
-        let batch = batch.map_err(|e| format!("parquet decode error: {e}"))?;
+        let group = part.group;
 
-        let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
-        if let Some(gi) = self.geom_read_idx {
-            cols[gi] = normalize_geometry(cols[gi].as_ref(), self.store.encoding)?;
-        }
+        // Nothing to read from the file (partition / row-index columns
+        // only): emit batches straight from the known row counts.
+        let (n_rows, cols): (usize, Vec<ArrayRef>) = if self.read_cols.is_empty() {
+            let left = *self.synth_left.get_or_insert_with(|| {
+                match &part.ranges {
+                    Some(r) => r.iter().map(|&(s, e)| (e - s) as usize).sum(),
+                    None => {
+                        let starts = self.store.rg_starts();
+                        (starts[group + 1] - starts[group]) as usize
+                    }
+                }
+            });
+            if left == 0 {
+                return Ok(None);
+            }
+            let n = left.min(BATCH_SIZE);
+            self.synth_left = Some(left - n);
+            (n, Vec::new())
+        } else {
+            if self.reader.is_none() {
+                self.reader = Some(self.store.reader_for_group(
+                    group,
+                    BATCH_SIZE,
+                    part.ranges.as_deref(),
+                    Some(&self.read_cols),
+                )?);
+            }
+            let Some(batch) = self.reader.as_mut().unwrap().next() else {
+                return Ok(None);
+            };
+            let batch = batch.map_err(|e| format!("parquet decode error: {e}"))?;
+            let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
+            if let Some(gi) = self.geom_read_idx {
+                cols[gi] = normalize_geometry(cols[gi].as_ref(), self.store.encoding)?;
+            }
+            (batch.num_rows(), cols)
+        };
+
         let needs_row_index = self
             .reorder
             .iter()
             .any(|s| matches!(s, ColSrc::RowIndex));
         let row_index: Option<ArrayRef> = if needs_row_index {
             Some(Arc::new(arrow::array::UInt32Array::from(
-                self.take_positions(batch.num_rows()),
+                self.take_positions(n_rows),
             )))
         } else {
-            self.advance_positions(batch.num_rows());
+            self.advance_positions(n_rows);
             None
         };
         let out_cols: Vec<ArrayRef> = self
@@ -513,11 +590,15 @@ impl GroupIter {
             .iter()
             .map(|src| match src {
                 ColSrc::Read(i) => Arc::clone(&cols[*i]),
+                ColSrc::Part(k) => {
+                    let v = self.store.part_value(group, *k);
+                    Arc::new(arrow::array::StringArray::from(vec![v; n_rows])) as ArrayRef
+                }
                 ColSrc::RowIndex => Arc::clone(row_index.as_ref().expect("built above")),
             })
             .collect();
         let opts = arrow::record_batch::RecordBatchOptions::new()
-            .with_row_count(Some(batch.num_rows()));
+            .with_row_count(Some(n_rows));
         RecordBatch::try_new_with_options(Arc::clone(&self.out_schema), out_cols, &opts)
             .map(Some)
             .map_err(|e| format!("batch shape error: {e}"))

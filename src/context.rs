@@ -45,6 +45,10 @@ pub enum SourceCtx {
     Local {
         path: String,
     },
+    /// A hive-partitioned dataset directory.
+    Dir {
+        path: String,
+    },
     Remote {
         url: String,
     },
@@ -59,6 +63,9 @@ impl SourceCtx {
     pub fn of(source: &Source) -> Self {
         match source {
             Source::Local(p) => SourceCtx::Local {
+                path: p.display().to_string(),
+            },
+            Source::Dir(p) => SourceCtx::Dir {
                 path: p.display().to_string(),
             },
             Source::Remote { url, .. } => SourceCtx::Remote { url: url.clone() },
@@ -79,6 +86,7 @@ impl SourceCtx {
     pub fn into_source(self) -> Source {
         match self {
             SourceCtx::Local { path } => Source::Local(path.into()),
+            SourceCtx::Dir { path } => Source::Dir(path.into()),
             SourceCtx::Remote { url } => Source::Remote { url, len: 0 },
             SourceCtx::S3 {
                 uri,

@@ -867,6 +867,18 @@ impl ViewerApp {
                         }
                     }
                 }
+                if ui
+                    .button("📂 Open folder…")
+                    .on_hover_text(
+                        "Load a directory of GeoParquet files (hive-partitioned or not) \
+                         as a single layer; key=value path segments become columns",
+                    )
+                    .clicked()
+                {
+                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        self.enqueue_load(Source::Dir(dir), &ctx);
+                    }
+                }
                 if ui.button("🌐 Open URL…").clicked() && self.url_input.is_none() {
                     self.url_input = Some((
                         String::new(),
@@ -1135,13 +1147,17 @@ impl ViewerApp {
                                     if ui.button("Info…").clicked() {
                                         info_open = Some(l.id);
                                     }
+                                    let single = !l.store.is_partitioned();
                                     if ui
-                                        .button("Optimize…")
-                                        .on_hover_text(
+                                        .add_enabled(single, egui::Button::new("Optimize…"))
+                                        .on_hover_text(if single {
                                             "Rewrite as a spatially sorted GeoParquet 1.1 or \
                                              2.0 file (Hilbert order, covering bbox / native \
-                                             geo stats, bloom filters)",
-                                        )
+                                             geo stats, bloom filters)"
+                                        } else {
+                                            "Optimize works on single files; this layer is a \
+                                             multi-file dataset"
+                                        })
                                         .clicked()
                                     {
                                         optimize_open = Some(l.id);
@@ -2269,6 +2285,21 @@ impl ViewerApp {
                             if layer.store.source.is_remote() { "url" } else { "path" },
                             layer.store.source.label(),
                         );
+                        if info.files > 1 {
+                            row(
+                                ui,
+                                "files",
+                                format!(
+                                    "{} (hive keys: {})",
+                                    info.files,
+                                    if layer.store.part_cols.is_empty() {
+                                        "none".to_string()
+                                    } else {
+                                        layer.store.part_cols.join(", ")
+                                    }
+                                ),
+                            );
+                        }
                         row(ui, "file size", fmt_bytes(info.file_size));
                         row(ui, "rows", info.rows.to_string());
                         row(
@@ -2985,7 +3016,8 @@ impl eframe::App for ViewerApp {
                 .collect()
         });
         for p in dropped {
-            self.enqueue_load(Source::Local(p), &ctx);
+            let src = if p.is_dir() { Source::Dir(p) } else { Source::Local(p) };
+            self.enqueue_load(src, &ctx);
         }
 
         egui::Panel::top("menubar").show(ui, |ui| self.menu_bar(ui));

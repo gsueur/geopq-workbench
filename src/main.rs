@@ -25,6 +25,8 @@ fn main() -> eframe::Result {
                     url: String::new(),
                     len: 0,
                 }
+            } else if std::path::Path::new(&a).is_dir() {
+                data::source::Source::Dir(a.into())
             } else {
                 data::source::Source::Local(a.into())
             }
