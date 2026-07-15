@@ -476,9 +476,10 @@ impl SqlConsole {
                             .on_hover_text(&l.name);
                     }
                 });
+            // Selecting a table only targets it — no implicit full-table
+            // query (expensive on large/remote layers); ▶ or Enter runs.
             if picked != self.browse_table {
                 self.browse_table = picked;
-                run = true; // load on select, like TablePlus
             }
 
             ui.label(RichText::new("WHERE").weak().monospace());

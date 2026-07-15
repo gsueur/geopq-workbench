@@ -205,14 +205,31 @@ impl FeatureStore {
             "virtual partition columns cannot be read from files"
         );
         let frag = self.frag_of_group(group);
-        open_file_group_reader(
-            &frag.source,
-            &frag.meta,
-            group - frag.rg_offset,
-            batch_size,
-            ranges,
-            columns,
-        )
+        let local = group - frag.rg_offset;
+        // Remote file without a page index: the reader would stream every
+        // projected column chunk sequentially (one round trip each — SQL
+        // scans over wide remote files never finish that way). Prefetch
+        // the group's projected chunks in a few coalesced range requests
+        // instead. With a page index, per-page fetches are already exact.
+        if frag.source.is_remote() && frag.meta.metadata().offset_index().is_none() {
+            let roots: Vec<usize> = match columns {
+                Some(c) => c.to_vec(),
+                None => (0..self.base_fields()).collect(),
+            };
+            if let Some(cache) =
+                prefetch_columns(frag, &[local], &roots, GROUP_PREFETCH_MAX_BYTES)?
+            {
+                return open_file_group_reader(
+                    cache,
+                    &frag.meta,
+                    local,
+                    batch_size,
+                    ranges,
+                    columns,
+                );
+            }
+        }
+        open_file_group_reader(frag.source.open()?, &frag.meta, local, batch_size, ranges, columns)
     }
 
     /// Fetch specific rows (global row indices, must be sorted and unique).
@@ -345,13 +362,14 @@ impl FeatureStore {
         let selection = RowSelection::from(selectors);
         let batch = local_rows.len().min(8192);
 
-        // Remote sources: without a page index the reader issues one
-        // sequential read per projected column chunk — hundreds of
-        // round trips on wide schemas. Prefetch the needed chunk byte
-        // ranges in a few coalesced range requests and serve the reader
-        // from memory instead.
-        if frag.source.is_remote() {
-            if let Some(cache) = prefetch_columns(frag, &groups, real)? {
+        // Remote sources without a page index: the reader would issue one
+        // sequential read per projected column chunk — hundreds of round
+        // trips on wide schemas. Prefetch the needed chunk byte ranges in
+        // a few coalesced range requests and serve the reader from memory
+        // instead. (With a page index, per-page fetches are already exact
+        // and cheaper for sparse rows.)
+        if frag.source.is_remote() && frag.meta.metadata().offset_index().is_none() {
+            if let Some(cache) = prefetch_columns(frag, &groups, real, PREFETCH_MAX_BYTES)? {
                 return Self::read_selected(cache, frag, &groups, selection, batch, real);
             }
         }
@@ -420,17 +438,21 @@ impl FeatureStore {
 /// Prefetch budget for coalesced remote reads; larger projections fall
 /// back to the streaming per-chunk path.
 const PREFETCH_MAX_BYTES: u64 = 128 * 1024 * 1024;
+/// Tighter per-row-group budget for scan prefetches: several scan
+/// partitions decode concurrently, so the caps multiply.
+const GROUP_PREFETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// Ranges closer than this merge into one request (a gap this size costs
 /// less to download than a fresh round trip).
 const PREFETCH_GAP: u64 = 1024 * 1024;
 
 /// The byte ranges of the projected columns' chunks in the chosen row
 /// groups, fetched with coalesced range requests. None when the plan
-/// exceeds [`PREFETCH_MAX_BYTES`].
+/// exceeds `max_bytes`.
 fn prefetch_columns(
     frag: &Fragment,
     groups: &[usize],
     roots: &[usize],
+    max_bytes: u64,
 ) -> Result<Option<Prefetched>, String> {
     let pmd = frag.meta.metadata();
     // Leaf column -> arrow root index (leaves of one root are adjacent).
@@ -470,7 +492,7 @@ fn prefetch_columns(
         }
     }
     let total: u64 = segments.iter().map(|(_, l)| l).sum();
-    if total > PREFETCH_MAX_BYTES {
+    if total > max_bytes {
         log::debug!("prefetch plan {total} B exceeds budget; streaming instead");
         return Ok(None);
     }
@@ -549,15 +571,14 @@ impl parquet::file::reader::ChunkReader for Prefetched {
 
 /// Open a reader over one row group of one file (the single-file primitive
 /// behind [`FeatureStore::reader_for_group`]).
-fn open_file_group_reader(
-    source: &Source,
+fn open_file_group_reader<R: parquet::file::reader::ChunkReader + 'static>(
+    reader: R,
     meta: &ArrowReaderMetadata,
     group: usize,
     batch_size: usize,
     ranges: Option<&[(u32, u32)]>,
     columns: Option<&[usize]>,
 ) -> Result<ParquetRecordBatchReader, String> {
-    let reader = source.open()?;
     let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(reader, meta.clone())
         .with_row_groups(vec![group])
         .with_batch_size(batch_size);

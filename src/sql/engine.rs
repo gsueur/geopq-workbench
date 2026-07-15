@@ -743,4 +743,44 @@ mod tests {
         let err = run_query("select st_geomfromtext('POINT(banana)')", &layers).unwrap_err();
         assert!(err.contains("invalid WKT"), "{err}");
     }
+
+    /// Live remote query probe, opt-in:
+    /// GEOPQ_QUERY_URI=https://.../roads.parquet \
+    ///   GEOPQ_QUERY_SQL="select count(*) from t where ref='MA 2'" \
+    ///   cargo test --release remote_query_probe -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn remote_query_probe() {
+        let Ok(url) = std::env::var("GEOPQ_QUERY_URI") else {
+            eprintln!("set GEOPQ_QUERY_URI");
+            return;
+        };
+        let sql = std::env::var("GEOPQ_QUERY_SQL")
+            .unwrap_or_else(|_| "select count(*) from t".into());
+        let src = crate::data::source::Source::Remote { url, len: 0 }
+            .resolve()
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        let (store, crs, _info, rg) =
+            crate::data::loader::open_source_for_test(&src).unwrap();
+        eprintln!(
+            "open: {} ms; {} rows, {} groups",
+            t0.elapsed().as_millis(),
+            store.total_rows(),
+            store.rg_starts().len() - 1
+        );
+        let layers = vec![SqlLayer {
+            table: "t".into(),
+            store: Arc::new(store),
+            crs,
+            rg_bboxes: rg.map(|(_, b)| Arc::new(b)),
+        }];
+        let t0 = std::time::Instant::now();
+        let out = run_query(&sql, &layers).unwrap();
+        eprintln!(
+            "query: {} ms, {} rows",
+            t0.elapsed().as_millis(),
+            out.total_rows
+        );
+    }
 }
