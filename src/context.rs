@@ -34,6 +34,9 @@ pub struct Context {
 pub struct LayerCtx {
     pub source: SourceCtx,
     pub style: StyleCtx,
+    /// Persistent layer filter (SQL predicate), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -197,6 +200,7 @@ mod tests {
                         fill_opacity: 0.4,
                         opacity: 0.9,
                     },
+                    filter: Some("status = 'active'".into()),
                 },
                 LayerCtx {
                     source: SourceCtx::S3 {
@@ -205,6 +209,7 @@ mod tests {
                         endpoint: Some("s3.geomermaids.com".into()),
                     },
                     style: StyleCtx::of(&LayerStyle::new(Color32::RED)),
+                    filter: None,
                 },
             ],
         };

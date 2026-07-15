@@ -169,6 +169,17 @@ pub struct VectorLayer {
     pub rg_bboxes: Option<RgBboxes>,
     /// Decode state per row group (len = row groups in the file).
     pub loaded: Vec<GroupLoad>,
+    /// Active layer filter: the persistent working subset. While set,
+    /// `loaded` holds exactly the matching row ranges (with an infinite
+    /// coverage rect, so viewport refinement never adds rows back).
+    pub filter: Option<LayerFilter>,
+}
+
+/// A persistent SQL predicate restricting the layer to a subset of rows.
+#[derive(Clone, Debug)]
+pub struct LayerFilter {
+    pub sql: String,
+    pub matched: usize,
 }
 
 impl VectorLayer {

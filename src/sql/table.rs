@@ -42,25 +42,49 @@ use crate::data::store::FeatureStore;
 
 const BATCH_SIZE: usize = 8192;
 
+/// Synthetic global-row-index column (layer filters resolve SQL matches
+/// back to file rows through it). Name chosen to never collide.
+pub const ROW_INDEX_COL: &str = "___row";
+
 /// A loaded layer registered as a SQL table.
 pub struct LayerTable {
     store: Arc<FeatureStore>,
     /// Table schema: the file's arrow schema with the geometry field
-    /// normalized to nullable `Binary` (WKB).
+    /// normalized to nullable `Binary` (WKB), plus the synthetic
+    /// [`ROW_INDEX_COL`] when requested.
     schema: SchemaRef,
     /// Per-row-group bboxes (data CRS, index-aligned with the file's row
     /// groups) when the layer's metadata provides them; enables group
     /// pruning for pushed-down spatial predicates.
     rg_bboxes: Option<Arc<Vec<[f64; 4]>>>,
+    /// Index of the synthetic row-index field in `schema`, if enabled.
+    row_index_field: Option<usize>,
 }
 
 impl LayerTable {
     pub fn new(store: Arc<FeatureStore>, rg_bboxes: Option<Arc<Vec<[f64; 4]>>>) -> Self {
+        Self::build(store, rg_bboxes, false)
+    }
+
+    /// A table that also exposes [`ROW_INDEX_COL`]: each row's global
+    /// index in the file (for layer filters).
+    pub fn with_row_index(
+        store: Arc<FeatureStore>,
+        rg_bboxes: Option<Arc<Vec<[f64; 4]>>>,
+    ) -> Self {
+        Self::build(store, rg_bboxes, true)
+    }
+
+    fn build(
+        store: Arc<FeatureStore>,
+        rg_bboxes: Option<Arc<Vec<[f64; 4]>>>,
+        row_index: bool,
+    ) -> Self {
         // Column names are lowercased so unquoted SQL identifiers (which
         // DataFusion normalizes to lowercase) match files with uppercase
         // or mixed-case columns; collisions get _2, _3, ... suffixes.
         let mut seen: std::collections::HashMap<String, usize> = Default::default();
-        let fields: Vec<Field> = store
+        let mut fields: Vec<Field> = store
             .schema
             .fields()
             .iter()
@@ -77,11 +101,16 @@ impl LayerTable {
                 }
             })
             .collect();
+        let row_index_field = row_index.then(|| {
+            fields.push(Field::new(ROW_INDEX_COL, DataType::UInt32, false));
+            fields.len() - 1
+        });
         let schema = Arc::new(Schema::new(fields));
         Self {
             store,
             schema,
             rg_bboxes,
+            row_index_field,
         }
     }
 
@@ -138,13 +167,24 @@ impl TableProvider for LayerTable {
         let out_schema = Arc::new(self.schema.project(&projection)?);
 
         // Columns are decoded in file order whatever the requested order;
-        // remember where each output column lands in the decoded batch.
-        let mut read_cols: Vec<usize> = projection.clone();
+        // remember where each output column comes from — the decoded batch
+        // or the synthetic row-index (not a file column).
+        let mut read_cols: Vec<usize> = projection
+            .iter()
+            .copied()
+            .filter(|p| Some(*p) != self.row_index_field)
+            .collect();
         read_cols.sort_unstable();
         read_cols.dedup();
-        let reorder: Vec<usize> = projection
+        let reorder: Vec<ColSrc> = projection
             .iter()
-            .map(|p| read_cols.binary_search(p).expect("projected col present"))
+            .map(|p| {
+                if Some(*p) == self.row_index_field {
+                    ColSrc::RowIndex
+                } else {
+                    ColSrc::Read(read_cols.binary_search(p).expect("projected col present"))
+                }
+            })
             .collect();
         let geom_read_idx = read_cols
             .iter()
@@ -283,13 +323,22 @@ fn literal_geom_bbox(expr: &Expr) -> Option<[f64; 4]> {
 }
 
 /// Physical scan: partition N streams row group N from the store.
+/// Where one output column comes from.
+#[derive(Clone, Copy, Debug)]
+enum ColSrc {
+    /// Position in the decoded parquet batch.
+    Read(usize),
+    /// The synthetic global row index.
+    RowIndex,
+}
+
 struct LayerScanExec {
     store: Arc<FeatureStore>,
     out_schema: SchemaRef,
     /// File-order arrow root indices to decode.
     read_cols: Vec<usize>,
-    /// For each output column, its position in the decoded batch.
-    reorder: Vec<usize>,
+    /// For each output column, where it comes from.
+    reorder: Vec<ColSrc>,
     /// Position of the geometry column in the decoded batch, if projected.
     geom_read_idx: Option<usize>,
     /// Row groups (with optional row ranges) surviving predicate pushdown;
@@ -351,6 +400,8 @@ impl ExecutionPlan for LayerScanExec {
             geom_read_idx: self.geom_read_idx,
             reader: None,
             done: false,
+            sel_cursor: (0, 0),
+            consumed: 0,
         };
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.out_schema),
@@ -368,13 +419,57 @@ struct GroupIter {
     part: Option<GroupPart>,
     out_schema: SchemaRef,
     read_cols: Vec<usize>,
-    reorder: Vec<usize>,
+    reorder: Vec<ColSrc>,
     geom_read_idx: Option<usize>,
     reader: Option<ParquetRecordBatchReader>,
     done: bool,
+    /// Row-index tracking through a range selection: (range idx, offset).
+    sel_cursor: (usize, u32),
+    /// Rows emitted so far (contiguous case).
+    consumed: u32,
 }
 
 impl GroupIter {
+    /// Global row indices of the next `n` emitted rows, advancing the
+    /// cursor: contiguous from the group start, or mapped through the
+    /// row-range selection.
+    fn take_positions(&mut self, n: usize) -> Vec<u32> {
+        let Some(part) = &self.part else {
+            return Vec::new();
+        };
+        let start = self.store.rg_starts()[part.group] as u32;
+        let mut out = Vec::with_capacity(n);
+        match &part.ranges {
+            None => {
+                for i in 0..n as u32 {
+                    out.push(start + self.consumed + i);
+                }
+                self.consumed += n as u32;
+            }
+            Some(ranges) => {
+                let (mut ri, mut off) = self.sel_cursor;
+                while out.len() < n && ri < ranges.len() {
+                    let (s, e) = ranges[ri];
+                    let pos = s + off;
+                    if pos < e {
+                        out.push(start + pos);
+                        off += 1;
+                    } else {
+                        ri += 1;
+                        off = 0;
+                    }
+                }
+                self.sel_cursor = (ri, off);
+            }
+        }
+        out
+    }
+
+    /// Keep the cursor in sync when the row index isn't projected.
+    fn advance_positions(&mut self, n: usize) {
+        let _ = self.take_positions(n);
+    }
+
     fn next_inner(&mut self) -> Result<Option<RecordBatch>, String> {
         let Some(part) = &self.part else {
             return Ok(None);
@@ -401,10 +496,25 @@ impl GroupIter {
         if let Some(gi) = self.geom_read_idx {
             cols[gi] = normalize_geometry(cols[gi].as_ref(), self.store.encoding)?;
         }
+        let needs_row_index = self
+            .reorder
+            .iter()
+            .any(|s| matches!(s, ColSrc::RowIndex));
+        let row_index: Option<ArrayRef> = if needs_row_index {
+            Some(Arc::new(arrow::array::UInt32Array::from(
+                self.take_positions(batch.num_rows()),
+            )))
+        } else {
+            self.advance_positions(batch.num_rows());
+            None
+        };
         let out_cols: Vec<ArrayRef> = self
             .reorder
             .iter()
-            .map(|&i| Arc::clone(&cols[i]))
+            .map(|src| match src {
+                ColSrc::Read(i) => Arc::clone(&cols[*i]),
+                ColSrc::RowIndex => Arc::clone(row_index.as_ref().expect("built above")),
+            })
             .collect();
         let opts = arrow::record_batch::RecordBatchOptions::new()
             .with_row_count(Some(batch.num_rows()));

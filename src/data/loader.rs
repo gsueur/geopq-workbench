@@ -436,6 +436,7 @@ pub fn spawn_load(
                             info,
                             rg_bboxes,
                             loaded,
+                            filter: None,
                         };
                         handle.send(LoadMsg::Loaded {
                             job,
@@ -479,6 +480,8 @@ pub fn spawn_rebuild(
             .filter_map(|(g, st)| match st {
                 GroupLoad::None => None,
                 GroupLoad::Full => Some(GroupSel::All(g as u32)),
+                // Empty ranges: a layer-filter group with no matching rows.
+                GroupLoad::Rows { ranges, .. } if ranges.is_empty() => None,
                 GroupLoad::Rows { ranges, .. } => {
                     Some(GroupSel::Ranges(g as u32, ranges.clone()))
                 }

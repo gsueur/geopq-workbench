@@ -62,7 +62,7 @@ enum Mode {
 
 /// Autocomplete popup state for one text field.
 #[derive(Default)]
-struct AcState {
+pub(crate) struct AcState {
     open: bool,
     items: Vec<String>,
     /// Byte range of the token being completed.
@@ -837,7 +837,7 @@ fn completion_dict(layers: &[VectorLayer], tables: &[String]) -> Vec<String> {
 /// A text edit with a completion popup: candidates from `dict` matching the
 /// identifier under the cursor; Up/Down navigate, Tab/Enter accept, Esc
 /// closes.
-fn autocomplete_edit(
+pub(crate) fn autocomplete_edit(
     ui: &mut egui::Ui,
     id: egui::Id,
     text: &mut String,
@@ -873,9 +873,20 @@ fn autocomplete_edit(
     let output = edit.show(ui);
     let response = output.response.response.clone();
 
-    // Recompute the token under the cursor and the candidate list.
-    ac.open = false;
+    // Recompute the token under the cursor and the candidate list. When
+    // the pointer is over the popup, keep it open even though the click
+    // just defocused the field — otherwise the popup vanishes between
+    // press and release and candidates can never be clicked.
+    let pointer_over_popup = ui
+        .ctx()
+        .memory(|m| m.area_rect(id.with("ac_popup")))
+        .zip(ui.input(|i| i.pointer.latest_pos()))
+        .is_some_and(|(rect, pos)| rect.expand(4.0).contains(pos));
+    if !response.has_focus() && !pointer_over_popup {
+        ac.open = false;
+    }
     if response.has_focus() {
+        ac.open = false;
         if let Some(range) = output.state.cursor.char_range() {
             let cursor_char = range.primary.index.0;
             let chars: Vec<char> = text.chars().collect();

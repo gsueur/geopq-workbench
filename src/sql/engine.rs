@@ -125,6 +125,116 @@ pub fn spawn_export(
         .expect("spawn sql thread");
 }
 
+/// Layer-filter computation result: the file rows matching a predicate,
+/// as group-relative ranges per row group.
+pub struct FilterRows {
+    pub matched: usize,
+    /// Index-aligned with the file's row groups.
+    pub per_group: Vec<Vec<(u32, u32)>>,
+}
+
+pub struct FilterMsg {
+    pub layer_id: u64,
+    pub predicate: String,
+    pub result: Result<FilterRows, String>,
+}
+
+/// Evaluate `predicate` against one layer and report the matching global
+/// rows (background thread). Spatial predicates prune via pushdown, so a
+/// location filter on a huge file only reads the relevant row groups.
+pub fn spawn_row_filter(
+    layer_id: u64,
+    layer: SqlLayer,
+    predicate: String,
+    tx: Sender<FilterMsg>,
+    on_done: impl FnOnce() + Send + 'static,
+) {
+    std::thread::Builder::new()
+        .name("sql-layer-filter".into())
+        .spawn(move || {
+            let result = run_row_filter(&layer, &predicate);
+            let _ = tx.send(FilterMsg {
+                layer_id,
+                predicate,
+                result,
+            });
+            on_done();
+        })
+        .expect("spawn sql thread");
+}
+
+pub(crate) fn run_row_filter(layer: &SqlLayer, predicate: &str) -> Result<FilterRows, String> {
+    use super::table::{LayerTable, ROW_INDEX_COL};
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let config = SessionConfig::new().with_target_partitions(num_cpus());
+    let ctx = SessionContext::new_with_config(config);
+    udf::register_all(&ctx);
+    ctx.register_table(
+        layer.table.as_str(),
+        Arc::new(LayerTable::with_row_index(
+            Arc::clone(&layer.store),
+            layer.rg_bboxes.clone(),
+        )),
+    )
+    .map_err(|e| format!("register {}: {e}", layer.table))?;
+
+    let sql = format!(
+        "select \"{ROW_INDEX_COL}\" from {} where ({predicate})",
+        layer.table
+    );
+    let mut rows: Vec<u32> = rt.block_on(async {
+        let df = ctx.sql(&sql).await.map_err(fmt_df_err)?;
+        let mut stream = df.execute_stream().await.map_err(fmt_df_err)?;
+        let mut rows: Vec<u32> = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(fmt_df_err)?;
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt32Array>()
+                .ok_or("row index column has an unexpected type")?;
+            rows.extend(col.values().iter().copied());
+        }
+        Ok::<_, String>(rows)
+    })?;
+    // Partitions stream in arbitrary order.
+    rows.sort_unstable();
+
+    // Split into group-relative ranges.
+    let starts = layer.store.rg_starts();
+    let n_groups = starts.len().saturating_sub(1);
+    let mut per_group: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n_groups];
+    let mut g = 0usize;
+    let mut run: Option<(u32, u32)> = None; // group-relative [start, end)
+    for &r in &rows {
+        let r = r as u64;
+        while g + 1 < n_groups && r >= starts[g + 1] {
+            if let Some(rn) = run.take() {
+                per_group[g].push(rn);
+            }
+            g += 1;
+        }
+        let rel = (r - starts[g]) as u32;
+        run = match run {
+            Some((s, e)) if rel == e => Some((s, e + 1)),
+            Some(rn) => {
+                per_group[g].push(rn);
+                Some((rel, rel + 1))
+            }
+            None => Some((rel, rel + 1)),
+        };
+    }
+    if let Some(rn) = run {
+        per_group[g].push(rn);
+    }
+    Ok(FilterRows {
+        matched: rows.len(),
+        per_group,
+    })
+}
+
 #[cfg(test)]
 pub fn run_query_for_test(query: &str, layers: &[SqlLayer]) -> Result<QueryOutput, String> {
     run_query(query, layers)
@@ -474,6 +584,55 @@ mod tests {
         assert_eq!(store.total_rows(), rows as u64);
         assert_eq!(crs.epsg, Some(2154), "CRS carried through");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Layer filter: the computed per-group row ranges must cover exactly
+    /// the rows the equivalent COUNT query matches, and decoding one range
+    /// must yield rows that satisfy the predicate.
+    #[test]
+    fn row_filter_matches_query_count() {
+        let Some(layers) = fixture("parcels_hilbert.parquet") else {
+            return;
+        };
+        let b = layers[0].rg_bboxes.as_ref().expect("metadata bboxes")[0];
+        let (cx, cy) = ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
+        let (dx, dy) = ((b[2] - b[0]) * 0.1, (b[3] - b[1]) * 0.1);
+        let pred = format!(
+            "st_intersects(geometry, st_makeenvelope({}, {}, {}, {}))",
+            cx - dx,
+            cy - dy,
+            cx + dx,
+            cy + dy
+        );
+
+        let rows = run_row_filter(&layers[0], &pred).unwrap();
+        let expected = {
+            let out =
+                run_query(&format!("select count(*) c from t where {pred}"), &layers).unwrap();
+            use arrow::array::Int64Array;
+            out.batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0) as usize
+        };
+        assert_eq!(rows.matched, expected);
+        assert!(rows.matched > 0);
+        let range_sum: usize = rows
+            .per_group
+            .iter()
+            .flatten()
+            .map(|(s, e)| (e - s) as usize)
+            .sum();
+        assert_eq!(range_sum, rows.matched, "ranges cover every matched row");
+        // Group-pruning sanity: a small window must not touch every group.
+        let touched = rows.per_group.iter().filter(|g| !g.is_empty()).count();
+        assert!(
+            touched < rows.per_group.len(),
+            "small window touched {touched}/{} groups",
+            rows.per_group.len()
+        );
     }
 
     #[test]

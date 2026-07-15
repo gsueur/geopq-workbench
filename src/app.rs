@@ -118,6 +118,30 @@ pub struct ViewerApp {
     epsg_input: String,
     cursor_world: Option<[f64; 2]>,
     sql: crate::sql::console::SqlConsole,
+    /// Layer-filter dialog (Some = open).
+    filter_dialog: Option<FilterDialog>,
+    filter_tx: Sender<crate::sql::engine::FilterMsg>,
+    filter_rx: Receiver<crate::sql::engine::FilterMsg>,
+    /// Layers with a filter computation in flight.
+    filter_pending: HashSet<u64>,
+    /// Filter-dialog "Test" runs (separate channel: results go to the
+    /// dialog, not to the layer).
+    test_tx: Sender<crate::sql::engine::FilterMsg>,
+    test_rx: Receiver<crate::sql::engine::FilterMsg>,
+    /// Filters to apply once a context-restored layer finishes loading.
+    pending_filters: HashMap<u64, String>,
+}
+
+/// Editor for a layer's persistent SQL filter.
+struct FilterDialog {
+    layer_id: u64,
+    text: String,
+    ac: crate::sql::console::AcState,
+    /// Test run state: predicate tested, in-flight flag, and the outcome
+    /// (kept so Apply can reuse the computed rows without a second run).
+    test_pred: String,
+    testing: bool,
+    test: Option<Result<crate::sql::engine::FilterRows, String>>,
 }
 
 impl ViewerApp {
@@ -133,6 +157,8 @@ impl ViewerApp {
 
         let (load_tx, load_rx) = channel();
         let (opt_tx, opt_rx) = channel();
+        let (filter_tx, filter_rx) = channel();
+        let (test_tx, test_rx) = channel();
         let display = DisplayCrs::hobo_dyer();
         let graticule_chunks = build_graticule(&display);
         let coastline_chunks = crate::data::coastline::build_coastline(&display);
@@ -180,6 +206,13 @@ impl ViewerApp {
             epsg_input: String::new(),
             cursor_world: None,
             sql: crate::sql::console::SqlConsole::new(),
+            filter_dialog: None,
+            filter_tx,
+            filter_rx,
+            filter_pending: HashSet::new(),
+            test_tx,
+            test_rx,
+            pending_filters: HashMap::new(),
         };
         for f in files {
             app.enqueue_load(f, &cc.egui_ctx);
@@ -243,6 +276,294 @@ impl ViewerApp {
         self.sql_highlight_chunks = Some(Arc::new(mb.finish()));
     }
 
+    /// The single-layer SQL registration used by filter computations.
+    fn sql_layer_of(&self, layer_id: u64) -> Option<crate::sql::engine::SqlLayer> {
+        let l = self.layers.iter().find(|l| l.id == layer_id)?;
+        Some(crate::sql::engine::SqlLayer {
+            table: crate::sql::engine::table_name(&l.name),
+            store: Arc::clone(&l.store),
+            crs: l.crs.clone(),
+            rg_bboxes: l
+                .rg_bboxes
+                .as_ref()
+                .filter(|r| r.boxes.len() == l.store.rg_starts().len().saturating_sub(1))
+                .map(|r| Arc::new(r.boxes.clone())),
+        })
+    }
+
+    /// Kick off a layer-filter computation (SQL predicate → matching row
+    /// ranges) on a background thread.
+    fn start_layer_filter(&mut self, layer_id: u64, predicate: String, ctx: &egui::Context) {
+        let Some(sql_layer) = self.sql_layer_of(layer_id) else {
+            return;
+        };
+        self.filter_pending.insert(layer_id);
+        let egui_ctx = ctx.clone();
+        crate::sql::engine::spawn_row_filter(
+            layer_id,
+            sql_layer,
+            predicate,
+            self.filter_tx.clone(),
+            move || egui_ctx.request_repaint(),
+        );
+    }
+
+    /// Apply computed filter ranges: the layer's loaded state becomes
+    /// exactly the matching rows (with infinite coverage rects so viewport
+    /// refinement never adds rows back), then the geometry rebuilds.
+    fn poll_filters(&mut self, ctx: &egui::Context) {
+        while let Ok(msg) = self.filter_rx.try_recv() {
+            self.filter_pending.remove(&msg.layer_id);
+            match msg.result {
+                Err(e) => {
+                    let name = self
+                        .layers
+                        .iter()
+                        .find(|l| l.id == msg.layer_id)
+                        .map(|l| l.name.clone())
+                        .unwrap_or_default();
+                    self.push_error(format!("filter on {name}: {e}"));
+                }
+                Ok(rows) => self.apply_filter_rows(msg.layer_id, msg.predicate, rows, ctx),
+            }
+        }
+        // Test runs: results land in the dialog, the layer is untouched.
+        while let Ok(msg) = self.test_rx.try_recv() {
+            if let Some(d) = &mut self.filter_dialog {
+                if d.layer_id == msg.layer_id && d.test_pred == msg.predicate {
+                    d.testing = false;
+                    d.test = Some(msg.result);
+                }
+            }
+        }
+    }
+
+    /// Make computed filter rows the layer's working subset and rebuild.
+    fn apply_filter_rows(
+        &mut self,
+        layer_id: u64,
+        predicate: String,
+        rows: crate::sql::engine::FilterRows,
+        ctx: &egui::Context,
+    ) {
+        let display = self.display.clone();
+        let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) else {
+            return;
+        };
+        const INF: [f64; 4] =
+            [f64::NEG_INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::INFINITY];
+        let starts = l.store.rg_starts();
+        l.loaded = rows
+            .per_group
+            .iter()
+            .enumerate()
+            .map(|(g, ranges)| {
+                let n = (starts[g + 1] - starts[g]) as u32;
+                if ranges.len() == 1 && ranges[0] == (0, n) {
+                    crate::data::layer::GroupLoad::Full
+                } else {
+                    crate::data::layer::GroupLoad::Rows {
+                        ranges: ranges.clone(),
+                        rect: INF,
+                    }
+                }
+            })
+            .collect();
+        l.filter = Some(crate::data::layer::LayerFilter {
+            sql: predicate,
+            matched: rows.matched,
+        });
+        l.feature_count = rows.matched;
+        l.generation += 1;
+        self.rebuilding.insert(l.id);
+        loader::spawn_rebuild(
+            LoaderHandle {
+                tx: self.load_tx.clone(),
+                egui_ctx: ctx.clone(),
+            },
+            l.id,
+            l.generation,
+            Arc::clone(&l.store),
+            l.crs.clone(),
+            display,
+            l.loaded.clone(),
+        );
+    }
+
+    /// Remove a layer's filter: everything loads again.
+    fn clear_layer_filter(&mut self, layer_id: u64, ctx: &egui::Context) {
+        let display = self.display.clone();
+        let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) else {
+            return;
+        };
+        let n_groups = l.store.rg_starts().len().saturating_sub(1);
+        l.filter = None;
+        l.loaded = vec![crate::data::layer::GroupLoad::Full; n_groups];
+        l.feature_count = l.store.total_rows() as usize;
+        l.generation += 1;
+        self.rebuilding.insert(l.id);
+        loader::spawn_rebuild(
+            LoaderHandle {
+                tx: self.load_tx.clone(),
+                egui_ctx: ctx.clone(),
+            },
+            l.id,
+            l.generation,
+            Arc::clone(&l.store),
+            l.crs.clone(),
+            display,
+            l.loaded.clone(),
+        );
+    }
+
+    /// The layer-filter dialog: predicate editor with autocomplete.
+    fn filter_window(&mut self, ctx: &egui::Context) {
+        let Some(layer_id) = self.filter_dialog.as_ref().map(|d| d.layer_id) else {
+            return;
+        };
+        let Some(layer) = self.layers.iter().find(|l| l.id == layer_id) else {
+            self.filter_dialog = None;
+            return;
+        };
+        let layer_name = layer.name.clone();
+        let has_filter = layer.filter.is_some();
+        // Columns of this layer + ST_* functions + a few predicate keywords.
+        let mut dict: Vec<String> = layer
+            .store
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().to_lowercase())
+            .collect();
+        dict.extend(crate::sql::udf::NAMES.iter().map(|s| s.to_string()));
+        for k in ["and", "or", "not", "like", "between", "in", "is null", "is not null"] {
+            dict.push(k.into());
+        }
+        let sql_layer = self.sql_layer_of(layer_id);
+        let test_tx = self.test_tx.clone();
+
+        let Some(dialog) = &mut self.filter_dialog else {
+            return;
+        };
+        let mut open = true;
+        let mut apply = false;
+        let mut clear = false;
+        egui::Window::new(format!("Filter — {layer_name}"))
+            .id(egui::Id::new("layer_filter"))
+            .open(&mut open)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Persistent SQL predicate: the layer shows only matching \
+                         rows until the filter is cleared (spatial predicates are \
+                         pruned via row-group/page statistics).",
+                    )
+                    .weak()
+                    .small(),
+                );
+                let id = egui::Id::new("layer_filter_edit");
+                crate::sql::console::autocomplete_edit(
+                    ui,
+                    id,
+                    &mut dialog.text,
+                    &mut dialog.ac,
+                    &dict,
+                    |text| {
+                        egui::TextEdit::multiline(text)
+                            .id(id)
+                            .code_editor()
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY)
+                            .hint_text(
+                                "status = 'active' and st_area(geometry) > 1000",
+                            )
+                    },
+                );
+                let mut test = false;
+                ui.horizontal(|ui| {
+                    let busy = self.filter_pending.contains(&layer_id) || dialog.testing;
+                    let has_text = !dialog.text.trim().is_empty();
+                    test = ui
+                        .add_enabled(!busy && has_text, egui::Button::new("Test"))
+                        .on_hover_text(
+                            "Validate the expression and count matching rows \
+                             without changing the layer",
+                        )
+                        .clicked();
+                    apply = ui
+                        .add_enabled(!busy && has_text, egui::Button::new("Apply"))
+                        .clicked();
+                    if has_filter {
+                        clear = ui.button("Clear filter").clicked();
+                    }
+                    if busy {
+                        ui.spinner();
+                        ui.label(RichText::new("computing…").weak().small());
+                    }
+                });
+                // Test outcome (only while it still matches the text).
+                if let Some(result) = &dialog.test {
+                    if dialog.test_pred == dialog.text.trim() {
+                        match result {
+                            Ok(rows) => {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "✔ {} rows match",
+                                        fmt_count(rows.matched)
+                                    ))
+                                    .color(Color32::from_rgb(80, 200, 120)),
+                                );
+                            }
+                            Err(e) => {
+                                ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
+                            }
+                        }
+                    }
+                }
+                if test {
+                    dialog.test_pred = dialog.text.trim().to_string();
+                    dialog.testing = true;
+                    dialog.test = None;
+                    if let Some(sql_layer) = sql_layer.clone() {
+                        let egui_ctx = ctx.clone();
+                        crate::sql::engine::spawn_row_filter(
+                            layer_id,
+                            sql_layer,
+                            dialog.test_pred.clone(),
+                            test_tx.clone(),
+                            move || egui_ctx.request_repaint(),
+                        );
+                    }
+                }
+            });
+        if apply {
+            let predicate = self
+                .filter_dialog
+                .as_ref()
+                .map(|d| d.text.trim().to_string())
+                .unwrap_or_default();
+            // Reuse the tested rows when the text hasn't changed since.
+            let cached = self.filter_dialog.as_mut().and_then(|d| {
+                if d.test_pred == predicate {
+                    d.test.take().and_then(Result::ok)
+                } else {
+                    None
+                }
+            });
+            match cached {
+                Some(rows) => self.apply_filter_rows(layer_id, predicate, rows, ctx),
+                None => self.start_layer_filter(layer_id, predicate, ctx),
+            }
+            self.filter_dialog = None;
+        } else if clear {
+            self.clear_layer_filter(layer_id, ctx);
+            self.filter_dialog = None;
+        } else if !open {
+            self.filter_dialog = None;
+        }
+    }
+
     /// Zoom the map to a data-CRS bbox (e.g. a feature clicked in the SQL
     /// results grid). Pads by 20% of the span, with a floor so point
     /// features land at a usable zoom instead of the camera's max.
@@ -287,7 +608,12 @@ impl ViewerApp {
                         }
                         None => false,
                     };
+                    let new_layer_id = layer.id;
                     self.layers.push(layer);
+                    // Context-restored filter: compute once the layer exists.
+                    if let Some(f) = self.pending_filters.remove(&job) {
+                        self.start_layer_filter(new_layer_id, f, ctx);
+                    }
                     match adopt_display {
                         // Geometry already built in the auto projection:
                         // just switch overlays, no layer rebuild.
@@ -737,10 +1063,13 @@ impl ViewerApp {
         let mut info_open: Option<u64> = None;
         let mut load_all: Option<u64> = None;
         let mut optimize_open: Option<u64> = None;
+        let mut filter_open: Option<u64> = None;
+        let mut filter_clear: Option<u64> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             // Top-most layer first in the list.
             let rebuilding = &self.rebuilding;
+            let filter_pending = &self.filter_pending;
             let n_layers = self.layers.len();
             for (idx, l) in self.layers.iter_mut().enumerate().rev() {
                 let is_rebuilding = rebuilding.contains(&l.id);
@@ -796,7 +1125,12 @@ impl ViewerApp {
                                     {
                                         optimize_open = Some(l.id);
                                     }
-                                    if l.is_partial() && ui.button("Load all row groups").clicked()
+                                    if ui.button("Filter…").clicked() {
+                                        filter_open = Some(l.id);
+                                    }
+                                    if l.is_partial()
+                                        && l.filter.is_none()
+                                        && ui.button("Load all row groups").clicked()
                                     {
                                         load_all = Some(l.id);
                                     }
@@ -900,7 +1234,37 @@ impl ViewerApp {
                             egui::Slider::new(&mut l.style.opacity, 0.0..=1.0).show_value(false),
                         );
                     });
-                    if l.is_partial() {
+                    if let Some(f) = &l.filter {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "filter: {} of {} rows",
+                                    fmt_count(f.matched),
+                                    fmt_count(l.store.total_rows() as usize)
+                                ))
+                                .color(Color32::from_rgb(80, 180, 240))
+                                .small(),
+                            )
+                            .on_hover_text(&f.sql);
+                            if ui.small_button("Edit").clicked() {
+                                filter_open = Some(l.id);
+                            }
+                            if ui
+                                .small_button("✕")
+                                .on_hover_text("Clear the filter (reload all rows)")
+                                .clicked()
+                            {
+                                filter_clear = Some(l.id);
+                            }
+                        });
+                    }
+                    if filter_pending.contains(&l.id) {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(RichText::new("computing filter…").weak().small());
+                        });
+                    }
+                    if l.is_partial() && l.filter.is_none() {
                         ui.horizontal(|ui| {
                             let partial = l.partial_rgs();
                             let text = if partial > 0 {
@@ -976,6 +1340,26 @@ impl ViewerApp {
                 }
             }
         }
+        if let Some(id) = filter_open {
+            let text = self
+                .layers
+                .iter()
+                .find(|l| l.id == id)
+                .and_then(|l| l.filter.as_ref().map(|f| f.sql.clone()))
+                .unwrap_or_default();
+            self.filter_dialog = Some(FilterDialog {
+                layer_id: id,
+                text,
+                ac: Default::default(),
+                test_pred: String::new(),
+                testing: false,
+                test: None,
+            });
+        }
+        if let Some(id) = filter_clear {
+            let ctx = ui.ctx().clone();
+            self.clear_layer_filter(id, &ctx);
+        }
         if let Some(id) = load_all {
             use crate::data::layer::GroupLoad;
             use crate::data::loader::{complement_ranges, GroupSel};
@@ -1033,6 +1417,7 @@ impl ViewerApp {
                 .map(|l| LayerCtx {
                     source: SourceCtx::of(&l.store.source),
                     style: StyleCtx::of(&l.style),
+                    filter: l.filter.as_ref().map(|f| f.sql.clone()),
                 })
                 .collect(),
         };
@@ -1102,6 +1487,9 @@ impl ViewerApp {
         for layer in saved.layers {
             let job = self.enqueue_load(layer.source.into_source(), ctx);
             self.pending_styles.insert(job, layer.style.into_style());
+            if let Some(f) = layer.filter {
+                self.pending_filters.insert(job, f);
+            }
         }
     }
 
@@ -2296,11 +2684,18 @@ impl eframe::App for ViewerApp {
         self.info_window(&ctx);
         self.optimize_window(&ctx);
         self.url_window(&ctx);
+        self.poll_filters(&ctx);
+        self.filter_window(&ctx);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.map_panel(ui));
 
-        if !self.loading.is_empty() || !self.rebuilding.is_empty() || self.sql.is_running() {
+        if !self.loading.is_empty()
+            || !self.rebuilding.is_empty()
+            || self.sql.is_running()
+            || !self.filter_pending.is_empty()
+            || self.filter_dialog.as_ref().is_some_and(|d| d.testing)
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
