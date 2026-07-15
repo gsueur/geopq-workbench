@@ -29,6 +29,10 @@ struct LoadingJob {
     label: String,
     frac: f32,
     stage: String,
+    /// Display generation this job builds geometry for; a mismatch at
+    /// arrival means the projection changed mid-load and the layer must
+    /// rebuild (its world coordinates are in the old display's frame).
+    display_gen: u64,
 }
 
 enum OptMsg {
@@ -168,6 +172,9 @@ pub struct ViewerApp {
     /// Names to give layers when their load finishes (keyed by job id) —
     /// repository themes would otherwise all be called "buildings".
     pending_names: HashMap<u64, String>,
+    /// Bumped on every display projection change; load jobs record it to
+    /// detect a switch that happened while they were building.
+    display_gen: u64,
 }
 
 /// Browser over external GeoParquet repositories (parquetry layout):
@@ -399,6 +406,7 @@ impl ViewerApp {
             repo_tx,
             repo_rx,
             pending_names: HashMap::new(),
+            display_gen: 0,
         };
         for f in files {
             app.enqueue_load(f, &cc.egui_ctx);
@@ -425,6 +433,7 @@ impl ViewerApp {
                 label: source.label(),
                 frac: 0.0,
                 stage: "queued".into(),
+                display_gen: self.display_gen,
             },
         );
         loader::spawn_load(
@@ -778,6 +787,12 @@ impl ViewerApp {
                     layer,
                     adopt_display,
                 } => {
+                    // Projection switched while this job was building?
+                    // Its world geometry is in the old display's frame.
+                    let stale = self
+                        .loading
+                        .get(&job)
+                        .is_some_and(|j| j.display_gen != self.display_gen);
                     self.loading.remove(&job);
                     let first = self.layers.is_empty();
                     if layer.stats.bad_geoms > 0 {
@@ -798,6 +813,22 @@ impl ViewerApp {
                         None => false,
                     };
                     let new_layer_id = layer.id;
+                    if stale && adopt_display.is_none() {
+                        layer.generation += 1;
+                        self.rebuilding.insert(layer.id);
+                        loader::spawn_rebuild(
+                            LoaderHandle {
+                                tx: self.load_tx.clone(),
+                                egui_ctx: ctx.clone(),
+                            },
+                            layer.id,
+                            layer.generation,
+                            layer.store.clone(),
+                            layer.crs.clone(),
+                            self.display.clone(),
+                            layer.loaded.clone(),
+                        );
+                    }
                     // Category z-order: polygons at the bottom, lines above,
                     // points on top; a new layer lands on top of its own
                     // category (vec order is draw order, last = top-most).
@@ -814,9 +845,13 @@ impl ViewerApp {
                         self.start_layer_filter(new_layer_id, f, ctx);
                     }
                     match adopt_display {
-                        // Geometry already built in the auto projection:
-                        // just switch overlays, no layer rebuild.
-                        Some((d, true)) => self.adopt_display_lite(d),
+                        // Geometry already built in the auto-adopted
+                        // display — but layers that finished earlier are
+                        // still in the previous frame and must rebuild.
+                        Some((d, true)) => {
+                            self.adopt_display_lite(d);
+                            self.rebuild_layers_for_display(Some(new_layer_id), ctx);
+                        }
                         // Post-build suggestion: full projection rebuild.
                         Some((d, false)) => rebuild_display = Some(d),
                         None => {}
@@ -883,6 +918,7 @@ impl ViewerApp {
     /// Switch the display projection without rebuilding layers (their
     /// geometry was already built in it by the loader).
     fn adopt_display_lite(&mut self, d: DisplayCrs) {
+        self.display_gen += 1;
         self.display = d;
         self.clear_selection();
         self.graticule_chunks = build_graticule(&self.display);
@@ -915,6 +951,7 @@ impl ViewerApp {
     }
 
     fn set_display(&mut self, display: DisplayCrs, ctx: &egui::Context) {
+        self.display_gen += 1;
         self.display = display;
         self.selection = None;
         self.highlight_chunks = None;
@@ -924,7 +961,19 @@ impl ViewerApp {
         self.graticule_chunks = build_graticule(&self.display);
         self.coastline_chunks = crate::data::coastline::build_coastline(&self.display);
         self.graticule_generation += 1;
+        self.rebuild_layers_for_display(None, ctx);
+        if self.layers.is_empty() {
+            self.pending_fit = true;
+        }
+    }
+
+    /// Rebuild every layer's world geometry for the current display,
+    /// except `skip` (a layer already built in it).
+    fn rebuild_layers_for_display(&mut self, skip: Option<u64>, ctx: &egui::Context) {
         for l in &mut self.layers {
+            if Some(l.id) == skip {
+                continue;
+            }
             l.generation += 1;
             self.rebuilding.insert(l.id);
             loader::spawn_rebuild(
@@ -939,9 +988,6 @@ impl ViewerApp {
                 self.display.clone(),
                 l.loaded.clone(),
             );
-        }
-        if self.layers.is_empty() {
-            self.pending_fit = true;
         }
     }
 
