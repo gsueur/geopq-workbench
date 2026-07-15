@@ -335,6 +335,16 @@ impl DisplayCrs {
         if dx >= 120.0 || dy >= 60.0 || b[0] < -179.9 && b[2] > 179.9 {
             return None;
         }
+        // Data inside a country's area of use displays in that country's
+        // official national CRS.
+        if let Some(n) = super::national::national_for_extent(b) {
+            if let Ok(mut ncrs) = Crs::from_epsg(n.epsg) {
+                ncrs.name = format!("{} — {}", n.country, n.name);
+                let mut d = DisplayCrs::new(ncrs);
+                d.name = format!("Auto: {} ({})", n.name, n.country);
+                return Some(d);
+            }
+        }
         let build = |proj4: String, name: String| -> Option<DisplayCrs> {
             let crs = Crs::from_proj4(&proj4, None, &name).ok()?;
             let mut d = DisplayCrs::new(crs);
@@ -694,18 +704,27 @@ mod auto_projection_tests {
     #[test]
     fn regional_extents_pick_equal_area_families() {
         let wgs = Crs::wgs84();
-        // France-ish: squarish → LAEA on centroid.
+        // France-extent data → the official national CRS (Lambert-93).
         let d = DisplayCrs::auto_for(&wgs, Some([-5.0, 41.0, 10.0, 51.0])).unwrap();
-        assert!(d.crs.proj4.contains("+proj=laea"), "{}", d.crs.proj4);
-        assert!(d.crs.proj4.contains("+lat_0=46"), "{}", d.crs.proj4);
+        assert_eq!(d.crs.epsg, Some(2154), "{}", d.name);
         roundtrip_center(&d, 2.5, 46.0);
 
-        // CONUS-ish: wide mid-latitude band → Albers with 1/6-rule parallels.
+        // CONUS extent → the official CONUS Albers (EPSG:5070).
         let d = DisplayCrs::auto_for(&wgs, Some([-125.0, 24.0, -66.0, 49.0])).unwrap();
-        assert!(d.crs.proj4.contains("+proj=aea"), "{}", d.crs.proj4);
-        assert!(d.crs.proj4.contains("+lat_1=28.167"), "{}", d.crs.proj4);
-        assert!(d.crs.proj4.contains("+lat_2=44.833"), "{}", d.crs.proj4);
+        assert_eq!(d.crs.epsg, Some(5070), "{}", d.name);
         roundtrip_center(&d, -95.5, 36.5);
+
+        // Squarish extent with no national match (Central Asia) → LAEA.
+        let d = DisplayCrs::auto_for(&wgs, Some([60.0, 35.0, 75.0, 50.0])).unwrap();
+        assert!(d.crs.proj4.contains("+proj=laea"), "{}", d.crs.proj4);
+        roundtrip_center(&d, 67.5, 42.5);
+
+        // Wide mid-latitude band with no national match → generic Albers
+        // with 1/6-rule parallels.
+        let d = DisplayCrs::auto_for(&wgs, Some([40.0, 30.0, 100.0, 50.0])).unwrap();
+        assert!(d.crs.proj4.contains("+proj=aea"), "{}", d.crs.proj4);
+        assert!(d.crs.proj4.contains("+lat_1=33.333"), "{}", d.crs.proj4);
+        roundtrip_center(&d, 70.0, 40.0);
 
         // Equatorial band → equal-area cylindrical.
         let d = DisplayCrs::auto_for(&wgs, Some([95.0, -8.0, 140.0, 6.0])).unwrap();

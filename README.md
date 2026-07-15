@@ -126,7 +126,12 @@ Fixture-dependent tests self-skip when the files are absent.
   Albers conic for mid-latitude east–west bands (1/6-rule parallels),
   azimuthal equal-area on the centroid for square-ish regions, equal-area
   cylindrical for equatorial bands, polar azimuthal near the poles, and the
-  Hobo–Dyer world default for global data. Selected before geometry builds
+  Hobo–Dyer world default for global data. A curated table of ~30 official
+  national CRSs (Wikipedia's list, validated against the embedded EPSG
+  database) takes precedence: France-extent data displays in Lambert-93,
+  UK in British National Grid, CONUS in EPSG:5070 Albers, tightest country
+  wins on overlap. The national grids are also directly selectable in the
+  projection combo. Selected before geometry builds
   when metadata bboxes exist (no double build, remote-safe); any manual
   projection choice turns auto off for the session.
 - **Display projection switching**: Auto (above), Hobo–Dyer cylindrical

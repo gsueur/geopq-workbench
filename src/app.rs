@@ -579,6 +579,21 @@ impl ViewerApp {
                     if ui.selectable_label(is_4326, "WGS 84 (4326)").clicked() && !is_4326 {
                         pick = Some(DisplayCrs::new(Crs::wgs84()));
                     }
+                    ui.separator();
+                    ui.label(RichText::new("National grids").weak().small());
+                    for n in crate::data::national::NATIONAL_CRS {
+                        let selected = self.display.crs.epsg == Some(n.epsg);
+                        let label = format!("{} — {}", n.country, n.name);
+                        if ui.selectable_label(selected, label).clicked() && !selected {
+                            match DisplayCrs::from_epsg(n.epsg) {
+                                Ok(mut d) => {
+                                    d.name = format!("{} ({})", n.name, n.country);
+                                    pick = Some(d);
+                                }
+                                Err(e) => self.push_error(e),
+                            }
+                        }
+                    }
                 });
             ui.add(
                 egui::TextEdit::singleline(&mut self.epsg_input)

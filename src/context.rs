@@ -241,10 +241,17 @@ mod tests {
         }
         assert!(projection_from_token("bogus").is_err());
 
-        // Auto-fit projections persist as proj4 tokens.
+        // National auto picks persist as clean EPSG tokens...
         let auto = crate::data::crs::DisplayCrs::auto_for(
             &crate::data::crs::Crs::wgs84(),
             Some([-5.0, 41.0, 10.0, 51.0]),
+        )
+        .unwrap();
+        assert_eq!(projection_token(&auto), "epsg:2154");
+        // ...and custom extent-fit ones as proj4 tokens.
+        let auto = crate::data::crs::DisplayCrs::auto_for(
+            &crate::data::crs::Crs::wgs84(),
+            Some([60.0, 35.0, 75.0, 50.0]),
         )
         .unwrap();
         let t = projection_token(&auto);
