@@ -19,7 +19,7 @@ const USER_AGENT: &str = concat!("geopq-viewer/", env!("CARGO_PKG_VERSION"));
 /// Shared agent: connection pooling across range requests. HTTP error
 /// statuses come back as responses (not `Err`), so callers can read
 /// headers like `x-amz-bucket-region` from 301/403 answers.
-fn http_agent() -> &'static ureq::Agent {
+pub(crate) fn http_agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
         ureq::Agent::config_builder()

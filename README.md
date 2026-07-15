@@ -50,6 +50,25 @@ Fixture-dependent tests self-skip when the files are absent.
   from metadata without touching the files. Files lacking per-row-group
   bboxes fall back to their file-level `geo` bbox for pruning. All files
   must share schema, CRS and geometry encoding.
+- **Repository browser** (File → Repositories…): browse external
+  GeoParquet repositories and load their layers directly, no URL typing.
+  A repository is a plain HTTPS object store ("parquetry" layout):
+  `snapshots.json` at the root (dated prefixes + `latest/`), one folder
+  per region with a `_manifest.json` listing its themes and feature
+  counts, one GeoParquet file per theme. The browser picks a snapshot,
+  discovers datasets (via the repository's `index.json` — `{"datasets":
+  [{"path": "country=US/state=US-AR", "name": "Arkansas"}]}` — or, when
+  absent, by probing a built-in ISO 3166-2 grid concurrently), filters
+  regions by country or text, and loads any set of checked themes as
+  layers over range requests with meaningful names (`US-AR buildings`).
+  Layers stack by geometry category — polygons at the bottom, lines,
+  then points, each new layer on top of its own category (the layer
+  rows show a small type glyph; manual reorder still wins) — so loading
+  buildings + roads + pois renders sensibly without shuffling.
+  Geomermaids Parquetry (OSM North
+  America: 101 regions × 16 themes, daily snapshots) is preconfigured;
+  add or remove repositories in the dialog (persisted in
+  `~/.config/geopq-viewer/repositories.json`).
 - **File info panel**: per-layer Info button — detected GeoParquet version,
   encoding, CRS, metadata bbox, covering/edges, column types + compression,
   row-group layout, raw `geo` JSON with copy.

@@ -161,6 +161,41 @@ pub struct ViewerApp {
     pick_job: u64,
     /// A pick is in flight (status-bar spinner).
     pick_pending: bool,
+    /// Repository browser dialog (Some = open).
+    repo_browser: Option<RepoBrowser>,
+    repo_tx: Sender<RepoMsg>,
+    repo_rx: Receiver<RepoMsg>,
+    /// Names to give layers when their load finishes (keyed by job id) —
+    /// repository themes would otherwise all be called "buildings".
+    pending_names: HashMap<u64, String>,
+}
+
+/// Browser over external GeoParquet repositories (parquetry layout):
+/// snapshot picker, discovered datasets, per-theme loading.
+struct RepoBrowser {
+    repos: Vec<crate::data::repo::Repository>,
+    sel_repo: usize,
+    snapshots: Vec<crate::data::repo::Snapshot>,
+    sel_snapshot: usize,
+    /// None = discovery in flight.
+    datasets: Option<Result<Vec<crate::data::repo::Dataset>, String>>,
+    filter: String,
+    /// Country filter over the dataset list; empty = all.
+    country: String,
+    /// Selected dataset path + its manifest (None = fetch in flight).
+    selected: Option<(usize, Option<Result<crate::data::repo::Manifest, String>>)>,
+    /// Themes ticked for loading in the selected dataset.
+    checked: std::collections::HashSet<String>,
+    /// Add-repository row (name, base URL).
+    add: (String, String),
+    /// Drops stale async results after repo/snapshot switches.
+    generation: u64,
+}
+
+enum RepoMsg {
+    Snapshots(u64, Result<Vec<crate::data::repo::Snapshot>, String>),
+    Datasets(u64, Result<Vec<crate::data::repo::Dataset>, String>),
+    Manifest(u64, Result<crate::data::repo::Manifest, String>),
 }
 
 /// Cap on attribute columns fetched for the feature info panel. Wide
@@ -175,6 +210,59 @@ struct PickMsg {
     attrs: Option<arrow::record_batch::RecordBatch>,
     /// (shown, total) when the attribute fetch was column-capped.
     truncated: Option<(usize, usize)>,
+}
+
+/// Draw-order category of a geometry kind: polygons under lines under
+/// points (mixed/unknown sink to the bottom with the polygons).
+fn kind_rank(k: crate::data::geometry::GeomKind) -> u8 {
+    use crate::data::geometry::GeomKind;
+    match k {
+        GeomKind::Line => 1,
+        GeomKind::Point => 2,
+        _ => 0,
+    }
+}
+
+/// Small painter-drawn geometry-type glyph (font-independent) for the
+/// layer rows: filled square = polygons, diagonal = lines, dot = points.
+fn geom_kind_icon(ui: &mut egui::Ui, kind: crate::data::geometry::GeomKind) {
+    use crate::data::geometry::GeomKind;
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+    let color = ui.visuals().weak_text_color();
+    let p = ui.painter();
+    let c = rect.center();
+    match kind {
+        GeomKind::Point => {
+            p.circle_filled(c, 3.0, color);
+        }
+        GeomKind::Line => {
+            p.line_segment(
+                [
+                    rect.left_bottom() + egui::vec2(2.5, -2.5),
+                    rect.right_top() + egui::vec2(-2.5, 2.5),
+                ],
+                egui::Stroke::new(2.0, color),
+            );
+        }
+        GeomKind::Polygon => {
+            p.rect_filled(
+                egui::Rect::from_center_size(c, egui::vec2(9.0, 9.0)),
+                1.0,
+                color,
+            );
+        }
+        GeomKind::Mixed | GeomKind::Unknown => {
+            p.rect_stroke(
+                egui::Rect::from_center_size(c, egui::vec2(9.0, 9.0)),
+                1.0,
+                egui::Stroke::new(1.5, color),
+                egui::StrokeKind::Inside,
+            );
+            p.circle_filled(c, 1.8, color);
+        }
+    }
+    resp.on_hover_text(kind.label());
 }
 
 /// Fetch the picked feature's attribute row, capping very wide schemas to
@@ -240,6 +328,7 @@ impl ViewerApp {
         let (filter_tx, filter_rx) = channel();
         let (test_tx, test_rx) = channel();
         let (pick_tx, pick_rx) = channel();
+        let (repo_tx, repo_rx) = channel();
         let display = DisplayCrs::hobo_dyer();
         let graticule_chunks = build_graticule(&display);
         let coastline_chunks = crate::data::coastline::build_coastline(&display);
@@ -299,6 +388,10 @@ impl ViewerApp {
             pick_rx,
             pick_job: 0,
             pick_pending: false,
+            repo_browser: None,
+            repo_tx,
+            repo_rx,
+            pending_names: HashMap::new(),
         };
         for f in files {
             app.enqueue_load(f, &cc.egui_ctx);
@@ -687,6 +780,9 @@ impl ViewerApp {
                         ));
                     }
                     let mut layer = *layer;
+                    if let Some(name) = self.pending_names.remove(&job) {
+                        layer.name = name;
+                    }
                     let restored = match self.pending_styles.remove(&job) {
                         Some(style) => {
                             layer.style = style;
@@ -695,7 +791,17 @@ impl ViewerApp {
                         None => false,
                     };
                     let new_layer_id = layer.id;
-                    self.layers.push(layer);
+                    // Category z-order: polygons at the bottom, lines above,
+                    // points on top; a new layer lands on top of its own
+                    // category (vec order is draw order, last = top-most).
+                    let r = kind_rank(layer.kind());
+                    let pos = self
+                        .layers
+                        .iter()
+                        .rposition(|l| kind_rank(l.kind()) <= r)
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    self.layers.insert(pos, layer);
                     // Context-restored filter: compute once the layer exists.
                     if let Some(f) = self.pending_filters.remove(&job) {
                         self.start_layer_filter(new_layer_id, f, ctx);
@@ -993,6 +1099,17 @@ impl ViewerApp {
                         String::new(),
                     ));
                 }
+                if ui
+                    .button("🌐 Repositories…")
+                    .on_hover_text(
+                        "Browse preconfigured GeoParquet repositories and load \
+                         their layers directly",
+                    )
+                    .clicked()
+                    && self.repo_browser.is_none()
+                {
+                    self.open_repo_browser(&ctx);
+                }
                 ui.separator();
                 if ui
                     .button("💾 Save context…")
@@ -1215,6 +1332,7 @@ impl ViewerApp {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut l.style.visible, "");
+                        geom_kind_icon(ui, l.kind());
                         let mut c = l.style.color;
                         if ui
                             .color_edit_button_srgba(&mut c)
@@ -1642,6 +1760,448 @@ impl ViewerApp {
             if let Some(f) = layer.filter {
                 self.pending_filters.insert(job, f);
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Repository browser
+    // ------------------------------------------------------------------
+
+    fn open_repo_browser(&mut self, ctx: &egui::Context) {
+        self.repo_browser = Some(RepoBrowser {
+            repos: crate::data::repo::load_repos(),
+            sel_repo: 0,
+            snapshots: vec![crate::data::repo::Snapshot::latest()],
+            sel_snapshot: 0,
+            datasets: None,
+            filter: String::new(),
+            country: String::new(),
+            selected: None,
+            checked: Default::default(),
+            add: (String::new(), String::new()),
+            generation: 0,
+        });
+        self.repo_refetch(ctx);
+    }
+
+    /// (Re)fetch snapshots + datasets for the browser's current repository
+    /// and snapshot, dropping any stale in-flight results.
+    fn repo_refetch(&mut self, ctx: &egui::Context) {
+        let Some(b) = &mut self.repo_browser else { return };
+        b.generation += 1;
+        b.datasets = None;
+        b.selected = None;
+        b.checked.clear();
+        let generation = b.generation;
+        let base = b.repos[b.sel_repo].url.trim_end_matches('/').to_string();
+        let snapshot = b.snapshots[b.sel_snapshot].path.clone();
+        let tx = self.repo_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(RepoMsg::Snapshots(
+                generation,
+                crate::data::repo::fetch_snapshots(&base),
+            ));
+            let _ = tx.send(RepoMsg::Datasets(
+                generation,
+                crate::data::repo::discover_datasets(&base, &snapshot),
+            ));
+            ctx.request_repaint();
+        });
+    }
+
+    fn repo_fetch_manifest(&mut self, ds_idx: usize, ctx: &egui::Context) {
+        let Some(b) = &mut self.repo_browser else { return };
+        b.selected = Some((ds_idx, None));
+        b.checked.clear();
+        let generation = b.generation;
+        let base = b.repos[b.sel_repo].url.trim_end_matches('/').to_string();
+        let snapshot = b.snapshots[b.sel_snapshot].path.clone();
+        let Some(Ok(ds)) = &b.datasets else { return };
+        let path = ds[ds_idx].path.clone();
+        let tx = self.repo_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(RepoMsg::Manifest(
+                generation,
+                crate::data::repo::fetch_manifest(&base, &snapshot, &path),
+            ));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_repo(&mut self) {
+        while let Ok(msg) = self.repo_rx.try_recv() {
+            let Some(b) = &mut self.repo_browser else { continue };
+            match msg {
+                RepoMsg::Snapshots(g, res) if g == b.generation => {
+                    if let Ok(snaps) = res {
+                        // Keep the current selection by path across refreshes.
+                        let cur = b.snapshots[b.sel_snapshot].path.clone();
+                        b.sel_snapshot =
+                            snaps.iter().position(|s| s.path == cur).unwrap_or(0);
+                        b.snapshots = snaps;
+                    }
+                }
+                RepoMsg::Datasets(g, res) if g == b.generation => b.datasets = Some(res),
+                RepoMsg::Manifest(g, res) if g == b.generation => {
+                    if let Some((_, m)) = &mut b.selected {
+                        *m = Some(res);
+                    }
+                }
+                _ => {} // stale generation
+            }
+        }
+    }
+
+    fn repo_window(&mut self, ctx: &egui::Context) {
+        if self.repo_browser.is_none() {
+            return;
+        }
+        let mut open = true;
+        let mut refetch = false;
+        let mut fetch_manifest: Option<usize> = None;
+        let mut load: Vec<(String, String)> = Vec::new(); // (url, layer name)
+
+        {
+            let b = self.repo_browser.as_mut().unwrap();
+            egui::Window::new("GeoParquet repositories")
+                .id(egui::Id::new("repo_browser"))
+                .open(&mut open)
+                .default_width(560.0)
+                .show(ctx, |ui| {
+                    // --- repository + snapshot row ---
+                    ui.horizontal(|ui| {
+                        let before = b.sel_repo;
+                        egui::ComboBox::from_id_salt("repo_sel")
+                            .width(260.0)
+                            .selected_text(&b.repos[b.sel_repo].name)
+                            .show_ui(ui, |ui| {
+                                for (i, r) in b.repos.iter().enumerate() {
+                                    ui.selectable_value(&mut b.sel_repo, i, &r.name)
+                                        .on_hover_text(&r.url);
+                                }
+                            });
+                        if b.sel_repo != before {
+                            b.snapshots = vec![crate::data::repo::Snapshot::latest()];
+                            b.sel_snapshot = 0;
+                            refetch = true;
+                        }
+                        ui.label("snapshot:");
+                        let before = b.sel_snapshot;
+                        egui::ComboBox::from_id_salt("repo_snap")
+                            .selected_text(&b.snapshots[b.sel_snapshot].label)
+                            .show_ui(ui, |ui| {
+                                for (i, s) in b.snapshots.iter().enumerate() {
+                                    ui.selectable_value(&mut b.sel_snapshot, i, &s.label);
+                                }
+                            });
+                        if b.sel_snapshot != before {
+                            refetch = true;
+                        }
+                        if ui.button("⟳").on_hover_text("Refresh").clicked() {
+                            refetch = true;
+                        }
+                    });
+                    ui.separator();
+
+                    // --- datasets (left) + themes (right) ---
+                    // Owned views of the async state, so the widgets below
+                    // can mutate the browser (filters, checkboxes) freely.
+                    let ds_view: Option<Result<Vec<(usize, String, String, String)>, String>> =
+                        match &b.datasets {
+                            None => None,
+                            Some(Err(e)) => Some(Err(e.clone())),
+                            Some(Ok(ds)) => Some(Ok(ds
+                                .iter()
+                                .enumerate()
+                                .map(|(i, d)| {
+                                    (i, d.name.clone(), d.code.clone(), d.path.clone())
+                                })
+                                .collect())),
+                        };
+                    let sel_view: Option<(
+                        String,
+                        String,
+                        String,
+                        Option<Result<crate::data::repo::Manifest, String>>,
+                    )> = match (&b.selected, &b.datasets) {
+                        (Some((i, m)), Some(Ok(ds))) => Some((
+                            ds[*i].code.clone(),
+                            ds[*i].path.clone(),
+                            ds[*i].name.clone(),
+                            m.clone(),
+                        )),
+                        _ => None,
+                    };
+                    let sel_idx = b.selected.as_ref().map(|(i, _)| *i);
+
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(230.0);
+                            match &ds_view {
+                                None => {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label(RichText::new("discovering datasets…").weak());
+                                    });
+                                }
+                                Some(Err(e)) => {
+                                    ui.label(
+                                        RichText::new(e).color(Color32::from_rgb(220, 60, 60)),
+                                    );
+                                }
+                                Some(Ok(ds)) => {
+                                    // Country selector, derived from the
+                                    // dataset paths (hidden when the repo
+                                    // has no country= level).
+                                    let mut countries: Vec<&str> = ds
+                                        .iter()
+                                        .filter_map(|(_, _, _, path)| {
+                                            path.split('/')
+                                                .find_map(|s| s.strip_prefix("country="))
+                                        })
+                                        .collect();
+                                    countries.sort_unstable();
+                                    countries.dedup();
+                                    ui.horizontal(|ui| {
+                                        if countries.len() > 1 {
+                                            egui::ComboBox::from_id_salt("repo_country")
+                                                .width(70.0)
+                                                .selected_text(if b.country.is_empty() {
+                                                    "All".to_string()
+                                                } else {
+                                                    b.country.clone()
+                                                })
+                                                .show_ui(ui, |ui| {
+                                                    ui.selectable_value(
+                                                        &mut b.country,
+                                                        String::new(),
+                                                        "All",
+                                                    );
+                                                    for c in &countries {
+                                                        ui.selectable_value(
+                                                            &mut b.country,
+                                                            c.to_string(),
+                                                            *c,
+                                                        );
+                                                    }
+                                                });
+                                        }
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut b.filter)
+                                                .hint_text("filter…")
+                                                .desired_width(ui.available_width()),
+                                        );
+                                    });
+                                    let needle = b.filter.to_lowercase();
+                                    let country = format!("country={}", b.country);
+                                    egui::ScrollArea::vertical()
+                                        .max_height(320.0)
+                                        .show(ui, |ui| {
+                                            for (i, name, code, path) in ds {
+                                                if !b.country.is_empty()
+                                                    && !path.contains(&country)
+                                                {
+                                                    continue;
+                                                }
+                                                if !needle.is_empty()
+                                                    && !name.to_lowercase().contains(&needle)
+                                                    && !code.to_lowercase().contains(&needle)
+                                                {
+                                                    continue;
+                                                }
+                                                if ui
+                                                    .selectable_label(
+                                                        sel_idx == Some(*i),
+                                                        format!("{name} ({code})"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    fetch_manifest = Some(*i);
+                                                }
+                                            }
+                                        });
+                                }
+                            }
+                        });
+                        ui.separator();
+                        ui.vertical(|ui| match &sel_view {
+                            Some((code, path, name, manifest)) => {
+                                // The manifest's own name is authoritative
+                                // (discovery may only know the ISO code).
+                                let title = match manifest {
+                                    Some(Ok(m)) => {
+                                        m.state_name.as_deref().unwrap_or(name)
+                                    }
+                                    _ => name,
+                                };
+                                ui.label(RichText::new(title).strong());
+                                match manifest {
+                                    None => {
+                                        ui.horizontal(|ui| {
+                                            ui.spinner();
+                                            ui.label(RichText::new("reading manifest…").weak());
+                                        });
+                                    }
+                                    Some(Err(e)) => {
+                                        ui.label(
+                                            RichText::new(e)
+                                                .color(Color32::from_rgb(220, 60, 60)),
+                                        );
+                                    }
+                                    Some(Ok(m)) => {
+                                        if let Some(t) = m.total_features {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{} features",
+                                                    fmt_count(t as usize)
+                                                ))
+                                                .weak()
+                                                .small(),
+                                            );
+                                        }
+                                        let base = b.repos[b.sel_repo]
+                                            .url
+                                            .trim_end_matches('/')
+                                            .to_string();
+                                        let snap = b.snapshots[b.sel_snapshot].path.clone();
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("repo_themes")
+                                            .max_height(300.0)
+                                            .show(ui, |ui| {
+                                                egui::Grid::new("repo_theme_grid")
+                                                    .num_columns(2)
+                                                    .striped(true)
+                                                    .show(ui, |ui| {
+                                                        for (theme, count) in &m.themes {
+                                                            let mut on =
+                                                                b.checked.contains(theme);
+                                                            if ui
+                                                                .checkbox(&mut on, theme)
+                                                                .changed()
+                                                            {
+                                                                if on {
+                                                                    b.checked
+                                                                        .insert(theme.clone());
+                                                                } else {
+                                                                    b.checked.remove(theme);
+                                                                }
+                                                            }
+                                                            ui.label(
+                                                                RichText::new(fmt_count(
+                                                                    *count as usize,
+                                                                ))
+                                                                .weak(),
+                                                            );
+                                                            ui.end_row();
+                                                        }
+                                                    });
+                                            });
+                                        ui.horizontal(|ui| {
+                                            let n = b.checked.len();
+                                            if ui
+                                                .add_enabled(
+                                                    n > 0,
+                                                    egui::Button::new(format!(
+                                                        "Load {n} layer{}",
+                                                        if n == 1 { "" } else { "s" }
+                                                    )),
+                                                )
+                                                .clicked()
+                                            {
+                                                for (theme, _) in &m.themes {
+                                                    if b.checked.contains(theme) {
+                                                        load.push((
+                                                            crate::data::repo::theme_url(
+                                                                &base, &snap, path, theme,
+                                                            ),
+                                                            format!("{code} {theme}"),
+                                                        ));
+                                                    }
+                                                }
+                                                b.checked.clear();
+                                            }
+                                            if ui.small_button("all").clicked() {
+                                                b.checked = m
+                                                    .themes
+                                                    .iter()
+                                                    .map(|(t, _)| t.clone())
+                                                    .collect();
+                                            }
+                                            if ui.small_button("none").clicked() {
+                                                b.checked.clear();
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                            None => {
+                                ui.label(
+                                    RichText::new("select a dataset to list its layers").weak(),
+                                );
+                            }
+                        });
+                    });
+
+                    // --- add repository ---
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut b.add.0)
+                                .hint_text("name")
+                                .desired_width(140.0),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut b.add.1)
+                                .hint_text("https://repo.example.com")
+                                .desired_width(240.0),
+                        );
+                        let valid = !b.add.0.trim().is_empty()
+                            && b.add.1.trim().starts_with("https://");
+                        if ui
+                            .add_enabled(valid, egui::Button::new("Add repository"))
+                            .clicked()
+                        {
+                            b.repos.push(crate::data::repo::Repository {
+                                name: b.add.0.trim().to_string(),
+                                url: b.add.1.trim().trim_end_matches('/').to_string(),
+                            });
+                            b.add = (String::new(), String::new());
+                            b.sel_repo = b.repos.len() - 1;
+                            if let Err(e) = crate::data::repo::save_repos(&b.repos) {
+                                log::warn!("saving repositories: {e}");
+                            }
+                            b.snapshots = vec![crate::data::repo::Snapshot::latest()];
+                            b.sel_snapshot = 0;
+                            refetch = true;
+                        }
+                        if b.repos.len() > 1 && ui.button("Remove current").clicked() {
+                            b.repos.remove(b.sel_repo);
+                            b.sel_repo = 0;
+                            if let Err(e) = crate::data::repo::save_repos(&b.repos) {
+                                log::warn!("saving repositories: {e}");
+                            }
+                            b.snapshots = vec![crate::data::repo::Snapshot::latest()];
+                            b.sel_snapshot = 0;
+                            refetch = true;
+                        }
+                    });
+                });
+        }
+
+        if refetch {
+            self.repo_refetch(ctx);
+        }
+        if let Some(i) = fetch_manifest {
+            self.repo_fetch_manifest(i, ctx);
+        }
+        for (url, name) in load {
+            let job = self.enqueue_load(Source::Remote { url, len: 0 }, ctx);
+            self.pending_names.insert(job, name);
+        }
+        if !open {
+            self.repo_browser = None;
         }
     }
 
@@ -3134,6 +3694,7 @@ impl eframe::App for ViewerApp {
         self.poll_loader(&ctx);
         self.poll_optimizer();
         self.poll_picks();
+        self.poll_repo();
         self.strip_uploaded_cpu_meshes(frame);
 
         // Drag & drop.
@@ -3217,6 +3778,7 @@ impl eframe::App for ViewerApp {
         self.info_window(&ctx);
         self.optimize_window(&ctx);
         self.url_window(&ctx);
+        self.repo_window(&ctx);
         self.poll_filters(&ctx);
         self.filter_window(&ctx);
         egui::CentralPanel::default()
