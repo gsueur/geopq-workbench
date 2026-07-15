@@ -22,6 +22,7 @@ use crate::data::store::FeatureStore;
 pub const MAX_RESULT_ROWS: usize = 500_000;
 
 /// A layer visible to SQL.
+#[derive(Clone)]
 pub struct SqlLayer {
     /// Sanitized identifier the layer is registered under.
     pub table: String,
@@ -34,7 +35,9 @@ pub struct SqlLayer {
 #[derive(Debug)]
 pub struct QueryOutput {
     pub schema: SchemaRef,
-    pub batches: Vec<RecordBatch>,
+    /// The materialized result as one concatenated batch (display cap
+    /// applied); pagination/sorting are view concerns over it.
+    pub batch: RecordBatch,
     pub total_rows: usize,
     pub truncated: bool,
     pub elapsed_ms: u64,
@@ -43,9 +46,20 @@ pub struct QueryOutput {
     pub geom: Option<(usize, Crs)>,
 }
 
+/// A finished background job.
+pub enum SqlDone {
+    Query(QueryOutput),
+    /// Full-result export (re-runs the query, streaming): temp file + rows.
+    Export {
+        path: std::path::PathBuf,
+        #[allow(dead_code)] // reported in logs/tests; UI shows the layer
+        rows: usize,
+    },
+}
+
 pub struct SqlMsg {
     pub id: u64,
-    pub result: Result<QueryOutput, String>,
+    pub result: Result<SqlDone, String>,
 }
 
 /// Turn a layer display name into a stable SQL identifier: lowercase
@@ -82,7 +96,29 @@ pub fn spawn_query(
     std::thread::Builder::new()
         .name("sql-query".into())
         .spawn(move || {
-            let result = run_query(&query, &layers);
+            let result = run_query(&query, &layers).map(SqlDone::Query);
+            let _ = tx.send(SqlMsg { id, result });
+            on_done();
+        })
+        .expect("spawn sql thread");
+}
+
+/// Re-run `query` and stream the FULL result (no display cap) to a
+/// GeoParquet file on a worker thread — "add as layer" beyond what the
+/// grid materialized.
+pub fn spawn_export(
+    id: u64,
+    query: String,
+    layers: Vec<SqlLayer>,
+    path: std::path::PathBuf,
+    tx: Sender<SqlMsg>,
+    on_done: impl FnOnce() + Send + 'static,
+) {
+    std::thread::Builder::new()
+        .name("sql-export".into())
+        .spawn(move || {
+            let result =
+                run_export(&query, &layers, &path).map(|rows| SqlDone::Export { path, rows });
             let _ = tx.send(SqlMsg { id, result });
             on_done();
         })
@@ -94,12 +130,16 @@ pub fn run_query_for_test(query: &str, layers: &[SqlLayer]) -> Result<QueryOutpu
     run_query(query, layers)
 }
 
-fn run_query(query: &str, layers: &[SqlLayer]) -> Result<QueryOutput, String> {
-    let started = Instant::now();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .map_err(|e| format!("tokio runtime: {e}"))?;
+#[cfg(test)]
+pub fn run_export_for_test(
+    query: &str,
+    layers: &[SqlLayer],
+    path: &std::path::Path,
+) -> Result<usize, String> {
+    run_export(query, layers, path)
+}
 
+fn make_ctx(layers: &[SqlLayer]) -> Result<SessionContext, String> {
     // DataFusion partitions the scan per row group already; keep its own
     // repartitioning from shuffling small interactive results.
     let config = SessionConfig::new().with_target_partitions(num_cpus());
@@ -112,6 +152,15 @@ fn run_query(query: &str, layers: &[SqlLayer]) -> Result<QueryOutput, String> {
         )
         .map_err(|e| format!("register {}: {e}", l.table))?;
     }
+    Ok(ctx)
+}
+
+fn run_query(query: &str, layers: &[SqlLayer]) -> Result<QueryOutput, String> {
+    let started = Instant::now();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let ctx = make_ctx(layers)?;
 
     let (schema, batches, total_rows, truncated) = rt.block_on(async {
         let df = ctx.sql(query).await.map_err(fmt_df_err)?;
@@ -140,14 +189,49 @@ fn run_query(query: &str, layers: &[SqlLayer]) -> Result<QueryOutput, String> {
         Ok::<_, String>((schema, batches, rows, truncated))
     })?;
 
-    let geom = detect_geometry(&schema, &batches, layers, query);
+    let batch = arrow::compute::concat_batches(&schema, &batches)
+        .map_err(|e| format!("result concat: {e}"))?;
+    let geom = detect_geometry(&schema, &batch, layers, query);
     Ok(QueryOutput {
         schema,
-        batches,
+        batch,
         total_rows,
         truncated,
         elapsed_ms: started.elapsed().as_millis() as u64,
         geom,
+    })
+}
+
+/// Execute and stream every result row into a GeoParquet file.
+fn run_export(query: &str, layers: &[SqlLayer], path: &std::path::Path) -> Result<usize, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let ctx = make_ctx(layers)?;
+    rt.block_on(async {
+        let df = ctx.sql(query).await.map_err(fmt_df_err)?;
+        let mut stream = df.execute_stream().await.map_err(fmt_df_err)?;
+        let schema = stream.schema();
+        // Geometry detection needs a data sample: peek the first batch.
+        let mut first = None;
+        while let Some(b) = stream.next().await {
+            let b = b.map_err(fmt_df_err)?;
+            if b.num_rows() > 0 {
+                first = Some(b);
+                break;
+            }
+        }
+        let Some(first) = first else {
+            return Err("no rows to export".into());
+        };
+        let (geom_col, crs) = detect_geometry(&schema, &first, layers, query)
+            .ok_or("no geometry column in result")?;
+        let mut writer = super::export::StreamWriter::new(path, &schema, geom_col, &crs)?;
+        writer.write(&first)?;
+        while let Some(b) = stream.next().await {
+            writer.write(&b.map_err(fmt_df_err)?)?;
+        }
+        writer.finish()
     })
 }
 
@@ -170,7 +254,7 @@ fn num_cpus() -> usize {
 /// CRS is taken from the first registered layer the query text references.
 fn detect_geometry(
     schema: &SchemaRef,
-    batches: &[RecordBatch],
+    batch: &RecordBatch,
     layers: &[SqlLayer],
     query: &str,
 ) -> Option<(usize, Crs)> {
@@ -190,14 +274,12 @@ fn detect_geometry(
         }
     });
     let col = candidates.into_iter().find(|&i| {
-        batches.iter().any(|b| {
-            let arr = b.column(i);
-            let arr = arr.as_any().downcast_ref::<arrow::array::BinaryArray>();
-            arr.is_some_and(|arr| {
-                (0..arr.len())
-                    .find(|&r| !arr.is_null(r))
-                    .is_some_and(|r| decode_wkb(arr.value(r)).is_some())
-            })
+        let arr = batch.column(i);
+        let arr = arr.as_any().downcast_ref::<arrow::array::BinaryArray>();
+        arr.is_some_and(|arr| {
+            (0..arr.len())
+                .find(|&r| !arr.is_null(r))
+                .is_some_and(|r| decode_wkb(arr.value(r)).is_some())
         })
     })?;
 
@@ -234,7 +316,7 @@ mod tests {
 
     fn get_f64(out: &QueryOutput, col: usize) -> f64 {
         use arrow::array::Float64Array;
-        out.batches[0]
+        out.batch
             .column(col)
             .as_any()
             .downcast_ref::<Float64Array>()
@@ -250,7 +332,7 @@ mod tests {
         let total = layers[0].store.total_rows();
         let out = run_query("select count(*) c from t", &layers).unwrap();
         use arrow::array::Int64Array;
-        let c = out.batches[0]
+        let c = out.batch
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -274,7 +356,7 @@ mod tests {
         )
         .unwrap();
         use arrow::array::Int64Array;
-        let c = out.batches[0]
+        let c = out.batch
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -313,7 +395,7 @@ mod tests {
         )
         .unwrap();
         use arrow::array::StringArray;
-        let w = out.batches[0]
+        let w = out.batch
             .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
@@ -321,7 +403,7 @@ mod tests {
             .value(0);
         assert_eq!(w, "POINT(1 2)");
         assert_eq!(get_f64(&out, 1), 5.0);
-        let bt = out.batches[0]
+        let bt = out.batch
             .column(2)
             .as_any()
             .downcast_ref::<StringArray>()
@@ -357,7 +439,7 @@ mod tests {
             let out = run_query(&format!("select count(*) c from t where {pred}"), &layers)
                 .unwrap();
             use arrow::array::Int64Array;
-            out.batches[0]
+            out.batch
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
@@ -371,6 +453,27 @@ mod tests {
         let total = layers[0].store.total_rows() as i64;
         assert_eq!(pushed, control, "pruning must not drop matching rows");
         assert!(pushed > 0 && pushed < total, "window count: {pushed}/{total}");
+    }
+
+    /// The streaming full-result export ("Result as layer" beyond the
+    /// display cap) must write every matching row with the CRS intact.
+    #[test]
+    fn full_export_streams_all_rows() {
+        let Some(layers) = fixture("polygons_5k_l93.parquet") else {
+            return;
+        };
+        let path = std::env::temp_dir().join("geopq_sql_full_export_test.parquet");
+        let rows = run_export_for_test(
+            "select * from t where st_area(geometry) > 0",
+            &layers,
+            &path,
+        )
+        .unwrap();
+        assert_eq!(rows as u64, layers[0].store.total_rows());
+        let (store, crs, _, _) = crate::data::loader::open_store_for_test(&path).unwrap();
+        assert_eq!(store.total_rows(), rows as u64);
+        assert_eq!(crs.epsg, Some(2154), "CRS carried through");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -422,7 +525,7 @@ mod tests {
         assert_eq!(out.total_rows, 2);
         assert_eq!(out.schema.field(0).name(), "name");
         use arrow::array::StringArray as SA;
-        let names = out.batches[0].column(0).as_any().downcast_ref::<SA>().unwrap();
+        let names = out.batch.column(0).as_any().downcast_ref::<SA>().unwrap();
         assert_eq!((names.value(0), names.value(1)), ("a", "c"));
         let _ = std::fs::remove_file(&path);
     }

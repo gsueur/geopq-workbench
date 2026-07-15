@@ -26,14 +26,52 @@ pub fn write_result(
     geom_col: usize,
     crs: &Crs,
 ) -> Result<(), String> {
-    let geom_name = schema.field(geom_col).name().clone();
-
-    // Geometry types present and overall bbox, from the WKB values.
-    let mut types: Vec<&'static str> = Vec::new();
-    let mut bbox: Option<[f64; 4]> = None;
+    let mut w = StreamWriter::new(path, schema, geom_col, crs)?;
     for batch in batches {
+        w.write(batch)?;
+    }
+    w.finish().map(|_| ())
+}
+
+/// Incremental GeoParquet 1.1 (WKB) writer: geometry types and the file
+/// bbox accumulate per batch, the `geo` metadata is attached at close.
+pub struct StreamWriter {
+    writer: ArrowWriter<File>,
+    geom_col: usize,
+    geom_name: String,
+    crs_meta: CrsOut,
+    types: Vec<&'static str>,
+    bbox: Option<[f64; 4]>,
+    rows: usize,
+}
+
+impl StreamWriter {
+    pub fn new(
+        path: &Path,
+        schema: &SchemaRef,
+        geom_col: usize,
+        crs: &Crs,
+    ) -> Result<Self, String> {
+        let file = File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .build();
+        let writer = ArrowWriter::try_new(file, Arc::clone(schema), Some(props))
+            .map_err(|e| format!("parquet writer: {e}"))?;
+        Ok(Self {
+            writer,
+            geom_col,
+            geom_name: schema.field(geom_col).name().clone(),
+            crs_meta: crs_value(crs),
+            types: Vec::new(),
+            bbox: None,
+            rows: 0,
+        })
+    }
+
+    pub fn write(&mut self, batch: &RecordBatch) -> Result<(), String> {
         let Some(arr) = batch
-            .column(geom_col)
+            .column(self.geom_col)
             .as_any()
             .downcast_ref::<BinaryArray>()
         else {
@@ -57,11 +95,11 @@ pub fn write_result(
                 geo_types::Geometry::MultiPolygon(_) => "MultiPolygon",
                 geo_types::Geometry::GeometryCollection(_) => "GeometryCollection",
             };
-            if !types.contains(&t) {
-                types.push(t);
+            if !self.types.contains(&t) {
+                self.types.push(t);
             }
             if let Some(r) = g.bounding_rect() {
-                bbox = Some(match bbox {
+                self.bbox = Some(match self.bbox {
                     None => [r.min().x, r.min().y, r.max().x, r.max().y],
                     Some(b) => [
                         b[0].min(r.min().x),
@@ -72,47 +110,46 @@ pub fn write_result(
                 });
             }
         }
-    }
-    types.sort_unstable();
-
-    let mut col_meta = json!({
-        "encoding": "WKB",
-        "geometry_types": types,
-    });
-    match crs_value(crs) {
-        CrsOut::Omit => {}
-        CrsOut::Value(v) => {
-            col_meta["crs"] = v;
-        }
-    }
-    if let Some(b) = bbox {
-        col_meta["bbox"] = json!(b);
-    }
-    let geo = json!({
-        "version": "1.1.0",
-        "primary_column": geom_name,
-        "columns": { geom_name.clone(): col_meta },
-    });
-
-    let file = File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::default()))
-        .build();
-    let mut writer = ArrowWriter::try_new(file, Arc::clone(schema), Some(props))
-        .map_err(|e| format!("parquet writer: {e}"))?;
-    // KV metadata must go through the writer; arrow schema metadata is not
-    // copied into the parquet footer.
-    writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
-        "geo".to_string(),
-        geo.to_string(),
-    ));
-    for batch in batches {
-        writer
+        self.rows += batch.num_rows();
+        self.writer
             .write(batch)
-            .map_err(|e| format!("parquet write: {e}"))?;
+            .map_err(|e| format!("parquet write: {e}"))
     }
-    writer.close().map_err(|e| format!("parquet close: {e}"))?;
-    Ok(())
+
+    /// Attach the `geo` metadata and close; returns the rows written.
+    pub fn finish(mut self) -> Result<usize, String> {
+        let mut types = std::mem::take(&mut self.types);
+        types.sort_unstable();
+        let mut col_meta = json!({
+            "encoding": "WKB",
+            "geometry_types": types,
+        });
+        match &self.crs_meta {
+            CrsOut::Omit => {}
+            CrsOut::Value(v) => {
+                col_meta["crs"] = v.clone();
+            }
+        }
+        if let Some(b) = self.bbox {
+            col_meta["bbox"] = json!(b);
+        }
+        let geo = json!({
+            "version": "1.1.0",
+            "primary_column": self.geom_name,
+            "columns": { self.geom_name.clone(): col_meta },
+        });
+        // KV metadata must go through the writer; arrow schema metadata is
+        // not copied into the parquet footer.
+        self.writer
+            .append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+                "geo".to_string(),
+                geo.to_string(),
+            ));
+        self.writer
+            .close()
+            .map_err(|e| format!("parquet close: {e}"))?;
+        Ok(self.rows)
+    }
 }
 
 enum CrsOut {
@@ -173,7 +210,7 @@ mod tests {
 
         let dir = std::env::temp_dir();
         let dst = dir.join("geopq_sql_export_test.parquet");
-        write_result(&dst, &out.schema, &out.batches, geom_col, &crs).unwrap();
+        write_result(&dst, &out.schema, std::slice::from_ref(&out.batch), geom_col, &crs).unwrap();
 
         let (store2, crs2, _, _) = open_store_for_test(&dst).unwrap();
         assert_eq!(store2.total_rows(), 100);

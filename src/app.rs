@@ -17,6 +17,9 @@ use crate::map::tiles::{TileCache, TILE_SOURCES};
 use crate::picking::{self, Selection};
 
 const HIGHLIGHT_KEY: u64 = u64::MAX;
+/// Separate render layer for the SQL checked-rows selection, so picking a
+/// feature on the map doesn't wipe it.
+const SQL_HIGHLIGHT_KEY: u64 = u64::MAX - 1;
 const GRATICULE_KEY: u64 = u64::MAX - 1;
 const COASTLINE_KEY: u64 = u64::MAX - 2;
 /// Row-group bbox overlays: key = RG_OVERLAY_BASE | layer id.
@@ -60,6 +63,10 @@ pub struct ViewerApp {
     selection_attrs: Option<arrow::record_batch::RecordBatch>,
     selection_generation: u64,
     highlight_chunks: Option<Arc<Vec<crate::data::geometry::ChunkMesh>>>,
+    /// SQL checked-rows selection, rendered independently of the picked
+    /// feature so map clicks don't wipe it.
+    sql_highlight_chunks: Option<Arc<Vec<crate::data::geometry::ChunkMesh>>>,
+    sql_highlight_generation: u64,
     graticule_chunks: Arc<Vec<crate::data::geometry::ChunkMesh>>,
     coastline_chunks: Arc<Vec<crate::data::geometry::ChunkMesh>>,
     /// Bumped when overlays (graticule/coastline) are rebuilt for a new projection.
@@ -138,6 +145,8 @@ impl ViewerApp {
             selection_attrs: None,
             selection_generation: 0,
             highlight_chunks: None,
+            sql_highlight_chunks: None,
+            sql_highlight_generation: 0,
             graticule_chunks,
             coastline_chunks,
             graticule_generation: 0,
@@ -215,15 +224,15 @@ impl ViewerApp {
         job
     }
 
-    /// Highlight the SQL-checked features on the map. The geometries are
+    /// Highlight the SQL-checked features on the map (own render layer —
+    /// independent of the picked-feature highlight). The geometries are
     /// whatever the query returned (possibly computed, e.g. centroids), so
     /// the highlight is built from them directly instead of going through
     /// layer picking.
     fn apply_sql_selection(&mut self, crs: &Crs, geoms: Vec<geo_types::Geometry<f64>>) {
-        // Replace any picked-feature selection with this highlight.
-        self.select(None);
-        self.selection_generation += 1;
+        self.sql_highlight_generation += 1;
         if geoms.is_empty() {
+            self.sql_highlight_chunks = None;
             return;
         }
         let mut mb = MeshBuilder::default();
@@ -231,7 +240,7 @@ impl ViewerApp {
             let world = crate::picking::to_world_geom(g, crs, &self.display);
             mb.add(&world, crate::data::geometry::FeatureRef::INVALID);
         }
-        self.highlight_chunks = Some(Arc::new(mb.finish()));
+        self.sql_highlight_chunks = Some(Arc::new(mb.finish()));
     }
 
     /// Zoom the map to a data-CRS bbox (e.g. a feature clicked in the SQL
@@ -384,6 +393,9 @@ impl ViewerApp {
         self.display = display;
         self.selection = None;
         self.highlight_chunks = None;
+        // World-space geometry; must rebuild for the new projection.
+        self.sql_highlight_chunks = None;
+        self.sql_highlight_generation += 1;
         self.graticule_chunks = build_graticule(&self.display);
         self.coastline_chunks = crate::data::coastline::build_coastline(&self.display);
         self.graticule_generation += 1;
@@ -1900,8 +1912,22 @@ impl ViewerApp {
                 .any(|l| l.id == *id && l.style.show_rg_bboxes)
         });
 
-        // Highlight renders for a picked feature or a clicked SQL result
-        // row (which has chunks but no layer selection).
+        // Two independent highlight layers: the SQL checked-rows selection
+        // (cyan, below) and the picked feature (amber, on top).
+        if let Some(chunks) = &self.sql_highlight_chunks {
+            draws.push(LayerDraw {
+                key: (SQL_HIGHLIGHT_KEY, self.sql_highlight_generation),
+                composite_group: SQL_HIGHLIGHT_KEY,
+                chunks: chunks.clone(),
+                style: DrawStyle {
+                    fill_color: [0.05, 0.75, 0.95, 0.35],
+                    line_color: [0.1, 0.85, 1.0, 1.0],
+                    point_color: [0.1, 0.85, 1.0, 1.0],
+                    line_half_width_px: 1.8,
+                    point_radius_px: 6.0,
+                },
+            });
+        }
         if let Some(chunks) = &self.highlight_chunks {
             draws.push(LayerDraw {
                 key: (HIGHLIGHT_KEY, self.selection_generation),
@@ -2205,36 +2231,43 @@ impl eframe::App for ViewerApp {
         egui::Panel::top("menubar").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
-        self.sql.poll();
+        let mut sql_action = self.sql.poll();
         if self.sql.open {
-            let mut action = None;
+            let view_world = self.last_view_world;
+            let display = self.display.clone();
             egui::Panel::bottom("sql_console")
                 .resizable(true)
                 .default_size(240.0)
                 .show(ui, |ui| {
-                    action = self.sql.panel_ui(ui, &self.layers);
-                });
-            match action {
-                Some(crate::sql::console::ConsoleAction::LoadLayer(path)) => {
-                    self.enqueue_load(Source::Local(path), &ctx);
-                }
-                Some(crate::sql::console::ConsoleAction::Select { crs, geoms }) => {
-                    self.apply_sql_selection(&crs, geoms);
-                }
-                Some(crate::sql::console::ConsoleAction::Zoom { crs, geom }) => {
-                    use geo::BoundingRect;
-                    if let Some(r) = geom.bounding_rect() {
-                        self.zoom_to_data_bbox(
-                            [r.min().x, r.min().y, r.max().x, r.max().y],
-                            &crs,
-                        );
+                    if let Some(a) = self.sql.panel_ui(ui, &self.layers, view_world, &display)
+                    {
+                        sql_action = Some(a);
                     }
-                }
-                Some(crate::sql::console::ConsoleAction::ClearSelection) => {
-                    self.select(None);
-                }
-                None => {}
+                });
+        }
+        match sql_action {
+            Some(crate::sql::console::ConsoleAction::LoadLayer(path)) => {
+                self.enqueue_load(Source::Local(path), &ctx);
             }
+            Some(crate::sql::console::ConsoleAction::Select { crs, geoms }) => {
+                self.apply_sql_selection(&crs, geoms);
+            }
+            Some(crate::sql::console::ConsoleAction::Zoom {
+                crs,
+                zoom,
+                highlight,
+            }) => {
+                use geo::BoundingRect;
+                if let Some(r) = zoom.bounding_rect() {
+                    self.zoom_to_data_bbox([r.min().x, r.min().y, r.max().x, r.max().y], &crs);
+                }
+                self.apply_sql_selection(&crs, highlight);
+            }
+            Some(crate::sql::console::ConsoleAction::ClearSelection) => {
+                self.sql_highlight_chunks = None;
+                self.sql_highlight_generation += 1;
+            }
+            None => {}
         }
         egui::Panel::left("layers")
             .resizable(true)

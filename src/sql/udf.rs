@@ -31,6 +31,33 @@ pub fn register_all(ctx: &SessionContext) {
     }
 }
 
+/// Bare function names, for autocomplete.
+pub const NAMES: &[&str] = &[
+    "st_area",
+    "st_length",
+    "st_centroid",
+    "st_x",
+    "st_y",
+    "st_xmin",
+    "st_ymin",
+    "st_xmax",
+    "st_ymax",
+    "st_astext",
+    "st_geomfromtext",
+    "st_point",
+    "st_makeenvelope",
+    "st_intersects",
+    "st_contains",
+    "st_within",
+    "st_distance",
+    "st_dwithin",
+    "st_geometrytype",
+    "st_npoints",
+    "st_buffer",
+    "st_simplify",
+    "st_convexhull",
+];
+
 /// Names and signatures for the console's help panel.
 pub fn catalog() -> &'static [(&'static str, &'static str)] {
     &[

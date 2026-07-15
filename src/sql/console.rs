@@ -1,5 +1,6 @@
-//! SQL console panel: editor, background execution, results table, and
-//! "add as layer" export back through the loader.
+//! SQL console panel: editors with autocomplete, background execution,
+//! paginated/sortable results grid, and "add as layer" export back through
+//! the loader.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -7,18 +8,28 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
 use arrow::array::{Array, BinaryArray};
+use arrow::record_batch::RecordBatch;
 use eframe::egui::{self, RichText};
 use egui_extras::{Column, TableBuilder};
 
-use super::engine::{self, QueryOutput, SqlLayer, SqlMsg, MAX_RESULT_ROWS};
+use super::engine::{self, QueryOutput, SqlDone, SqlLayer, SqlMsg, MAX_RESULT_ROWS};
+use super::{export, udf};
+use crate::data::crs::{Crs, DisplayCrs};
+use crate::data::layer::VectorLayer;
+use crate::data::loader::{decode_wkb, viewport_to_data_bbox};
 
 /// Above this many checked rows the map highlight is skipped: decoding and
 /// meshing every geometry happens on the UI thread.
 const MAX_HIGHLIGHT_ROWS: usize = 20_000;
-use super::{export, udf};
-use crate::data::crs::Crs;
-use crate::data::layer::VectorLayer;
-use crate::data::loader::decode_wkb;
+
+const PAGE_SIZES: [usize; 3] = [100, 1_000, 10_000];
+
+const SQL_KEYWORDS: &[&str] = &[
+    "select", "from", "where", "and", "or", "not", "order by", "group by", "having", "limit",
+    "offset", "as", "join", "left join", "inner join", "on", "distinct", "count", "sum", "avg",
+    "min", "max", "between", "like", "in", "is null", "is not null", "case", "when", "then",
+    "else", "end", "cast", "asc", "desc", "union all",
+];
 
 /// What the app should do after a console interaction.
 pub enum ConsoleAction {
@@ -30,10 +41,12 @@ pub enum ConsoleAction {
         crs: Crs,
         geoms: Vec<geo_types::Geometry<f64>>,
     },
-    /// Zoom the map to one feature (🔍 button), leaving selection alone.
+    /// Zoom the map to one feature and highlight it together with the
+    /// current checked selection.
     Zoom {
         crs: Crs,
-        geom: geo_types::Geometry<f64>,
+        zoom: geo_types::Geometry<f64>,
+        highlight: Vec<geo_types::Geometry<f64>>,
     },
     /// No rows checked anymore: clear the map selection.
     ClearSelection,
@@ -47,29 +60,50 @@ enum Mode {
     Query,
 }
 
+/// Autocomplete popup state for one text field.
+#[derive(Default)]
+struct AcState {
+    open: bool,
+    items: Vec<String>,
+    /// Byte range of the token being completed.
+    token: std::ops::Range<usize>,
+    selected: usize,
+}
+
 pub struct SqlConsole {
     pub open: bool,
     mode: Mode,
-    /// Browse mode: selected table, WHERE clause, row limit.
+    /// Browse mode: selected table, WHERE clause, viewport filter.
     browse_table: String,
     browse_where: String,
-    browse_limit: usize,
+    viewport_only: bool,
     /// Query mode: free-form SQL.
     query: String,
+    /// The SQL actually executed last and the layer set it ran against
+    /// (for full-result re-run exports).
+    last_sql: String,
+    last_layers: Vec<SqlLayer>,
     tx: Sender<SqlMsg>,
     rx: Receiver<SqlMsg>,
     next_id: u64,
     running: Option<u64>,
+    exporting: Option<u64>,
     result: Option<QueryOutput>,
-    /// Cumulative row offset of each result batch (len = batches + 1).
-    row_offsets: Vec<usize>,
-    /// Rows checked in the results grid (map selection + TSV copy).
+    /// Rows checked in the results grid — underlying (unsorted) indices.
     selected_rows: BTreeSet<usize>,
+    /// Result view: current page and rows per page.
+    page: usize,
+    page_size: usize,
+    /// Sort state: (column, ascending); `perm[view] = underlying`.
+    sort: Option<(usize, bool)>,
+    perm: Option<Vec<u32>>,
     /// Wall-clock time of the last clipboard copy, for brief feedback.
     copied_at: Option<f64>,
     error: Option<String>,
     show_help: bool,
     export_n: u64,
+    ac_query: AcState,
+    ac_where: AcState,
 }
 
 impl SqlConsole {
@@ -80,24 +114,32 @@ impl SqlConsole {
             mode: Mode::Browse,
             browse_table: String::new(),
             browse_where: String::new(),
-            browse_limit: 1000,
+            viewport_only: false,
             query: String::new(),
+            last_sql: String::new(),
+            last_layers: Vec::new(),
             tx,
             rx,
             next_id: 0,
             running: None,
+            exporting: None,
             result: None,
-            row_offsets: vec![0],
             selected_rows: BTreeSet::new(),
+            page: 0,
+            page_size: 1_000,
+            sort: None,
+            perm: None,
             copied_at: None,
             error: None,
             show_help: false,
             export_n: 0,
+            ac_query: AcState::default(),
+            ac_where: AcState::default(),
         }
     }
 
     pub fn is_running(&self) -> bool {
-        self.running.is_some()
+        self.running.is_some() || self.exporting.is_some()
     }
 
     /// Open the console with the ST_* reference visible (Help menu).
@@ -106,42 +148,53 @@ impl SqlConsole {
         self.show_help = true;
     }
 
-    /// Drain finished queries. Call every frame before the panel.
-    pub fn poll(&mut self) {
+    /// Drain finished jobs. Call every frame; may return an action (e.g. a
+    /// finished full-result export to load).
+    pub fn poll(&mut self) -> Option<ConsoleAction> {
+        let mut action = None;
         while let Ok(msg) = self.rx.try_recv() {
-            if Some(msg.id) != self.running {
-                continue; // stale result from a superseded query
-            }
-            self.running = None;
-            self.selected_rows.clear();
-            match msg.result {
-                Ok(out) => {
-                    self.row_offsets = std::iter::once(0)
-                        .chain(out.batches.iter().scan(0usize, |acc, b| {
-                            *acc += b.num_rows();
-                            Some(*acc)
-                        }))
-                        .collect();
-                    self.result = Some(out);
-                    self.error = None;
+            if Some(msg.id) == self.running {
+                self.running = None;
+                self.selected_rows.clear();
+                self.page = 0;
+                self.sort = None;
+                self.perm = None;
+                match msg.result {
+                    Ok(SqlDone::Query(out)) => {
+                        self.result = Some(out);
+                        self.error = None;
+                    }
+                    Ok(SqlDone::Export { .. }) => {}
+                    Err(e) => {
+                        self.error = Some(e);
+                        self.result = None;
+                    }
                 }
-                Err(e) => {
-                    self.error = Some(e);
-                    self.result = None;
+            } else if Some(msg.id) == self.exporting {
+                self.exporting = None;
+                match msg.result {
+                    Ok(SqlDone::Export { path, .. }) => {
+                        action = Some(ConsoleAction::LoadLayer(path));
+                    }
+                    Ok(SqlDone::Query(_)) => {}
+                    Err(e) => self.error = Some(e),
                 }
             }
         }
+        action
     }
 
-    /// Render the console. Returns an action for the app to apply (load an
-    /// exported result as a layer, zoom to a clicked feature).
+    /// Render the console. Returns an action for the app to apply.
     pub fn panel_ui(
         &mut self,
         ui: &mut egui::Ui,
         layers: &[VectorLayer],
+        view_world: [f64; 4],
+        display: &DisplayCrs,
     ) -> Option<ConsoleAction> {
         let mut action = None;
         let tables = table_names(layers);
+        let dict = completion_dict(layers, &tables);
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -152,6 +205,10 @@ impl SqlConsole {
                 ui.spinner();
                 ui.label(RichText::new("running…").weak());
             }
+            if self.exporting.is_some() {
+                ui.spinner();
+                ui.label(RichText::new("exporting full result…").weak());
+            }
             ui.toggle_value(&mut self.show_help, "ST_* help");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("✕").clicked() {
@@ -161,8 +218,8 @@ impl SqlConsole {
         });
 
         match self.mode {
-            Mode::Browse => self.browse_bar(ui, layers, &tables),
-            Mode::Query => self.query_editor(ui, layers, &tables),
+            Mode::Browse => self.browse_bar(ui, layers, &tables, &dict, view_world, display),
+            Mode::Query => self.query_editor(ui, layers, &tables, &dict),
         }
 
         if self.show_help {
@@ -189,34 +246,83 @@ impl SqlConsole {
         }
 
         let mut clear = false;
-        let mut export = false;
+        let mut export_all = false;
         let mut export_sel = false;
         let mut copy_tsv = false;
         if let Some(out) = &self.result {
-            let mut status = format!("{} rows · {} ms", out.total_rows, out.elapsed_ms);
-            if out.truncated {
-                status.push_str(&format!(" · truncated at {MAX_RESULT_ROWS}"));
-            }
-            let geom_name = out
-                .geom
-                .as_ref()
-                .map(|(i, _)| out.schema.field(*i).name().clone());
-            let has_geom = geom_name.is_some();
+            let total = out.total_rows;
             let n_sel = self.selected_rows.len();
+            let has_geom = out.geom.is_some();
             let copied_recently = self
                 .copied_at
                 .is_some_and(|t| ui.input(|i| i.time) - t < 2.0);
-            let total = out.total_rows;
+            let mut status = format!("{total} rows · {} ms", out.elapsed_ms);
+            if out.truncated {
+                status.push_str(&format!(" · showing first {MAX_RESULT_ROWS}"));
+            }
+
+            let mut new_page = self.page;
+            let mut new_size = self.page_size;
             ui.horizontal(|ui| {
                 ui.label(RichText::new(status).weak().small());
-                if let Some(gname) = geom_name {
-                    export = ui
-                        .button(format!("🗺 Result as layer ({total} rows)"))
-                        .on_hover_text(format!(
-                            "Write the whole result grid — exactly the {total} rows \
-                             shown here, after any LIMIT/truncation — to a temporary \
-                             GeoParquet ({gname} as geometry) and load it on the map"
-                        ))
+
+                // Pagination.
+                let n_pages = total.div_ceil(self.page_size).max(1);
+                if n_pages > 1 {
+                    ui.separator();
+                    if ui.add_enabled(self.page > 0, egui::Button::new("⏮")).clicked() {
+                        new_page = 0;
+                    }
+                    if ui.add_enabled(self.page > 0, egui::Button::new("⏴")).clicked() {
+                        new_page = self.page - 1;
+                    }
+                    let lo = self.page * self.page_size + 1;
+                    let hi = ((self.page + 1) * self.page_size).min(total);
+                    ui.label(RichText::new(format!("{lo}–{hi} of {total}")).small());
+                    if ui
+                        .add_enabled(self.page + 1 < n_pages, egui::Button::new("⏵"))
+                        .clicked()
+                    {
+                        new_page = self.page + 1;
+                    }
+                    if ui
+                        .add_enabled(self.page + 1 < n_pages, egui::Button::new("⏭"))
+                        .clicked()
+                    {
+                        new_page = n_pages - 1;
+                    }
+                }
+                egui::ComboBox::from_id_salt("sql_page_size")
+                    .selected_text(format!("{}/page", self.page_size))
+                    .width(80.0)
+                    .show_ui(ui, |ui| {
+                        for s in PAGE_SIZES {
+                            ui.selectable_value(&mut new_size, s, format!("{s}/page"));
+                        }
+                    });
+
+                ui.separator();
+                if has_geom {
+                    let (label, hover) = if out.truncated {
+                        (
+                            "🗺 Result as layer (all rows)".to_string(),
+                            "Re-runs the query and streams EVERY matching row to a \
+                             temporary GeoParquet (not just the rows shown), then \
+                             loads it on the map"
+                                .to_string(),
+                        )
+                    } else {
+                        (
+                            format!("🗺 Result as layer ({total} rows)"),
+                            format!(
+                                "Write the whole result ({total} rows) to a temporary \
+                                 GeoParquet and load it on the map"
+                            ),
+                        )
+                    };
+                    export_all = ui
+                        .add_enabled(self.exporting.is_none(), egui::Button::new(label))
+                        .on_hover_text(hover)
                         .clicked();
                 }
                 if n_sel > 0 {
@@ -248,24 +354,37 @@ impl SqlConsole {
                     ui.label(RichText::new("✔ copied").weak().small());
                 }
             });
+            if new_size != self.page_size {
+                // Keep the first visible row stable across page-size change.
+                let first = self.page * self.page_size;
+                self.page_size = new_size;
+                self.page = first / new_size;
+            } else {
+                self.page = new_page;
+            }
         }
-        if export || export_sel {
-            let rows = export_sel.then(|| self.selected_rows.clone());
-            match self.export_result(rows.as_ref()) {
+
+        if export_all {
+            action = self.export_full().or(action);
+        }
+        if export_sel {
+            let rows = self.selected_rows.clone();
+            match self.export_materialized(Some(&rows)) {
                 Ok(path) => action = Some(ConsoleAction::LoadLayer(path)),
                 Err(e) => self.error = Some(e),
             }
         }
         if copy_tsv {
             if let Some(out) = &self.result {
-                ui.ctx()
-                    .copy_text(selection_tsv(out, &self.row_offsets, &self.selected_rows));
+                ui.ctx().copy_text(selection_tsv(out, &self.selected_rows));
                 self.copied_at = Some(ui.input(|i| i.time));
             }
         }
         if clear {
             self.result = None;
-            self.row_offsets = vec![0];
+            self.perm = None;
+            self.sort = None;
+            self.page = 0;
             if !self.selected_rows.is_empty() {
                 action = Some(ConsoleAction::ClearSelection);
             }
@@ -274,51 +393,71 @@ impl SqlConsole {
 
         if let Some(out) = &self.result {
             ui.separator();
-            let ev = results_table(ui, out, &self.row_offsets, &mut self.selected_rows);
+            let ev = results_table(
+                ui,
+                out,
+                &mut self.selected_rows,
+                self.page,
+                self.page_size,
+                self.sort,
+                self.perm.as_deref(),
+            );
             if ev.copied {
                 self.copied_at = Some(ui.input(|i| i.time));
+            }
+            if let Some(col) = ev.sort_clicked {
+                self.cycle_sort(col);
             }
             if ev.toggled {
                 action = Some(self.selection_action());
             } else if let Some(row) = ev.zoom_clicked {
-                if let (Some((_, crs)), Some(geom)) = (
-                    out.geom.clone(),
-                    geometry_at(out, &self.row_offsets, row),
-                ) {
-                    action = Some(ConsoleAction::Zoom { crs, geom });
+                if let Some(zoom) = self.zoom_action(row) {
+                    action = Some(zoom);
                 }
             }
         }
         action
     }
 
-    /// Rebuild the map-selection action after a checkbox toggle.
-    fn selection_action(&self) -> ConsoleAction {
-        let Some(out) = &self.result else {
-            return ConsoleAction::ClearSelection;
+    /// ASC → DESC → NONE cycle on a header click.
+    fn cycle_sort(&mut self, col: usize) {
+        self.sort = match self.sort {
+            Some((c, true)) if c == col => Some((col, false)),
+            Some((c, false)) if c == col => None,
+            _ => Some((col, true)),
         };
-        let Some((_, crs)) = out.geom.clone() else {
-            return ConsoleAction::ClearSelection;
+        self.perm = match self.sort {
+            None => None,
+            Some((c, asc)) => {
+                let out = self.result.as_ref().unwrap();
+                let opts = arrow::compute::SortOptions {
+                    descending: !asc,
+                    nulls_first: false,
+                };
+                match arrow::compute::sort_to_indices(out.batch.column(c), Some(opts), None) {
+                    Ok(idx) => Some(idx.values().to_vec()),
+                    Err(e) => {
+                        self.error = Some(format!("sort: {e}"));
+                        self.sort = None;
+                        None
+                    }
+                }
+            }
         };
-        // Select-all on a huge result must not freeze the UI decoding
-        // every geometry; the selection still works for TSV/export.
-        if self.selected_rows.len() > MAX_HIGHLIGHT_ROWS {
-            return ConsoleAction::ClearSelection;
-        }
-        let geoms: Vec<geo_types::Geometry<f64>> = self
-            .selected_rows
-            .iter()
-            .filter_map(|&r| geometry_at(out, &self.row_offsets, r))
-            .collect();
-        if geoms.is_empty() {
-            return ConsoleAction::ClearSelection;
-        }
-        ConsoleAction::Select { crs, geoms }
+        self.page = 0;
     }
 
     /// TablePlus-style bar: pick a table, type a WHERE clause, Enter (or ▶)
-    /// applies it.
-    fn browse_bar(&mut self, ui: &mut egui::Ui, layers: &[VectorLayer], tables: &[String]) {
+    /// applies it; optionally restrict to the current viewport.
+    fn browse_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        layers: &[VectorLayer],
+        tables: &[String],
+        dict: &[String],
+        view_world: [f64; 4],
+        display: &DisplayCrs,
+    ) {
         if !tables.contains(&self.browse_table) {
             self.browse_table = tables.first().cloned().unwrap_or_default();
         }
@@ -345,21 +484,35 @@ impl SqlConsole {
             ui.label(RichText::new("WHERE").weak().monospace());
             let where_id = egui::Id::new("sql_browse_where");
             ctrl_z_alias(ui, where_id);
-            let w = ui.add(
-                egui::TextEdit::singleline(&mut self.browse_where)
-                    .id(where_id)
-                    .desired_width(ui.available_width() - 170.0)
-                    .hint_text("st_area(geometry) > 1000 — Enter applies"),
+            let width = ui.available_width() - 200.0;
+            let w = autocomplete_edit(
+                ui,
+                where_id,
+                &mut self.browse_where,
+                &mut self.ac_where,
+                dict,
+                move |text| {
+                    egui::TextEdit::singleline(text)
+                        .id(where_id)
+                        .desired_width(width)
+                        .hint_text("st_area(geometry) > 1000 — Enter applies")
+                },
             );
             if w.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 run = true;
             }
 
-            ui.add(
-                egui::DragValue::new(&mut self.browse_limit)
-                    .range(1..=MAX_RESULT_ROWS)
-                    .prefix("limit "),
-            );
+            if ui
+                .checkbox(&mut self.viewport_only, "viewport")
+                .on_hover_text(
+                    "Only rows intersecting the current map viewport \
+                     (adds st_intersects against the view envelope; pruned \
+                     via row-group/page statistics)",
+                )
+                .changed()
+            {
+                run = true;
+            }
             if ui
                 .add_enabled(
                     self.running.is_none() && !self.browse_table.is_empty(),
@@ -372,18 +525,64 @@ impl SqlConsole {
             }
         });
         if run && self.running.is_none() && !self.browse_table.is_empty() {
-            let mut sql = format!("select * from {}", self.browse_table);
+            let mut preds: Vec<String> = Vec::new();
             let w = self.browse_where.trim();
             if !w.is_empty() {
-                sql.push_str(&format!(" where {w}"));
+                preds.push(format!("({w})"));
             }
-            sql.push_str(&format!(" limit {}", self.browse_limit));
+            if self.viewport_only {
+                match self.viewport_predicate(layers, tables, view_world, display) {
+                    Ok(p) => preds.push(p),
+                    Err(e) => {
+                        self.error = Some(e);
+                        return;
+                    }
+                }
+            }
+            let mut sql = format!("select * from {}", self.browse_table);
+            if !preds.is_empty() {
+                sql.push_str(&format!(" where {}", preds.join(" and ")));
+            }
             self.run(ui.ctx().clone(), layers, sql);
         }
     }
 
+    /// `st_intersects(<geom>, st_makeenvelope(...))` for the current
+    /// viewport, in the browsed layer's data CRS.
+    fn viewport_predicate(
+        &self,
+        layers: &[VectorLayer],
+        tables: &[String],
+        view_world: [f64; 4],
+        display: &DisplayCrs,
+    ) -> Result<String, String> {
+        let idx = tables
+            .iter()
+            .position(|t| *t == self.browse_table)
+            .ok_or("no table selected")?;
+        let layer = &layers[idx];
+        let b = viewport_to_data_bbox(view_world, display, &layer.crs)
+            .ok_or("viewport does not transform into the layer CRS")?;
+        let geom = layer
+            .store
+            .schema
+            .field(layer.store.geom_col)
+            .name()
+            .to_lowercase();
+        Ok(format!(
+            "st_intersects({geom}, st_makeenvelope({}, {}, {}, {}))",
+            b[0], b[1], b[2], b[3]
+        ))
+    }
+
     /// Free-form SQL editor with table-name chips and Ctrl+Enter.
-    fn query_editor(&mut self, ui: &mut egui::Ui, layers: &[VectorLayer], tables: &[String]) {
+    fn query_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        layers: &[VectorLayer],
+        tables: &[String],
+        dict: &[String],
+    ) {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("tables:").weak().small());
             if layers.is_empty() {
@@ -396,7 +595,7 @@ impl SqlConsole {
                     .clicked()
                 {
                     if self.query.trim().is_empty() {
-                        self.query = format!("select * from {t} limit 100");
+                        self.query = format!("select * from {t}");
                     } else {
                         self.query.push_str(t);
                     }
@@ -406,13 +605,20 @@ impl SqlConsole {
 
         let query_id = egui::Id::new("sql_query_edit");
         ctrl_z_alias(ui, query_id);
-        ui.add(
-            egui::TextEdit::multiline(&mut self.query)
-                .id(query_id)
-                .code_editor()
-                .desired_rows(3)
-                .desired_width(f32::INFINITY)
-                .hint_text("select * from <table> where st_area(geometry) > 1000"),
+        autocomplete_edit(
+            ui,
+            query_id,
+            &mut self.query,
+            &mut self.ac_query,
+            dict,
+            |text| {
+                egui::TextEdit::multiline(text)
+                    .id(query_id)
+                    .code_editor()
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("select * from <table> where st_area(geometry) > 1000")
+            },
         );
 
         let run_clicked = ui
@@ -430,8 +636,8 @@ impl SqlConsole {
         }
     }
 
-    fn run(&mut self, egui_ctx: egui::Context, layers: &[VectorLayer], sql: String) {
-        let sql_layers: Vec<SqlLayer> = layers
+    fn sql_layers(layers: &[VectorLayer]) -> Vec<SqlLayer> {
+        layers
             .iter()
             .zip(table_names(layers))
             .map(|(l, table)| SqlLayer {
@@ -448,27 +654,67 @@ impl SqlConsole {
                     })
                     .map(|r| Arc::new(r.boxes.clone())),
             })
-            .collect();
+            .collect()
+    }
+
+    fn run(&mut self, egui_ctx: egui::Context, layers: &[VectorLayer], sql: String) {
         let id = self.next_id;
         self.next_id += 1;
         self.running = Some(id);
         self.error = None;
-        engine::spawn_query(id, sql, sql_layers, self.tx.clone(), move || {
+        self.last_sql = sql.clone();
+        self.last_layers = Self::sql_layers(layers);
+        engine::spawn_query(id, sql, self.last_layers.clone(), self.tx.clone(), move || {
             egui_ctx.request_repaint();
         });
     }
 
-    /// Export the result (or only `rows`, when given) to a temp GeoParquet.
-    fn export_result(&mut self, rows: Option<&BTreeSet<usize>>) -> Result<PathBuf, String> {
+    /// "Result as layer": materialized fast path when complete, streaming
+    /// re-run when the display cap truncated the result.
+    fn export_full(&mut self) -> Option<ConsoleAction> {
+        let out = self.result.as_ref()?;
+        if !out.truncated {
+            return match self.export_materialized(None) {
+                Ok(path) => Some(ConsoleAction::LoadLayer(path)),
+                Err(e) => {
+                    self.error = Some(e);
+                    None
+                }
+            };
+        }
+        // Truncated: re-run the exact SQL against the same layer set and
+        // stream everything.
+        let id = self.next_id;
+        self.next_id += 1;
+        self.exporting = Some(id);
+        self.export_n += 1;
+        let path = std::env::temp_dir().join(format!(
+            "geopq_query_{}_{}.parquet",
+            std::process::id(),
+            self.export_n
+        ));
+        engine::spawn_export(
+            id,
+            self.last_sql.clone(),
+            self.last_layers.clone(),
+            path,
+            self.tx.clone(),
+            || {},
+        );
+        None
+    }
+
+    /// Export the materialized result (or only `rows`) to a temp GeoParquet.
+    fn export_materialized(&mut self, rows: Option<&BTreeSet<usize>>) -> Result<PathBuf, String> {
         let out = self.result.as_ref().ok_or("no result")?;
         let (gcol, crs) = out.geom.clone().ok_or("no geometry column in result")?;
         let filtered;
-        let batches: &[arrow::record_batch::RecordBatch] = match rows {
+        let batches: &[RecordBatch] = match rows {
             Some(rows) => {
-                filtered = filter_rows(out, &self.row_offsets, rows)?;
+                filtered = vec![filter_rows(out, rows)?];
                 &filtered
             }
-            None => &out.batches,
+            None => std::slice::from_ref(&out.batch),
         };
         self.export_n += 1;
         let path = std::env::temp_dir().join(format!(
@@ -478,6 +724,53 @@ impl SqlConsole {
         ));
         export::write_result(&path, &out.schema, batches, gcol, &crs)?;
         Ok(path)
+    }
+
+    /// Rebuild the map-selection action after a checkbox toggle.
+    fn selection_action(&self) -> ConsoleAction {
+        let Some(out) = &self.result else {
+            return ConsoleAction::ClearSelection;
+        };
+        let Some((_, crs)) = out.geom.clone() else {
+            return ConsoleAction::ClearSelection;
+        };
+        // Select-all on a huge result must not freeze the UI decoding
+        // every geometry; the selection still works for TSV/export.
+        if self.selected_rows.len() > MAX_HIGHLIGHT_ROWS {
+            return ConsoleAction::ClearSelection;
+        }
+        let geoms: Vec<geo_types::Geometry<f64>> = self
+            .selected_rows
+            .iter()
+            .filter_map(|&r| geometry_at(out, r))
+            .collect();
+        if geoms.is_empty() {
+            return ConsoleAction::ClearSelection;
+        }
+        ConsoleAction::Select { crs, geoms }
+    }
+
+    /// Zoom to a row's feature, highlighting it along with the checked set.
+    fn zoom_action(&self, row: usize) -> Option<ConsoleAction> {
+        let out = self.result.as_ref()?;
+        let (_, crs) = out.geom.clone()?;
+        let zoom = geometry_at(out, row)?;
+        let mut highlight: Vec<geo_types::Geometry<f64>> =
+            if self.selected_rows.len() <= MAX_HIGHLIGHT_ROWS {
+                self.selected_rows
+                    .iter()
+                    .filter(|&&r| r != row)
+                    .filter_map(|&r| geometry_at(out, r))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        highlight.push(zoom.clone());
+        Some(ConsoleAction::Zoom {
+            crs,
+            zoom,
+            highlight,
+        })
     }
 }
 
@@ -514,6 +807,162 @@ fn ctrl_z_alias(ui: &mut egui::Ui, field: egui::Id) {
     }
 }
 
+/// Names offered by autocomplete: table names, every layer's column names
+/// (lowercased), ST_* functions, SQL keywords.
+fn completion_dict(layers: &[VectorLayer], tables: &[String]) -> Vec<String> {
+    let mut dict: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push = |s: String| {
+        if seen.insert(s.clone()) {
+            dict.push(s);
+        }
+    };
+    for l in layers {
+        for f in l.store.schema.fields() {
+            push(f.name().to_lowercase());
+        }
+    }
+    for t in tables {
+        push(t.clone());
+    }
+    for n in udf::NAMES {
+        push((*n).to_string());
+    }
+    for k in SQL_KEYWORDS {
+        push((*k).to_string());
+    }
+    dict
+}
+
+/// A text edit with a completion popup: candidates from `dict` matching the
+/// identifier under the cursor; Up/Down navigate, Tab/Enter accept, Esc
+/// closes.
+fn autocomplete_edit(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    text: &mut String,
+    ac: &mut AcState,
+    dict: &[String],
+    make_edit: impl FnOnce(&mut String) -> egui::TextEdit<'_>,
+) -> egui::Response {
+    // Handle navigation/acceptance keys before the editor consumes them.
+    let mut accept: Option<String> = None;
+    if ac.open && !ac.items.is_empty() {
+        ui.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                ac.selected = (ac.selected + 1) % ac.items.len();
+            }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                ac.selected = (ac.selected + ac.items.len() - 1) % ac.items.len();
+            }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                ac.open = false;
+            }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+                || i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+            {
+                accept = Some(ac.items[ac.selected].clone());
+            }
+        });
+    }
+    if let Some(word) = &accept {
+        apply_completion(ui.ctx(), id, text, ac, word);
+    }
+
+    let edit = make_edit(text);
+    let output = edit.show(ui);
+    let response = output.response.response.clone();
+
+    // Recompute the token under the cursor and the candidate list.
+    ac.open = false;
+    if response.has_focus() {
+        if let Some(range) = output.state.cursor.char_range() {
+            let cursor_char = range.primary.index.0;
+            let chars: Vec<char> = text.chars().collect();
+            let cur = cursor_char.min(chars.len());
+            let mut start = cur;
+            while start > 0 && (chars[start - 1].is_ascii_alphanumeric() || chars[start - 1] == '_')
+            {
+                start -= 1;
+            }
+            if start < cur {
+                let prefix: String = chars[start..cur].iter().collect();
+                let prefix_l = prefix.to_lowercase();
+                let items: Vec<String> = dict
+                    .iter()
+                    .filter(|c| c.starts_with(&prefix_l) && **c != prefix_l)
+                    .take(8)
+                    .cloned()
+                    .collect();
+                if !items.is_empty() {
+                    let byte_start: usize =
+                        chars[..start].iter().map(|c| c.len_utf8()).sum();
+                    let byte_end: usize = chars[..cur].iter().map(|c| c.len_utf8()).sum();
+                    ac.token = byte_start..byte_end;
+                    ac.selected = ac.selected.min(items.len() - 1);
+                    ac.items = items;
+                    ac.open = true;
+                }
+            }
+        }
+    }
+
+    if ac.open {
+        let mut clicked: Option<String> = None;
+        egui::Area::new(id.with("ac_popup"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(response.rect.left_bottom() + egui::vec2(8.0, 2.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_max_width(260.0);
+                    for (i, item) in ac.items.iter().enumerate() {
+                        if ui
+                            .selectable_label(i == ac.selected, RichText::new(item).monospace())
+                            .clicked()
+                        {
+                            clicked = Some(item.clone());
+                        }
+                    }
+                    ui.label(
+                        RichText::new("Tab/Enter to complete · Esc to dismiss")
+                            .weak()
+                            .small(),
+                    );
+                });
+            });
+        if let Some(word) = clicked {
+            apply_completion(ui.ctx(), id, text, ac, &word);
+            response.request_focus();
+        }
+    }
+    response
+}
+
+/// Replace the token under completion with `word` and move the cursor to
+/// its end.
+fn apply_completion(
+    ctx: &egui::Context,
+    id: egui::Id,
+    text: &mut String,
+    ac: &mut AcState,
+    word: &str,
+) {
+    let range = ac.token.clone();
+    if range.end > text.len() || !text.is_char_boundary(range.start) {
+        ac.open = false;
+        return;
+    }
+    text.replace_range(range.clone(), word);
+    let cursor_chars = text[..range.start + word.len()].chars().count();
+    if let Some(mut state) = egui::text_edit::TextEditState::load(ctx, id) {
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(cursor_chars),
+        )));
+        state.store(ctx, id);
+    }
+    ac.open = false;
+}
+
 /// SQL identifier per layer; same-named layers get `_2`, `_3`, ...
 /// suffixes so both stay queryable.
 fn table_names(layers: &[VectorLayer]) -> Vec<String> {
@@ -533,39 +982,21 @@ fn table_names(layers: &[VectorLayer]) -> Vec<String> {
         .collect()
 }
 
-/// Locate (batch index, row within batch) for a global result row.
-fn locate(row_offsets: &[usize], r: usize) -> (usize, usize) {
-    let b = match row_offsets.binary_search(&r) {
-        Ok(i) if i + 1 < row_offsets.len() => i,
-        Ok(i) => i - 1,
-        Err(i) => i - 1,
-    };
-    (b, r - row_offsets[b])
-}
-
-/// Decode the geometry of one result row.
-fn geometry_at(
-    out: &QueryOutput,
-    row_offsets: &[usize],
-    r: usize,
-) -> Option<geo_types::Geometry<f64>> {
+/// Decode the geometry of one result row (underlying index).
+fn geometry_at(out: &QueryOutput, r: usize) -> Option<geo_types::Geometry<f64>> {
     let (gcol, _) = out.geom.as_ref()?;
-    let (b, local) = locate(row_offsets, r);
-    let arr = out.batches[b]
-        .column(*gcol)
-        .as_any()
-        .downcast_ref::<BinaryArray>()?;
-    if arr.is_null(local) {
+    let arr = out.batch.column(*gcol).as_any().downcast_ref::<BinaryArray>()?;
+    if r >= arr.len() || arr.is_null(r) {
         return None;
     }
-    decode_wkb(arr.value(local))
+    decode_wkb(arr.value(r))
 }
 
 /// The full (untruncated) value of one result cell; geometry as WKT.
-fn cell_value(out: &QueryOutput, row_offsets: &[usize], r: usize, c: usize) -> String {
+fn cell_value(out: &QueryOutput, r: usize, c: usize) -> String {
     use arrow::util::display::{ArrayFormatter, FormatOptions};
     if out.geom.as_ref().is_some_and(|(gcol, _)| *gcol == c) {
-        return match geometry_at(out, row_offsets, r) {
+        return match geometry_at(out, r) {
             Some(g) => {
                 use wkt::ToWkt;
                 g.wkt_string()
@@ -573,45 +1004,28 @@ fn cell_value(out: &QueryOutput, row_offsets: &[usize], r: usize, c: usize) -> S
             None => String::new(),
         };
     }
-    let (b, local) = locate(row_offsets, r);
     let opts = FormatOptions::default().with_display_error(true);
-    ArrayFormatter::try_new(out.batches[b].column(c).as_ref(), &opts)
-        .map(|f| f.value(local).to_string())
+    ArrayFormatter::try_new(out.batch.column(c).as_ref(), &opts)
+        .map(|f| f.value(r).to_string())
         .unwrap_or_default()
 }
 
-/// Only the given rows of the result, as new record batches.
-fn filter_rows(
-    out: &QueryOutput,
-    row_offsets: &[usize],
-    rows: &BTreeSet<usize>,
-) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+/// Only the given rows of the result, as one new record batch.
+fn filter_rows(out: &QueryOutput, rows: &BTreeSet<usize>) -> Result<RecordBatch, String> {
     use arrow::array::UInt32Array;
-    let mut per_batch: Vec<Vec<u32>> = vec![Vec::new(); out.batches.len()];
-    for &r in rows {
-        let (b, local) = locate(row_offsets, r);
-        per_batch[b].push(local as u32);
-    }
-    per_batch
+    let indices = UInt32Array::from(rows.iter().map(|&r| r as u32).collect::<Vec<_>>());
+    let cols = out
+        .batch
+        .columns()
         .iter()
-        .enumerate()
-        .filter(|(_, idx)| !idx.is_empty())
-        .map(|(b, idx)| {
-            let indices = UInt32Array::from(idx.clone());
-            let cols = out.batches[b]
-                .columns()
-                .iter()
-                .map(|c| arrow::compute::take(c.as_ref(), &indices, None))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("row filter: {e}"))?;
-            arrow::record_batch::RecordBatch::try_new(out.schema.clone(), cols)
-                .map_err(|e| format!("row filter: {e}"))
-        })
-        .collect()
+        .map(|c| arrow::compute::take(c.as_ref(), &indices, None))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("row filter: {e}"))?;
+    RecordBatch::try_new(out.schema.clone(), cols).map_err(|e| format!("row filter: {e}"))
 }
 
 /// Checked rows as tab-separated text with a header line, for spreadsheets.
-fn selection_tsv(out: &QueryOutput, row_offsets: &[usize], rows: &BTreeSet<usize>) -> String {
+fn selection_tsv(out: &QueryOutput, rows: &BTreeSet<usize>) -> String {
     let n_cols = out.schema.fields().len();
     let mut s = out
         .schema
@@ -626,7 +1040,7 @@ fn selection_tsv(out: &QueryOutput, row_offsets: &[usize], rows: &BTreeSet<usize
             if c > 0 {
                 s.push('\t');
             }
-            let v = cell_value(out, row_offsets, r, c);
+            let v = cell_value(out, r, c);
             // Keep the grid rectangular for the paste target.
             s.push_str(&v.replace(['\t', '\n'], " "));
         }
@@ -639,19 +1053,25 @@ fn selection_tsv(out: &QueryOutput, row_offsets: &[usize], rows: &BTreeSet<usize
 struct TableEvent {
     /// A row checkbox changed.
     toggled: bool,
-    /// The 🔍 button of this row was clicked.
+    /// The 🔍 button of this row (underlying index) was clicked.
     zoom_clicked: Option<usize>,
+    /// A sortable header was clicked (column index).
+    sort_clicked: Option<usize>,
     /// A cell value was copied to the clipboard.
     copied: bool,
 }
 
-/// Virtualized result grid. A checkbox per row adds the feature to the map
-/// selection, 🔍 zooms to it, clicking any cell copies its full value.
+/// Virtualized, paginated result grid. A checkbox per row adds the feature
+/// to the map selection, 🔍 zooms to it, clicking any cell copies its full
+/// value, clicking a header cycles the sort.
 fn results_table(
     ui: &mut egui::Ui,
     out: &QueryOutput,
-    row_offsets: &[usize],
     selected: &mut BTreeSet<usize>,
+    page: usize,
+    page_size: usize,
+    sort: Option<(usize, bool)>,
+    perm: Option<&[u32]>,
 ) -> TableEvent {
     use arrow::util::display::{ArrayFormatter, FormatOptions};
     let n_cols = out.schema.fields().len();
@@ -662,6 +1082,13 @@ fn results_table(
     let has_geom = geom_col.is_some();
     let opts = FormatOptions::default().with_display_error(true);
     let mut ev = TableEvent::default();
+
+    let total = out.total_rows;
+    let page_start = (page * page_size).min(total);
+    let page_rows = page_size.min(total - page_start);
+    let underlying = |view: usize| -> usize {
+        perm.map_or(view, |p| p[view] as usize)
+    };
 
     // No vertical gap between rows: dead space for clicks, and selected
     // rows should read as solid bands.
@@ -678,20 +1105,21 @@ fn results_table(
         .columns(Column::auto().at_least(60.0).clip(true), n_cols)
         .header(20.0, |mut header| {
             header.col(|ui| {
-                // Select all / none; shows the mixed state when partial.
+                // Select all / none (the WHOLE result, not just this page);
+                // shows the mixed state when partial.
                 let n_sel = selected.len();
-                let mut all = n_sel == out.total_rows && out.total_rows > 0;
+                let mut all = n_sel == total && total > 0;
                 if ui
                     .add(
                         egui::Checkbox::without_text(&mut all)
-                            .indeterminate(n_sel > 0 && n_sel < out.total_rows),
+                            .indeterminate(n_sel > 0 && n_sel < total),
                     )
-                    .on_hover_text("Check / uncheck all rows")
+                    .on_hover_text("Check / uncheck all result rows")
                     .changed()
                 {
                     selected.clear();
                     if all {
-                        selected.extend(0..out.total_rows);
+                        selected.extend(0..total);
                     }
                     ev.toggled = true;
                 }
@@ -699,27 +1127,47 @@ fn results_table(
             if has_geom {
                 header.col(|_| {});
             }
-            for f in out.schema.fields() {
+            for (c, f) in out.schema.fields().iter().enumerate() {
                 header.col(|ui| {
-                    ui.label(RichText::new(f.name()).strong().small());
+                    if Some(c) == geom_col {
+                        ui.label(RichText::new(f.name()).strong().small());
+                        return;
+                    }
+                    let arrow = match sort {
+                        Some((sc, true)) if sc == c => " ⏶",
+                        Some((sc, false)) if sc == c => " ⏷",
+                        _ => "",
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(format!("{}{arrow}", f.name())).strong().small(),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text("Sort: ascending / descending / none")
+                        .clicked()
+                    {
+                        ev.sort_clicked = Some(c);
+                    }
                 });
             }
         })
         .body(|body| {
-            body.rows(22.0, out.total_rows, |mut row| {
-                let r = row.index();
-                row.set_selected(selected.contains(&r));
+            body.rows(22.0, page_rows, |mut row| {
+                let u = underlying(page_start + row.index());
+                row.set_selected(selected.contains(&u));
                 row.col(|ui| {
-                    let mut checked = selected.contains(&r);
+                    let mut checked = selected.contains(&u);
                     if ui
                         .checkbox(&mut checked, "")
                         .on_hover_text("Add to the map selection")
                         .changed()
                     {
                         if checked {
-                            selected.insert(r);
+                            selected.insert(u);
                         } else {
-                            selected.remove(&r);
+                            selected.remove(&u);
                         }
                         ev.toggled = true;
                     }
@@ -728,22 +1176,20 @@ fn results_table(
                     row.col(|ui| {
                         if ui
                             .add(egui::Button::new(RichText::new("🔍").small()).frame(false))
-                            .on_hover_text("Zoom to this feature")
+                            .on_hover_text("Zoom to this feature (and highlight it)")
                             .clicked()
                         {
-                            ev.zoom_clicked = Some(r);
+                            ev.zoom_clicked = Some(u);
                         }
                     });
                 }
-                let (b, local) = locate(row_offsets, r);
-                let batch = &out.batches[b];
                 for c in 0..n_cols {
                     row.col(|ui| {
                         let text = if Some(c) == geom_col {
-                            geom_cell(batch.column(c).as_ref(), local)
+                            geom_cell(out.batch.column(c).as_ref(), u)
                         } else {
-                            ArrayFormatter::try_new(batch.column(c).as_ref(), &opts)
-                                .map(|f| f.value(local).to_string())
+                            ArrayFormatter::try_new(out.batch.column(c).as_ref(), &opts)
+                                .map(|f| f.value(u).to_string())
                                 .unwrap_or_else(|_| "<?>".into())
                         };
                         let resp = ui.add(
@@ -751,7 +1197,7 @@ fn results_table(
                                 .sense(egui::Sense::click()),
                         );
                         if resp.clicked() {
-                            ui.ctx().copy_text(cell_value(out, row_offsets, r, c));
+                            ui.ctx().copy_text(cell_value(out, u, c));
                             ev.copied = true;
                         }
                     });
