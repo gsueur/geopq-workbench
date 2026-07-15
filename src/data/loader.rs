@@ -115,6 +115,41 @@ pub fn viewport_to_data_bbox(
     Some([b[0] - mx, b[1] - my, b[2] + mx, b[3] + my])
 }
 
+/// Inverse of [`viewport_to_data_bbox`]: a data-CRS bbox expressed in world
+/// (display) coordinates, by sampling a grid of points through the
+/// transform. None when nothing transforms (e.g. outside projection domain).
+pub fn data_bbox_to_world(
+    bbox: [f64; 4],
+    data_crs: &Crs,
+    display: &DisplayCrs,
+) -> Option<[f64; 4]> {
+    use super::crs::transform_point;
+    let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+    let mut any = false;
+    const N: usize = 8;
+    for i in 0..=N {
+        for j in 0..=N {
+            let x = bbox[0] + (bbox[2] - bbox[0]) * i as f64 / N as f64;
+            let y = bbox[1] + (bbox[3] - bbox[1]) * j as f64 / N as f64;
+            let Ok((px, py)) = transform_point(data_crs, &display.crs, x, y) else {
+                continue;
+            };
+            if !px.is_finite() || !py.is_finite() {
+                continue;
+            }
+            let w = display.world_from_projected(px, py);
+            if w[0].is_finite() && w[1].is_finite() {
+                b[0] = b[0].min(w[0]);
+                b[1] = b[1].min(w[1]);
+                b[2] = b[2].max(w[0]);
+                b[3] = b[3].max(w[1]);
+                any = true;
+            }
+        }
+    }
+    any.then_some(b)
+}
+
 /// Union of a set of bboxes.
 fn union_of(boxes: &[[f64; 4]]) -> Option<[f64; 4]> {
     boxes.iter().copied().reduce(|a, b| {
@@ -1297,6 +1332,30 @@ pub fn build_geometry_for_test(
 }
 
 #[cfg(test)]
+mod bbox_transform_tests {
+    use super::*;
+
+    /// data → world → data must come back around the original bbox
+    /// (both directions sample-and-inflate, so containment, not equality).
+    #[test]
+    fn data_bbox_world_roundtrip() {
+        let l93 = Crs::from_epsg(2154).unwrap();
+        let display = DisplayCrs::hobo_dyer();
+        // A ~20 km box near Toulouse in Lambert-93.
+        let data = [570_000.0, 6_270_000.0, 590_000.0, 6_290_000.0];
+        let world = data_bbox_to_world(data, &l93, &display).expect("transforms");
+        assert!(world[0] < world[2] && world[1] < world[3]);
+        let back = viewport_to_data_bbox(world, &display, &l93).expect("back");
+        assert!(
+            back[0] <= data[0] && back[1] <= data[1] && back[2] >= data[2] && back[3] >= data[3],
+            "roundtrip must cover the original: {back:?} vs {data:?}"
+        );
+        // And not explode: within ~3x the original span.
+        assert!((back[2] - back[0]) < 3.0 * (data[2] - data[0]), "{back:?}");
+    }
+}
+
+#[cfg(test)]
 mod rg_bbox_tests {
     use super::*;
 
@@ -1627,6 +1686,36 @@ mod pruning_tests {
             served < file_len / 2,
             "expected partial download: {served} of {file_len}"
         );
+    }
+
+    /// Local full-load benchmark, opt-in:
+    /// cargo test --release local_load_bench -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn local_load_bench() {
+        let path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/parcels_hilbert.parquet"
+        ));
+        if !path.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let display = crate::data::crs::DisplayCrs::hobo_dyer();
+        for run in 0..3 {
+            let t0 = std::time::Instant::now();
+            let (store, crs, info, _) = open_store(&Source::Local(path.clone())).unwrap();
+            let open_ms = t0.elapsed().as_millis();
+            let t1 = std::time::Instant::now();
+            let (geometry, rows, bad, _, _) =
+                build_geometry(&store, &crs, &display, None, all_groups(&store)).unwrap();
+            eprintln!(
+                "run {run}: open {open_ms} ms, build {} ms, {rows} rows ({bad} bad), {} chunks, {} rgs",
+                t1.elapsed().as_millis(),
+                geometry.chunks.len(),
+                info.row_groups,
+            );
+        }
     }
 
     /// Live remote benchmark, opt-in:

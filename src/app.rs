@@ -110,6 +110,7 @@ pub struct ViewerApp {
     stripped: HashSet<(u64, u64)>,
     epsg_input: String,
     cursor_world: Option<[f64; 2]>,
+    sql: crate::sql::console::SqlConsole,
 }
 
 impl ViewerApp {
@@ -169,6 +170,7 @@ impl ViewerApp {
             stripped: HashSet::new(),
             epsg_input: String::new(),
             cursor_world: None,
+            sql: crate::sql::console::SqlConsole::new(),
         };
         for f in files {
             app.enqueue_load(f, &cc.egui_ctx);
@@ -211,6 +213,38 @@ impl ViewerApp {
             auto_project,
         );
         job
+    }
+
+    /// Highlight the SQL-checked features on the map. The geometries are
+    /// whatever the query returned (possibly computed, e.g. centroids), so
+    /// the highlight is built from them directly instead of going through
+    /// layer picking.
+    fn apply_sql_selection(&mut self, crs: &Crs, geoms: Vec<geo_types::Geometry<f64>>) {
+        // Replace any picked-feature selection with this highlight.
+        self.select(None);
+        self.selection_generation += 1;
+        if geoms.is_empty() {
+            return;
+        }
+        let mut mb = MeshBuilder::default();
+        for g in geoms {
+            let world = crate::picking::to_world_geom(g, crs, &self.display);
+            mb.add(&world, crate::data::geometry::FeatureRef::INVALID);
+        }
+        self.highlight_chunks = Some(Arc::new(mb.finish()));
+    }
+
+    /// Zoom the map to a data-CRS bbox (e.g. a feature clicked in the SQL
+    /// results grid). Pads by 20% of the span, with a floor so point
+    /// features land at a usable zoom instead of the camera's max.
+    fn zoom_to_data_bbox(&mut self, bbox: [f64; 4], crs: &Crs) {
+        let min_pad = if crs.is_latlong { 1e-3 } else { 100.0 };
+        let px = ((bbox[2] - bbox[0]) * 0.2).max(min_pad);
+        let py = ((bbox[3] - bbox[1]) * 0.2).max(min_pad);
+        let padded = [bbox[0] - px, bbox[1] - py, bbox[2] + px, bbox[3] + py];
+        if let Some(world) = loader::data_bbox_to_world(padded, crs, &self.display) {
+            self.fit_bounds = Some(world);
+        }
     }
 
     fn poll_loader(&mut self, ctx: &egui::Context) {
@@ -493,6 +527,8 @@ impl ViewerApp {
             {
                 self.pending_fit = true;
             }
+            ui.toggle_value(&mut self.sql.open, "🖩 SQL")
+                .on_hover_text("Query loaded layers with SQL (ST_* spatial functions)");
 
             ui.separator();
 
@@ -1812,7 +1848,9 @@ impl ViewerApp {
                 .any(|l| l.id == *id && l.style.show_rg_bboxes)
         });
 
-        if let (Some(chunks), Some(_)) = (&self.highlight_chunks, &self.selection) {
+        // Highlight renders for a picked feature or a clicked SQL result
+        // row (which has chunks but no layer selection).
+        if let Some(chunks) = &self.highlight_chunks {
             draws.push(LayerDraw {
                 key: (HIGHLIGHT_KEY, self.selection_generation),
                 composite_group: HIGHLIGHT_KEY,
@@ -2109,6 +2147,37 @@ impl eframe::App for ViewerApp {
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        self.sql.poll();
+        if self.sql.open {
+            let mut action = None;
+            egui::Panel::bottom("sql_console")
+                .resizable(true)
+                .default_size(240.0)
+                .show(ui, |ui| {
+                    action = self.sql.panel_ui(ui, &self.layers);
+                });
+            match action {
+                Some(crate::sql::console::ConsoleAction::LoadLayer(path)) => {
+                    self.enqueue_load(Source::Local(path), &ctx);
+                }
+                Some(crate::sql::console::ConsoleAction::Select { crs, geoms }) => {
+                    self.apply_sql_selection(&crs, geoms);
+                }
+                Some(crate::sql::console::ConsoleAction::Zoom { crs, geom }) => {
+                    use geo::BoundingRect;
+                    if let Some(r) = geom.bounding_rect() {
+                        self.zoom_to_data_bbox(
+                            [r.min().x, r.min().y, r.max().x, r.max().y],
+                            &crs,
+                        );
+                    }
+                }
+                Some(crate::sql::console::ConsoleAction::ClearSelection) => {
+                    self.select(None);
+                }
+                None => {}
+            }
+        }
         egui::Panel::left("layers")
             .resizable(true)
             .default_size(260.0)
@@ -2127,7 +2196,7 @@ impl eframe::App for ViewerApp {
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.map_panel(ui));
 
-        if !self.loading.is_empty() || !self.rebuilding.is_empty() {
+        if !self.loading.is_empty() || !self.rebuilding.is_empty() || self.sql.is_running() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }

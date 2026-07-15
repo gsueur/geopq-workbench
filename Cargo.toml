@@ -4,10 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-arrow = "59.1.0"
+arrow = "58.3.0"
 bytemuck = "1.25.1"
 bytes = "1.12"
 crs-definitions = "0.5.0"
+datafusion = { version = "54.0.0", default-features = false, features = ["sql", "nested_expressions", "string_expressions", "unicode_expressions", "datetime_expressions", "math_expressions", "regex_expressions"] }
 eframe = { version = "0.35.0", features = ["wgpu"] }
 env_logger = "0.11.11"
 geo = "0.33.1"
@@ -16,8 +17,8 @@ geo-traits = "0.3"
 image = "0.25.10"
 log = "0.4.33"
 lyon = "1.0.19"
-parquet = { version = "59.1.0", features = ["arrow", "snap", "zstd", "lz4", "brotli", "flate2", "geospatial"] }
-parquet-geospatial = "59.1.0"
+parquet = { version = "58.3.0", features = ["arrow", "snap", "zstd", "lz4", "brotli", "flate2", "geospatial"] }
+parquet-geospatial = "58.3.0"
 proj4rs = { version = "0.1.10", features = ["esri", "krovak"] }
 rfd = "0.17.2"
 rstar = "0.13.0"
@@ -29,6 +30,19 @@ wgpu = "29"
 egui_extras = "0.35.0"
 rayon = "1.12.0"
 rusty-s3 = "0.10.0"
+wkt = "0.14"
+tokio = { version = "1.52.3", features = ["rt"] }
+async-trait = "0.1.89"
+futures = "0.3.32"
 
 [dev-dependencies]
 pollster = "1.0.1"
+
+# Debug binaries were ~10x slower to load data (70 s vs 7 s for a 1.9M-row
+# parcels file), which reads as an app regression when it is just an
+# unoptimized build. Optimize code in dev while keeping debug assertions.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

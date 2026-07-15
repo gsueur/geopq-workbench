@@ -15,13 +15,13 @@ pub struct Selection {
     pub world_geom: Geometry<f64>,
 }
 
-/// Transform a geometry from the layer's data CRS into world coordinates.
-fn to_world_geom(
+/// Transform a geometry from a data CRS into world coordinates.
+pub fn to_world_geom(
     mut geom: Geometry<f64>,
-    layer: &VectorLayer,
+    crs: &crate::data::crs::Crs,
     display: &DisplayCrs,
 ) -> Geometry<f64> {
-    let tr = BulkTransformer::new(&layer.crs, display);
+    let tr = BulkTransformer::new(crs, display);
     geom.map_coords_in_place(|c| {
         let (mut x, mut y) = (c.x, c.y);
         tr.apply(&mut x, &mut y);
@@ -44,7 +44,7 @@ pub fn feature_world_geom(
         .into_iter()
         .next()?
         .1?;
-    Some(to_world_geom(geom, layer, display))
+    Some(to_world_geom(geom, &layer.crs, display))
 }
 
 /// Scan the point instances of chunks near the cursor. Points carry their
@@ -177,7 +177,7 @@ pub fn pick(
             return Some(Selection {
                 layer_id: layer.id,
                 feature: fref,
-                world_geom: to_world_geom(geom, layer, display),
+                world_geom: to_world_geom(geom, &layer.crs, display),
             });
         }
     }

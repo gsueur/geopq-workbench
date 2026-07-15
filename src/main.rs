@@ -5,6 +5,7 @@ mod context;
 mod data;
 mod map;
 mod picking;
+mod sql;
 
 use eframe::egui;
 

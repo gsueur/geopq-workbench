@@ -697,8 +697,8 @@ fn logical_type_crs(
         .iter()
         .find(|c| c.column_descr().path().parts().first().map(String::as_str) == Some(geom_name))?;
     let crs = match col.column_descr().logical_type_ref() {
-        Some(LogicalType::Geometry(g)) => g.crs.clone(),
-        Some(LogicalType::Geography(g)) => g.crs.clone(),
+        Some(LogicalType::Geometry { crs }) => crs.clone(),
+        Some(LogicalType::Geography { crs, .. }) => crs.clone(),
         _ => None,
     }?;
     serde_json::from_str(&crs)
@@ -1005,8 +1005,8 @@ mod tests {
             .find(|c| c.column_descr().name() == "geometry")
             .expect("geometry column");
         match geom.column_descr().logical_type_ref() {
-            Some(parquet::basic::LogicalType::Geometry(g)) => {
-                let crs = g.crs.as_deref().expect("crs recorded");
+            Some(parquet::basic::LogicalType::Geometry { crs }) => {
+                let crs = crs.as_deref().expect("crs recorded");
                 assert!(crs.contains("2154"), "{crs}");
             }
             other => panic!("expected GEOMETRY logical type, got {other:?}"),
