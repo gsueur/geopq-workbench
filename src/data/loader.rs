@@ -35,6 +35,9 @@ pub enum LoadMsg {
     Loaded {
         job: u64,
         layer: Box<VectorLayer>,
+        /// Auto-selected display projection: (display, geometry already
+        /// built in it). false = the app must run a projection rebuild.
+        adopt_display: Option<(DisplayCrs, bool)>,
     },
     /// Geometry rebuilt for a new display projection (replaces all sections).
     Rebuilt {
@@ -110,6 +113,13 @@ pub fn viewport_to_data_bbox(
     // Safety margin for projection nonlinearity between samples.
     let (mx, my) = ((b[2] - b[0]) * 0.05, (b[3] - b[1]) * 0.05);
     Some([b[0] - mx, b[1] - my, b[2] + mx, b[3] + my])
+}
+
+/// Union of a set of bboxes.
+fn union_of(boxes: &[[f64; 4]]) -> Option<[f64; 4]> {
+    boxes.iter().copied().reduce(|a, b| {
+        [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
+    })
 }
 
 /// Row groups whose bbox intersects the given data-CRS rect.
@@ -247,6 +257,7 @@ pub fn spawn_load(
     display: DisplayCrs,
     color: eframe::egui::Color32,
     view_world: [f64; 4],
+    auto_project: bool,
 ) {
     std::thread::spawn(move || {
         let t0 = Instant::now();
@@ -268,7 +279,26 @@ pub fn spawn_load(
             Ok((store, crs, info, rg_meta)) => {
                 let store = Arc::new(store);
                 let n_rg = store.rg_starts().len().saturating_sub(1);
+                // The pruning rect is in the DATA CRS, so it stays valid
+                // across a display switch — compute it with the display the
+                // viewport coordinates are expressed in.
                 let rect = viewport_to_data_bbox(view_world, &display, &crs);
+                // Auto projection: pick a best-fit display before building
+                // when the extent is known from metadata (projected data CRS
+                // needs no extent at all).
+                let mut display = display;
+                let mut adopt_display: Option<(DisplayCrs, bool)> = None;
+                if auto_project {
+                    let bbox = rg_meta
+                        .as_ref()
+                        .filter(|_| crs.is_latlong)
+                        .and_then(|(_, boxes)| union_of(boxes));
+                    if let Some(d) = DisplayCrs::auto_for(&crs, bbox) {
+                        log::info!("auto projection: {}", d.name);
+                        display = d.clone();
+                        adopt_display = Some((d, true));
+                    }
+                }
                 // Prune only with metadata-sourced boxes: a pruned first load
                 // never sees the skipped row groups, so computed boxes can't
                 // drive it.
@@ -310,6 +340,16 @@ pub fn spawn_load(
                 let build_t0 = Instant::now();
                 match build_geometry(&store, &crs, &display, Some((&handle, job)), sel) {
                     Ok((geometry, rows, bad, rg_computed, resolved)) => {
+                        // Extent only known post-build (no metadata bboxes):
+                        // suggest the auto projection; the app rebuilds.
+                        if auto_project && adopt_display.is_none() && crs.is_latlong {
+                            if let Some(d) =
+                                DisplayCrs::auto_for(&crs, union_of(&rg_computed))
+                            {
+                                log::info!("auto projection (post-build): {}", d.name);
+                                adopt_display = Some((d, false));
+                            }
+                        }
                         let mut loaded = vec![GroupLoad::None; n_rg];
                         for (g, st) in resolved {
                             loaded[g as usize] = st;
@@ -355,6 +395,7 @@ pub fn spawn_load(
                         handle.send(LoadMsg::Loaded {
                             job,
                             layer: Box::new(layer),
+                            adopt_display,
                         });
                     }
                     Err(e) => handle.send(LoadMsg::Failed {

@@ -17,8 +17,12 @@ pub struct Context {
     pub version: u32,
     pub camera_center: [f64; 2],
     pub camera_zoom: f64,
-    /// "hobo-dyer" | "winkel-tripel" | "mercator" | "epsg:NNNN".
+    /// "hobo-dyer" | "winkel-tripel" | "mercator" | "epsg:NNNN" |
+    /// "proj4:<string>" (auto-fit / custom projections).
     pub projection: String,
+    /// Display name for proj4-token projections.
+    #[serde(default)]
+    pub projection_name: Option<String>,
     pub basemap: Option<usize>,
     pub show_graticule: bool,
     pub show_coastline: bool,
@@ -139,7 +143,8 @@ pub fn projection_token(d: &DisplayCrs) -> String {
     } else if let Some(e) = d.crs.epsg {
         format!("epsg:{e}")
     } else {
-        "hobo-dyer".into()
+        // Auto-fit / custom projections: persist the proj string itself.
+        format!("proj4:{}", d.crs.proj4)
     }
 }
 
@@ -148,11 +153,17 @@ pub fn projection_from_token(t: &str) -> Result<DisplayCrs, String> {
         "hobo-dyer" => Ok(DisplayCrs::hobo_dyer()),
         "winkel-tripel" => Ok(DisplayCrs::winkel_tripel()),
         "mercator" => Ok(DisplayCrs::mercator()),
-        other => other
-            .strip_prefix("epsg:")
-            .and_then(|c| c.parse::<u32>().ok())
-            .ok_or_else(|| format!("unknown projection '{other}'"))
-            .and_then(DisplayCrs::from_epsg),
+        other => {
+            if let Some(proj4) = other.strip_prefix("proj4:") {
+                let crs = crate::data::crs::Crs::from_proj4(proj4, None, "custom projection")?;
+                return Ok(DisplayCrs::new(crs));
+            }
+            other
+                .strip_prefix("epsg:")
+                .and_then(|c| c.parse::<u32>().ok())
+                .ok_or_else(|| format!("unknown projection '{other}'"))
+                .and_then(DisplayCrs::from_epsg)
+        }
     }
 }
 
@@ -167,6 +178,7 @@ mod tests {
             camera_center: [0.51, 0.29],
             camera_zoom: 13.25,
             projection: "epsg:2154".into(),
+            projection_name: None,
             basemap: Some(1),
             show_graticule: false,
             show_coastline: true,
@@ -228,5 +240,16 @@ mod tests {
             assert_eq!(projection_token(&d), t, "token {t}");
         }
         assert!(projection_from_token("bogus").is_err());
+
+        // Auto-fit projections persist as proj4 tokens.
+        let auto = crate::data::crs::DisplayCrs::auto_for(
+            &crate::data::crs::Crs::wgs84(),
+            Some([-5.0, 41.0, 10.0, 51.0]),
+        )
+        .unwrap();
+        let t = projection_token(&auto);
+        assert!(t.starts_with("proj4:+proj=laea"), "{t}");
+        let back = projection_from_token(&t).unwrap();
+        assert_eq!(back.crs.proj4, auto.crs.proj4);
     }
 }

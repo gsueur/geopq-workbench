@@ -309,6 +309,74 @@ pub struct DisplayCrs {
 }
 
 impl DisplayCrs {
+    /// Best-fit display projection for a layer, Snyder-style but restricted
+    /// to equal-area families:
+    ///
+    /// - projected data CRS → display in that CRS (the mapping agency
+    ///   already chose the best local projection);
+    /// - geographic data, by lon/lat extent: world-scale → None (keep the
+    ///   world default), polar → polar LAEA, equatorial E–W band →
+    ///   equal-area cylindrical, mid-latitude E–W band → Albers conic
+    ///   (standard parallels by the 1/6 rule), otherwise → LAEA on the
+    ///   extent centroid.
+    pub fn auto_for(crs: &Crs, lonlat_bbox: Option<[f64; 4]>) -> Option<DisplayCrs> {
+        if !crs.is_latlong {
+            let mut d = DisplayCrs::new(crs.clone());
+            d.name = format!("Auto: data CRS — {}", crs.name);
+            return Some(d);
+        }
+        let b = lonlat_bbox?;
+        let (dx, dy) = (b[2] - b[0], b[3] - b[1]);
+        let (cx, cy) = ((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5);
+        if !(dx.is_finite() && dy.is_finite()) || dx <= 0.0 || dy <= 0.0 {
+            return None;
+        }
+        // World-scale: the existing equal-area world default fits best.
+        if dx >= 120.0 || dy >= 60.0 || b[0] < -179.9 && b[2] > 179.9 {
+            return None;
+        }
+        let build = |proj4: String, name: String| -> Option<DisplayCrs> {
+            let crs = Crs::from_proj4(&proj4, None, &name).ok()?;
+            let mut d = DisplayCrs::new(crs);
+            d.name = name;
+            Some(d)
+        };
+        if cy.abs() >= 70.0 {
+            let pole = if cy > 0.0 { 90.0 } else { -90.0 };
+            return build(
+                format!(
+                    "+proj=laea +lat_0={pole} +lon_0={cx:.3} +ellps=WGS84 +units=m +no_defs"
+                ),
+                format!("Auto: polar azimuthal equal-area (lon₀ {cx:.1}°)"),
+            );
+        }
+        if dx >= 2.0 * dy {
+            if cy.abs() < 15.0 {
+                return build(
+                    format!(
+                        "+proj=cea +lat_ts={:.3} +lon_0={cx:.3} +ellps=WGS84 +units=m +no_defs",
+                        cy.abs()
+                    ),
+                    format!("Auto: equal-area cylindrical (lat_ts {:.1}°)", cy.abs()),
+                );
+            }
+            // Mid-latitude east–west band: Albers with the 1/6 rule.
+            let (lat1, lat2) = (b[1] + dy / 6.0, b[3] - dy / 6.0);
+            return build(
+                format!(
+                    "+proj=aea +lat_1={lat1:.3} +lat_2={lat2:.3} +lat_0={cy:.3} +lon_0={cx:.3} +ellps=WGS84 +units=m +no_defs"
+                ),
+                format!("Auto: Albers equal-area ({lat1:.1}°/{lat2:.1}°)"),
+            );
+        }
+        build(
+            format!(
+                "+proj=laea +lat_0={cy:.3} +lon_0={cx:.3} +ellps=WGS84 +units=m +no_defs"
+            ),
+            format!("Auto: azimuthal equal-area ({cy:.1}°, {cx:.1}°)"),
+        )
+    }
+
     pub fn new(crs: Crs) -> Self {
         let (kind, world_offset, world_per_unit) = if crs.epsg == Some(3857) {
             (DisplayKind::Mercator, [-MERC_MAX, MERC_MAX], 1.0 / (2.0 * MERC_MAX))
@@ -594,5 +662,60 @@ mod tests {
         assert!((w[0]).abs() < 1e-9 && w[1].abs() < 1e-9, "{w:?}");
         let w = d.world_from_projected(180.0, -90.0);
         assert!((w[0] - 1.0).abs() < 1e-9 && (w[1] - 0.5).abs() < 1e-9, "{w:?}");
+    }
+}
+
+#[cfg(test)]
+mod auto_projection_tests {
+    use super::*;
+
+    fn roundtrip_center(d: &DisplayCrs, lon: f64, lat: f64) {
+        let (x, y) = transform_point(&Crs::wgs84(), &d.crs, lon, lat).unwrap();
+        assert!(x.is_finite() && y.is_finite(), "{}: center projects", d.name);
+        let (lon2, lat2) = transform_point(&d.crs, &Crs::wgs84(), x, y).unwrap();
+        assert!((lon2 - lon).abs() < 1e-6 && (lat2 - lat).abs() < 1e-6, "{}", d.name);
+    }
+
+    #[test]
+    fn projected_data_crs_wins() {
+        let crs = Crs::from_epsg(2154).unwrap(); // Lambert-93
+        let d = DisplayCrs::auto_for(&crs, None).unwrap();
+        assert!(d.name.contains("data CRS"), "{}", d.name);
+        assert_eq!(d.crs.epsg, Some(2154));
+    }
+
+    #[test]
+    fn world_extent_keeps_default() {
+        let wgs = Crs::wgs84();
+        assert!(DisplayCrs::auto_for(&wgs, Some([-180.0, -80.0, 180.0, 80.0])).is_none());
+        assert!(DisplayCrs::auto_for(&wgs, None).is_none());
+    }
+
+    #[test]
+    fn regional_extents_pick_equal_area_families() {
+        let wgs = Crs::wgs84();
+        // France-ish: squarish → LAEA on centroid.
+        let d = DisplayCrs::auto_for(&wgs, Some([-5.0, 41.0, 10.0, 51.0])).unwrap();
+        assert!(d.crs.proj4.contains("+proj=laea"), "{}", d.crs.proj4);
+        assert!(d.crs.proj4.contains("+lat_0=46"), "{}", d.crs.proj4);
+        roundtrip_center(&d, 2.5, 46.0);
+
+        // CONUS-ish: wide mid-latitude band → Albers with 1/6-rule parallels.
+        let d = DisplayCrs::auto_for(&wgs, Some([-125.0, 24.0, -66.0, 49.0])).unwrap();
+        assert!(d.crs.proj4.contains("+proj=aea"), "{}", d.crs.proj4);
+        assert!(d.crs.proj4.contains("+lat_1=28.167"), "{}", d.crs.proj4);
+        assert!(d.crs.proj4.contains("+lat_2=44.833"), "{}", d.crs.proj4);
+        roundtrip_center(&d, -95.5, 36.5);
+
+        // Equatorial band → equal-area cylindrical.
+        let d = DisplayCrs::auto_for(&wgs, Some([95.0, -8.0, 140.0, 6.0])).unwrap();
+        assert!(d.crs.proj4.contains("+proj=cea"), "{}", d.crs.proj4);
+        roundtrip_center(&d, 117.0, -1.0);
+
+        // Svalbard-ish → polar azimuthal.
+        let d = DisplayCrs::auto_for(&wgs, Some([10.0, 76.0, 34.0, 81.0])).unwrap();
+        assert!(d.crs.proj4.contains("+proj=laea"), "{}", d.crs.proj4);
+        assert!(d.crs.proj4.contains("+lat_0=90"), "{}", d.crs.proj4);
+        roundtrip_center(&d, 20.0, 78.0);
     }
 }

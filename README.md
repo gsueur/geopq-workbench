@@ -119,11 +119,21 @@ Fixture-dependent tests self-skip when the files are absent.
 - **CRS handling**: data CRS read from PROJJSON (EPSG id), transformed via
   proj4rs + the embedded `crs-definitions` EPSG database. Mixed-CRS layers
   coexist on one map (e.g. Lambert-93 polygons over WGS84 points).
-- **Display projection switching**: Hobo–Dyer cylindrical equal-area (default
-  world projection), Winkel Tripel (implemented natively — analytic forward,
-  Newton inverse), Web Mercator (with basemap), WGS84 plate carrée, or any
-  EPSG code typed in the toolbar. Layers re-tessellate in the background on
-  switch.
+- **Auto projection (default)**: the first loaded layer picks the display
+  projection. Projected data CRS wins outright (the mapping agency already
+  chose the best local projection — MassGIS parcels display in EPSG:26986);
+  geographic data gets a Snyder-style equal-area choice from its extent:
+  Albers conic for mid-latitude east–west bands (1/6-rule parallels),
+  azimuthal equal-area on the centroid for square-ish regions, equal-area
+  cylindrical for equatorial bands, polar azimuthal near the poles, and the
+  Hobo–Dyer world default for global data. Selected before geometry builds
+  when metadata bboxes exist (no double build, remote-safe); any manual
+  projection choice turns auto off for the session.
+- **Display projection switching**: Auto (above), Hobo–Dyer cylindrical
+  equal-area (world default), Winkel Tripel (implemented natively — analytic
+  forward, Newton inverse), Web Mercator (with basemap), WGS84 plate carrée,
+  or any EPSG code typed in the toolbar. Layers re-tessellate in the
+  background on switch.
 - **Graticule + coastline**: 15° meridians/parallels and the Natural Earth
   1:50m coastline (public domain, ~0.5 MB embedded in the binary), both
   rendered through the active projection (toggleable).

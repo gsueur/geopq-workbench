@@ -87,6 +87,10 @@ pub struct ViewerApp {
     palette_idx: usize,
     pending_fit: bool,
     fit_bounds: Option<[f64; 4]>,
+    /// Pick the display projection automatically from the first loaded
+    /// layer (data CRS if projected, extent-based equal-area otherwise);
+    /// turned off by any manual projection choice.
+    auto_projection: bool,
     /// Layers with a row-group append in flight.
     appending: HashSet<u64>,
     /// Last camera pose + when it last changed (for refinement debounce).
@@ -153,6 +157,7 @@ impl ViewerApp {
             palette_idx: 0,
             pending_fit: true,
             fit_bounds: None,
+            auto_projection: true,
             appending: HashSet::new(),
             last_cam: None,
             cam_changed_at: 0.0,
@@ -172,6 +177,12 @@ impl ViewerApp {
     }
 
     fn enqueue_load(&mut self, source: Source, ctx: &egui::Context) -> u64 {
+        // Auto-projection only applies to the very first layer of a session
+        // (evaluated before this job is registered).
+        let auto_project = self.auto_projection
+            && self.layers.is_empty()
+            && self.loading.is_empty()
+            && self.pending_styles.is_empty();
         let job = self.next_job;
         self.next_job += 1;
         let layer_id = self.next_layer_id;
@@ -197,11 +208,13 @@ impl ViewerApp {
             self.display.clone(),
             color,
             self.last_view_world,
+            auto_project,
         );
         job
     }
 
-    fn poll_loader(&mut self) {
+    fn poll_loader(&mut self, ctx: &egui::Context) {
+        let mut rebuild_display: Option<DisplayCrs> = None;
         while let Ok(msg) = self.load_rx.try_recv() {
             match msg {
                 LoadMsg::Progress { job, frac, stage } => {
@@ -210,7 +223,11 @@ impl ViewerApp {
                         j.stage = stage;
                     }
                 }
-                LoadMsg::Loaded { job, layer } => {
+                LoadMsg::Loaded {
+                    job,
+                    layer,
+                    adopt_display,
+                } => {
                     self.loading.remove(&job);
                     let first = self.layers.is_empty();
                     if layer.stats.bad_geoms > 0 {
@@ -228,6 +245,14 @@ impl ViewerApp {
                         None => false,
                     };
                     self.layers.push(layer);
+                    match adopt_display {
+                        // Geometry already built in the auto projection:
+                        // just switch overlays, no layer rebuild.
+                        Some((d, true)) => self.adopt_display_lite(d),
+                        // Post-build suggestion: full projection rebuild.
+                        Some((d, false)) => rebuild_display = Some(d),
+                        None => {}
+                    }
                     if first && !restored {
                         self.pending_fit = true;
                     }
@@ -282,6 +307,20 @@ impl ViewerApp {
                 }
             }
         }
+        if let Some(d) = rebuild_display {
+            self.set_display(d, ctx);
+        }
+    }
+
+    /// Switch the display projection without rebuilding layers (their
+    /// geometry was already built in it by the loader).
+    fn adopt_display_lite(&mut self, d: DisplayCrs) {
+        self.display = d;
+        self.select(None);
+        self.graticule_chunks = build_graticule(&self.display);
+        self.coastline_chunks = crate::data::coastline::build_coastline(&self.display);
+        self.graticule_generation += 1;
+        self.rg_overlays.clear();
     }
 
     fn push_error(&mut self, e: String) {
@@ -484,10 +523,42 @@ impl ViewerApp {
             let is_wintri = self.display.kind == DisplayKind::WinkelTripel;
             let is_4326 = self.display.kind == DisplayKind::Plain && self.display.crs.epsg == Some(4326);
             let mut pick: Option<DisplayCrs> = None;
+            let mut picked_auto = false;
             egui::ComboBox::from_id_salt("projection")
                 .selected_text(self.display.name.clone())
                 .width(200.0)
                 .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(self.auto_projection, "Auto (fit first layer)")
+                        .on_hover_text(
+                            "Projected data CRS if the layer has one; otherwise an\n\
+                             equal-area projection fit to the extent (Albers / LAEA /\n\
+                             cylindrical), or Hobo–Dyer for world-scale data.",
+                        )
+                        .clicked()
+                    {
+                        picked_auto = true;
+                        if let Some(l) = self.layers.first() {
+                            let bbox = l
+                                .rg_bboxes
+                                .as_ref()
+                                .filter(|_| l.crs.is_latlong)
+                                .and_then(|r| {
+                                    r.boxes.iter().copied().reduce(|a, b| {
+                                        [
+                                            a[0].min(b[0]),
+                                            a[1].min(b[1]),
+                                            a[2].max(b[2]),
+                                            a[3].max(b[3]),
+                                        ]
+                                    })
+                                });
+                            pick = Some(
+                                DisplayCrs::auto_for(&l.crs, bbox)
+                                    .unwrap_or_else(DisplayCrs::hobo_dyer),
+                            );
+                        }
+                    }
                     if ui
                         .selectable_label(is_hobo, "Hobo–Dyer (equal-area)")
                         .clicked()
@@ -524,7 +595,10 @@ impl ViewerApp {
                 }
             }
             if let Some(d) = pick {
+                self.auto_projection = picked_auto;
                 self.set_display(d, &ctx);
+            } else if picked_auto {
+                self.auto_projection = true;
             }
 
             ui.separator();
@@ -849,6 +923,7 @@ impl ViewerApp {
             camera_center: self.camera.center,
             camera_zoom: self.camera.zoom,
             projection: crate::context::projection_token(&self.display),
+            projection_name: Some(self.display.name.clone()),
             basemap: self.basemap,
             show_graticule: self.show_graticule,
             show_coastline: self.show_coastline,
@@ -898,7 +973,12 @@ impl ViewerApp {
         // Replace the current session: projection first (so loads build in
         // the right space), then camera, then layers with their styles.
         match crate::context::projection_from_token(&saved.projection) {
-            Ok(d) => {
+            Ok(mut d) => {
+                if let Some(n) = &saved.projection_name {
+                    if saved.projection.starts_with("proj4:") {
+                        d.name = n.clone();
+                    }
+                }
                 self.layers.clear();
                 self.rebuilding.clear();
                 self.appending.clear();
@@ -913,6 +993,7 @@ impl ViewerApp {
         self.camera.center = saved.camera_center;
         self.camera.zoom = saved.camera_zoom;
         self.pending_fit = false;
+        self.auto_projection = false;
         self.basemap = saved.basemap;
         self.show_graticule = saved.show_graticule;
         self.show_coastline = saved.show_coastline;
@@ -1995,7 +2076,7 @@ impl ViewerApp {
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.poll_loader();
+        self.poll_loader(&ctx);
         self.poll_optimizer();
         self.strip_uploaded_cpu_meshes(frame);
 
