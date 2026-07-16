@@ -137,6 +137,11 @@ pub struct ViewerApp {
     /// new rebuild for a layer cancels the previous one (projection
     /// flip-flops), removal cancels outright.
     rebuild_cancel: HashMap<u64, Arc<std::sync::atomic::AtomicBool>>,
+    /// Refit the camera when the current rebuild wave completes — set only
+    /// by an explicit projection switch (world coordinates changed under
+    /// the camera). Filter/restyle/load-triggered rebuilds must not move
+    /// the viewport.
+    fit_after_rebuilds: bool,
     /// Layers whose refinement was stopped by the user: paused until the
     /// camera moves again (else the same viewport would respawn it).
     refine_hold: HashSet<u64>,
@@ -443,6 +448,7 @@ impl ViewerApp {
             appending: HashSet::new(),
             append_cancel: HashMap::new(),
             rebuild_cancel: HashMap::new(),
+            fit_after_rebuilds: false,
             refine_hold: HashSet::new(),
             last_cam: None,
             cam_changed_at: 0.0,
@@ -485,8 +491,16 @@ impl ViewerApp {
 
     fn enqueue_load(&mut self, source: Source, ctx: &egui::Context) -> u64 {
         // Auto-projection only applies to the very first layer of a session
-        // (evaluated before this job is registered).
+        // (evaluated before this job is registered) — and only while the
+        // camera is still the untouched startup pose: adopting a projection
+        // keeps the camera's world coordinates, so under a viewport the
+        // user already framed it would silently show a different place.
+        let untouched = {
+            let d = crate::map::camera::Camera::default();
+            self.camera.center == d.center && self.camera.zoom == d.zoom
+        };
         let auto_project = self.auto_projection
+            && untouched
             && self.layers.is_empty()
             && self.loading.is_empty()
             && self.pending_styles.is_empty();
@@ -969,11 +983,15 @@ impl ViewerApp {
                         }
                     }
                     // Fit only when this message really finished the last
-                    // pending rebuild (projection switches change world
-                    // coordinates); a stale generation or a removed layer
-                    // must not move the viewport.
-                    if applied && self.rebuilding.is_empty() {
+                    // rebuild of an explicit projection switch (world
+                    // coordinates changed under the camera). Stale
+                    // generations, removed layers and filter/restyle/load
+                    // rebuilds must not move the viewport.
+                    if applied && self.rebuilding.is_empty() && self.fit_after_rebuilds {
                         self.pending_fit = true;
+                    }
+                    if self.rebuilding.is_empty() {
+                        self.fit_after_rebuilds = false;
                     }
                 }
                 LoadMsg::Appended {
@@ -1099,6 +1117,8 @@ impl ViewerApp {
         self.rebuild_layers_for_display(None, ctx);
         if self.layers.is_empty() {
             self.pending_fit = true;
+        } else {
+            self.fit_after_rebuilds = true;
         }
     }
 
