@@ -12,7 +12,7 @@ const USER_AGENT: &str = concat!(
     env!("CARGO_PKG_NAME"),
     "/",
     env!("CARGO_PKG_VERSION"),
-    " (+https://github.com/gsueur/geopq-viewer)"
+    " (+https://github.com/gsueur/geopq-workbench)"
 );
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

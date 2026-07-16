@@ -13,7 +13,7 @@ at vsync.
 
 Prebuilt binaries for macOS (Apple Silicon and Intel), Linux x86_64 and
 Windows x86_64 are published on the
-[GitHub Releases](https://github.com/gsueur/geopq-viewer/releases) page,
+[GitHub Releases](https://github.com/gsueur/geopq-workbench/releases) page,
 with SHA-256 checksums. Unpack and run — no installer, no dependencies
 (Linux needs a Wayland or X11 session; the file dialogs use the XDG
 desktop portal). The macOS binaries are not notarized: clear the
