@@ -52,9 +52,15 @@ pub enum LoadMsg {
     },
     /// A row append ended without a result (error or user cancel).
     AppendEnded { layer_id: u64, error: String },
-    /// A projection/filter rebuild failed (the layer keeps its previous
-    /// geometry; the app must clear its rebuilding flag).
-    RebuildFailed { layer_id: u64, error: String },
+    /// A projection/filter rebuild ended without geometry (error or
+    /// cancel). The layer keeps its previous sections; the app clears its
+    /// rebuilding flag only when `generation` is still the layer's current
+    /// one (a superseded rebuild must not unmask the newer in-flight one).
+    RebuildFailed {
+        layer_id: u64,
+        generation: u64,
+        error: String,
+    },
     /// Additional rows loaded for an existing layer (new section).
     Appended {
         layer_id: u64,
@@ -158,11 +164,21 @@ pub fn data_bbox_to_world(
     any.then_some(b)
 }
 
-/// Union of a set of bboxes.
-fn union_of(boxes: &[[f64; 4]]) -> Option<[f64; 4]> {
-    boxes.iter().copied().reduce(|a, b| {
-        [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
-    })
+/// Never-intersecting placeholder for a row group that contributed no
+/// decodable geometry: keeps computed per-group bbox vectors index-aligned
+/// with the file's row groups, and fails every intersection test.
+pub(crate) const EMPTY_BBOX: [f64; 4] =
+    [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+
+/// Union of a set of bboxes, ignoring empty (inverted) sentinels.
+pub(crate) fn union_of(boxes: &[[f64; 4]]) -> Option<[f64; 4]> {
+    boxes
+        .iter()
+        .filter(|b| b[0] <= b[2] && b[1] <= b[3])
+        .copied()
+        .reduce(|a, b| {
+            [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
+        })
 }
 
 /// Row groups whose bbox intersects the given data-CRS rect.
@@ -516,7 +532,10 @@ pub fn spawn_load(
                         }
                         let rg_bboxes = rg_meta
                             .or_else(|| {
-                                (!rg_computed.is_empty())
+                                // At least one real (non-sentinel) box.
+                                rg_computed
+                                    .iter()
+                                    .any(|b| b[0] <= b[2])
                                     .then(|| ("computed at load".to_string(), rg_computed))
                             })
                             .map(|(source, boxes)| {
@@ -587,6 +606,7 @@ pub fn spawn_rebuild(
     crs: Crs,
     display: DisplayCrs,
     loaded: Vec<GroupLoad>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
     style: Option<crate::data::layer::StyleBy>,
 ) {
     std::thread::spawn(move || {
@@ -602,15 +622,16 @@ pub fn spawn_rebuild(
                 GroupLoad::Rows { ranges, .. } => {
                     Some(GroupSel::Ranges(g as u32, ranges.clone()))
                 }
-                GroupLoad::Preview { stride } => Some(GroupSel::Preview {
+                GroupLoad::Preview { stride, rect } => Some(GroupSel::Preview {
                     group: g as u32,
-                    rect: None,
+                    rect: *rect,
                     stride: *stride,
                 }),
             })
             .collect();
         let style_sel = style.as_ref().and_then(|sb| resolve_style(&store, sb));
-        match build_geometry(&store, &crs, &display, None, sel, None, style_sel.as_ref()) {
+        match build_geometry(&store, &crs, &display, None, sel, Some(&cancel), style_sel.as_ref())
+        {
             Ok((geometry, _rows, bad, _rg, _resolved)) => handle.send(LoadMsg::Rebuilt {
                 layer_id,
                 generation,
@@ -618,8 +639,14 @@ pub fn spawn_rebuild(
                 stats_build_ms: t0.elapsed().as_millis() as u64,
                 bad_geoms: bad,
             }),
+            Err(e) if e == CANCELLED => handle.send(LoadMsg::RebuildFailed {
+                layer_id,
+                generation,
+                error: CANCELLED.into(),
+            }),
             Err(e) => handle.send(LoadMsg::RebuildFailed {
                 layer_id,
+                generation,
                 error: format!("{}: projection rebuild failed: {e}", store.source.label()),
             }),
         }
@@ -1099,9 +1126,14 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
             leaf_of_root(schema.field(xi).name()),
             leaf_of_root(schema.field(yi).name()),
         ),
-        None => {
-            rg_bboxes_from_metadata(&builder, geo_meta.as_ref(), geom_leaf, &geom_name, encoding)
-        }
+        None => rg_bboxes_from_metadata(
+            &builder,
+            geo_meta.as_ref(),
+            geom_leaf,
+            &geom_name,
+            encoding,
+            crs.is_latlong,
+        ),
     };
     let covering = covering_column(geo_meta.as_ref(), &geom_name, &schema);
 
@@ -1232,6 +1264,7 @@ fn rg_bboxes_from_metadata(
     geom_leaf: Option<usize>,
     primary: &str,
     encoding: GeomEncoding,
+    is_latlong: bool,
 ) -> Option<(String, Vec<[f64; 4]>)> {
     let meta = builder.metadata();
 
@@ -1263,7 +1296,10 @@ fn rg_bboxes_from_metadata(
             .map(|rg| {
                 let stats = rg.columns().get(leaf)?.geo_statistics()?;
                 let b = stats.bounding_box()?;
-                Some([b.get_xmin(), b.get_ymin(), b.get_xmax(), b.get_ymax()])
+                normalize_geo_stat_bbox(
+                    [b.get_xmin(), b.get_ymin(), b.get_xmax(), b.get_ymax()],
+                    is_latlong,
+                )
             })
             .collect()
     });
@@ -1342,6 +1378,20 @@ fn rg_bboxes_from_metadata(
         .map(|b| ("coordinate column statistics (GeoArrow)".into(), b))
 }
 
+/// Parquet geospatial statistics allow xmin > xmax for row groups that
+/// wrap the antimeridian. Taken verbatim such a box never intersects any
+/// query rect (silently un-prunable groups); widen it to the full
+/// longitude span instead — conservative: the group is never pruned and
+/// unions stay sane. A wrapped box on a non-geographic CRS has no defined
+/// world span, so the whole native-stats source is rejected (None) and
+/// the caller falls back to the next bbox source.
+fn normalize_geo_stat_bbox(b: [f64; 4], is_latlong: bool) -> Option<[f64; 4]> {
+    if b[0] <= b[2] {
+        return Some(b);
+    }
+    is_latlong.then_some([-180.0, b[1], 180.0, b[3]])
+}
+
 /// Average number of other boxes each box intersects.
 pub(crate) fn bbox_overlap_metric(boxes: &[[f64; 4]]) -> f64 {
     let n = boxes.len().min(4096);
@@ -1416,6 +1466,23 @@ pub fn sample_loaded_values(
     cap: usize,
 ) -> Result<Vec<f64>, String> {
     let starts = store.rg_starts();
+    // Rect-filtered previews: reproduce the load's exact selection (same
+    // covering scan, same decimation) so sampling never fetches rows that
+    // were never loaded.
+    let mut preview_rows: std::collections::HashMap<usize, Vec<u32>> = Default::default();
+    for (g, st) in loaded.iter().enumerate() {
+        if let GroupLoad::Preview { stride, rect: Some(r) } = st {
+            let group_rows = (starts[g + 1] - starts[g]) as u32;
+            let ranges = covering_select(store, g as u32, *r)?
+                .unwrap_or_else(|| vec![(0, group_rows)]);
+            let sampled: Vec<u32> = ranges
+                .iter()
+                .flat_map(|&(s, e)| s..e)
+                .step_by((*stride).max(1) as usize)
+                .collect();
+            preview_rows.insert(g, sampled);
+        }
+    }
     let total: u64 = loaded
         .iter()
         .enumerate()
@@ -1424,7 +1491,8 @@ pub fn sample_loaded_values(
             GroupLoad::Rows { ranges, .. } => {
                 ranges.iter().map(|&(s, e)| (e - s) as u64).sum()
             }
-            GroupLoad::Preview { stride } => {
+            GroupLoad::Preview { rect: Some(_), .. } => preview_rows[&g].len() as u64,
+            GroupLoad::Preview { stride, rect: None } => {
                 (starts[g + 1] - starts[g]).div_ceil(*stride as u64)
             }
             GroupLoad::None => 0,
@@ -1460,7 +1528,17 @@ pub fn sample_loaded_values(
                     push_span(s, e, &mut c, 1);
                 }
             }
-            GroupLoad::Preview { stride: ps } => {
+            GroupLoad::Preview { rect: Some(_), .. } => {
+                // Every global-stride-th of the group's loaded rows.
+                let list = &preview_rows[&g];
+                let mut i = (stride - (c % stride)) % stride;
+                while i < list.len() {
+                    rows.push(start + list[i]);
+                    i += stride;
+                }
+                c += list.len();
+            }
+            GroupLoad::Preview { stride: ps, rect: None } => {
                 push_span(0, (starts[g + 1] - starts[g]) as u32, &mut c, *ps as usize)
             }
             GroupLoad::None => {}
@@ -1662,7 +1740,7 @@ fn build_geometry(
                 };
                 (
                     Some(rows_to_ranges(sampled.into_iter())),
-                    GroupLoad::Preview { stride: stride as u32 },
+                    GroupLoad::Preview { stride: stride as u32, rect: *rect },
                 )
             }
         };
@@ -1807,12 +1885,12 @@ fn build_geometry(
     }
     let rtree = RTree::bulk_load(items);
 
-    let mut rg_vec: Vec<[f64; 4]> = Vec::new();
-    for i in 0..rg_starts.len().saturating_sub(1) {
-        if let Some(b) = rg_boxes.get(&(i as u32)) {
-            rg_vec.push(*b);
-        }
-    }
+    // Index-aligned with the file's row groups: a group whose selected
+    // rows yielded no decodable geometry keeps a sentinel box, so
+    // consumers can index the vector by global group id.
+    let rg_vec: Vec<[f64; 4]> = (0..rg_starts.len().saturating_sub(1))
+        .map(|i| rg_boxes.get(&(i as u32)).copied().unwrap_or(EMPTY_BBOX))
+        .collect();
 
     Ok((
         LayerGeometry {
@@ -2153,6 +2231,104 @@ mod rg_bbox_tests {
             overlap > (n_rg - 1) as f64 * 0.9,
             "all boxes overlap: {overlap} vs {n_rg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod sentinel_bbox_tests {
+    use super::*;
+    use arrow::array::{BinaryArray, Int64Array};
+    use arrow::datatypes::{Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use std::fs::File;
+
+    fn wkb_point(x: f64, y: f64) -> Vec<u8> {
+        let mut b = vec![1u8];
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&x.to_le_bytes());
+        b.extend_from_slice(&y.to_le_bytes());
+        b
+    }
+
+    /// A row group whose rows are all null geometry must keep its slot in
+    /// the computed bbox vector (sentinel), so later groups' boxes stay
+    /// addressable by global group id, and sentinel boxes must be inert
+    /// for intersection and union.
+    #[test]
+    fn computed_bboxes_stay_index_aligned_over_empty_groups() {
+        let dir = std::env::temp_dir().join("geopq_sentinel_bbox");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nulls.parquet");
+
+        // 3 groups of 4 rows; group 1 is all-null geometry.
+        let wkbs: Vec<Option<Vec<u8>>> = (0..12)
+            .map(|i| match i / 4 {
+                0 => Some(wkb_point(i as f64, 0.0)),
+                1 => None,
+                _ => Some(wkb_point(10.0 + (i - 8) as f64, 10.0)),
+            })
+            .collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, true),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(wkbs.into_iter().collect::<BinaryArray>()),
+                Arc::new(Int64Array::from((0..12).collect::<Vec<i64>>())),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(4))
+            .build();
+        let mut w =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let (store, crs, _info, rg_meta) = open_store(&Source::Local(path)).unwrap();
+        assert!(rg_meta.is_none(), "plain WKB file has no metadata bboxes");
+        let display = crate::data::crs::DisplayCrs::hobo_dyer();
+        let (_g, rows, _bad, boxes, _res) =
+            build_geometry(&store, &crs, &display, None, all_groups(&store), None, None)
+                .unwrap();
+        assert_eq!(rows, 12);
+        assert_eq!(boxes.len(), 3, "one slot per row group");
+        assert_eq!(boxes[1], EMPTY_BBOX, "empty group keeps a sentinel");
+        // Real boxes stay at their own group's index.
+        assert!(boxes[0][0] >= -0.1 && boxes[0][2] <= 3.1 && boxes[0][3] <= 0.1, "{:?}", boxes[0]);
+        assert!(boxes[2][0] >= 9.9 && boxes[2][1] >= 9.9, "{:?}", boxes[2]);
+        // Sentinels never intersect and never contribute to unions.
+        assert_eq!(intersecting_rgs(&boxes, [-1.0, -1.0, 20.0, 20.0]), vec![0, 2]);
+        let u = union_of(&boxes).unwrap();
+        assert!(u[0] >= -0.1 && u[1] >= -0.1 && u[2] <= 13.1 && u[3] <= 10.1, "{u:?}");
+        assert_eq!(union_of(&[EMPTY_BBOX]), None);
+    }
+}
+
+#[cfg(test)]
+mod geo_stat_normalize_tests {
+    use super::*;
+
+    #[test]
+    fn antimeridian_wraparound_widens_geographic_boxes() {
+        // Ordinary box passes through untouched.
+        assert_eq!(
+            normalize_geo_stat_bbox([-10.0, 40.0, 5.0, 50.0], true),
+            Some([-10.0, 40.0, 5.0, 50.0])
+        );
+        // Wraparound (xmin > xmax): widened to the full longitude span —
+        // still intersects viewports on both sides of the antimeridian.
+        let b = normalize_geo_stat_bbox([170.0, -20.0, -170.0, -10.0], true).unwrap();
+        assert_eq!(b, [-180.0, -20.0, 180.0, -10.0]);
+        assert_eq!(intersecting_rgs(&[b], [175.0, -15.0, 179.0, -12.0]), vec![0]);
+        assert_eq!(intersecting_rgs(&[b], [-179.0, -15.0, -175.0, -12.0]), vec![0]);
+        // Projected CRS: a wrapped box has no defined span — rejected.
+        assert_eq!(normalize_geo_stat_bbox([5.0, 0.0, 1.0, 2.0], false), None);
     }
 }
 
@@ -2921,8 +3097,10 @@ mod xy_tests {
         assert_eq!(rows_prev, expect_prev);
         assert!(resolved
             .iter()
-            .all(|(_, st)| matches!(st, GroupLoad::Preview { stride: 4 })));
-        assert!(!GroupLoad::Preview { stride: 4 }.covers([0.0, 0.0, 1.0, 1.0]));
+            .all(|(_, st)| matches!(st, GroupLoad::Preview { stride: 4, rect: None })));
+        assert!(
+            !GroupLoad::Preview { stride: 4, rect: None }.covers([0.0, 0.0, 1.0, 1.0])
+        );
 
         // Data-driven styling: graduated bins on the id column spread
         // chunks across bins, and binning matches the value math.
@@ -3019,5 +3197,101 @@ mod xy_tests {
             .unwrap()
             .value(0);
         assert_eq!(x, lons[21]);
+    }
+}
+
+#[cfg(test)]
+mod preview_rect_tests {
+    use super::*;
+    use arrow::array::{Float64Array, Int64Array};
+    use arrow::datatypes::{Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use std::fs::File;
+
+    /// A rect-filtered preview must resolve to a state that records the
+    /// rect, and value sampling must reproduce exactly the loaded
+    /// selection (never fetching rows the preview skipped).
+    #[test]
+    fn rect_preview_state_and_sampling_match_load() {
+        let dir = std::env::temp_dir().join("geopq_preview_rect");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("grid.parquet");
+
+        // 20x20 lon/lat grid, groups of 128 rows (x/y point store: the
+        // coordinate columns are the covering).
+        let n = 400usize;
+        let (mut lons, mut lats) = (Vec::new(), Vec::new());
+        for i in 0..n {
+            lons.push(-71.0 + (i % 20) as f64 * 0.01);
+            lats.push(42.0 + (i / 20) as f64 * 0.01);
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("lon", DataType::Float64, false),
+            Field::new("lat", DataType::Float64, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Float64Array::from(lons.clone())),
+                Arc::new(Float64Array::from(lats.clone())),
+                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<i64>>())),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(128))
+            .build();
+        let mut w =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let (store, crs, _info, _rg) = open_store(&Source::Local(path)).unwrap();
+        assert!(store.xy_geom.is_some());
+        let n_groups = store.rg_starts().len() - 1;
+        assert_eq!(n_groups, 4);
+
+        // Rows of group 0 inside the rect, decimated at 1/3 — the ground
+        // truth the loader must reproduce.
+        let rect = [-70.95, 42.0, -70.85, 42.06];
+        let stride = 3u32;
+        let expected: Vec<u32> = (0..128u32)
+            .filter(|&i| {
+                let (x, y) = (lons[i as usize], lats[i as usize]);
+                x >= rect[0] && x <= rect[2] && y >= rect[1] && y <= rect[3]
+            })
+            .collect::<Vec<u32>>()
+            .into_iter()
+            .step_by(stride as usize)
+            .collect();
+        assert!(expected.len() > 3, "fixture must select several rows");
+
+        let display = crate::data::crs::DisplayCrs::hobo_dyer();
+        let sel = vec![GroupSel::Preview { group: 0, rect: Some(rect), stride }];
+        let (_g, rows, _bad, _boxes, resolved) =
+            build_geometry(&store, &crs, &display, None, sel, None, None).unwrap();
+        assert_eq!(rows, expected.len(), "only in-rect decimated rows decode");
+        assert_eq!(resolved.len(), 1);
+        match &resolved[0] {
+            (0, GroupLoad::Preview { stride: s, rect: r }) => {
+                assert_eq!(*s, stride);
+                assert_eq!(*r, Some(rect), "resolved state must keep the rect");
+            }
+            other => panic!("unexpected resolved state: {other:?}"),
+        }
+
+        // Sampling classifies only what was loaded: with an uncapped
+        // sample, the returned ids are exactly the loaded rows.
+        let mut loaded = vec![GroupLoad::None; n_groups];
+        loaded[0] = resolved[0].1.clone();
+        let id_col = store.schema.index_of("id").unwrap();
+        let mut vals =
+            sample_loaded_values(&store, &loaded, id_col, 10_000).unwrap();
+        vals.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let got: Vec<u32> = vals.iter().map(|v| *v as u32).collect();
+        assert_eq!(got, expected, "sampling must reproduce the preview selection");
     }
 }

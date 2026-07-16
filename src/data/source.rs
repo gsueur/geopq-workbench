@@ -169,12 +169,31 @@ impl Source {
     }
 }
 
-/// Keep signed query parameters out of error strings.
+/// Keep signed query parameters out of error strings: replace each
+/// presigned query string with `?<presigned>` while preserving the rest of
+/// the message — errors are formatted "{url}: {cause}", and the cause
+/// (e.g. "(status 403)") is what distinguishes expired credentials from an
+/// unreachable host.
 fn redact_presign(msg: &str) -> String {
-    match msg.find("?X-Amz") {
-        Some(i) => format!("{}?<presigned>", &msg[..i]),
-        None => msg.to_string(),
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(i) = rest.find("?X-Amz") {
+        out.push_str(&rest[..i]);
+        out.push_str("?<presigned>");
+        let tail = &rest[i..];
+        // The query string ends at the first character that cannot appear
+        // in it: whitespace, or the ": " separating the URL from the error
+        // cause (AWS presign params are percent-encoded, so neither occurs
+        // inside them).
+        let end = tail
+            .char_indices()
+            .find(|&(j, c)| c.is_whitespace() || (c == ':' && tail[j + 1..].starts_with(' ')))
+            .map(|(j, _)| j)
+            .unwrap_or(tail.len());
+        rest = &tail[end..];
     }
+    out.push_str(rest);
+    out
 }
 
 /// AWS credential/profile handling and S3 presigning. Kept deliberately
@@ -323,6 +342,24 @@ pub mod aws {
         "us-east-1".into()
     }
 
+    /// RFC 3986 path encoding of an object key: percent-encode every byte
+    /// outside the unreserved set, preserving `/` separators. Produces the
+    /// same encoding rusty_s3 applies on the signed branch, so anonymous
+    /// and presigned URLs address the same object (a raw '#' would
+    /// truncate the key to a fragment, a raw space breaks URI parsing).
+    fn encode_key_path(key: &str) -> String {
+        let mut out = String::with_capacity(key.len());
+        for &b in key.as_bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                    out.push(b as char)
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
+
     /// Turn `s3://bucket/key` into a GET URL: presigned when credentials
     /// exist, plain URL for anonymous/public access. Endpoint priority:
     /// explicit `endpoint` (UI field) > `AWS_ENDPOINT_URL` > the profile's
@@ -387,7 +424,9 @@ pub mod aws {
 
         match creds {
             None => {
-                // Anonymous: plain object URL.
+                // Anonymous: plain object URL, key encoded like the
+                // signed branch.
+                let key = encode_key_path(key);
                 Ok(match &endpoint_env {
                     Some(e) => format!("{}/{bucket}/{key}", e.trim_end_matches('/')),
                     None => format!("https://{bucket}.s3.{region}.amazonaws.com/{key}"),
@@ -459,6 +498,51 @@ pub mod aws {
         fn s3_uri_validation() {
             assert!(super::presign("s3://bucket-only", None, None).is_err());
             assert!(super::presign("http://x/y", None, None).is_err());
+        }
+
+        #[test]
+        fn key_path_encoding() {
+            // Unreserved characters and '/' pass through untouched.
+            assert_eq!(
+                super::encode_key_path("path/to/data-1.0_x~.parquet"),
+                "path/to/data-1.0_x~.parquet"
+            );
+            // '#' would truncate to a fragment, '?' starts a query, a raw
+            // space breaks parsing, '%' must not be double-decodable.
+            assert_eq!(
+                super::encode_key_path("a b#c?100%.parquet"),
+                "a%20b%23c%3F100%25.parquet"
+            );
+            // Non-ASCII is encoded byte-wise as UTF-8.
+            assert_eq!(super::encode_key_path("Zürich.parquet"), "Z%C3%BCrich.parquet");
+        }
+
+        #[test]
+        fn anonymous_key_encoding_matches_signed_branch() {
+            // The signed and anonymous URL forms must address the same
+            // object: compare our encoder against rusty_s3's path.
+            use rusty_s3::S3Action;
+            let key = "path/to/héllo #1 100%.parquet";
+            let b = rusty_s3::Bucket::new(
+                "https://s3.eu-west-3.amazonaws.com".parse().unwrap(),
+                rusty_s3::UrlStyle::VirtualHost,
+                "my-bucket",
+                "eu-west-3",
+            )
+            .unwrap();
+            let c = rusty_s3::Credentials::new("AKIAEXAMPLE", "secret");
+            let url = b
+                .get_object(Some(&c), key)
+                .sign(std::time::Duration::from_secs(60))
+                .to_string();
+            let path = url.split('?').next().unwrap();
+            assert_eq!(
+                path,
+                format!(
+                    "https://my-bucket.s3.eu-west-3.amazonaws.com/{}",
+                    super::encode_key_path(key)
+                )
+            );
         }
     }
 }
@@ -718,6 +802,54 @@ pub(crate) mod testserver {
             bytes_served,
             requests,
         }
+    }
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_presign;
+
+    #[test]
+    fn keeps_error_cause_after_query() {
+        let msg = "https://b.s3.eu-west-3.amazonaws.com/k.parquet?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIA%2F20260716%2Feu-west-3%2Fs3%2Faws4_request&X-Amz-Signature=abc123: server does not support range requests (status 403)";
+        let red = redact_presign(msg);
+        assert_eq!(
+            red,
+            "https://b.s3.eu-west-3.amazonaws.com/k.parquet?<presigned>: server does not support range requests (status 403)"
+        );
+        assert!(red.contains("(status 403)"));
+        assert!(!red.contains("X-Amz"));
+    }
+
+    #[test]
+    fn message_ending_at_query() {
+        assert_eq!(
+            redact_presign("cannot reach https://x/y.parquet?X-Amz-Signature=abc"),
+            "cannot reach https://x/y.parquet?<presigned>"
+        );
+    }
+
+    #[test]
+    fn query_followed_by_whitespace() {
+        assert_eq!(
+            redact_presign("https://x/y?X-Amz-Signature=abc timed out"),
+            "https://x/y?<presigned> timed out"
+        );
+    }
+
+    #[test]
+    fn multiple_urls_redacted() {
+        assert_eq!(
+            redact_presign(
+                "https://a/1?X-Amz-Signature=s1: moved to https://b/2?X-Amz-Signature=s2: gone"
+            ),
+            "https://a/1?<presigned>: moved to https://b/2?<presigned>: gone"
+        );
+    }
+
+    #[test]
+    fn no_presign_untouched() {
+        assert_eq!(redact_presign("plain error: no url here"), "plain error: no url here");
     }
 }
 

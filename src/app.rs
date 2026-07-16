@@ -42,8 +42,9 @@ enum OptMsg {
     Progress(f32, String),
     Done(Box<crate::data::optimize::OptimizeReport>, PathBuf),
     Failed(String),
-    /// Distinct-value counts for partition-field candidates.
-    Cardinalities(std::collections::HashMap<String, usize>),
+    /// Distinct-value counts for partition-field candidates, tagged with
+    /// the layer they were scanned for (the dialog may have moved on).
+    Cardinalities(u64, std::collections::HashMap<String, usize>),
 }
 
 /// State of the per-layer "Optimize" export dialog (one at a time).
@@ -132,6 +133,10 @@ pub struct ViewerApp {
     appending: HashSet<u64>,
     /// Cancel flags of in-flight appends (layer id -> flag).
     append_cancel: HashMap<u64, Arc<std::sync::atomic::AtomicBool>>,
+    /// Cancel flags of in-flight rebuilds (layer id -> flag). Spawning a
+    /// new rebuild for a layer cancels the previous one (projection
+    /// flip-flops), removal cancels outright.
+    rebuild_cancel: HashMap<u64, Arc<std::sync::atomic::AtomicBool>>,
     /// Layers whose refinement was stopped by the user: paused until the
     /// camera moves again (else the same viewport would respawn it).
     refine_hold: HashSet<u64>,
@@ -225,7 +230,10 @@ enum RepoMsg {
         Result<Vec<crate::data::repo::Dataset>, String>,
         Option<u64>,
     ),
-    Manifest(u64, Result<crate::data::repo::Manifest, String>),
+    /// Manifest of one dataset: (generation, dataset index, result). The
+    /// index pins the result to the dataset it was fetched for — a slow
+    /// fetch must not fill the panel of a dataset selected later.
+    Manifest(u64, usize, Result<crate::data::repo::Manifest, String>),
 }
 
 /// Cap on attribute columns fetched for the feature info panel. Wide
@@ -240,6 +248,22 @@ struct PickMsg {
     attrs: Option<arrow::record_batch::RecordBatch>,
     /// (shown, total) when the attribute fetch was column-capped.
     truncated: Option<(usize, usize)>,
+}
+
+/// Arm a fresh cancel flag for a layer's background worker, cancelling
+/// the one already in flight (if any). Free function so call sites can
+/// hold disjoint borrows of other `ViewerApp` fields.
+fn fresh_cancel(
+    map: &mut HashMap<u64, Arc<std::sync::atomic::AtomicBool>>,
+    layer_id: u64,
+) -> Arc<std::sync::atomic::AtomicBool> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    if let Some(prev) = map.get(&layer_id) {
+        prev.store(true, Ordering::Relaxed);
+    }
+    let c = Arc::new(AtomicBool::new(false));
+    map.insert(layer_id, Arc::clone(&c));
+    c
 }
 
 /// Draw-order category of a geometry kind: polygons under lines under
@@ -418,6 +442,7 @@ impl ViewerApp {
             auto_projection: true,
             appending: HashSet::new(),
             append_cancel: HashMap::new(),
+            rebuild_cancel: HashMap::new(),
             refine_hold: HashSet::new(),
             last_cam: None,
             cam_changed_at: 0.0,
@@ -632,6 +657,7 @@ impl ViewerApp {
             l.crs.clone(),
             display,
             l.loaded.clone(),
+            fresh_cancel(&mut self.rebuild_cancel, l.id),
             l.style.style_by.clone(),
         );
     }
@@ -659,6 +685,7 @@ impl ViewerApp {
             l.crs.clone(),
             display,
             l.loaded.clone(),
+            fresh_cancel(&mut self.rebuild_cancel, l.id),
             l.style.style_by.clone(),
         );
     }
@@ -839,13 +866,15 @@ impl ViewerApp {
                     layer,
                     adopt_display,
                 } => {
+                    // Untracked job: cancelled by a session reset (e.g.
+                    // Load context) — drop the result instead of
+                    // resurrecting the layer.
+                    let Some(j) = self.loading.remove(&job) else {
+                        continue;
+                    };
                     // Projection switched while this job was building?
                     // Its world geometry is in the old display's frame.
-                    let stale = self
-                        .loading
-                        .get(&job)
-                        .is_some_and(|j| j.display_gen != self.display_gen);
-                    self.loading.remove(&job);
+                    let stale = j.display_gen != self.display_gen;
                     if layer.stats.bad_geoms > 0 {
                         self.push_error(format!(
                             "{}: {} geometries could not be decoded/projected",
@@ -860,7 +889,18 @@ impl ViewerApp {
                         layer.style = style;
                     }
                     let new_layer_id = layer.id;
-                    if stale && adopt_display.is_none() {
+                    // The loader's auto-projection only applies if nothing
+                    // changed mid-load: a manual pick bumps display_gen
+                    // (stale) and turns auto_projection off.
+                    let built_in_adopted = matches!(&adopt_display, Some((_, true)));
+                    let adopt = if !stale && self.auto_projection {
+                        adopt_display
+                    } else {
+                        None
+                    };
+                    if adopt.is_none() && (stale || built_in_adopted) {
+                        // The arriving geometry is in another display's
+                        // frame; rebuild it for the current one.
                         layer.generation += 1;
                         self.rebuilding.insert(layer.id);
                         loader::spawn_rebuild(
@@ -874,7 +914,8 @@ impl ViewerApp {
                             layer.crs.clone(),
                             self.display.clone(),
                             layer.loaded.clone(),
-                        layer.style.style_by.clone(),
+                            fresh_cancel(&mut self.rebuild_cancel, layer.id),
+                            layer.style.style_by.clone(),
                         );
                     }
                     // Category z-order: polygons at the bottom, lines above,
@@ -892,7 +933,7 @@ impl ViewerApp {
                     if let Some(f) = self.pending_filters.remove(&job) {
                         self.start_layer_filter(new_layer_id, f, ctx);
                     }
-                    match adopt_display {
+                    match adopt {
                         // Geometry already built in the auto-adopted
                         // display — but layers that finished earlier are
                         // still in the previous frame and must rebuild.
@@ -916,15 +957,22 @@ impl ViewerApp {
                     stats_build_ms,
                     bad_geoms,
                 } => {
+                    let mut applied = false;
                     if let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) {
                         if l.generation == generation {
                             l.sections = vec![geometry];
                             l.stats.build_ms = stats_build_ms;
                             l.stats.bad_geoms = bad_geoms;
                             self.rebuilding.remove(&layer_id);
+                            self.rebuild_cancel.remove(&layer_id);
+                            applied = true;
                         }
                     }
-                    if self.rebuilding.is_empty() {
+                    // Fit only when this message really finished the last
+                    // pending rebuild (projection switches change world
+                    // coordinates); a stale generation or a removed layer
+                    // must not move the viewport.
+                    if applied && self.rebuilding.is_empty() {
                         self.pending_fit = true;
                     }
                 }
@@ -954,12 +1002,27 @@ impl ViewerApp {
                         }
                     }
                 }
-                LoadMsg::RebuildFailed { layer_id, error } => {
+                LoadMsg::RebuildFailed {
+                    layer_id,
+                    generation,
+                    error,
+                } => {
                     // The layer keeps drawing its previous-generation
-                    // sections; without this the spinner and the rebuild
-                    // gate stayed on forever.
-                    self.rebuilding.remove(&layer_id);
-                    self.push_error(error);
+                    // sections. Only the LATEST rebuild's failure clears
+                    // the gate — a superseded (cancelled) rebuild must not
+                    // unmask the newer one still in flight.
+                    let current = self
+                        .layers
+                        .iter()
+                        .find(|l| l.id == layer_id)
+                        .is_some_and(|l| l.generation == generation);
+                    if current {
+                        self.rebuilding.remove(&layer_id);
+                        self.rebuild_cancel.remove(&layer_id);
+                    }
+                    if error != loader::CANCELLED {
+                        self.push_error(error);
+                    }
                 }
                 LoadMsg::AppendEnded { layer_id, error } => {
                     self.appending.remove(&layer_id);
@@ -1059,8 +1122,9 @@ impl ViewerApp {
                 l.crs.clone(),
                 self.display.clone(),
                 l.loaded.clone(),
-            l.style.style_by.clone(),
-                        );
+                fresh_cancel(&mut self.rebuild_cancel, l.id),
+                l.style.style_by.clone(),
+            );
         }
     }
 
@@ -1406,16 +1470,7 @@ impl ViewerApp {
                                 .rg_bboxes
                                 .as_ref()
                                 .filter(|_| l.crs.is_latlong)
-                                .and_then(|r| {
-                                    r.boxes.iter().copied().reduce(|a, b| {
-                                        [
-                                            a[0].min(b[0]),
-                                            a[1].min(b[1]),
-                                            a[2].max(b[2]),
-                                            a[3].max(b[3]),
-                                        ]
-                                    })
-                                });
+                                .and_then(|r| loader::union_of(&r.boxes));
                             pick = Some(
                                 DisplayCrs::auto_for(&l.crs, bbox)
                                     .unwrap_or_else(DisplayCrs::hobo_dyer),
@@ -1820,8 +1875,19 @@ impl ViewerApp {
             }
         }
         if let Some(id) = remove {
+            use std::sync::atomic::Ordering;
             self.layers.retain(|l| l.id != id);
             self.rebuilding.remove(&id);
+            self.appending.remove(&id);
+            self.refine_hold.remove(&id);
+            // Stop the removed layer's in-flight workers instead of letting
+            // them stream/rebuild into the void.
+            if let Some(c) = self.append_cancel.remove(&id) {
+                c.store(true, Ordering::Relaxed);
+            }
+            if let Some(c) = self.rebuild_cancel.remove(&id) {
+                c.store(true, Ordering::Relaxed);
+            }
             if self.selection.as_ref().map(|s| s.layer_id) == Some(id) {
                 self.clear_selection();
             }
@@ -1997,6 +2063,25 @@ impl ViewerApp {
                         d.name = n.clone();
                     }
                 }
+                // Cancel everything still in flight from the previous
+                // session: a late Loaded/Rebuilt/Appended message must not
+                // land in the restored one (or clobber its camera).
+                use std::sync::atomic::Ordering;
+                for j in self.loading.values() {
+                    j.cancel.store(true, Ordering::Relaxed);
+                }
+                self.loading.clear();
+                for c in self.append_cancel.values() {
+                    c.store(true, Ordering::Relaxed);
+                }
+                self.append_cancel.clear();
+                for c in self.rebuild_cancel.values() {
+                    c.store(true, Ordering::Relaxed);
+                }
+                self.rebuild_cancel.clear();
+                self.pending_styles.clear();
+                self.pending_filters.clear();
+                self.pending_names.clear();
                 self.layers.clear();
                 self.rebuilding.clear();
                 self.appending.clear();
@@ -2099,6 +2184,7 @@ impl ViewerApp {
         std::thread::spawn(move || {
             let _ = tx.send(RepoMsg::Manifest(
                 generation,
+                ds_idx,
                 crate::data::repo::fetch_manifest(&base, &snapshot, &path),
             ));
             ctx.request_repaint();
@@ -2122,9 +2208,11 @@ impl ViewerApp {
                     b.datasets = Some(res);
                     b.cache_age = cached_at;
                 }
-                RepoMsg::Manifest(g, res) if g == b.generation => {
-                    if let Some((_, m)) = &mut b.selected {
-                        *m = Some(res);
+                RepoMsg::Manifest(g, ds_idx, res) if g == b.generation => {
+                    if let Some((sel, m)) = &mut b.selected {
+                        if *sel == ds_idx {
+                            *m = Some(res);
+                        }
                     }
                 }
                 _ => {} // stale generation
@@ -2952,6 +3040,7 @@ impl ViewerApp {
             l.crs.clone(),
             self.display.clone(),
             l.loaded.clone(),
+            fresh_cancel(&mut self.rebuild_cancel, l.id),
             l.style.style_by.clone(),
         );
     }
@@ -3052,9 +3141,11 @@ impl ViewerApp {
                     o.running = false;
                     o.error = Some(e);
                 }
-                OptMsg::Cardinalities(c) => {
-                    o.cardinalities = Some(c);
-                    o.card_pending = false;
+                OptMsg::Cardinalities(id, c) => {
+                    if o.layer_id == id {
+                        o.cardinalities = Some(c);
+                        o.card_pending = false;
+                    }
                 }
             }
         }
@@ -3598,7 +3689,7 @@ impl ViewerApp {
                     std::thread::spawn(move || {
                         let counts =
                             crate::sql::engine::distinct_counts(&sl, &cols).unwrap_or_default();
-                        let _ = tx.send(OptMsg::Cardinalities(counts));
+                        let _ = tx.send(OptMsg::Cardinalities(layer_id, counts));
                         egui_ctx.request_repaint();
                     });
                 }

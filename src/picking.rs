@@ -126,25 +126,27 @@ pub fn to_world_geom(
 /// Scan the point instances of chunks near the cursor. Points carry their
 /// FeatureRef inline (no R-tree entries), so this is the point pick path.
 /// Returns the hit and its world position (no data read needed).
-fn pick_point_in_chunks(
-    layer: &PickLayer,
+fn pick_point_in_chunks<'a>(
+    chunks: impl Iterator<Item = &'a ChunkMesh>,
     world: [f64; 2],
     tol_world: f64,
 ) -> Option<(FeatureRef, [f64; 2])> {
-    use crate::data::geometry::CHUNK_WORLD;
     let tol2 = tol_world * tol_world;
     let mut best: Option<(f64, FeatureRef, [f64; 2])> = None;
-    for chunk in layer.sections.iter().flat_map(|(c, _)| c.iter()) {
+    for chunk in chunks {
         if chunk.point_instances.is_empty() {
             continue;
         }
-        // Points are assigned to the chunk containing them, so only chunks
-        // whose cell overlaps the tolerance box can hold a hit.
+        // Points land in the chunk keyed by their feature's bbox center, so
+        // a MultiPoint's members can sit far outside the chunk's grid cell.
+        // Cull by the chunk's content bounds (chunk-local offsets), not the
+        // cell box, or those members would be unpickable.
         let o = chunk.origin;
-        if world[0] + tol_world < o[0]
-            || world[0] - tol_world > o[0] + CHUNK_WORLD
-            || world[1] + tol_world < o[1]
-            || world[1] - tol_world > o[1] + CHUNK_WORLD
+        let b = chunk.bounds_local;
+        if world[0] + tol_world < o[0] + b[0] as f64
+            || world[0] - tol_world > o[0] + b[2] as f64
+            || world[1] + tol_world < o[1] + b[1] as f64
+            || world[1] - tol_world > o[1] + b[3] as f64
         {
             continue;
         }
@@ -182,7 +184,8 @@ pub fn pick(
         // Points render on top of fills/lines; check them first. The
         // highlight comes straight from the rendered instance position —
         // no geometry read.
-        if let Some((fref, pos)) = pick_point_in_chunks(layer, world, tol_world) {
+        let layer_chunks = layer.sections.iter().flat_map(|(c, _)| c.iter());
+        if let Some((fref, pos)) = pick_point_in_chunks(layer_chunks, world, tol_world) {
             return Some(Selection {
                 layer_id: layer.id,
                 feature: fref,
@@ -265,6 +268,35 @@ pub fn pick(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod point_pick_tests {
+    use super::*;
+    use crate::data::geometry::MeshBuilder;
+    use geo_types::MultiPoint;
+
+    #[test]
+    fn multipoint_member_outside_center_cell_is_pickable() {
+        let mut mb = MeshBuilder::default();
+        // Members 0.01 world apart, ~20x the chunk cell (1/2048): both are
+        // stored in the single chunk keyed by the feature bbox center.
+        let mp = MultiPoint::from(vec![(0.5, 0.5), (0.51, 0.5)]);
+        assert!(mb
+            .add(&Geometry::MultiPoint(mp), FeatureRef { index: 7 })
+            .is_some());
+        let chunks = mb.finish();
+        let tol = 1e-5;
+
+        let (fref, pos) = pick_point_in_chunks(chunks.iter(), [0.51, 0.5], tol)
+            .expect("member outside the bbox-center cell must be pickable");
+        assert_eq!(fref.index, 7);
+        assert!((pos[0] - 0.51).abs() < tol && (pos[1] - 0.5).abs() < tol);
+
+        assert!(pick_point_in_chunks(chunks.iter(), [0.5, 0.5], tol).is_some());
+        // Between the members: inside the content bounds, but no hit.
+        assert!(pick_point_in_chunks(chunks.iter(), [0.505, 0.5], tol).is_none());
+    }
 }
 
 #[cfg(test)]

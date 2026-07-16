@@ -65,9 +65,11 @@ pub enum GroupLoad {
     /// [start, end) row spans that cover them.
     Rows { ranges: Vec<(u32, u32)>, rect: [f64; 4] },
     /// Decimated preview: every `stride`-th row was decoded (a load that
-    /// would have exceeded the row budget). Never covers a viewport, so
-    /// zooming in refines it with real rows.
-    Preview { stride: u32 },
+    /// would have exceeded the row budget), restricted to the features
+    /// intersecting `rect` (data CRS) first when the load was
+    /// viewport-filtered. Never covers a viewport, so zooming in refines
+    /// it with real rows.
+    Preview { stride: u32, rect: Option<[f64; 4]> },
     /// Whole group decoded.
     Full,
 }
@@ -269,6 +271,8 @@ impl Ramp {
     }
 
     /// Color at t in [0, 1].
+    // A viridis stop happens to sit near 1/pi; these are colors, not math.
+    #[allow(clippy::approx_constant)]
     pub fn sample(&self, t: f32) -> [f32; 3] {
         let t = t.clamp(0.0, 1.0);
         match self {
@@ -515,7 +519,9 @@ impl VectorLayer {
                 GroupLoad::Rows { ranges, .. } => {
                     ranges.iter().map(|&(s, e)| (e - s) as u64).sum()
                 }
-                GroupLoad::Preview { stride } => {
+                // Rect-filtered previews load fewer rows; this upper bound
+                // only drives the staleness hint.
+                GroupLoad::Preview { stride, .. } => {
                     (starts[g + 1] - starts[g]).div_ceil(*stride as u64)
                 }
                 GroupLoad::None => 0,

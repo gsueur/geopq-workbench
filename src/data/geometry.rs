@@ -543,69 +543,85 @@ impl MeshBuilder {
     }
 
     pub fn finish(self) -> Vec<ChunkMesh> {
-        let mut chunks: Vec<ChunkMesh> = self
-            .chunks
-            .into_values()
-            .filter(|c| !c.is_empty())
-            .flat_map(|c| split_oversized(c, &SplitCaps::default()))
-            .collect();
-        for c in &mut chunks {
-            // Shuffle points (with refs) and line segments so a buffer
-            // prefix is a uniform random sample: the renderer draws only as
-            // much as the chunk's on-screen area warrants.
-            let mut state =
-                (c.origin[0].to_bits() ^ c.origin[1].to_bits().rotate_left(17)) | 1;
-            let mut rand = move || {
-                // xorshift64*
-                state ^= state >> 12;
-                state ^= state << 25;
-                state ^= state >> 27;
-                state.wrapping_mul(0x2545_F491_4F6C_DD1D)
-            };
-            let n = c.point_instances.len();
-            if n > 1 {
-                for i in (1..n).rev() {
-                    let j = (rand() % (i as u64 + 1)) as usize;
-                    c.point_instances.swap(i, j);
-                    c.point_refs.swap(i, j);
+        self.finish_with_caps(&SplitCaps::default())
+    }
+
+    fn finish_with_caps(self, caps: &SplitCaps) -> Vec<ChunkMesh> {
+        let mut chunks: Vec<ChunkMesh> = Vec::new();
+        for chunk in self.chunks.into_values().filter(|c| !c.is_empty()) {
+            let parts = split_oversized(chunk, caps);
+            // split_oversized slices each LOD level independently, so the
+            // levels of one part are not views of the same feature set;
+            // the near-duplicate aliasing below is only sound on unsplit
+            // chunks (split parts keep the identity alias).
+            let aliasable = parts.len() == 1;
+            for mut c in parts {
+                // Shuffle points (with refs) and line segments so a buffer
+                // prefix is a uniform random sample: the renderer draws only as
+                // much as the chunk's on-screen area warrants.
+                let mut state =
+                    (c.origin[0].to_bits() ^ c.origin[1].to_bits().rotate_left(17)) | 1;
+                let mut rand = move || {
+                    // xorshift64*
+                    state ^= state >> 12;
+                    state ^= state << 25;
+                    state ^= state >> 27;
+                    state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+                };
+                let n = c.point_instances.len();
+                if n > 1 {
+                    for i in (1..n).rev() {
+                        let j = (rand() % (i as u64 + 1)) as usize;
+                        c.point_instances.swap(i, j);
+                        c.point_refs.swap(i, j);
+                    }
                 }
-            }
-            let _ = &mut rand;
-            // Alias LODs that barely improve on the previous kept level.
-            let mut last_kept = 0usize;
-            for k in 1..LINE_LODS_TOTAL {
-                let prev_len = c.lines[last_kept].segments.len();
-                let len = c.lines[k].segments.len();
-                if prev_len > 0 && len as f64 > prev_len as f64 * LOD_ALIAS_FRACTION {
-                    c.lines[k] = LineLod::default();
-                    c.line_alias[k] = last_kept as u8;
-                } else {
-                    c.line_alias[k] = k as u8;
-                    last_kept = k;
+                let _ = &mut rand;
+                if aliasable {
+                    // Alias LODs that barely improve on the previous kept level.
+                    let mut last_kept = 0usize;
+                    for k in 1..LINE_LODS_TOTAL {
+                        let prev_len = c.lines[last_kept].segments.len();
+                        let len = c.lines[k].segments.len();
+                        if prev_len > 0 && len as f64 > prev_len as f64 * LOD_ALIAS_FRACTION
+                        {
+                            c.lines[k] = LineLod::default();
+                            c.line_alias[k] = last_kept as u8;
+                        } else {
+                            c.line_alias[k] = k as u8;
+                            last_kept = k;
+                        }
+                    }
                 }
+                for lod in &mut c.lines {
+                    sort_and_index_lod(lod);
+                }
+                // Tight local bounds over all vertex data. Every LOD level
+                // counts: a split part may hold only coarse-LOD segments,
+                // and culling by lines[0] alone would hide it.
+                let mut b =
+                    [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+                let mut grow = |x: f32, y: f32| {
+                    b[0] = b[0].min(x);
+                    b[1] = b[1].min(y);
+                    b[2] = b[2].max(x);
+                    b[3] = b[3].max(y);
+                };
+                for v in &c.fill_vertices {
+                    grow(v[0], v[1]);
+                }
+                for lod in &c.lines {
+                    for l in &lod.segments {
+                        grow(l[0], l[1]);
+                        grow(l[2], l[3]);
+                    }
+                }
+                for p in &c.point_instances {
+                    grow(p[0], p[1]);
+                }
+                c.bounds_local = b;
+                chunks.push(c);
             }
-            for lod in &mut c.lines {
-                sort_and_index_lod(lod);
-            }
-            // Tight local bounds over all vertex data.
-            let mut b = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
-            let mut grow = |x: f32, y: f32| {
-                b[0] = b[0].min(x);
-                b[1] = b[1].min(y);
-                b[2] = b[2].max(x);
-                b[3] = b[3].max(y);
-            };
-            for v in &c.fill_vertices {
-                grow(v[0], v[1]);
-            }
-            for l in &c.lines[0].segments {
-                grow(l[0], l[1]);
-                grow(l[2], l[3]);
-            }
-            for p in &c.point_instances {
-                grow(p[0], p[1]);
-            }
-            c.bounds_local = b;
         }
         chunks
     }
@@ -752,14 +768,16 @@ fn sort_and_index_lod(lod: &mut LineLod) {
         .collect();
     let extents: Vec<f32> = order.iter().map(|&i| lod.extents[i as usize]).collect();
 
-    // Geometric thresholds from the largest extent downward.
+    // Geometric thresholds from the largest extent downward. The first
+    // entry sits at max_e itself so any cutoff <= max_e resolves to a
+    // non-empty prefix (the draw-time comparison is threshold >= cutoff);
+    // starting below max_e would drop the largest features an octave early.
     lod.size_index.clear();
     let max_e = extents[0].max(1e-12);
     let min_e = extents[n - 1].max(1e-12);
     let mut threshold = max_e;
     let mut idx = 0usize;
     for _ in 0..28 {
-        threshold *= 0.5;
         while idx < n && extents[idx] >= threshold {
             idx += 1;
         }
@@ -767,6 +785,7 @@ fn sort_and_index_lod(lod: &mut LineLod) {
         if threshold <= min_e {
             break;
         }
+        threshold *= 0.5;
     }
     if lod.size_index.last().map(|&(_, c)| c) != Some(n as u32) {
         lod.size_index.push((0.0, n as u32));
@@ -881,6 +900,24 @@ mod lod_tests {
         );
         let _ = l6;
     }
+
+    #[test]
+    fn size_index_first_entry_covers_max_extent() {
+        let mut lod = LineLod {
+            segments: vec![[0.0; 4]; 3],
+            extents: vec![1.0, 4.0, 0.5],
+            ..Default::default()
+        };
+        sort_and_index_lod(&mut lod);
+        // Any cutoff up to and including the largest extent must draw that
+        // feature's segment (renderer contract: outlines survive until the
+        // feature drops below the pixel cutoff, not an octave earlier).
+        assert_eq!(lod.count_for_cutoff(4.0), 1);
+        assert_eq!(lod.count_for_cutoff(3.9), 1);
+        assert_eq!(lod.count_for_cutoff(4.1), 0);
+        assert_eq!(lod.count_for_cutoff(0.9), 2);
+        assert_eq!(lod.count_for_cutoff(0.0), 3);
+    }
 }
 
 #[cfg(test)]
@@ -948,5 +985,59 @@ mod split_tests {
             .flat_map(|p| p.point_refs.iter().map(|r| r.index))
             .collect();
         assert_eq!(refs, (0..30).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn split_parts_keep_all_lods_and_cover_them_with_bounds() {
+        // 13 full-detail and 10 coarse segments with a 12-segment cap:
+        // part 1 gets {lvl0: 12}, part 2 gets {lvl0: 1, lvl1: 10}, the shape
+        // that used to trip the LOD-alias delete and the lines[0]-only bounds.
+        let mut c = ChunkMesh {
+            origin: [0.5, 0.5],
+            ..Default::default()
+        };
+        for i in 0..13 {
+            let x = i as f32 * 0.1;
+            c.lines[0].segments.push([x, 0.0, x, 1.0]);
+            c.lines[0].extents.push(1.0);
+        }
+        for i in 0..10 {
+            let x = i as f32 * 0.1;
+            c.lines[1].segments.push([x, 2.0, x, 3.0]);
+            c.lines[1].extents.push(1.0);
+        }
+        let mut mb = MeshBuilder::default();
+        mb.chunks.insert(key_of([0.5, 0.5], 0), c);
+        let caps = SplitCaps {
+            line_instances: 12,
+            ..SplitCaps::default()
+        };
+        let parts = mb.finish_with_caps(&caps);
+        assert!(parts.len() > 1);
+
+        // No level was deleted by the alias optimization; aliases stay identity.
+        let lvl0: usize = parts.iter().map(|p| p.lines[0].segments.len()).sum();
+        let lvl1: usize = parts.iter().map(|p| p.lines[1].segments.len()).sum();
+        assert_eq!(lvl0, 13);
+        assert_eq!(lvl1, 10);
+        for p in &parts {
+            for (k, &a) in p.line_alias.iter().enumerate() {
+                assert_eq!(a as usize, k, "split part must keep identity alias");
+            }
+            // Bounds are finite and cover every LOD level's segments, so a
+            // part holding only coarse-LOD content is never culled away.
+            let b = p.bounds_local;
+            assert!(b[0].is_finite() && b[2] >= b[0] && b[3] >= b[1]);
+            for lod in &p.lines {
+                for s in &lod.segments {
+                    for (x, y) in [(s[0], s[1]), (s[2], s[3])] {
+                        assert!(
+                            x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3],
+                            "segment vertex ({x},{y}) outside bounds {b:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

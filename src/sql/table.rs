@@ -45,6 +45,30 @@ const BATCH_SIZE: usize = 8192;
 /// back to file rows through it). Name chosen to never collide.
 pub const ROW_INDEX_COL: &str = "___row";
 
+/// The store-schema → SQL-schema column renaming, in store column order.
+/// Names are lowercased so unquoted SQL identifiers (which DataFusion
+/// normalizes to lowercase) match files with uppercase or mixed-case
+/// columns; case collisions get `_2`, `_3`, ... suffixes. Anything that
+/// splices a store column name into SQL must map it through this — plain
+/// lowercasing diverges on collisions.
+pub fn sql_column_names(schema: &arrow::datatypes::Schema) -> Vec<String> {
+    let mut seen: std::collections::HashMap<String, usize> = Default::default();
+    schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let base = f.name().to_lowercase();
+            let n = seen.entry(base.clone()).or_insert(0);
+            *n += 1;
+            if *n > 1 {
+                format!("{base}_{n}")
+            } else {
+                base
+            }
+        })
+        .collect()
+}
+
 /// A loaded layer registered as a SQL table.
 pub struct LayerTable {
     store: Arc<FeatureStore>,
@@ -79,24 +103,14 @@ impl LayerTable {
         rg_bboxes: Option<Arc<Vec<[f64; 4]>>>,
         row_index: bool,
     ) -> Self {
-        // Column names are lowercased so unquoted SQL identifiers (which
-        // DataFusion normalizes to lowercase) match files with uppercase
-        // or mixed-case columns; collisions get _2, _3, ... suffixes.
-        let mut seen: std::collections::HashMap<String, usize> = Default::default();
-        let mut fields: Vec<Field> = store
-            .schema
-            .fields()
-            .iter()
+        let mut fields: Vec<Field> = sql_column_names(&store.schema)
+            .into_iter()
             .enumerate()
-            .map(|(i, f)| {
-                let base = f.name().to_lowercase();
-                let n = seen.entry(base.clone()).or_insert(0);
-                *n += 1;
-                let name = if *n > 1 { format!("{base}_{n}") } else { base };
+            .map(|(i, name)| {
                 if i == store.geom_col {
                     Field::new(name, DataType::Binary, true)
                 } else {
-                    f.as_ref().clone().with_name(name)
+                    store.schema.field(i).clone().with_name(name)
                 }
             })
             .collect();

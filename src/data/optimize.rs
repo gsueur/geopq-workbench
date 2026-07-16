@@ -368,7 +368,7 @@ pub fn optimize(
 
     let mut batches: Vec<RecordBatch> = Vec::new();
     let mut row_bboxes: Vec<Option<[f64; 4]>> = Vec::with_capacity(total_rows);
-    let mut geom_types: HashSet<&'static str> = HashSet::new();
+    let mut geom_types: HashSet<String> = HashSet::new();
     for res in reader {
         let mut batch = res.map_err(|e| format!("parquet decode error: {e}"))?;
         if let Some((xi, yi)) = opts.xy_geom {
@@ -516,7 +516,10 @@ pub fn optimize(
     // --- geometry output form ---
     let geom_out: GeomOut = match opts.version {
         GpVersion::V1_1GeoArrow => {
-            let target = geoarrow::target_encoding(geom_types.iter().copied())?;
+            // GeoArrow coordinate arrays are 2D here: Z is dropped by the
+            // rebuild, so the family choice ignores the " Z" suffix.
+            let target =
+                geoarrow::target_encoding(geom_types.iter().map(|t| t.trim_end_matches(" Z")))?;
             if target == src_encoding {
                 GeomOut::PassThrough
             } else {
@@ -538,8 +541,15 @@ pub fn optimize(
     let mut fields: Vec<Field> = Vec::new();
     let mut kept_src_indices: Vec<usize> = Vec::new();
     for (i, f) in src_schema.fields().iter().enumerate() {
+        // Only a covering-style struct named `bbox` is dropped for the
+        // rebuilt covering column; a plain attribute that happens to be
+        // called `bbox` is data and must survive (the new covering column
+        // is renamed around it below).
         if Some(f.name().as_str()) == drop_covering
-            || (write_covering && f.name() == "bbox" && i != geom_idx)
+            || (write_covering
+                && f.name() == "bbox"
+                && i != geom_idx
+                && is_covering_struct(f.data_type()))
             // Hive convention: partition columns live in the path only.
             || (part_fields.iter().any(|p| p == f.name()) && i != geom_idx)
         {
@@ -588,8 +598,24 @@ pub fn optimize(
         .iter()
         .map(|n| Field::new(*n, DataType::Float64, true))
         .collect();
+    // The conventional `bbox` name may be taken by a surviving source
+    // attribute; readers follow the geo metadata's covering section, so
+    // any non-colliding name works.
+    let covering_name = {
+        let mut name = "bbox".to_string();
+        let mut k = 0usize;
+        while fields.iter().any(|f| f.name() == &name) {
+            k += 1;
+            name = format!("bbox_{k}");
+        }
+        name
+    };
     if write_covering {
-        fields.push(Field::new("bbox", DataType::Struct(bbox_fields.clone()), true));
+        fields.push(Field::new(
+            covering_name.as_str(),
+            DataType::Struct(bbox_fields.clone()),
+            true,
+        ));
     }
     // Derived columns (skipped when hive uses them as path-only keys).
     let write_h3 = h3_name
@@ -626,7 +652,7 @@ pub fn optimize(
         }
         BloomMode::AllAttributes => {
             for f in out_schema.fields() {
-                if f.name() == &primary || f.name() == "bbox" {
+                if f.name() == &primary || (write_covering && f.name() == &covering_name) {
                     continue;
                 }
                 let eligible = matches!(
@@ -676,7 +702,7 @@ pub fn optimize(
             // (no dict win) and the page-size cap applies to the encoded
             // size, which tiny dict indices would defeat.
             for leaf in ["xmin", "ymin", "xmax", "ymax"] {
-                let path = ColumnPath::new(vec!["bbox".into(), leaf.into()]);
+                let path = ColumnPath::new(vec![covering_name.clone(), leaf.into()]);
                 props = props
                     .set_column_data_page_size_limit(path.clone(), BBOX_LEAF_PAGE_BYTES)
                     .set_column_dictionary_enabled(path, false);
@@ -752,8 +778,16 @@ pub fn optimize(
         // `geo` is rebuilt; other source key-value metadata passes through.
         writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
             "geo".to_string(),
-            build_geo_meta(opts, &primary, crs_value.as_ref(), &geom_types, out_encoding, part_bbox)
-                .to_string(),
+            build_geo_meta(
+                opts,
+                &primary,
+                crs_value.as_ref(),
+                &geom_types,
+                out_encoding,
+                part_bbox,
+                &covering_name,
+            )
+            .to_string(),
         ));
         for entry in kv.iter().filter(|kv| kv.key != "geo" && kv.key != "ARROW:schema") {
             writer.append_key_value_metadata(entry.clone());
@@ -873,13 +907,15 @@ fn build_geo_meta(
     opts: &OptimizeOptions,
     primary: &str,
     crs: Option<&Value>,
-    geom_types: &HashSet<&'static str>,
+    geom_types: &HashSet<String>,
     out_encoding: GeomEncoding,
     file_bbox: Option<[f64; 4]>,
+    covering_name: &str,
 ) -> Value {
-    // GeoArrow columns store exactly one type (singles promoted).
+    // GeoArrow columns store exactly one type (singles promoted, Z dropped
+    // by the coordinate rebuild).
     let types: Vec<&str> = if out_encoding.is_wkb() {
-        let mut t: Vec<&str> = geom_types.iter().copied().collect();
+        let mut t: Vec<&str> = geom_types.iter().map(String::as_str).collect();
         t.sort_unstable();
         t
     } else {
@@ -897,8 +933,8 @@ fn build_geo_meta(
     }
     if opts.covering {
         col["covering"] = json!({"bbox": {
-            "xmin": ["bbox", "xmin"], "ymin": ["bbox", "ymin"],
-            "xmax": ["bbox", "xmax"], "ymax": ["bbox", "ymax"],
+            "xmin": [covering_name, "xmin"], "ymin": [covering_name, "ymin"],
+            "xmax": [covering_name, "xmax"], "ymax": [covering_name, "ymax"],
         }});
     }
     json!({
@@ -954,31 +990,73 @@ fn guess_geom_column(schema: &Schema) -> Option<String> {
         })
 }
 
+/// A covering-style bbox column: a struct with numeric
+/// xmin/ymin/xmax/ymax fields.
+fn is_covering_struct(dt: &DataType) -> bool {
+    let DataType::Struct(fs) = dt else {
+        return false;
+    };
+    ["xmin", "ymin", "xmax", "ymax"].iter().all(|n| {
+        fs.iter().any(|f| {
+            f.name() == n && matches!(f.data_type(), DataType::Float32 | DataType::Float64)
+        })
+    })
+}
+
+/// Does this WKB value carry Z coordinates? Header-only check — the
+/// decoder drops Z, but pass-through outputs keep the original bytes, so
+/// the reported geometry types need the " Z" suffix. Recognizes ISO codes
+/// (1000s = Z, 3000s = ZM) and the EWKB 0x80000000 flag.
+pub(crate) fn wkb_has_z(buf: &[u8]) -> bool {
+    if buf.len() < 5 {
+        return false;
+    }
+    let code = match buf[0] {
+        1 => u32::from_le_bytes(buf[1..5].try_into().unwrap()),
+        0 => u32::from_be_bytes(buf[1..5].try_into().unwrap()),
+        _ => return false,
+    };
+    if code & 0x8000_0000 != 0 {
+        return true; // EWKB Z flag
+    }
+    // Mask EWKB M/SRID flags before reading the ISO dimension digit.
+    matches!((code & 0x0FFF_FFFF) / 1000, 1 | 3)
+}
+
 /// Append per-row bboxes (None for null/undecodable geometries).
 fn scan_bboxes(
     batch: &RecordBatch,
     geom_idx: usize,
     encoding: GeomEncoding,
     out: &mut Vec<Option<[f64; 4]>>,
-    geom_types: &mut HashSet<&'static str>,
+    geom_types: &mut HashSet<String>,
 ) -> Result<(), String> {
     use geo::BoundingRect;
     let col = batch.column(geom_idx);
     let geoms = GeomCol::new(col.as_ref(), encoding)
         .ok_or("geometry column does not match its declared encoding")?;
+    let insert_type = |set: &mut HashSet<String>, name: &str, z: bool| {
+        let full = if z { format!("{name} Z") } else { name.to_string() };
+        set.insert(full);
+    };
     for i in 0..batch.num_rows() {
         if geoms.is_null(i) {
             out.push(None);
             continue;
         }
+        // GeoArrow arrays are 2D; only WKB values can carry Z.
+        let z = match &geoms {
+            GeomCol::Wkb(b) => b.value(i).is_some_and(wkb_has_z),
+            GeomCol::Ga(_) => false,
+        };
         if let Some((x, y)) = geoms.point2(i) {
-            geom_types.insert("Point");
+            insert_type(geom_types, "Point", z);
             out.push((x.is_finite() && y.is_finite()).then_some([x, y, x, y]));
             continue;
         }
         match geoms.geometry(i) {
             Some(geom) => {
-                geom_types.insert(geom_type_name(&geom));
+                insert_type(geom_types, geom_type_name(&geom), z);
                 out.push(geom.bounding_rect().map(|r| {
                     let (min, max) = (r.min(), r.max());
                     [min.x, min.y, max.x, max.y]
@@ -1275,6 +1353,187 @@ mod tests {
         b.extend_from_slice(&x.to_le_bytes());
         b.extend_from_slice(&y.to_le_bytes());
         b
+    }
+
+    /// ISO WKB POINT Z (type code 1001).
+    fn wkb_point_z(x: f64, y: f64, z: f64) -> Vec<u8> {
+        let mut b = vec![1u8];
+        b.extend_from_slice(&1001u32.to_le_bytes());
+        b.extend_from_slice(&x.to_le_bytes());
+        b.extend_from_slice(&y.to_le_bytes());
+        b.extend_from_slice(&z.to_le_bytes());
+        b
+    }
+
+    fn read_geo_meta(path: &Path) -> Value {
+        let b = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap()).unwrap();
+        let kv = b
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap()
+            .iter()
+            .find(|kv| kv.key == "geo")
+            .expect("geo metadata");
+        serde_json::from_str(kv.value.as_deref().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn wkb_z_header_detection() {
+        assert!(!wkb_has_z(&wkb_point(1.0, 2.0)));
+        assert!(wkb_has_z(&wkb_point_z(1.0, 2.0, 3.0))); // ISO Z
+        // ISO ZM (3001).
+        let mut zm = wkb_point_z(1.0, 2.0, 3.0);
+        zm[1..5].copy_from_slice(&3001u32.to_le_bytes());
+        assert!(wkb_has_z(&zm));
+        // ISO M only (2001): no Z.
+        let mut m = wkb_point_z(1.0, 2.0, 3.0);
+        m[1..5].copy_from_slice(&2001u32.to_le_bytes());
+        assert!(!wkb_has_z(&m));
+        // EWKB Z flag (with SRID flag set too).
+        let mut ewkb = wkb_point_z(1.0, 2.0, 3.0);
+        ewkb[1..5].copy_from_slice(&(1u32 | 0x8000_0000 | 0x2000_0000).to_le_bytes());
+        assert!(wkb_has_z(&ewkb));
+        // EWKB SRID-only 2D point: no Z.
+        let mut srid = wkb_point(1.0, 2.0);
+        srid[1..5].copy_from_slice(&(1u32 | 0x2000_0000).to_le_bytes());
+        assert!(!wkb_has_z(&srid));
+    }
+
+    /// A plain attribute that happens to be named `bbox` must survive the
+    /// covering rewrite; the covering struct takes a non-colliding name
+    /// that the geo metadata points at.
+    #[test]
+    fn plain_bbox_attribute_survives_covering() {
+        let dir = std::env::temp_dir().join("geopq_optimize_bbox_attr");
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = 4000usize;
+        let stride = n / 2 + 1;
+        let (mut wkbs, mut ids, mut bbox_attr) = (Vec::new(), Vec::new(), Vec::new());
+        for k in 0..n {
+            let i = (k * stride) % n;
+            wkbs.push(wkb_point((i % 64) as f64, (i / 64) as f64));
+            ids.push(i as i64);
+            bbox_attr.push(i as f64 * 2.0);
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("bbox", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(wkbs.iter())),
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Float64Array::from(bbox_attr)),
+            ],
+        )
+        .unwrap();
+        let src = dir.join("bbox_attr_src.parquet");
+        let mut w = ArrowWriter::try_new(File::create(&src).unwrap(), schema, None).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            serde_json::json!({
+                "version": "1.0.0", "primary_column": "geometry",
+                "columns": {"geometry": {"encoding": "WKB", "geometry_types": ["Point"]}},
+            })
+            .to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let dst = dir.join("bbox_attr_out.parquet");
+        let opts = OptimizeOptions {
+            row_group_size: 1024,
+            ..Default::default() // covering on
+        };
+        optimize(&Source::Local(src), &dst, &opts, None, None, &|_, _| {}).unwrap();
+
+        // Output keeps the Float64 attribute and adds the renamed struct.
+        let geo = read_geo_meta(&dst);
+        let covering = &geo["columns"]["geometry"]["covering"]["bbox"];
+        assert_eq!(covering["xmin"][0], "bbox_1", "{covering}");
+        let (store, _crs, _info, rg_meta) =
+            crate::data::loader::open_store_for_test(&dst).unwrap();
+        let attr_idx = store.schema.index_of("bbox").expect("attribute kept");
+        assert_eq!(store.schema.field(attr_idx).data_type(), &DataType::Float64);
+        let struct_idx = store.schema.index_of("bbox_1").expect("covering struct");
+        assert!(matches!(
+            store.schema.field(struct_idx).data_type(),
+            DataType::Struct(_)
+        ));
+        // The loader follows the metadata to the renamed covering column.
+        assert!(store.covering.is_some(), "covering usable via metadata");
+        let (source, _boxes) = rg_meta.expect("rg bboxes");
+        assert!(source.contains("covering"), "{source}");
+        // Attribute values stay attached to their row through the reorder.
+        let rows: Vec<u32> = (0..n as u32).step_by(197).collect();
+        let batches = store
+            .fetch(&rows, Some(&[store.schema.index_of("id").unwrap(), attr_idx]))
+            .unwrap();
+        for b in &batches {
+            let ids = Int64Array::from(b.column(0).to_data());
+            let vals = Float64Array::from(b.column(1).to_data());
+            for i in 0..b.num_rows() {
+                assert_eq!(vals.value(i), ids.value(i) as f64 * 2.0);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pass-through WKB keeps Z coordinates, so the written geometry_types
+    /// must carry the spec's " Z" suffix.
+    #[test]
+    fn z_wkb_types_get_suffix() {
+        let dir = std::env::temp_dir().join("geopq_optimize_z");
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = 500usize;
+        let wkbs: Vec<Vec<u8>> =
+            (0..n).map(|i| wkb_point_z((i % 25) as f64, (i / 25) as f64, i as f64)).collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(wkbs.iter())),
+                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap();
+        let src = dir.join("z_src.parquet");
+        let mut w = ArrowWriter::try_new(File::create(&src).unwrap(), schema, None).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            serde_json::json!({
+                "version": "1.0.0", "primary_column": "geometry",
+                "columns": {"geometry": {"encoding": "WKB", "geometry_types": ["Point Z"]}},
+            })
+            .to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        for version in [GpVersion::V1_1, GpVersion::V2_0] {
+            let dst = dir.join(format!("z_out_{version:?}.parquet"));
+            let opts = OptimizeOptions {
+                version,
+                row_group_size: 256,
+                covering: version == GpVersion::V1_1,
+                ..Default::default()
+            };
+            optimize(&Source::Local(src.clone()), &dst, &opts, None, None, &|_, _| {})
+                .unwrap();
+            let geo = read_geo_meta(&dst);
+            assert_eq!(
+                geo["columns"]["geometry"]["geometry_types"],
+                serde_json::json!(["Point Z"]),
+                "{version:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Write a spatially-scrambled GeoParquet 1.0 file: `rows` points on a

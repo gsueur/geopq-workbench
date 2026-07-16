@@ -19,12 +19,31 @@ pub struct Crs {
     pub proj4: String,
     pub is_latlong: bool,
     pub proj: Arc<Proj>,
+    /// The raw PROJJSON object the source file carried, when it came from
+    /// GeoParquet metadata — exports pass it through verbatim (an EPSG id
+    /// alone cannot be turned back into schema-valid PROJJSON).
+    pub projjson: Option<Arc<Value>>,
 }
 
 impl std::fmt::Debug for Crs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Crs({})", self.name)
     }
+}
+
+/// Rewrite embedded-database proj strings that proj4rs cannot evaluate:
+/// grid-based datums (NAD27 and friends) have no grid files here, so they
+/// get the standard 3-parameter approximations instead (~10 m over CONUS).
+fn sanitize_proj4(proj4: &str) -> String {
+    proj4
+        .split_whitespace()
+        .map(|tok| match tok {
+            "+datum=NAD27" => "+ellps=clrk66 +towgs84=-8,160,176",
+            _ => tok,
+        })
+        .filter(|tok| !tok.starts_with("+nadgrids=") || *tok == "+nadgrids=@null")
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl Crs {
@@ -38,6 +57,7 @@ impl Crs {
             proj4: proj4.to_string(),
             is_latlong,
             proj: Arc::new(proj),
+            projjson: None,
         })
     }
 
@@ -50,7 +70,8 @@ impl Crs {
             .map_err(|_| format!("EPSG:{code} out of range"))?;
         let def = crs_definitions::from_code(code16)
             .ok_or_else(|| format!("EPSG:{code} not found in embedded CRS database"))?;
-        Self::from_proj4(def.proj4, Some(code), &format!("EPSG:{code}"))
+        let proj4 = sanitize_proj4(def.proj4);
+        Self::from_proj4(&proj4, Some(code), &format!("EPSG:{code}"))
     }
 
     /// WGS84 lon/lat degrees (also used for OGC:CRS84, which GeoParquet defaults to).
@@ -93,24 +114,47 @@ impl Crs {
             .and_then(Value::as_str)
             .unwrap_or("unnamed CRS")
             .to_string();
+        // Keep the source PROJJSON verbatim so exports can round-trip it.
+        let keep = |mut crs: Crs| -> Crs {
+            crs.projjson = Some(Arc::new(v.clone()));
+            crs
+        };
         if let Some((auth, code)) = projjson_id(v) {
-            match (auth.as_str(), code) {
-                ("OGC", _) => return Ok(Self::wgs84()),
+            match (auth.as_str(), code.as_str()) {
+                // OGC string codes: the geographic axis-order variants of
+                // the North American datums plus CRS84 itself.
+                ("OGC", "CRS84" | "84") => return Ok(keep(Self::wgs84())),
+                ("OGC", "CRS83") => {
+                    let mut crs = Self::from_epsg(4269)?;
+                    crs.name = format!("{name} (OGC:CRS83, NAD83)");
+                    return Ok(keep(crs));
+                }
+                ("OGC", "CRS27") => {
+                    let mut crs = Self::from_epsg(4267)?;
+                    crs.name = format!("{name} (OGC:CRS27, NAD27)");
+                    return Ok(keep(crs));
+                }
                 ("EPSG", c) => {
-                    let mut crs = Self::from_epsg(c)?;
-                    crs.name = format!("{name} (EPSG:{c})");
-                    return Ok(crs);
+                    if let Ok(c) = c.parse::<u32>() {
+                        let mut crs = Self::from_epsg(c)?;
+                        crs.name = format!("{name} (EPSG:{c})");
+                        return Ok(keep(crs));
+                    }
                 }
                 _ => {}
             }
         }
-        // Heuristic fallback: a geographic WGS84-based CRS without an id.
+        // Id-less geographic CRS: render as lon/lat degrees, but don't
+        // claim WGS 84 — the datum is unknown (NAD27 would sit ~100 m off).
         if v.get("type")
             .and_then(Value::as_str)
             .map(|t| t.contains("Geographic"))
             .unwrap_or(false)
         {
-            return Ok(Self::wgs84());
+            let mut crs = Self::wgs84();
+            crs.name = format!("{name} (rendered as CRS84)");
+            crs.epsg = None;
+            return Ok(keep(crs));
         }
         Err(format!(
             "unsupported CRS '{name}': no EPSG id found in PROJJSON"
@@ -118,12 +162,12 @@ impl Crs {
     }
 }
 
-fn projjson_id(v: &Value) -> Option<(String, u32)> {
+fn projjson_id(v: &Value) -> Option<(String, String)> {
     let id = v.get("id")?;
     let auth = id.get("authority")?.as_str()?.to_uppercase();
     let code = match id.get("code")? {
-        Value::Number(n) => n.as_u64()? as u32,
-        Value::String(s) => s.parse().ok()?,
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
         _ => return None,
     };
     Some((auth, code))
@@ -546,6 +590,64 @@ pub fn world_to_lonlat(display: &DisplayCrs, w: [f64; 2]) -> Option<(f64, f64)> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ogc_string_codes_map_to_their_datums() {
+        use serde_json::json;
+        // OGC:CRS84 (numeric parse used to fail and fall through) → WGS 84.
+        let v = json!({"type": "GeographicCRS", "name": "WGS 84 (CRS84)",
+                       "id": {"authority": "OGC", "code": "CRS84"}});
+        let crs = Crs::from_geoparquet_crs(Some(&v)).unwrap();
+        assert_eq!(crs.epsg, Some(4326));
+        assert!(crs.is_latlong);
+        assert!(crs.projjson.is_some(), "source PROJJSON kept for export");
+
+        // OGC:CRS27 → NAD27 geographic (EPSG:4267), not WGS 84.
+        let v = json!({"type": "GeographicCRS", "name": "NAD27 (CRS27)",
+                       "id": {"authority": "OGC", "code": "CRS27"}});
+        let crs = Crs::from_geoparquet_crs(Some(&v)).unwrap();
+        assert_eq!(crs.epsg, Some(4267));
+        assert!(crs.is_latlong);
+        assert!(crs.name.contains("NAD27"), "{}", crs.name);
+        // The datum genuinely differs from WGS 84 (visible ~10-100 m shift).
+        assert!(!crs.same_as(&Crs::wgs84()), "{}", crs.proj4);
+
+        // OGC:CRS83 → NAD83 geographic (EPSG:4269).
+        let v = json!({"type": "GeographicCRS", "name": "NAD83 (CRS83)",
+                       "id": {"authority": "OGC", "code": "CRS83"}});
+        let crs = Crs::from_geoparquet_crs(Some(&v)).unwrap();
+        assert_eq!(crs.epsg, Some(4269));
+        assert!(crs.is_latlong);
+    }
+
+    #[test]
+    fn idless_geographic_crs_is_labeled_honestly() {
+        use serde_json::json;
+        let v = json!({"type": "GeographicCRS", "name": "NAD27"});
+        let crs = Crs::from_geoparquet_crs(Some(&v)).unwrap();
+        assert_eq!(crs.epsg, None, "must not claim an EPSG code");
+        assert!(crs.is_latlong, "still rendered as lon/lat");
+        assert!(
+            crs.name.contains("NAD27") && crs.name.contains("rendered as CRS84"),
+            "{}",
+            crs.name
+        );
+        assert!(crs.projjson.is_some());
+    }
+
+    #[test]
+    fn epsg_projjson_keeps_raw_value() {
+        use serde_json::json;
+        let v = json!({"type": "ProjectedCRS", "name": "RGF93 / Lambert-93",
+                       "id": {"authority": "EPSG", "code": 2154},
+                       "base_crs": {"name": "RGF93"}});
+        let crs = Crs::from_geoparquet_crs(Some(&v)).unwrap();
+        assert_eq!(crs.epsg, Some(2154));
+        assert_eq!(crs.projjson.as_deref(), Some(&v));
+        // Constructors that never saw PROJJSON leave it unset.
+        assert!(Crs::from_epsg(2154).unwrap().projjson.is_none());
+        assert!(Crs::wgs84().projjson.is_none());
+    }
 
     #[test]
     fn lambert93_origin_roundtrip() {

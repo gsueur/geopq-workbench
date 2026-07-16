@@ -850,14 +850,24 @@ pub fn hive_segments(rel: &std::path::Path) -> Vec<(String, Option<String>)> {
     out
 }
 
-fn percent_decode(v: &str) -> String {
+pub(crate) fn percent_decode(v: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
     let b = v.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
+        // Byte-wise only: slicing the &str here would panic when '%' is
+        // followed by a multibyte character (external directory names).
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(byte) = u8::from_str_radix(&v[i + 1..i + 3], 16) {
-                out.push(byte);
+            if let (Some(hi), Some(lo)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(hi << 4 | lo);
                 i += 3;
                 continue;
             }
@@ -886,6 +896,25 @@ mod tests {
         );
         // A bare file has no segments.
         assert!(hive_segments(std::path::Path::new("part-0.parquet")).is_empty());
+    }
+
+    #[test]
+    fn percent_decode_multibyte_after_percent() {
+        // '%' followed by a multibyte char must not panic (byte-offset
+        // slicing off a char boundary); the invalid escape passes through.
+        assert_eq!(percent_decode("%a€"), "%a€");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%€ab"), "%€ab");
+    }
+
+    #[test]
+    fn percent_decode_utf8_roundtrip() {
+        assert_eq!(percent_decode("Z%C3%BCrich"), "Zürich");
+        assert_eq!(percent_decode("%C5%81"), "Ł");
+        assert_eq!(percent_decode("New%20York"), "New York");
+        assert_eq!(percent_decode("100%25"), "100%");
+        // A lone invalid UTF-8 byte degrades to U+FFFD, not a panic.
+        assert_eq!(percent_decode("%FC"), "\u{FFFD}");
     }
 
     /// Validates row-group selection math against a real multi-row-group file.

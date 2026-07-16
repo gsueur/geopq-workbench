@@ -40,7 +40,7 @@ pub struct StreamWriter {
     geom_col: usize,
     geom_name: String,
     crs_meta: CrsOut,
-    types: Vec<&'static str>,
+    types: Vec<String>,
     bbox: Option<[f64; 4]>,
     rows: usize,
 }
@@ -94,6 +94,13 @@ impl StreamWriter {
                 geo_types::Geometry::MultiLineString(_) => "MultiLineString",
                 geo_types::Geometry::MultiPolygon(_) => "MultiPolygon",
                 geo_types::Geometry::GeometryCollection(_) => "GeometryCollection",
+            };
+            // The WKB bytes are written verbatim: 3D values keep their Z,
+            // so the spec requires the " Z" type suffix.
+            let t = if crate::data::optimize::wkb_has_z(arr.value(i)) {
+                format!("{t} Z")
+            } else {
+                t.to_string()
             };
             if !self.types.contains(&t) {
                 self.types.push(t);
@@ -159,12 +166,25 @@ enum CrsOut {
 }
 
 fn crs_value(crs: &Crs) -> CrsOut {
+    // The source file's PROJJSON round-trips verbatim — it is the only
+    // schema-valid representation we can emit.
+    if let Some(v) = &crs.projjson {
+        return CrsOut::Value(v.as_ref().clone());
+    }
     if let Some(code) = crs.epsg {
         if code == 4326 {
             return CrsOut::Omit;
         }
+        // Best-effort id-only reference for CRSs known by EPSG code alone:
+        // not schema-valid PROJJSON (no datum/base_crs), but it preserves
+        // the code for readers that resolve ids.
+        let kind = if crs.is_latlong {
+            "GeographicCRS"
+        } else {
+            "ProjectedCRS"
+        };
         return CrsOut::Value(json!({
-            "type": "ProjectedCRS",
+            "type": kind,
             "name": crs.name,
             "id": { "authority": "EPSG", "code": code },
         }));
@@ -222,6 +242,90 @@ mod tests {
                 "row {row}: centroid should be a point"
             );
         }
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    fn read_geo_meta(path: &Path) -> serde_json::Value {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let b =
+            ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap()).unwrap();
+        let kv = b
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap()
+            .iter()
+            .find(|kv| kv.key == "geo")
+            .expect("geo metadata");
+        serde_json::from_str(kv.value.as_deref().unwrap()).unwrap()
+    }
+
+    /// A source-file PROJJSON must round-trip verbatim through the export;
+    /// id-only CRSs fall back to a reference typed by is_latlong.
+    #[test]
+    fn crs_projjson_passthrough_and_fallback() {
+        let projjson = json!({
+            "type": "ProjectedCRS", "name": "RGF93 / Lambert-93",
+            "id": {"authority": "EPSG", "code": 2154},
+            "base_crs": {"name": "RGF93", "type": "GeographicCRS"},
+        });
+        let crs = Crs::from_geoparquet_crs(Some(&projjson)).unwrap();
+        match crs_value(&crs) {
+            CrsOut::Value(v) => assert_eq!(v, projjson, "verbatim passthrough"),
+            CrsOut::Omit => panic!("PROJJSON must not be dropped"),
+        }
+        // Id-only geographic CRS: best-effort reference, honestly typed.
+        let nad83 = Crs::from_epsg(4269).unwrap();
+        match crs_value(&nad83) {
+            CrsOut::Value(v) => {
+                assert_eq!(v["type"], "GeographicCRS", "{v}");
+                assert_eq!(v["id"]["code"], 4269);
+            }
+            CrsOut::Omit => panic!("non-4326 CRS must be recorded"),
+        }
+        // Id-only projected CRS keeps the projected type.
+        let l93 = Crs::from_epsg(2154).unwrap();
+        match crs_value(&l93) {
+            CrsOut::Value(v) => assert_eq!(v["type"], "ProjectedCRS", "{v}"),
+            CrsOut::Omit => panic!("non-4326 CRS must be recorded"),
+        }
+        // 4326 without source PROJJSON still omits (spec default CRS84).
+        assert!(matches!(crs_value(&Crs::wgs84()), CrsOut::Omit));
+    }
+
+    /// Z WKB passes through the export verbatim, so geometry_types needs
+    /// the " Z" suffix.
+    #[test]
+    fn z_wkb_export_types_get_suffix() {
+        use arrow::array::BinaryArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let mut wkbs: Vec<Vec<u8>> = Vec::new();
+        for i in 0..3 {
+            // ISO POINT Z (type code 1001).
+            let mut b = vec![1u8];
+            b.extend_from_slice(&1001u32.to_le_bytes());
+            b.extend_from_slice(&(i as f64).to_le_bytes());
+            b.extend_from_slice(&1.0f64.to_le_bytes());
+            b.extend_from_slice(&5.0f64.to_le_bytes());
+            wkbs.push(b);
+        }
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "geometry",
+            DataType::Binary,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(BinaryArray::from_iter_values(wkbs.iter()))],
+        )
+        .unwrap();
+        let dst = std::env::temp_dir().join("geopq_sql_export_z_test.parquet");
+        write_result(&dst, &schema, &[batch], 0, &Crs::wgs84()).unwrap();
+        let geo = read_geo_meta(&dst);
+        assert_eq!(
+            geo["columns"]["geometry"]["geometry_types"],
+            json!(["Point Z"])
+        );
         let _ = std::fs::remove_file(&dst);
     }
 }

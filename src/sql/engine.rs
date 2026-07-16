@@ -235,9 +235,26 @@ pub(crate) fn run_row_filter(layer: &SqlLayer, predicate: &str) -> Result<Filter
     })
 }
 
+/// Quoted SQL identifier for a store-schema column name: mapped through
+/// the same lowercase + collision-dedupe renaming the registered table
+/// applies, with embedded double quotes doubled.
+fn sql_ident(layer: &SqlLayer, column: &str) -> String {
+    let name = layer
+        .store
+        .schema
+        .fields()
+        .iter()
+        .position(|f| f.name() == column)
+        .map(|i| super::table::sql_column_names(&layer.store.schema)[i].clone())
+        // Unknown store name: fall back to plain lowercasing and let the
+        // query surface the error.
+        .unwrap_or_else(|| column.to_lowercase());
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 /// Distinct-value count per column (partition-field candidates in the
 /// export dialog). One scan, all aggregates at once. Blocking — call from
-/// a worker thread.
+/// a worker thread. Columns are store-schema names.
 pub fn distinct_counts(
     layer: &SqlLayer,
     columns: &[String],
@@ -247,7 +264,7 @@ pub fn distinct_counts(
     }
     let aggs = columns
         .iter()
-        .map(|c| format!("count(distinct \"{}\")", c.to_lowercase()))
+        .map(|c| format!("count(distinct {})", sql_ident(layer, c)))
         .collect::<Vec<_>>()
         .join(", ");
     let out = run_query(
@@ -271,24 +288,26 @@ pub fn distinct_counts(
 }
 
 /// Most frequent non-null values of a column (categorical styling).
-/// Blocking — run off the UI thread.
+/// Blocking — run off the UI thread. `column` is the store-schema name.
 pub fn top_values(
     layer: &SqlLayer,
     column: &str,
     limit: usize,
 ) -> Result<Vec<String>, String> {
-    let col = column.to_lowercase();
+    let col = sql_ident(layer, column);
     let out = run_query(
         &format!(
-            "select cast(\"{col}\" as varchar) v, count(*) c from {} \
-             where \"{col}\" is not null group by v order by c desc, v limit {limit}",
+            "select cast({col} as varchar) v, count(*) c from {} \
+             where {col} is not null group by v order by c desc, v limit {limit}",
             layer.table
         ),
         std::slice::from_ref(layer),
     )?;
-    let vals = out
-        .batch
-        .column(0)
+    // DataFusion may produce Utf8View (varchar) or dictionary-encoded
+    // group keys; normalize to plain Utf8 before reading.
+    let col0 = arrow::compute::cast(out.batch.column(0), &arrow::datatypes::DataType::Utf8)
+        .map_err(|e| format!("category values: {e}"))?;
+    let vals = col0
         .as_any()
         .downcast_ref::<arrow::array::StringArray>()
         .ok_or("unexpected type for category values")?;
@@ -457,11 +476,17 @@ fn detect_geometry(
     })?;
 
     let q = query.to_ascii_lowercase();
+    // Match table names as whole identifiers, not substrings — `roads`
+    // must not shadow `roads_2` (the console's dedupe suffixes make
+    // prefix collisions routine). First registered match wins.
+    let tokens: std::collections::HashSet<&str> = q
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|t| !t.is_empty())
+        .collect();
     let crs = layers
         .iter()
-        .filter(|l| q.contains(&l.table))
+        .find(|l| tokens.contains(l.table.as_str()))
         .map(|l| l.crs.clone())
-        .next()
         .or_else(|| layers.first().map(|l| l.crs.clone()))?;
     Some((col, crs))
 }
@@ -749,6 +774,114 @@ mod tests {
         use arrow::array::StringArray as SA;
         let names = out.batch.column(0).as_any().downcast_ref::<SA>().unwrap();
         assert_eq!((names.value(0), names.value(1)), ("a", "c"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Write a small GeoParquet file with the given string columns plus a
+    /// point geometry, and open it as a store.
+    fn store_with_columns(
+        file: &str,
+        cols: &[(&str, Vec<&str>)],
+    ) -> (std::path::PathBuf, Arc<crate::data::store::FeatureStore>) {
+        use arrow::array::{BinaryBuilder, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let n = cols[0].1.len();
+        let mut geoms = BinaryBuilder::new();
+        let wopts = wkb::writer::WriteOptions::default();
+        for i in 0..n {
+            let mut buf = Vec::new();
+            wkb::writer::write_geometry(
+                &mut buf,
+                &geo_types::Geometry::Point(geo_types::Point::new(i as f64, 1.0)),
+                &wopts,
+            )
+            .unwrap();
+            geoms.append_value(&buf);
+        }
+        let mut fields: Vec<Field> = cols
+            .iter()
+            .map(|(name, _)| Field::new(*name, DataType::Utf8, false))
+            .collect();
+        fields.push(Field::new("geometry", DataType::Binary, true));
+        let schema = Arc::new(Schema::new(fields));
+        let mut arrays: Vec<Arc<dyn Array>> = cols
+            .iter()
+            .map(|(_, vals)| Arc::new(StringArray::from(vals.clone())) as _)
+            .collect();
+        arrays.push(Arc::new(geoms.finish()));
+        let batch = arrow::record_batch::RecordBatch::try_new(Arc::clone(&schema), arrays)
+            .unwrap();
+        let path = std::env::temp_dir().join(file);
+        crate::sql::export::write_result(&path, &schema, &[batch], cols.len(), &Crs::wgs84())
+            .unwrap();
+        let (store, _, _, _) = crate::data::loader::open_store_for_test(&path).unwrap();
+        (path, Arc::new(store))
+    }
+
+    /// The result CRS must come from the table the query actually names —
+    /// whole-identifier match, not substring (`roads` vs `roads_2`).
+    #[test]
+    fn result_crs_matches_whole_table_identifier() {
+        let (path, store) =
+            store_with_columns("geopq_sql_crs_ident_test.parquet", &[("name", vec!["a", "b"])]);
+        let layers = vec![
+            SqlLayer {
+                table: "roads".into(),
+                store: Arc::clone(&store),
+                crs: Crs::from_epsg(2154).unwrap(),
+                rg_bboxes: None,
+            },
+            SqlLayer {
+                table: "roads_2".into(),
+                store,
+                crs: Crs::wgs84(),
+                rg_bboxes: None,
+            },
+        ];
+        let out = run_query("select * from roads_2", &layers).unwrap();
+        let (_, crs) = out.geom.expect("geometry detected");
+        assert_eq!(crs.epsg, Some(4326), "roads_2 must not match roads");
+        let out = run_query("select * from roads", &layers).unwrap();
+        let (_, crs) = out.geom.expect("geometry detected");
+        assert_eq!(crs.epsg, Some(2154));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Store-name → sql-name mapping in top_values/distinct_counts: a
+    /// NAME/name case collision resolves to the deduped `name_2`, and a
+    /// column name containing a double quote is escaped, not spliced raw.
+    #[test]
+    fn top_values_maps_and_escapes_identifiers() {
+        let (path, store) = store_with_columns(
+            "geopq_sql_ident_map_test.parquet",
+            &[
+                ("NAME", vec!["up", "up", "up"]),
+                ("name", vec!["low2", "low1", "low2"]),
+                ("va\"l", vec!["q", "q", "q"]),
+            ],
+        );
+        let layer = SqlLayer {
+            table: "t".into(),
+            store,
+            crs: Crs::wgs84(),
+            rg_bboxes: None,
+        };
+        // The second collision column queries name_2, not NAME.
+        let vals = top_values(&layer, "name", 5).unwrap();
+        assert_eq!(vals, vec!["low2".to_string(), "low1".to_string()]);
+        let vals = top_values(&layer, "NAME", 5).unwrap();
+        assert_eq!(vals, vec!["up".to_string()]);
+        // Embedded double quote survives as a quoted identifier.
+        let vals = top_values(&layer, "va\"l", 5).unwrap();
+        assert_eq!(vals, vec!["q".to_string()]);
+        let counts = distinct_counts(
+            &layer,
+            &["NAME".to_string(), "name".to_string(), "va\"l".to_string()],
+        )
+        .unwrap();
+        assert_eq!(counts.get("NAME"), Some(&1));
+        assert_eq!(counts.get("name"), Some(&2));
+        assert_eq!(counts.get("va\"l"), Some(&1));
         let _ = std::fs::remove_file(&path);
     }
 

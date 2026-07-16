@@ -281,14 +281,22 @@ pub fn split_adaptive_h3(
 }
 
 /// Hive path values: keep alphanumerics and a safe subset, percent-encode
-/// the rest so the directory name is filesystem- and URL-safe.
+/// the rest so the directory name is filesystem- and URL-safe. Encoding is
+/// per UTF-8 byte (not codepoint) and injective, so values round-trip
+/// exactly through `store::percent_decode` on reload — a lossy substitution
+/// (space → '_', low-byte truncation) would collide distinct values and
+/// break hive-equality pushdown.
 fn sanitize_hive_value(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
+    let mut buf = [0u8; 4];
     for c in v.chars() {
         match c {
             'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => out.push(c),
-            ' ' => out.push('_'),
-            other => out.push_str(&format!("%{:02X}", other as u32 & 0xFF)),
+            other => {
+                for b in other.encode_utf8(&mut buf).bytes() {
+                    out.push_str(&format!("%{b:02X}"));
+                }
+            }
         }
     }
     if out.is_empty() {
@@ -371,9 +379,34 @@ mod tests {
         let parts = split_by_fields(&order, &vals).unwrap();
         let dirs: Vec<&str> = parts.iter().map(|(d, _)| d.as_str()).collect();
         assert!(dirs.contains(&"state=MA"));
-        assert!(dirs.contains(&"state=New_York"));
+        assert!(dirs.contains(&"state=New%20York"));
         assert!(dirs.contains(&format!("state={NULL_PARTITION}").as_str()));
         let ma = &parts.iter().find(|(d, _)| d == "state=MA").unwrap().1;
         assert_eq!(ma, &vec![0, 1]);
+    }
+
+    #[test]
+    fn hive_value_roundtrips_through_decode() {
+        use crate::data::store::percent_decode;
+        for v in ["Zürich", "Ł", "New York", "New_York", "a/b=c%d", "München 2024"] {
+            assert_eq!(percent_decode(&sanitize_hive_value(v)), v, "roundtrip of {v:?}");
+        }
+        // Multibyte codepoints must encode all UTF-8 bytes, not the low
+        // byte of the scalar ('Ł' → %C5%81, never %41 which collides with 'A').
+        assert_eq!(sanitize_hive_value("Ł"), "%C5%81");
+        assert_eq!(sanitize_hive_value("Zürich"), "Z%C3%BCrich");
+        // Space encodes reversibly; no collision with a literal underscore.
+        assert_eq!(sanitize_hive_value("New York"), "New%20York");
+        assert_ne!(sanitize_hive_value("New York"), sanitize_hive_value("New_York"));
+    }
+
+    #[test]
+    fn hive_value_directory_safety() {
+        // Separators and hive metacharacters never survive raw.
+        let s = sanitize_hive_value("a/b\\c=d%e?f#g");
+        for bad in ['/', '\\', '=', '?', '#', ' '] {
+            assert!(!s.contains(bad), "{s} must not contain {bad:?}");
+        }
+        assert_eq!(sanitize_hive_value(""), NULL_PARTITION);
     }
 }

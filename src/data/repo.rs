@@ -14,7 +14,7 @@
 //! publishes one; otherwise a built-in ISO 3166-2 table (US/CA/MX) is
 //! probed concurrently for `_manifest.json` files.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -65,7 +65,21 @@ pub fn save_repos(repos: &[Repository]) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
     let json = serde_json::to_string_pretty(repos).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| format!("cannot write {}: {e}", path.display()))
+    write_atomic(&path, &json).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// Truncate-then-write can leave an empty or partial file if the process
+/// dies mid-write, and the `.ok()` readers would then silently fall back
+/// to defaults (losing user-added repositories). Write a sibling temp file
+/// and rename it into place — atomic on the same filesystem.
+fn write_atomic(path: &Path, data: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&tmp, data)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// GET a JSON document; Ok(None) on 404 (absent is not an error for
@@ -91,13 +105,21 @@ fn get_json(url: &str) -> Result<Option<Value>, String> {
     }
 }
 
-fn exists(url: &str) -> bool {
-    http_agent()
-        .head(url)
-        .header("User-Agent", USER_AGENT)
-        .call()
-        .map(|r| r.status() == 200)
-        .unwrap_or(false)
+/// HEAD probe: Ok(true) on 200, Ok(false) on any other HTTP status. A
+/// transport error (after one retry) is Err — a network blip must never
+/// read as "dataset absent", or discovery caches a silently incomplete
+/// list under a fresh timestamp.
+fn exists(url: &str) -> Result<bool, String> {
+    let probe = || {
+        http_agent()
+            .head(url)
+            .header("User-Agent", USER_AGENT)
+            .call()
+            .map(|r| r.status() == 200)
+    };
+    probe()
+        .or_else(|_| probe())
+        .map_err(|e| format!("cannot reach {url}: {e}"))
 }
 
 #[derive(Clone, PartialEq)]
@@ -138,7 +160,7 @@ pub fn fetch_snapshots(base: &str) -> Result<Vec<Snapshot>, String> {
     Ok(out)
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Dataset {
     /// ISO-style code ("US-AR"), for layer naming.
     pub code: String,
@@ -179,7 +201,7 @@ fn write_cache(cache: &std::collections::HashMap<String, CacheEntry>) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(json) = serde_json::to_string(cache) {
-        let _ = std::fs::write(path, json);
+        let _ = write_atomic(&path, &json);
     }
 }
 
@@ -256,19 +278,47 @@ pub fn discover_datasets(base: &str, snapshot: &str) -> Result<Vec<Dataset>, Str
         }
     }
 
-    // No index published: probe the known region grid concurrently.
-    use rayon::prelude::*;
-    let mut found: Vec<Dataset> = REGIONS
-        .par_iter()
-        .filter_map(|&(country, code, name)| {
-            let path = format!("country={country}/state={code}");
-            exists(&format!("{base}/{snapshot}{path}/_manifest.json")).then(|| Dataset {
-                code: code.to_string(),
-                name: name.to_string(),
-                path,
-            })
-        })
-        .collect();
+    // No index published: probe the known region grid concurrently on a
+    // small dedicated set of scoped threads — blocking HEADs must not
+    // occupy the global rayon pool, which also runs decode/tessellation
+    // (a slow repo host would stall map refinement).
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    const PROBE_THREADS: usize = 8;
+    let next = AtomicUsize::new(0);
+    let found = Mutex::new(Vec::<Dataset>::new());
+    let first_err = Mutex::new(None::<String>);
+    std::thread::scope(|s| {
+        for _ in 0..PROBE_THREADS.min(REGIONS.len()) {
+            s.spawn(|| loop {
+                if first_err.lock().unwrap().is_some() {
+                    break; // discovery already failed; stop probing
+                }
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&(country, code, name)) = REGIONS.get(i) else {
+                    break;
+                };
+                let path = format!("country={country}/state={code}");
+                match exists(&format!("{base}/{snapshot}{path}/_manifest.json")) {
+                    Ok(true) => found.lock().unwrap().push(Dataset {
+                        code: code.to_string(),
+                        name: name.to_string(),
+                        path,
+                    }),
+                    Ok(false) => {}
+                    // Fail the whole discovery rather than return (and
+                    // cache) a partial list.
+                    Err(e) => {
+                        first_err.lock().unwrap().get_or_insert(e);
+                    }
+                }
+            });
+        }
+    });
+    if let Some(e) = first_err.into_inner().unwrap() {
+        return Err(format!("discovery aborted: {e}"));
+    }
+    let mut found = found.into_inner().unwrap();
     found.sort_by(|a, b| a.code.cmp(&b.code));
     if found.is_empty() {
         return Err("no datasets found (no index.json and no known regions answered)".into());
@@ -419,6 +469,114 @@ const REGIONS: &[(&str, &str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Loopback HTTP responder: answers every request with `status` and an
+    /// empty body, counting requests. Returns the base URL (no path).
+    fn spawn_status_server(status: u16) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { continue };
+                h.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = conn.read(&mut buf);
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), hits)
+    }
+
+    #[test]
+    fn exists_distinguishes_status_from_transport() {
+        let (base, _) = spawn_status_server(200);
+        assert_eq!(exists(&format!("{base}/x")), Ok(true));
+        let (base, _) = spawn_status_server(404);
+        assert_eq!(exists(&format!("{base}/x")), Ok(false));
+        let (base, _) = spawn_status_server(500);
+        assert_eq!(exists(&format!("{base}/x")), Ok(false));
+        // A refused connection is a transport error, never "absent".
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        assert!(exists(&format!("http://127.0.0.1:{port}/x")).is_err());
+    }
+
+    #[test]
+    fn exists_retries_transport_error_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut first = true;
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { continue };
+                if first {
+                    first = false;
+                    continue; // drop without answering: transport error
+                }
+                let mut buf = [0u8; 2048];
+                let _ = conn.read(&mut buf);
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        assert_eq!(exists(&format!("http://127.0.0.1:{port}/x")), Ok(true));
+    }
+
+    #[test]
+    fn discover_probes_all_regions_off_the_global_pool() {
+        // 404 everywhere: index.json is absent, every manifest probe says
+        // "absent" — the dedicated probe pool must drain the full grid and
+        // report "no datasets", not a transport failure.
+        let (base, hits) = spawn_status_server(404);
+        let err = discover_datasets(&base, "latest/").unwrap_err();
+        assert!(err.contains("no datasets found"), "{err}");
+        assert!(hits.load(Ordering::SeqCst) > REGIONS.len(), "index.json + one HEAD per region");
+    }
+
+    #[test]
+    fn discover_fails_loud_on_unreachable_host() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        assert!(discover_datasets(&format!("http://127.0.0.1:{port}"), "latest/").is_err());
+    }
+
+    #[test]
+    fn write_atomic_replaces_and_cleans_up() {
+        let dir = std::env::temp_dir().join(format!("geopq_repo_atomic_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("repositories.json");
+        write_atomic(&path, "[1]").unwrap();
+        write_atomic(&path, "[1,2]").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[1,2]");
+        // No temp file left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        // A missing parent directory surfaces as an error, not a silent no-op.
+        let gone = dir.join("sub").join("x.json");
+        assert!(write_atomic(&gone, "x").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn repo_roundtrip_serde() {
