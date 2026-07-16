@@ -41,6 +41,9 @@ impl FeatureRef {
 #[derive(Clone)]
 pub struct ChunkMesh {
     pub origin: [f64; 2],
+    /// Style bin of every feature in this chunk (data-driven styling
+    /// splits chunks by bin so each draws with its own uniform color).
+    pub bin: u8,
     pub fill_vertices: Vec<[f32; 2]>,
     pub fill_indices: Vec<u32>,
     /// Line segments per LOD; index 0 is full detail. Within each LOD the
@@ -133,6 +136,7 @@ impl Default for ChunkMesh {
         }
         Self {
             origin: [0.0; 2],
+            bin: 0,
             fill_vertices: Vec::new(),
             fill_indices: Vec::new(),
             lines: Default::default(),
@@ -191,7 +195,9 @@ impl GeomKind {
 /// Accumulates tessellated features into spatial chunks. One builder per
 /// worker thread; merge with `merge_into`.
 pub struct MeshBuilder {
-    chunks: HashMap<(i64, i64), ChunkMesh>,
+    chunks: HashMap<(i64, i64, u8), ChunkMesh>,
+    /// Style bin applied to subsequently added features.
+    pub bin: u8,
     tess: FillTessellator,
     scratch: VertexBuffers<[f32; 2], u32>,
     /// Reused LOD decimation buffer (one allocation per builder, not per ring).
@@ -205,6 +211,7 @@ impl Default for MeshBuilder {
     fn default() -> Self {
         Self {
             chunks: HashMap::new(),
+            bin: 0,
             tess: FillTessellator::new(),
             scratch: VertexBuffers::new(),
             lod_scratch: Vec::new(),
@@ -239,9 +246,11 @@ impl MeshBuilder {
         let key = (
             (cx / CHUNK_WORLD).floor() as i64,
             (cy / CHUNK_WORLD).floor() as i64,
+            self.bin,
         );
         self.chunks.entry(key).or_insert_with(|| ChunkMesh {
             origin: [key.0 as f64 * CHUNK_WORLD, key.1 as f64 * CHUNK_WORLD],
+            bin: key.2,
             ..Default::default()
         })
     }
@@ -489,7 +498,7 @@ impl MeshBuilder {
             );
             match res {
                 Ok(()) => {
-                    let chunk = self.chunks.get_mut(&key_of(origin)).expect("chunk exists");
+                    let chunk = self.chunks.get_mut(&key_of(origin, self.bin)).expect("chunk exists");
                     let base = chunk.fill_vertices.len() as u32;
                     chunk.fill_vertices.extend_from_slice(&self.scratch.vertices);
                     chunk
@@ -602,10 +611,11 @@ impl MeshBuilder {
     }
 }
 
-fn key_of(origin: [f64; 2]) -> (i64, i64) {
+fn key_of(origin: [f64; 2], bin: u8) -> (i64, i64, u8) {
     (
         (origin[0] / CHUNK_WORLD).round() as i64,
         (origin[1] / CHUNK_WORLD).round() as i64,
+        bin,
     )
 }
 
@@ -650,9 +660,11 @@ pub fn split_oversized(c: ChunkMesh, caps: &SplitCaps) -> Vec<ChunkMesh> {
 
     let origin = c.origin;
     let alias = c.line_alias;
+    let bin = c.bin;
     let blank = move || ChunkMesh {
         origin,
         line_alias: alias,
+        bin,
         ..Default::default()
     };
     let mut out: Vec<ChunkMesh> = Vec::new();

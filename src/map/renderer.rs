@@ -12,13 +12,26 @@ pub const MSAA_SAMPLES: u32 = 4;
 const UNIFORM_STRIDE: u64 = 256;
 
 /// Style values resolved to shader units for one layer draw.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct DrawStyle {
     pub fill_color: [f32; 4],
     pub line_color: [f32; 4],
     pub point_color: [f32; 4],
     pub line_half_width_px: f32,
     pub point_radius_px: f32,
+    /// Data-driven styling: per-bin RGB (chunks carry their bin); alpha
+    /// channels come from the colors above. None = uniform colors.
+    pub bin_colors: Option<Arc<[[f32; 3]; crate::data::layer::STYLE_BINS]>>,
+}
+
+impl DrawStyle {
+    /// Fill/point RGB for a chunk (uniform color when unstyled).
+    fn rgb_for(&self, bin: u8, base: [f32; 4]) -> [f32; 3] {
+        match &self.bin_colors {
+            Some(lut) => lut[bin as usize % lut.len()],
+            None => [base[0], base[1], base[2]],
+        }
+    }
 }
 
 /// One vector layer section's draw request for this frame.
@@ -50,6 +63,8 @@ pub struct MapCallback {
 
 struct ChunkGpu {
     origin: [f64; 2],
+    /// Style bin (0 when the layer is not data-styled).
+    bin: u8,
     /// World-space bounds of this chunk's vertices, for viewport culling.
     bounds_world: [f64; 4],
     fill_vbuf: Option<wgpu::Buffer>,
@@ -553,6 +568,7 @@ impl MapResources {
                 };
                 ChunkGpu {
                     origin: c.origin,
+                    bin: c.bin,
                     bounds_world: [
                         c.origin[0] + c.bounds_local[0] as f64,
                         c.origin[1] + c.bounds_local[1] as f64,
@@ -724,8 +740,8 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                 };
                 for (ci, chunk) in gpu.chunks.iter().enumerate() {
                     if !no_fills && chunk.fill_index_count > 0 && visible(&chunk.bounds_world) {
-                        let opaque =
-                            [s.fill_color[0], s.fill_color[1], s.fill_color[2], 1.0];
+                        let rgb = layer.style.rgb_for(chunk.bin, s.fill_color);
+                        let opaque = [rgb[0], rgb[1], rgb[2], 1.0];
                         let uoffset =
                             push_uniform(&mut uniforms, chunk.origin, [1.0, 1.0], opaque, 0.0);
                         fill_cmds.push((layer.key, ci, uoffset));
@@ -768,11 +784,19 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                     if std::env::var("GEOPQ_DEBUG_DRAWS").is_ok() {
                         eprintln!("chunk {ci}: lod {lod} count {count}");
                     }
+                    let line_color = match &s.bin_colors {
+                        Some(lut) => {
+                            let c = lut[chunk.bin as usize % lut.len()];
+                            // Darkened ramp color keeps outlines readable.
+                            [c[0] * 0.65, c[1] * 0.65, c[2] * 0.65, s.line_color[3]]
+                        }
+                        None => s.line_color,
+                    };
                     let uoffset = push_uniform(
                         &mut uniforms,
                         chunk.origin,
                         [1.0, 1.0],
-                        s.line_color,
+                        line_color,
                         s.line_half_width_px,
                     );
                     draw_list.push(DrawCmd::Line {
@@ -793,11 +817,12 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                     ];
                     let count =
                         point_draw_count(chunk_px, s.point_radius_px, chunk.point_count);
+                    let rgb = s.rgb_for(chunk.bin, s.point_color);
                     let uoffset = push_uniform(
                         &mut uniforms,
                         chunk.origin,
                         [1.0, 1.0],
-                        s.point_color,
+                        [rgb[0], rgb[1], rgb[2], s.point_color[3]],
                         s.point_radius_px,
                     );
                     draw_list.push(DrawCmd::Point {
@@ -1010,6 +1035,7 @@ mod tests {
                         point_color: [0.0; 4],
                         line_half_width_px: 0.6,
                         point_radius_px: 3.0,
+                        bin_colors: None,
                     },
                 },
                 LayerDraw {
@@ -1022,6 +1048,7 @@ mod tests {
                         point_color: [0.0; 4],
                         line_half_width_px: 1.0,
                         point_radius_px: 0.0,
+                        bin_colors: None,
                     },
                 },
             ],
@@ -1131,6 +1158,7 @@ mod tests {
                             point_color: [0.0; 4],
                             line_half_width_px: 0.6,
                             point_radius_px: 3.0,
+                            bin_colors: None,
                         },
                     },
                     LayerDraw {
@@ -1143,6 +1171,7 @@ mod tests {
                             point_color: [0.0; 4],
                             line_half_width_px: 1.2,
                             point_radius_px: 0.0,
+                            bin_colors: None,
                         },
                     },
                 ],
@@ -1337,6 +1366,7 @@ mod tests {
                     point_color: [0.2, 0.4, 0.9, 1.0],
                     line_half_width_px: 0.6,
                     point_radius_px: radius,
+                    bin_colors: None,
                 },
             }],
             background: [0.0; 4],
@@ -1478,6 +1508,7 @@ mod tests {
                     point_color: [0.0, 0.0, 1.0, 1.0],
                     line_half_width_px: 2.0,
                     point_radius_px: 5.0,
+                    bin_colors: None,
                 },
             }],
             background: [0.0; 4],

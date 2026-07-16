@@ -113,10 +113,31 @@ pub struct StyleCtx {
     pub point_radius_px: f32,
     pub fill_opacity: f32,
     pub opacity: f32,
+    /// Data-driven styling: (column, ramp token, mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style_by: Option<StyleByCtx>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum StyleByMode {
+    Graduated { method: String, breaks: Vec<f64> },
+    Categorical { values: Vec<String> },
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct StyleByCtx {
+    pub column: String,
+    pub ramp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classified_rows: Option<usize>,
+    #[serde(flatten)]
+    pub mode: StyleByMode,
 }
 
 impl StyleCtx {
     pub fn of(s: &LayerStyle) -> Self {
+        use crate::data::layer::StyleMode;
         Self {
             visible: s.visible,
             show_rg_bboxes: s.show_rg_bboxes,
@@ -126,10 +147,25 @@ impl StyleCtx {
             point_radius_px: s.point_radius_px,
             fill_opacity: s.fill_opacity,
             opacity: s.opacity,
+            style_by: s.style_by.as_ref().map(|sb| StyleByCtx {
+                column: sb.column.clone(),
+                ramp: sb.ramp.label().to_string(),
+                classified_rows: sb.classified_rows,
+                mode: match &sb.mode {
+                    StyleMode::Graduated { method, breaks } => StyleByMode::Graduated {
+                        method: method.label().to_string(),
+                        breaks: breaks.clone(),
+                    },
+                    StyleMode::Categorical { values } => {
+                        StyleByMode::Categorical { values: values.clone() }
+                    }
+                },
+            }),
         }
     }
 
     pub fn into_style(self) -> LayerStyle {
+        use crate::data::layer::{Ramp, StyleBy, StyleMode};
         let color = |a: [u8; 4]| Color32::from_rgba_premultiplied(a[0], a[1], a[2], a[3]);
         LayerStyle {
             visible: self.visible,
@@ -140,6 +176,28 @@ impl StyleCtx {
             point_radius_px: self.point_radius_px,
             fill_opacity: self.fill_opacity,
             opacity: self.opacity,
+            style_by: self.style_by.map(|sb| StyleBy {
+                column: sb.column,
+                ramp: Ramp::ALL
+                    .iter()
+                    .copied()
+                    .find(|r| r.label() == sb.ramp)
+                    .unwrap_or(Ramp::Viridis),
+                classified_rows: sb.classified_rows,
+                mode: match sb.mode {
+                    StyleByMode::Graduated { method, breaks } => StyleMode::Graduated {
+                        method: crate::data::layer::ClassMethod::ALL
+                            .iter()
+                            .copied()
+                            .find(|m| m.label() == method)
+                            .unwrap_or(crate::data::layer::ClassMethod::EqualInterval),
+                        breaks,
+                    },
+                    StyleByMode::Categorical { values } => {
+                        StyleMode::Categorical { values }
+                    }
+                },
+            }),
         }
     }
 }
@@ -199,6 +257,7 @@ mod tests {
                         path: "/data/parcels.parquet".into(),
                     },
                     style: StyleCtx {
+                        style_by: None,
                         visible: true,
                         show_rg_bboxes: true,
                         color: [31, 119, 180, 255],

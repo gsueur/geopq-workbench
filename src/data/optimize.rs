@@ -132,6 +132,10 @@ pub struct OptimizeOptions {
     pub h3_resolution: Option<u8>,
     /// Split the output into hive directories / adaptive H3 cells.
     pub partition: super::partition::PartitionBy,
+    /// Source has no geometry column: synthesize WKB points from these
+    /// coordinate columns (x/lon, y/lat) — materializes x/y layers into
+    /// real GeoParquet.
+    pub xy_geom: Option<(usize, usize)>,
 }
 
 impl Default for OptimizeOptions {
@@ -146,6 +150,7 @@ impl Default for OptimizeOptions {
             filter_rect: None,
             h3_resolution: None,
             partition: super::partition::PartitionBy::None,
+            xy_geom: None,
         }
     }
 }
@@ -181,6 +186,40 @@ impl OptimizeReport {
 /// Rewrite `src` into `dst` per `opts`. `epsg_hint`: CRS to record when the
 /// source has no usable CRS metadata (e.g. the already-loaded layer's CRS).
 /// `progress(frac, stage)` is called from the worker thread.
+/// Append a WKB point column synthesized from two coordinate columns
+/// (null when either coordinate is null).
+fn append_xy_wkb(
+    batch: &RecordBatch,
+    xi: usize,
+    yi: usize,
+    schema: &arrow::datatypes::SchemaRef,
+) -> Result<RecordBatch, String> {
+    use arrow::array::{Array, BinaryBuilder, Float64Array};
+    let as_f64 = |i: usize| -> Result<Float64Array, String> {
+        arrow::compute::cast(batch.column(i), &DataType::Float64)
+            .map_err(|e| format!("coordinate cast: {e}"))
+            .map(|a| a.as_any().downcast_ref::<Float64Array>().unwrap().clone())
+    };
+    let (xs, ys) = (as_f64(xi)?, as_f64(yi)?);
+    let mut b = BinaryBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 21);
+    for i in 0..batch.num_rows() {
+        if xs.is_null(i) || ys.is_null(i) {
+            b.append_null();
+            continue;
+        }
+        let mut wkb = [0u8; 21];
+        wkb[0] = 1; // little endian
+        wkb[1..5].copy_from_slice(&1u32.to_le_bytes());
+        wkb[5..13].copy_from_slice(&xs.value(i).to_le_bytes());
+        wkb[13..21].copy_from_slice(&ys.value(i).to_le_bytes());
+        b.append_value(wkb);
+    }
+    let mut cols = batch.columns().to_vec();
+    cols.push(Arc::new(b.finish()));
+    RecordBatch::try_new(Arc::clone(schema), cols)
+        .map_err(|e| format!("point synthesis: {e}"))
+}
+
 pub fn optimize(
     src: &Source,
     dst: &Path,
@@ -218,21 +257,40 @@ pub fn optimize(
         .find(|kv| kv.key == "geo")
         .and_then(|kv| kv.value.as_ref())
         .and_then(|v| serde_json::from_str(v).ok());
-    let primary = geo_meta
-        .as_ref()
-        .and_then(|m| m.get("primary_column"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| guess_geom_column(&src_schema).unwrap_or_else(|| "geometry".into()));
-    let geom_idx = src_schema
-        .index_of(&primary)
-        .map_err(|_| format!("geometry column '{primary}' not found"))?;
-    let src_encoding = geo_meta
-        .as_ref()
-        .and_then(|m| m.get("columns")?.get(&primary)?.get("encoding")?.as_str())
-        .map(|e| GeomEncoding::parse(e).ok_or_else(|| format!("encoding '{e}' not supported")))
-        .transpose()?
-        .unwrap_or_default();
+    let (primary, geom_idx, src_encoding) = match opts.xy_geom {
+        // x/y source: a WKB point column is synthesized during the read
+        // and appended after the source fields.
+        Some(_) => {
+            let name = if src_schema.index_of("geometry").is_ok() {
+                "xy_geometry"
+            } else {
+                "geometry"
+            };
+            (name.to_string(), src_schema.fields().len(), GeomEncoding::Wkb)
+        }
+        None => {
+            let primary = geo_meta
+                .as_ref()
+                .and_then(|m| m.get("primary_column"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    guess_geom_column(&src_schema).unwrap_or_else(|| "geometry".into())
+                });
+            let geom_idx = src_schema
+                .index_of(&primary)
+                .map_err(|_| format!("geometry column '{primary}' not found"))?;
+            let src_encoding = geo_meta
+                .as_ref()
+                .and_then(|m| m.get("columns")?.get(&primary)?.get("encoding")?.as_str())
+                .map(|e| {
+                    GeomEncoding::parse(e).ok_or_else(|| format!("encoding '{e}' not supported"))
+                })
+                .transpose()?
+                .unwrap_or_default();
+            (primary, geom_idx, src_encoding)
+        }
+    };
 
     // CRS, best source first: geo metadata PROJJSON, then the GEOMETRY
     // logical type's crs string (2.0 sources), then the caller's hint.
@@ -291,11 +349,31 @@ pub fn optimize(
         .build()
         .map_err(|e| format!("parquet read error: {e}"))?;
 
+    // x/y source: extend the schema with the synthesized point column.
+    let src_schema = match opts.xy_geom {
+        Some(_) => {
+            let mut fields: Vec<arrow::datatypes::Field> = src_schema
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone())
+                .collect();
+            fields.push(arrow::datatypes::Field::new(&primary, DataType::Binary, true));
+            Arc::new(arrow::datatypes::Schema::new_with_metadata(
+                fields,
+                src_schema.metadata().clone(),
+            ))
+        }
+        None => src_schema,
+    };
+
     let mut batches: Vec<RecordBatch> = Vec::new();
     let mut row_bboxes: Vec<Option<[f64; 4]>> = Vec::with_capacity(total_rows);
     let mut geom_types: HashSet<&'static str> = HashSet::new();
     for res in reader {
-        let batch = res.map_err(|e| format!("parquet decode error: {e}"))?;
+        let mut batch = res.map_err(|e| format!("parquet decode error: {e}"))?;
+        if let Some((xi, yi)) = opts.xy_geom {
+            batch = append_xy_wkb(&batch, xi, yi, &src_schema)?;
+        }
         scan_bboxes(&batch, geom_idx, src_encoding, &mut row_bboxes, &mut geom_types)?;
         batches.push(batch);
         progress(

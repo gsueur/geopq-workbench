@@ -270,6 +270,34 @@ pub fn distinct_counts(
     Ok(map)
 }
 
+/// Most frequent non-null values of a column (categorical styling).
+/// Blocking — run off the UI thread.
+pub fn top_values(
+    layer: &SqlLayer,
+    column: &str,
+    limit: usize,
+) -> Result<Vec<String>, String> {
+    let col = column.to_lowercase();
+    let out = run_query(
+        &format!(
+            "select cast(\"{col}\" as varchar) v, count(*) c from {} \
+             where \"{col}\" is not null group by v order by c desc, v limit {limit}",
+            layer.table
+        ),
+        std::slice::from_ref(layer),
+    )?;
+    let vals = out
+        .batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .ok_or("unexpected type for category values")?;
+    Ok((0..vals.len())
+        .filter(|&i| !vals.is_null(i))
+        .map(|i| vals.value(i).to_string())
+        .collect())
+}
+
 #[cfg(test)]
 pub fn run_query_for_test(query: &str, layers: &[SqlLayer]) -> Result<QueryOutput, String> {
     run_query(query, layers)

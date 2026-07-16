@@ -43,6 +43,9 @@ Fixture-dependent tests self-skip when the files are absent.
   per-row-group bboxes come from the coordinate columns' ordinary min/max
   statistics — so viewport pruning works — and the virtual column is
   queryable in SQL like any geometry (WKB via the usual normalization).
+  Optimize… materializes such layers into real GeoParquet (synthesized
+  WKB points + the full Hilbert/covering treatment; lon/lat stay as
+  attribute columns).
 - **Hive-partitioned datasets as one layer**: open a directory (File →
   Open folder…, drag & drop, or a CLI argument) holding a multi-file
   GeoParquet dataset — including this viewer's own partitioned exports and
@@ -77,6 +80,20 @@ Fixture-dependent tests self-skip when the files are absent.
   `~/.config/geopq-viewer/repositories.json`). Discovered dataset lists
   are cached across sessions (`repo_cache.json`, "cached N h ago" shown
   in the dialog); the ⟳ button clears the cache and re-discovers.
+- **Data-driven styling** (layer ☰ → Style by value…): color features by
+  an attribute — numeric columns get a graduated ramp (Viridis / Turbo /
+  Blue–Red) with a classification method: equal interval (bounds from the
+  parquet column statistics, editable), quantiles, half-std-dev classes,
+  or Jenks natural breaks. Data-dependent methods classify **only the
+  already-loaded rows** (a capped background sample — the app never
+  fetches the whole dataset to classify), and the layer panel flags the
+  styling as stale when the loaded extent has drifted >25% since
+  classification. Text columns get a categorical palette from the 15
+  most frequent values (fetched through the SQL engine). Features are
+  binned into 16 style bins at tessellation time (chunk meshes split per
+  bin, each drawn with its own uniform color), so ramp swaps are free and
+  only column/break changes rebuild. Fills, outlines (darkened ramp) and
+  points all follow; persisted in saved contexts.
 - **File info panel**: per-layer Info button — detected GeoParquet version,
   encoding, CRS, metadata bbox, covering/edges, column types + compression,
   row-group layout, raw `geo` JSON with copy.
@@ -126,7 +143,12 @@ Fixture-dependent tests self-skip when the files are absent.
   completed with their complement rows (no duplicates). Projection switches
   consolidate sections; the layer panel shows full/viewport-filtered group
   counts with a Load-all button. Global row indices are preserved, so
-  picking/attributes work on partial layers. Fixture:
+  picking/attributes work on partial layers. Loads that would decode
+  more than ~2.5 M rows switch to a **decimated preview** (every Nth
+  row, ~1.2 M features) instead of exhausting memory: the layer panel
+  says so, zooming in replaces preview groups with real viewport rows,
+  and refinement is row-budgeted (it waits for a tight enough zoom
+  rather than re-downloading a world view). Fixture:
   `testdata/parcels_hilbert.parquet` (Hilbert-sorted, 1.1 covering).
 - **Optimize / export**: per-layer "Optimize…" rewrites any loaded file as a
   pruning-friendly GeoParquet — features Hilbert-sorted by bbox center, tuned
@@ -272,8 +294,9 @@ deep zoom stays jitter-free.
 
 ## Roadmap ideas
 
-- Overview/pyramid levels for zoomed-out views of huge remote files (a
-  remote open at world zoom legitimately downloads everything today)
+- Overview/pyramid levels for zoomed-out views of huge remote files
+  (decimated previews bound memory today, but a world view of a huge
+  remote file still downloads every candidate row group's coordinates)
 - Remote hive datasets (s3:// / https:// prefix listing; local dirs work)
 - Optimize over a multi-file dataset (single files only today)
 - Streaming (external-sort) optimize for files beyond the 8 GB in-memory cap
@@ -282,7 +305,6 @@ deep zoom stays jitter-free.
 - SQL: `st_transform` (proj4rs), polygon set ops (`st_union` /
   `st_intersection` via geo bool_ops), aggregates (`st_extent`,
   `st_collect`), query history, save result to a chosen path
-- Data-driven styling (color by attribute, graduated/categorical)
 - Zoom-dependent decimation / LOD for very dense line/polygon layers
 - Zoom-dependent coastline detail (embed 1:110m + fetch 1:10m on demand)
 - Basemap tiles warped to non-Mercator projections

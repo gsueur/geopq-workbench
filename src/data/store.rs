@@ -515,6 +515,40 @@ impl FeatureStore {
         Ok(out)
     }
 
+    /// Min/max of a numeric base column across all fragments' row-group
+    /// statistics (for auto styling breaks). None when any group lacks
+    /// stats or the column isn't a flat numeric leaf.
+    pub fn column_range(&self, col: usize) -> Option<(f64, f64)> {
+        use parquet::file::statistics::Statistics;
+        if col >= self.base_fields() {
+            return None;
+        }
+        let name = self.schema.field(col).name();
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for frag in &self.fragments {
+            let pmd = frag.meta.metadata();
+            let leaf = pmd
+                .file_metadata()
+                .schema_descr()
+                .columns()
+                .iter()
+                .position(|c| c.path().parts().first().map(String::as_str) == Some(name))?;
+            for rg in pmd.row_groups() {
+                let st = rg.columns().get(leaf)?.statistics()?;
+                let (mn, mx): (f64, f64) = match st {
+                    Statistics::Double(s) => (*s.min_opt()?, *s.max_opt()?),
+                    Statistics::Float(s) => (*s.min_opt()? as f64, *s.max_opt()? as f64),
+                    Statistics::Int32(s) => (*s.min_opt()? as f64, *s.max_opt()? as f64),
+                    Statistics::Int64(s) => (*s.min_opt()? as f64, *s.max_opt()? as f64),
+                    _ => return None,
+                };
+                lo = lo.min(mn);
+                hi = hi.max(mx);
+            }
+        }
+        (lo.is_finite() && hi.is_finite()).then_some((lo, hi))
+    }
+
     /// Fetch one full row (all columns). The feature panel path caps very
     /// wide schemas instead (see the app's fetch_pick_attrs).
     #[allow(dead_code)] // exercised by tests; kept as the simple-row API

@@ -184,15 +184,29 @@ pub enum GroupSel {
     /// Explicit group-relative [start, end) row ranges (rebuilds of
     /// partially loaded groups, complement appends).
     Ranges(u32, Vec<(u32, u32)>),
+    /// Decimated preview: every `stride`-th row, optionally rect-filtered
+    /// first. Used when a full decode would exceed the row budget.
+    Preview {
+        group: u32,
+        rect: Option<[f64; 4]>,
+        stride: u32,
+    },
 }
 
 impl GroupSel {
     fn group(&self) -> u32 {
         match self {
             GroupSel::All(g) | GroupSel::Rect(g, _) | GroupSel::Ranges(g, _) => *g,
+            GroupSel::Preview { group, .. } => *group,
         }
     }
 }
+
+/// Row budget for one build: selections above it decode a decimated
+/// preview instead (every Nth row), refined with real rows on zoom-in.
+pub const MAX_BUILD_ROWS: u64 = 2_500_000;
+/// Preview decimation targets roughly this many features.
+const PREVIEW_TARGET_ROWS: u64 = 1_200_000;
 
 /// Coalesce sorted row indices into [start, end) ranges.
 fn rows_to_ranges(rows: impl Iterator<Item = u32>) -> Vec<(u32, u32)> {
@@ -338,6 +352,7 @@ pub fn spawn_load(
     view_world: [f64; 4],
     auto_project: bool,
     cancel: Arc<std::sync::atomic::AtomicBool>,
+    style: Option<crate::data::layer::StyleBy>,
 ) {
     use std::sync::atomic::Ordering;
     std::thread::spawn(move || {
@@ -431,7 +446,7 @@ pub fn spawn_load(
                         }
                         _ => false,
                     };
-                let sel: Vec<GroupSel> = groups
+                let mut sel: Vec<GroupSel> = groups
                     .iter()
                     .map(|&g| {
                         if use_rect {
@@ -441,9 +456,46 @@ pub fn spawn_load(
                         }
                     })
                     .collect();
+                // Row budget: a selection that could decode more rows than
+                // the budget becomes a decimated preview (an upper bound —
+                // rect selections may resolve smaller, but a preview that
+                // refines on zoom beats an out-of-memory tessellation).
+                let est: u64 = groups
+                    .iter()
+                    .map(|&g| {
+                        store.rg_starts()[g as usize + 1] - store.rg_starts()[g as usize]
+                    })
+                    .sum();
+                if est > MAX_BUILD_ROWS {
+                    let stride = est.div_ceil(PREVIEW_TARGET_ROWS).max(2) as u32;
+                    log::info!(
+                        "{}: {est} candidate rows exceed the budget — preview at 1/{stride}",
+                        source.label()
+                    );
+                    sel = sel
+                        .into_iter()
+                        .map(|s| match s {
+                            GroupSel::All(g) => {
+                                GroupSel::Preview { group: g, rect: None, stride }
+                            }
+                            GroupSel::Rect(g, r) => {
+                                GroupSel::Preview { group: g, rect: Some(r), stride }
+                            }
+                            other => other,
+                        })
+                        .collect();
+                }
                 let build_t0 = Instant::now();
-                match build_geometry(&store, &crs, &display, Some((&handle, job)), sel, Some(&cancel))
-                {
+                let style_sel = style.as_ref().and_then(|sb| resolve_style(&store, sb));
+                match build_geometry(
+                    &store,
+                    &crs,
+                    &display,
+                    Some((&handle, job)),
+                    sel,
+                    Some(&cancel),
+                    style_sel.as_ref(),
+                ) {
                     Ok((geometry, rows, bad, rg_computed, resolved)) => {
                         // Extent only known post-build (no metadata bboxes):
                         // suggest the auto projection; the app rebuilds.
@@ -523,6 +575,7 @@ pub fn spawn_load(
 /// Rebuild geometry for an existing layer under a new display projection,
 /// re-streaming exactly the loaded rows (consolidates any appended
 /// sections into one).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_rebuild(
     handle: LoaderHandle,
     layer_id: u64,
@@ -531,6 +584,7 @@ pub fn spawn_rebuild(
     crs: Crs,
     display: DisplayCrs,
     loaded: Vec<GroupLoad>,
+    style: Option<crate::data::layer::StyleBy>,
 ) {
     std::thread::spawn(move || {
         let t0 = Instant::now();
@@ -545,9 +599,15 @@ pub fn spawn_rebuild(
                 GroupLoad::Rows { ranges, .. } => {
                     Some(GroupSel::Ranges(g as u32, ranges.clone()))
                 }
+                GroupLoad::Preview { stride } => Some(GroupSel::Preview {
+                    group: g as u32,
+                    rect: None,
+                    stride: *stride,
+                }),
             })
             .collect();
-        match build_geometry(&store, &crs, &display, None, sel, None) {
+        let style_sel = style.as_ref().and_then(|sb| resolve_style(&store, sb));
+        match build_geometry(&store, &crs, &display, None, sel, None, style_sel.as_ref()) {
             Ok((geometry, _rows, bad, _rg, _resolved)) => handle.send(LoadMsg::Rebuilt {
                 layer_id,
                 generation,
@@ -577,9 +637,12 @@ pub fn spawn_append(
     display: DisplayCrs,
     jobs: Vec<GroupSel>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
+    style: Option<crate::data::layer::StyleBy>,
 ) {
     std::thread::spawn(move || {
-        match build_geometry(&store, &crs, &display, None, jobs, Some(&cancel)) {
+        let style_sel = style.as_ref().and_then(|sb| resolve_style(&store, sb));
+        match build_geometry(&store, &crs, &display, None, jobs, Some(&cancel), style_sel.as_ref())
+        {
             Ok((geometry, rows, _bad, _rg, resolved)) => handle.send(LoadMsg::Appended {
                 layer_id,
                 generation,
@@ -1295,6 +1358,174 @@ pub(crate) fn bbox_overlap_metric(boxes: &[[f64; 4]]) -> f64 {
     total as f64 / n as f64
 }
 
+/// Resolved data-driven styling for the build: which store column feeds
+/// the bins and how values map to them.
+#[derive(Clone)]
+pub struct StyleSel {
+    /// Store-schema index of the value column.
+    pub col: usize,
+    pub binning: Binning,
+}
+
+#[derive(Clone)]
+pub enum Binning {
+    /// Ascending break values; bin = number of breaks ≤ value.
+    Breaks(Vec<f64>),
+    Categorical { map: std::collections::HashMap<String, u8> },
+}
+
+/// Resolve a layer's `style_by` against its store (None when the column
+/// vanished or is a geometry).
+pub fn resolve_style(
+    store: &FeatureStore,
+    sb: &crate::data::layer::StyleBy,
+) -> Option<StyleSel> {
+    use crate::data::layer::{StyleMode, STYLE_BINS};
+    let col = store
+        .schema
+        .fields()
+        .iter()
+        .position(|f| f.name().eq_ignore_ascii_case(&sb.column))?;
+    if col == store.geom_col || col >= store.first_part_index() {
+        // Partition columns aren't readable through the group readers.
+        return None;
+    }
+    let binning = match &sb.mode {
+        StyleMode::Graduated { breaks, .. } => Binning::Breaks(breaks.clone()),
+        StyleMode::Categorical { values } => Binning::Categorical {
+            map: values
+                .iter()
+                .take(STYLE_BINS - 1)
+                .enumerate()
+                .map(|(i, v)| (v.clone(), i as u8))
+                .collect(),
+        },
+    };
+    Some(StyleSel { col, binning })
+}
+
+/// Sample up to `cap` values of a column from the already-loaded rows of
+/// a layer (classification must never fetch the whole dataset). Blocking —
+/// run off the UI thread.
+pub fn sample_loaded_values(
+    store: &FeatureStore,
+    loaded: &[GroupLoad],
+    col: usize,
+    cap: usize,
+) -> Result<Vec<f64>, String> {
+    let starts = store.rg_starts();
+    let total: u64 = loaded
+        .iter()
+        .enumerate()
+        .map(|(g, st)| match st {
+            GroupLoad::Full => starts[g + 1] - starts[g],
+            GroupLoad::Rows { ranges, .. } => {
+                ranges.iter().map(|&(s, e)| (e - s) as u64).sum()
+            }
+            GroupLoad::Preview { stride } => {
+                (starts[g + 1] - starts[g]).div_ceil(*stride as u64)
+            }
+            GroupLoad::None => 0,
+        })
+        .sum();
+    if total == 0 {
+        return Err("no rows loaded yet".into());
+    }
+    let stride = (total / cap.max(1) as u64).max(1) as usize;
+    let mut rows: Vec<u32> = Vec::with_capacity(cap + 1);
+    let mut c = 0usize; // running loaded-row counter across groups
+    for (g, st) in loaded.iter().enumerate() {
+        let start = starts[g] as u32;
+        let mut push_span = |s: u32, e: u32, c: &mut usize, step_by: usize| {
+            let mut i = s as usize;
+            // Align to the global stride phase.
+            let phase = (*c) % stride;
+            if phase != 0 {
+                i += (stride - phase) * step_by;
+            }
+            while i < e as usize {
+                rows.push(start + i as u32);
+                i += stride * step_by;
+            }
+            *c += ((e - s) as usize).div_ceil(step_by);
+        };
+        match st {
+            GroupLoad::Full => {
+                push_span(0, (starts[g + 1] - starts[g]) as u32, &mut c, 1)
+            }
+            GroupLoad::Rows { ranges, .. } => {
+                for &(s, e) in ranges {
+                    push_span(s, e, &mut c, 1);
+                }
+            }
+            GroupLoad::Preview { stride: ps } => {
+                push_span(0, (starts[g + 1] - starts[g]) as u32, &mut c, *ps as usize)
+            }
+            GroupLoad::None => {}
+        }
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    if rows.is_empty() {
+        return Err("no rows loaded yet".into());
+    }
+    let batches = store.fetch(&rows, Some(&[col]))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for b in &batches {
+        let vals = arrow::compute::cast(b.column(0), &DataType::Float64)
+            .map_err(|e| format!("value cast: {e}"))?;
+        let vals = vals
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        for i in 0..vals.len() {
+            if !arrow::array::Array::is_null(vals, i) && vals.value(i).is_finite() {
+                out.push(vals.value(i));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Per-row style bins for one batch's value column.
+fn batch_bins(arr: &arrow::array::ArrayRef, binning: &Binning) -> Vec<u8> {
+    use crate::data::layer::STYLE_BINS;
+    let n = arr.len();
+    match binning {
+        Binning::Breaks(breaks) => {
+            let vals = arrow::compute::cast(arr, &DataType::Float64).ok();
+            let vals = vals
+                .as_ref()
+                .and_then(|a| a.as_any().downcast_ref::<arrow::array::Float64Array>());
+            (0..n)
+                .map(|i| match vals {
+                    Some(v) if !v.is_null(i) => {
+                        let x = v.value(i);
+                        (breaks.partition_point(|b| x >= *b) as u8)
+                            .min((STYLE_BINS - 1) as u8)
+                    }
+                    _ => 0,
+                })
+                .collect()
+        }
+        Binning::Categorical { map } => {
+            let vals = arrow::compute::cast(arr, &DataType::Utf8).ok();
+            let vals = vals
+                .as_ref()
+                .and_then(|a| a.as_any().downcast_ref::<arrow::array::StringArray>());
+            (0..n)
+                .map(|i| match vals {
+                    Some(v) if !v.is_null(i) => map
+                        .get(v.value(i))
+                        .copied()
+                        .unwrap_or((STYLE_BINS - 1) as u8),
+                    _ => (STYLE_BINS - 1) as u8,
+                })
+                .collect()
+        }
+    }
+}
+
 // (geometry, rows, bad, computed rg boxes, decode state per selected group).
 // State mapping: All → Full, Rect → Rows (or Full when everything matched /
 // no covering column), Ranges → Full (append-complement semantics; rebuilds
@@ -1337,12 +1568,24 @@ fn build_geometry(
     progress: Option<(&LoaderHandle, u64)>,
     sel: Vec<GroupSel>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    style: Option<&StyleSel>,
 ) -> Result<BuildOutput, String> {
     let cancelled = || {
         cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
     };
-    let geom_col = store.geom_col;
+    // Projected columns: geometry (+ the styling value column), sorted —
+    // remember where each lands in the batches.
+    let mut proj: Vec<usize> = vec![store.geom_col];
+    if let Some(st) = style {
+        if st.col != store.geom_col {
+            proj.push(st.col);
+        }
+    }
+    proj.sort_unstable();
+    let geom_pos = proj.binary_search(&store.geom_col).unwrap();
+    let style_pos = style.map(|st| proj.binary_search(&st.col).unwrap());
     let rg_starts = store.rg_starts();
+    let proj_ref: &[usize] = &proj;
     let stream_error: Mutex<Option<String>> = Mutex::new(None);
     let resolved: Mutex<Vec<(u32, GroupLoad)>> = Mutex::new(Vec::with_capacity(sel.len()));
 
@@ -1392,6 +1635,34 @@ fn build_geometry(
                     }
                 }
             }
+            GroupSel::Preview { rect, stride, .. } => {
+                // Optional rect filter first, then every stride-th row of
+                // the selection as explicit 1-row ranges (the reader skips
+                // decoding the rest).
+                let base: Option<Vec<(u32, u32)>> = match rect {
+                    Some(r) => match covering_select(store, g, *r) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            *err_ref.lock().unwrap() = Some(e);
+                            Some(vec![])
+                        }
+                    },
+                    None => None,
+                };
+                let stride = (*stride).max(2) as usize;
+                let sampled: Vec<u32> = match &base {
+                    Some(rs) => rs
+                        .iter()
+                        .flat_map(|&(s, e)| s..e)
+                        .step_by(stride)
+                        .collect(),
+                    None => (0..group_rows).step_by(stride).collect(),
+                };
+                (
+                    Some(rows_to_ranges(sampled.into_iter())),
+                    GroupLoad::Preview { stride: stride as u32 },
+                )
+            }
         };
         resolved_ref.lock().unwrap().push((g, state));
         // Global rows of the selection, for sparse batches.
@@ -1410,7 +1681,7 @@ fn build_geometry(
                 g as usize,
                 BATCH_SIZE,
                 ranges.as_deref(),
-                Some(&[geom_col]),
+                Some(proj_ref),
             ) {
                 Ok(r) => Some(r),
                 Err(e) => {
@@ -1454,7 +1725,8 @@ fn build_geometry(
             let tr = BulkTransformer::new(crs, display);
             let rows = process_batch(
                 &batch, &map, encoding, &tr, display, &mut mb, &mut items, &mut bad,
-                rg_starts, &mut rg_boxes,
+                rg_starts, &mut rg_boxes, geom_pos,
+                style.map(|st| (style_pos.unwrap(), &st.binning)),
             );
             if let Some((handle, job)) = progress {
                 let d = done.fetch_add(rows, Ordering::Relaxed) + rows;
@@ -1578,6 +1850,7 @@ fn grow_rg_box(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn process_batch(
     batch: &RecordBatch,
     map: &RowMap,
@@ -1589,13 +1862,18 @@ fn process_batch(
     bad: &mut usize,
     rg_starts: &[u64],
     rg_boxes: &mut std::collections::HashMap<u32, [f64; 4]>,
+    geom_pos: usize,
+    style: Option<(usize, &Binning)>,
 ) -> usize {
-    // The loader projects the read down to the geometry column.
-    let col = batch.column(0);
+    let col = batch.column(geom_pos);
     let Some(get) = GeomCol::new(col.as_ref(), encoding) else {
         *bad += batch.num_rows();
         return batch.num_rows();
     };
+    // Data-driven styling: per-row bin from the value column; the mesh
+    // builder keys chunks by (cell, bin).
+    let bins: Option<Vec<u8>> =
+        style.map(|(pos, binning)| batch_bins(batch.column(pos), binning));
 
     // GeoArrow: bulk path — one linear reprojection pass over the whole
     // coordinate buffer, features emitted straight from the arrow offsets.
@@ -1610,12 +1888,16 @@ fn process_batch(
             items,
             bad,
             &mut |global, b| grow_rg_box(rg_boxes, rg_of(global, rg_starts), b),
+            bins.as_deref(),
         );
     }
 
     for row in 0..batch.num_rows() {
         if get.is_null(row) {
             continue;
+        }
+        if let Some(b) = &bins {
+            mb.bin = b[row];
         }
         let global = map.global(row);
         let fref = FeatureRef {
@@ -1783,7 +2065,17 @@ pub fn build_geometry_for_test_full(
     crs: &Crs,
     display: &DisplayCrs,
 ) -> Result<BuildOutput, String> {
-    build_geometry(store, crs, display, None, all_groups(store), None)
+    build_geometry(store, crs, display, None, all_groups(store), None, None)
+}
+
+#[cfg(test)]
+pub fn build_geometry_styled_for_test(
+    store: &FeatureStore,
+    crs: &Crs,
+    display: &DisplayCrs,
+    style: &StyleSel,
+) -> Result<BuildOutput, String> {
+    build_geometry(store, crs, display, None, all_groups(store), None, Some(style))
 }
 
 #[cfg(test)]
@@ -1792,7 +2084,7 @@ pub fn build_geometry_for_test(
     crs: &Crs,
     display: &DisplayCrs,
 ) -> Result<(super::layer::LayerGeometry, usize, usize), String> {
-    build_geometry(store, crs, display, None, all_groups(store), None)
+    build_geometry(store, crs, display, None, all_groups(store), None, None)
         .map(|(g, r, b, _, _)| (g, r, b))
 }
 
@@ -1839,7 +2131,7 @@ mod rg_bbox_tests {
         assert!(store.covering.is_none());
         let display = crate::data::crs::DisplayCrs::hobo_dyer();
         let (_geom, rows, _bad, computed, resolved) =
-            build_geometry(&store, &crs, &display, None, all_groups(&store), None).unwrap();
+            build_geometry(&store, &crs, &display, None, all_groups(&store), None, None).unwrap();
         assert!(resolved.iter().all(|(_, st)| st.is_full()));
         assert_eq!(rows, 1_000_000);
         let n_rg = store.rg_starts().len() - 1;
@@ -1992,7 +2284,7 @@ mod pruning_tests {
         let display = crate::data::crs::DisplayCrs::hobo_dyer();
         let jobs: Vec<GroupSel> = sel.iter().map(|&g| GroupSel::All(g)).collect();
         let (geometry, rows, _bad, _rg, _resolved) =
-            build_geometry(&store, &crs, &display, None, jobs, None).unwrap();
+            build_geometry(&store, &crs, &display, None, jobs, None, None).unwrap();
         let expected: u64 = sel
             .iter()
             .map(|&g| store.rg_starts()[g as usize + 1] - store.rg_starts()[g as usize])
@@ -2018,7 +2310,7 @@ mod pruning_tests {
         assert_eq!(cov.children, ["xmin", "ymin", "xmax", "ymax"].map(String::from));
         let jobs: Vec<GroupSel> = sel.iter().map(|&g| GroupSel::Rect(g, rect)).collect();
         let (geometry_f, rows_f, _bad, _rg, resolved) =
-            build_geometry(&store, &crs, &display, None, jobs, None).unwrap();
+            build_geometry(&store, &crs, &display, None, jobs, None, None).unwrap();
         // Dense-urban viewport: still expect a substantial decode cut vs
         // the 4 whole groups (independently verified via DuckDB: 163,151
         // features intersect this rect).
@@ -2038,6 +2330,7 @@ mod pruning_tests {
                 }
                 GroupLoad::Full => {} // a group fully inside the viewport
                 GroupLoad::None => panic!("group {g} unresolved"),
+                GroupLoad::Preview { .. } => panic!("group {g} unexpectedly previewed"),
             }
         }
         // Every decoded feature actually intersects the viewport rect:
@@ -2080,6 +2373,7 @@ mod pruning_tests {
             &display,
             None,
             vec![GroupSel::Ranges(*g0, comp.clone())],
+            None,
             None,
         )
         .unwrap();
@@ -2126,9 +2420,9 @@ mod pruning_tests {
             sel.iter().map(|&g| GroupSel::Rect(g, rect)).collect()
         };
         let (_g, rows_r, bad_r, _rg, _res) =
-            build_geometry(&store_r, &crs_r, &display, None, jobs(()), None).unwrap();
+            build_geometry(&store_r, &crs_r, &display, None, jobs(()), None, None).unwrap();
         let (_g, rows_l, bad_l, _rg, _res) =
-            build_geometry(&store_l, &crs_l, &display, None, jobs(()), None).unwrap();
+            build_geometry(&store_l, &crs_l, &display, None, jobs(()), None, None).unwrap();
         assert_eq!((rows_r, bad_r), (rows_l, bad_l));
         assert!(rows_r > 0);
 
@@ -2245,7 +2539,7 @@ mod pruning_tests {
             let open_ms = t0.elapsed().as_millis();
             let t1 = std::time::Instant::now();
             let (geometry, rows, bad, _, _) =
-                build_geometry(&store, &crs, &display, None, all_groups(&store), None).unwrap();
+                build_geometry(&store, &crs, &display, None, all_groups(&store), None, None).unwrap();
             eprintln!(
                 "run {run}: open {open_ms} ms, build {} ms, {rows} rows ({bad} bad), {} chunks, {} rgs",
                 t1.elapsed().as_millis(),
@@ -2319,7 +2613,7 @@ mod pruning_tests {
         let jobs: Vec<GroupSel> = sel.iter().map(|&g| GroupSel::Rect(g, rect)).collect();
         let display = crate::data::crs::DisplayCrs::hobo_dyer();
         let (geometry, rows, bad, _rg, _res) =
-            build_geometry(&store, &crs, &display, None, jobs, None).unwrap();
+            build_geometry(&store, &crs, &display, None, jobs, None, None).unwrap();
         eprintln!(
             "loaded {rows} features ({bad} bad) in {} ms, {} chunks",
             t1.elapsed().as_millis(),
@@ -2608,6 +2902,77 @@ mod xy_tests {
             .count();
         assert_eq!(selected as usize, expect);
         assert!(selected > 0 && (selected as usize) < 128, "{selected}");
+
+        // Decimated preview: every 4th row decodes, resolved states say so.
+        let n_groups = store.rg_starts().len() - 1;
+        let sel: Vec<GroupSel> = (0..n_groups)
+            .map(|g| GroupSel::Preview { group: g as u32, rect: None, stride: 4 })
+            .collect();
+        let (_gp, rows_prev, _, _, resolved) =
+            build_geometry(&store, &crs, &display, None, sel, None, None).unwrap();
+        let expect_prev: usize = (0..n_groups)
+            .map(|g| {
+                let rows = (store.rg_starts()[g + 1] - store.rg_starts()[g]) as usize;
+                rows.div_ceil(4)
+            })
+            .sum();
+        assert_eq!(rows_prev, expect_prev);
+        assert!(resolved
+            .iter()
+            .all(|(_, st)| matches!(st, GroupLoad::Preview { stride: 4 })));
+        assert!(!GroupLoad::Preview { stride: 4 }.covers([0.0, 0.0, 1.0, 1.0]));
+
+        // Data-driven styling: graduated bins on the id column spread
+        // chunks across bins, and binning matches the value math.
+        let id_col = store.schema.index_of("id").unwrap();
+        let (lo, hi) = store.column_range(id_col).expect("stats range");
+        assert_eq!((lo, hi), (0.0, (n - 1) as f64));
+        let style = StyleSel {
+            col: id_col,
+            binning: Binning::Breaks(crate::data::layer::equal_interval_breaks(lo, hi)),
+        };
+        let (g_styled, rows_styled, _, _, _) =
+            build_geometry_styled_for_test(&store, &crs, &display, &style).unwrap();
+        assert_eq!(rows_styled, n);
+        let mut bins: Vec<u8> = g_styled.chunks.iter().map(|c| c.bin).collect();
+        bins.sort_unstable();
+        bins.dedup();
+        assert!(bins.len() > 4, "value spread must produce several bins: {bins:?}");
+        let total_pts: usize = g_styled.chunks.iter().map(|c| c.point_instances.len()).sum();
+        assert_eq!(total_pts, n, "binning must not drop features");
+
+        // Optimize materializes the x/y layer into real GeoParquet:
+        // WKB points, geo metadata, covering — loadable without synthesis.
+        let opt_dst = dir.join("grid_optimized.parquet");
+        let opts = crate::data::optimize::OptimizeOptions {
+            row_group_size: 128,
+            xy_geom: store.xy_geom,
+            ..Default::default()
+        };
+        let rep = crate::data::optimize::optimize(
+            &store.source,
+            &opt_dst,
+            &opts,
+            crs.epsg,
+            None,
+            &|_, _| {},
+        )
+        .unwrap();
+        assert_eq!(rep.rows, n as u64);
+        let (opt_store, opt_crs, opt_info, _) =
+            open_store(&Source::Local(opt_dst)).unwrap();
+        assert!(opt_store.xy_geom.is_none(), "output has a real geometry column");
+        assert_eq!(opt_store.total_rows(), n as u64);
+        assert!(opt_store.covering.is_some(), "covering written");
+        assert!(opt_info.geo.version_label.contains("GeoParquet"));
+        assert!(opt_crs.is_latlong);
+        // Original lon/lat stay as ordinary attribute columns.
+        assert!(opt_store.schema.index_of("lon").is_ok());
+        let g = opt_store.fetch_geoms(&[0]).unwrap();
+        assert!(matches!(
+            g[0].1.as_ref().unwrap(),
+            geo_types::Geometry::Point(_)
+        ));
 
         // SQL over the synthesized geometry, including spatial pushdown
         // through the stats-backed bboxes.

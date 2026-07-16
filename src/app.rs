@@ -155,6 +155,14 @@ pub struct ViewerApp {
     sql: crate::sql::console::SqlConsole,
     /// Layer-filter dialog (Some = open).
     filter_dialog: Option<FilterDialog>,
+    /// Data-driven styling dialog (Some = open).
+    style_dialog: Option<StyleDialog>,
+    /// Category-value fetches for the styling dialog.
+    cat_tx: Sender<(u64, String, Result<Vec<String>, String>)>,
+    cat_rx: Receiver<(u64, String, Result<Vec<String>, String>)>,
+    /// Classification runs for the styling dialog (breaks from loaded rows).
+    class_tx: Sender<(u64, String, Result<Vec<f64>, String>)>,
+    class_rx: Receiver<(u64, String, Result<Vec<f64>, String>)>,
     filter_tx: Sender<crate::sql::engine::FilterMsg>,
     filter_rx: Receiver<crate::sql::engine::FilterMsg>,
     /// Layers with a filter computation in flight.
@@ -322,6 +330,25 @@ fn fetch_pick_attrs(
     }
 }
 
+/// Data-driven styling editor for one layer.
+struct StyleDialog {
+    layer_id: u64,
+    column: String,
+    /// Whether the selected column is numeric (graduated) or text
+    /// (categorical).
+    numeric: bool,
+    ramp: crate::data::layer::Ramp,
+    method: crate::data::layer::ClassMethod,
+    /// Equal-interval bounds (from column statistics, editable).
+    min: f64,
+    max: f64,
+    /// Computed class breaks (None = classification in flight for
+    /// data-dependent methods).
+    breaks: Option<Result<Vec<f64>, String>>,
+    /// Top values for categorical columns (None = fetch in flight).
+    categories: Option<Result<Vec<String>, String>>,
+}
+
 /// Editor for a layer's persistent SQL filter.
 struct FilterDialog {
     layer_id: u64,
@@ -351,6 +378,8 @@ impl ViewerApp {
         let (test_tx, test_rx) = channel();
         let (pick_tx, pick_rx) = channel();
         let (repo_tx, repo_rx) = channel();
+        let (cat_tx, cat_rx) = channel();
+        let (class_tx, class_rx) = channel();
         let display = DisplayCrs::hobo_dyer();
         let graticule_chunks = build_graticule(&display);
         let coastline_chunks = crate::data::coastline::build_coastline(&display);
@@ -402,6 +431,11 @@ impl ViewerApp {
             cursor_world: None,
             sql: crate::sql::console::SqlConsole::new(),
             filter_dialog: None,
+            style_dialog: None,
+            cat_tx,
+            cat_rx,
+            class_tx,
+            class_rx,
             filter_tx,
             filter_rx,
             filter_pending: HashSet::new(),
@@ -461,6 +495,9 @@ impl ViewerApp {
             self.last_view_world,
             auto_project,
             cancel,
+            // Context-restored layers carry their styling into the first
+            // build (pending style registered by the caller right after).
+            None,
         );
         job
     }
@@ -595,6 +632,7 @@ impl ViewerApp {
             l.crs.clone(),
             display,
             l.loaded.clone(),
+            l.style.style_by.clone(),
         );
     }
 
@@ -621,6 +659,7 @@ impl ViewerApp {
             l.crs.clone(),
             display,
             l.loaded.clone(),
+            l.style.style_by.clone(),
         );
     }
 
@@ -845,6 +884,7 @@ impl ViewerApp {
                             layer.crs.clone(),
                             self.display.clone(),
                             layer.loaded.clone(),
+                        layer.style.style_by.clone(),
                         );
                     }
                     // Category z-order: polygons at the bottom, lines above,
@@ -1025,7 +1065,8 @@ impl ViewerApp {
                 l.crs.clone(),
                 self.display.clone(),
                 l.loaded.clone(),
-            );
+            l.style.style_by.clone(),
+                        );
         }
     }
 
@@ -1063,7 +1104,12 @@ impl ViewerApp {
                 ];
                 match &l.loaded[g as usize] {
                     GroupLoad::Full => {}
-                    GroupLoad::None => jobs.push(GroupSel::Rect(g, rect)),
+                    // Preview refines like an unseen group: the in-rect
+                    // sampled rows re-decode (a ~1/stride duplicate
+                    // fraction — invisible next to real coverage).
+                    GroupLoad::None | GroupLoad::Preview { .. } => {
+                        jobs.push(GroupSel::Rect(g, rect))
+                    }
                     st @ GroupLoad::Rows { ranges, .. } => {
                         if !st.covers(need) {
                             let n = (starts[g as usize + 1] - starts[g as usize]) as u32;
@@ -1073,6 +1119,40 @@ impl ViewerApp {
                 }
             }
             if jobs.is_empty() {
+                continue;
+            }
+            // Row-budget guard: refining a preview at a wide viewport
+            // would decode the very load the preview avoided. Estimate
+            // rect jobs by viewport/bbox area overlap and wait for a
+            // tighter zoom when the estimate exceeds the budget.
+            let est: u64 = jobs
+                .iter()
+                .map(|j| match j {
+                    GroupSel::Ranges(_, rs) => {
+                        rs.iter().map(|&(s, e)| (e - s) as u64).sum()
+                    }
+                    GroupSel::Rect(g, r) | GroupSel::Preview { group: g, rect: Some(r), .. } => {
+                        let gb = rg.boxes[*g as usize];
+                        let n = starts[*g as usize + 1] - starts[*g as usize];
+                        let (bw, bh) = (gb[2] - gb[0], gb[3] - gb[1]);
+                        let iw = (r[2].min(gb[2]) - r[0].max(gb[0])).max(0.0);
+                        let ih = (r[3].min(gb[3]) - r[1].max(gb[1])).max(0.0);
+                        if bw <= 0.0 || bh <= 0.0 {
+                            n
+                        } else {
+                            ((iw * ih) / (bw * bh) * n as f64).ceil() as u64
+                        }
+                    }
+                    GroupSel::All(g) | GroupSel::Preview { group: g, rect: None, .. } => {
+                        starts[*g as usize + 1] - starts[*g as usize]
+                    }
+                })
+                .sum();
+            if est > crate::data::loader::MAX_BUILD_ROWS {
+                log::debug!(
+                    "{}: refinement estimate {est} rows over budget — zoom in further",
+                    l.name
+                );
                 continue;
             }
             log::info!("{}: refining with {} row groups", l.name, jobs.len());
@@ -1091,7 +1171,8 @@ impl ViewerApp {
                 self.display.clone(),
                 jobs,
                 cancel,
-            );
+            l.style.style_by.clone(),
+                        );
         }
     }
 
@@ -1415,6 +1496,7 @@ impl ViewerApp {
         let mut load_all: Option<u64> = None;
         let mut optimize_open: Option<u64> = None;
         let mut filter_open: Option<u64> = None;
+        let mut style_open: Option<u64> = None;
         let mut filter_clear: Option<u64> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1429,11 +1511,12 @@ impl ViewerApp {
                         ui.checkbox(&mut l.style.visible, "");
                         geom_kind_icon(ui, l.kind());
                         let mut c = l.style.color;
-                        if ui
-                            .color_edit_button_srgba(&mut c)
-                            .on_hover_text("fill / point color")
-                            .changed()
-                        {
+                        if swatch_color_button(
+                            ui,
+                            &format!("fill{}", l.id),
+                            &mut c,
+                            "fill / point color",
+                        ) {
                             l.style.color = c;
                         }
                         if !matches!(l.kind(), crate::data::geometry::GeomKind::Point) {
@@ -1441,11 +1524,12 @@ impl ViewerApp {
                                 .style
                                 .line_color
                                 .unwrap_or_else(|| derived_line_color(l.style.color));
-                            if ui
-                                .color_edit_button_srgba(&mut lc)
-                                .on_hover_text("border / line color")
-                                .changed()
-                            {
+                            if swatch_color_button(
+                                ui,
+                                &format!("line{}", l.id),
+                                &mut lc,
+                                "border / line color",
+                            ) {
                                 l.style.line_color = Some(lc);
                             }
                             if l.style.line_color.is_some()
@@ -1467,15 +1551,15 @@ impl ViewerApp {
                                         info_open = Some(l.id);
                                     }
                                     let single = !l.store.is_partitioned();
-                                    let can_opt = single && l.store.xy_geom.is_none();
                                     if ui
-                                        .add_enabled(can_opt, egui::Button::new("Optimize…"))
+                                        .add_enabled(single, egui::Button::new("Optimize…"))
                                         .on_hover_text(if !single {
                                             "Optimize works on single files; this layer is a \
                                              multi-file dataset"
-                                        } else if !can_opt {
-                                            "This layer's geometry is synthesized from x/y \
-                                             columns; optimize needs a real geometry column"
+                                        } else if l.store.xy_geom.is_some() {
+                                            "Materialize this x/y layer as real GeoParquet: \
+                                             WKB points, Hilbert order, covering bbox / \
+                                             native geo stats"
                                         } else {
                                             "Rewrite as a spatially sorted GeoParquet 1.1 or \
                                              2.0 file (Hilbert order, covering bbox / native \
@@ -1487,6 +1571,17 @@ impl ViewerApp {
                                     }
                                     if ui.button("Filter…").clicked() {
                                         filter_open = Some(l.id);
+                                    }
+                                    if ui.button("Style by value…").clicked() {
+                                        style_open = Some(l.id);
+                                    }
+                                    if l.style.style_by.is_some()
+                                        && ui.button("Clear styling").clicked()
+                                    {
+                                        // Bins stay in the meshes; without
+                                        // bin colors everything draws in
+                                        // the uniform layer color again.
+                                        l.style.style_by = None;
                                     }
                                     if l.is_partial()
                                         && l.filter.is_none()
@@ -1636,10 +1731,36 @@ impl ViewerApp {
                             ui.label(RichText::new("computing filter…").weak().small());
                         });
                     }
+                    // Data-classified styling goes stale when the loaded
+                    // rows drift (classification never reads beyond them).
+                    if let Some(sb) = &l.style.style_by {
+                        if let Some(n0) = sb.classified_rows {
+                            let n1 = l.loaded_rows() as f64;
+                            let drift = (n1 - n0 as f64).abs() / (n0.max(1) as f64);
+                            if drift > 0.25 {
+                                ui.label(
+                                    RichText::new(
+                                        "style classes computed from a previous extent — \
+                                         reopen Style by value… to reclassify",
+                                    )
+                                    .color(Color32::from_rgb(242, 140, 26))
+                                    .small(),
+                                );
+                            }
+                        }
+                    }
                     if l.is_partial() && l.filter.is_none() {
                         ui.horizontal(|ui| {
+                            let preview = l.preview_rgs();
                             let partial = l.partial_rgs();
-                            let text = if partial > 0 {
+                            let text = if preview > 0 {
+                                format!(
+                                    "preview: {} of {} row groups decimated — zoom in \
+                                     to load real rows",
+                                    preview,
+                                    l.total_rgs()
+                                )
+                            } else if partial > 0 {
                                 format!(
                                     "partial: {}/{} row groups full, {} viewport-filtered",
                                     l.full_rgs(),
@@ -1715,7 +1836,10 @@ impl ViewerApp {
                         epsg: l.crs.epsg,
                         crs: l.crs.clone(),
                         viewport_only: false,
-                        opts: Default::default(),
+                        opts: crate::data::optimize::OptimizeOptions {
+                            xy_geom: l.store.xy_geom,
+                            ..Default::default()
+                        },
                         running: false,
                         progress: (0.0, String::new()),
                         report: None,
@@ -1752,6 +1876,10 @@ impl ViewerApp {
             let ctx = ui.ctx().clone();
             self.clear_layer_filter(id, &ctx);
         }
+        if let Some(id) = style_open {
+            let ctx = ui.ctx().clone();
+            self.open_style_dialog(id, &ctx);
+        }
         if let Some(id) = load_all {
             use crate::data::layer::GroupLoad;
             use crate::data::loader::{complement_ranges, GroupSel};
@@ -1765,7 +1893,9 @@ impl ViewerApp {
                         .enumerate()
                         .filter_map(|(g, st)| match st {
                             GroupLoad::Full => None,
-                            GroupLoad::None => Some(GroupSel::All(g as u32)),
+                            GroupLoad::None | GroupLoad::Preview { .. } => {
+                                Some(GroupSel::All(g as u32))
+                            }
                             GroupLoad::Rows { ranges, .. } => {
                                 let n = (starts[g + 1] - starts[g]) as u32;
                                 Some(GroupSel::Ranges(g as u32, complement_ranges(ranges, n)))
@@ -1788,6 +1918,7 @@ impl ViewerApp {
                             self.display.clone(),
                             missing,
                             cancel,
+                        l.style.style_by.clone(),
                         );
                     }
                 }
@@ -2358,6 +2489,464 @@ impl ViewerApp {
         if !open {
             self.repo_browser = None;
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Data-driven styling dialog
+    // ------------------------------------------------------------------
+
+    /// Columns of a layer eligible for styling: (name, numeric).
+    fn style_columns(store: &crate::data::store::FeatureStore) -> Vec<(String, bool)> {
+        use arrow::datatypes::DataType as DT;
+        store
+            .schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != store.geom_col && *i < store.base_fields())
+            .filter_map(|(_, f)| match f.data_type() {
+                DT::Int8 | DT::Int16 | DT::Int32 | DT::Int64 | DT::UInt8 | DT::UInt16
+                | DT::UInt32 | DT::UInt64 | DT::Float16 | DT::Float32 | DT::Float64 => {
+                    Some((f.name().clone(), true))
+                }
+                DT::Utf8 | DT::LargeUtf8 | DT::Utf8View | DT::Boolean | DT::Dictionary(_, _) => {
+                    Some((f.name().clone(), false))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn open_style_dialog(&mut self, layer_id: u64, ctx: &egui::Context) {
+        use crate::data::layer::{Ramp, StyleMode};
+        let Some(l) = self.layers.iter().find(|l| l.id == layer_id) else { return };
+        let cols = Self::style_columns(&l.store);
+        if cols.is_empty() {
+            self.push_error(format!("{}: no styleable columns", l.name));
+            return;
+        }
+        // Start from the active styling, else the first numeric column.
+        use crate::data::layer::ClassMethod;
+        let (column, ramp, method) = match &l.style.style_by {
+            Some(sb) => match &sb.mode {
+                StyleMode::Graduated { method, .. } => (sb.column.clone(), sb.ramp, *method),
+                StyleMode::Categorical { .. } => {
+                    (sb.column.clone(), sb.ramp, ClassMethod::EqualInterval)
+                }
+            },
+            None => {
+                let c = cols
+                    .iter()
+                    .find(|(_, num)| *num)
+                    .unwrap_or(&cols[0])
+                    .0
+                    .clone();
+                (c, Ramp::Viridis, ClassMethod::EqualInterval)
+            }
+        };
+        let mut d = StyleDialog {
+            layer_id,
+            column,
+            numeric: true,
+            ramp,
+            method,
+            min: 0.0,
+            max: 1.0,
+            breaks: None,
+            categories: None,
+        };
+        self.style_dialog_select_column(&mut d, ctx, true);
+        self.style_dialog = Some(d);
+    }
+
+    /// Resolve column kind + auto bounds / category fetch on (re)selection.
+    fn style_dialog_select_column(
+        &self,
+        d: &mut StyleDialog,
+        ctx: &egui::Context,
+        auto_bounds: bool,
+    ) {
+        let Some(l) = self.layers.iter().find(|l| l.id == d.layer_id) else { return };
+        let cols = Self::style_columns(&l.store);
+        let Some((_, numeric)) = cols.iter().find(|(n, _)| *n == d.column) else { return };
+        d.numeric = *numeric;
+        d.categories = None;
+        d.breaks = None;
+        if d.numeric {
+            if auto_bounds {
+                let idx = l
+                    .store
+                    .schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == &d.column);
+                if let Some((lo, hi)) = idx.and_then(|i| l.store.column_range(i)) {
+                    d.min = lo;
+                    d.max = hi;
+                }
+            }
+            if d.method.needs_values() {
+                // Classify from already-loaded rows in the background —
+                // never from the whole dataset (see the dialog note).
+                let idx = l
+                    .store
+                    .schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == &d.column);
+                if let Some(idx) = idx {
+                    let store = Arc::clone(&l.store);
+                    let loaded = l.loaded.clone();
+                    let (id, col, method) = (d.layer_id, d.column.clone(), d.method);
+                    let tx = self.class_tx.clone();
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || {
+                        let res = crate::data::loader::sample_loaded_values(
+                            &store, &loaded, idx, 50_000,
+                        )
+                        .map(|mut vals| {
+                            crate::data::layer::classify_breaks(method, &mut vals)
+                        });
+                        let _ = tx.send((id, col, res));
+                        ctx.request_repaint();
+                    });
+                }
+            } else {
+                d.breaks = Some(Ok(crate::data::layer::equal_interval_breaks(
+                    d.min, d.max,
+                )));
+            }
+        } else if let Some(sql) = self.sql_layer_of(d.layer_id) {
+            // Fetch the top category values in the background.
+            let tx = self.cat_tx.clone();
+            let (id, col) = (d.layer_id, d.column.clone());
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let res = crate::sql::engine::top_values(
+                    &sql,
+                    &col,
+                    crate::data::layer::STYLE_BINS - 1,
+                );
+                let _ = tx.send((id, col, res));
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    fn poll_classes(&mut self) {
+        while let Ok((layer_id, column, res)) = self.class_rx.try_recv() {
+            if let Some(d) = &mut self.style_dialog {
+                if d.layer_id == layer_id
+                    && d.column == column
+                    && d.numeric
+                    && d.method.needs_values()
+                {
+                    d.breaks = Some(res);
+                }
+            }
+        }
+    }
+
+    fn poll_categories(&mut self) {
+        while let Ok((layer_id, column, res)) = self.cat_rx.try_recv() {
+            if let Some(d) = &mut self.style_dialog {
+                if d.layer_id == layer_id && d.column == column && !d.numeric {
+                    d.categories = Some(res);
+                }
+            }
+        }
+    }
+
+    fn style_window(&mut self, ctx: &egui::Context) {
+        use crate::data::layer::{Ramp, StyleBy, StyleMode};
+        if self.style_dialog.is_none() {
+            return;
+        }
+        let layer_id = self.style_dialog.as_ref().unwrap().layer_id;
+        let Some(layer_idx) = self.layers.iter().position(|l| l.id == layer_id) else {
+            self.style_dialog = None;
+            return;
+        };
+        let layer_name = self.layers[layer_idx].name.clone();
+        let cols = Self::style_columns(&self.layers[layer_idx].store);
+        let current = self.layers[layer_idx].style.style_by.clone();
+
+        let mut open = true;
+        let mut reselect = false;
+        let mut apply: Option<StyleBy> = None;
+        {
+            let d = self.style_dialog.as_mut().unwrap();
+            egui::Window::new(format!("Style — {layer_name}"))
+                .id(egui::Id::new("style_dialog"))
+                .open(&mut open)
+                .default_width(360.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("column:");
+                        let before = d.column.clone();
+                        egui::ComboBox::from_id_salt("style_col")
+                            .width(200.0)
+                            .selected_text(&d.column)
+                            .show_ui(ui, |ui| {
+                                for (name, numeric) in &cols {
+                                    ui.selectable_value(
+                                        &mut d.column,
+                                        name.clone(),
+                                        format!(
+                                            "{name} {}",
+                                            if *numeric { "(numeric)" } else { "(text)" }
+                                        ),
+                                    );
+                                }
+                            });
+                        if d.column != before {
+                            reselect = true;
+                        }
+                    });
+                    if d.numeric {
+                        ui.horizontal(|ui| {
+                            ui.label("ramp:");
+                            egui::ComboBox::from_id_salt("style_ramp")
+                                .selected_text(d.ramp.label())
+                                .show_ui(ui, |ui| {
+                                    for r in Ramp::ALL {
+                                        ui.selectable_value(&mut d.ramp, *r, r.label());
+                                    }
+                                });
+                            ui.label("classes:");
+                            let before = d.method;
+                            egui::ComboBox::from_id_salt("style_method")
+                                .selected_text(d.method.label())
+                                .show_ui(ui, |ui| {
+                                    for m in crate::data::layer::ClassMethod::ALL {
+                                        ui.selectable_value(&mut d.method, *m, m.label());
+                                    }
+                                });
+                            if d.method != before {
+                                reselect = true;
+                            }
+                        });
+                        if d.method.needs_values() {
+                            ui.label(
+                                RichText::new(
+                                    "classified from the currently loaded rows only \
+                                     (never the whole dataset)",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            match &d.breaks {
+                                None => {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label(
+                                            RichText::new("classifying loaded rows…").weak(),
+                                        );
+                                    });
+                                }
+                                Some(Err(e)) => {
+                                    ui.label(
+                                        RichText::new(e)
+                                            .color(Color32::from_rgb(220, 60, 60)),
+                                    );
+                                }
+                                Some(Ok(b)) => {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} classes · breaks {:.4} … {:.4}",
+                                            b.len() + 1,
+                                            b.first().copied().unwrap_or(0.0),
+                                            b.last().copied().unwrap_or(0.0),
+                                        ))
+                                        .weak()
+                                        .small(),
+                                    );
+                                }
+                            }
+                        } else {
+                            let before = (d.min, d.max);
+                            ui.horizontal(|ui| {
+                                ui.label("min:");
+                                ui.add(egui::DragValue::new(&mut d.min).speed(0.1));
+                                ui.label("max:");
+                                ui.add(egui::DragValue::new(&mut d.max).speed(0.1));
+                            });
+                            if (d.min, d.max) != before {
+                                d.breaks =
+                                    Some(Ok(crate::data::layer::equal_interval_breaks(
+                                        d.min, d.max,
+                                    )));
+                            }
+                        }
+                        // Ramp preview strip.
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width().min(320.0), 14.0),
+                            egui::Sense::hover(),
+                        );
+                        let p = ui.painter();
+                        let n = crate::data::layer::STYLE_BINS;
+                        for i in 0..n {
+                            let c = d.ramp.sample(i as f32 / (n - 1) as f32);
+                            let x0 = rect.left() + rect.width() * i as f32 / n as f32;
+                            let x1 = rect.left() + rect.width() * (i + 1) as f32 / n as f32;
+                            p.rect_filled(
+                                egui::Rect::from_min_max(
+                                    egui::pos2(x0, rect.top()),
+                                    egui::pos2(x1, rect.bottom()),
+                                ),
+                                0.0,
+                                Color32::from_rgb(
+                                    (c[0] * 255.0) as u8,
+                                    (c[1] * 255.0) as u8,
+                                    (c[2] * 255.0) as u8,
+                                ),
+                            );
+                        }
+                    } else {
+                        match &d.categories {
+                            None => {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(RichText::new("reading category values…").weak());
+                                });
+                            }
+                            Some(Err(e)) => {
+                                ui.label(
+                                    RichText::new(e).color(Color32::from_rgb(220, 60, 60)),
+                                );
+                            }
+                            Some(Ok(values)) => {
+                                egui::ScrollArea::vertical().max_height(220.0).show(
+                                    ui,
+                                    |ui| {
+                                        for (i, v) in values.iter().enumerate() {
+                                            ui.horizontal(|ui| {
+                                                let c = palette_color(i);
+                                                let (r, _) = ui.allocate_exact_size(
+                                                    egui::vec2(12.0, 12.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                ui.painter().rect_filled(r, 2.0, c);
+                                                ui.label(v);
+                                            });
+                                        }
+                                        ui.horizontal(|ui| {
+                                            let (r, _) = ui.allocate_exact_size(
+                                                egui::vec2(12.0, 12.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().rect_filled(
+                                                r,
+                                                2.0,
+                                                Color32::from_gray(140),
+                                            );
+                                            ui.label(RichText::new("(other)").weak());
+                                        });
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let ready = if d.numeric {
+                            matches!(&d.breaks, Some(Ok(_)))
+                        } else {
+                            matches!(&d.categories, Some(Ok(v)) if !v.is_empty())
+                        };
+                        if ui.add_enabled(ready, egui::Button::new("Apply")).clicked() {
+                            apply = Some(StyleBy {
+                                column: d.column.clone(),
+                                ramp: d.ramp,
+                                mode: if d.numeric {
+                                    StyleMode::Graduated {
+                                        method: d.method,
+                                        breaks: match &d.breaks {
+                                            Some(Ok(b)) => b.clone(),
+                                            _ => Vec::new(),
+                                        },
+                                    }
+                                } else {
+                                    StyleMode::Categorical {
+                                        values: match &d.categories {
+                                            Some(Ok(v)) => v.clone(),
+                                            _ => Vec::new(),
+                                        },
+                                    }
+                                },
+                                classified_rows: None, // stamped on apply below
+                            });
+                        }
+                        if current.is_some() && ui.button("Remove styling").clicked() {
+                            apply = None;
+                            // Explicit clear: applied below via marker.
+                            d.min = f64::NAN; // marker consumed below
+                        }
+                    });
+                });
+        }
+
+        if reselect {
+            let mut d = self.style_dialog.take().unwrap();
+            self.style_dialog_select_column(&mut d, ctx, true);
+            self.style_dialog = Some(d);
+        }
+        let clear = self
+            .style_dialog
+            .as_ref()
+            .is_some_and(|d| d.min.is_nan());
+        if clear {
+            if let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) {
+                l.style.style_by = None;
+            }
+            self.style_dialog = None;
+        } else if let Some(mut sb) = apply {
+            // Same column + breaks: bins are unchanged, so ramp swaps are
+            // free. Anything else re-bins the meshes.
+            let needs_rebuild = match &current {
+                Some(cur) => cur.column != sb.column || cur.mode != sb.mode,
+                None => true,
+            };
+            if let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) {
+                // Data-dependent classes remember the loaded extent they
+                // were computed from (drives the staleness hint).
+                if matches!(
+                    &sb.mode,
+                    crate::data::layer::StyleMode::Graduated { method, .. }
+                        if method.needs_values()
+                ) {
+                    sb.classified_rows = Some(l.loaded_rows() as usize);
+                }
+                l.style.style_by = Some(sb);
+            }
+            if needs_rebuild {
+                self.restyle_layer(layer_id, ctx);
+            }
+            self.style_dialog = None;
+        }
+        if !open {
+            self.style_dialog = None;
+        }
+    }
+
+    /// Rebuild a layer's meshes so features land in their style bins.
+    fn restyle_layer(&mut self, layer_id: u64, ctx: &egui::Context) {
+        let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) else { return };
+        l.generation += 1;
+        self.rebuilding.insert(l.id);
+        loader::spawn_rebuild(
+            LoaderHandle {
+                tx: self.load_tx.clone(),
+                egui_ctx: ctx.clone(),
+            },
+            l.id,
+            l.generation,
+            l.store.clone(),
+            l.crs.clone(),
+            self.display.clone(),
+            l.loaded.clone(),
+            l.style.style_by.clone(),
+        );
     }
 
     fn url_window(&mut self, ctx: &egui::Context) {
@@ -3472,6 +4061,7 @@ impl ViewerApp {
                     point_color: [0.0; 4],
                     line_half_width_px: 0.4,
                     point_radius_px: 0.0,
+                    bin_colors: None,
                 },
             });
         }
@@ -3491,6 +4081,7 @@ impl ViewerApp {
                     point_color: [0.0; 4],
                     line_half_width_px: 0.5,
                     point_radius_px: 0.0,
+                    bin_colors: None,
                 },
             });
         }
@@ -3537,6 +4128,7 @@ impl ViewerApp {
                     point_color: [0.0; 4],
                     line_half_width_px: 0.8,
                     point_radius_px: 0.0,
+                    bin_colors: None,
                 },
             });
             if anchors.len() <= 64 {
@@ -3568,6 +4160,7 @@ impl ViewerApp {
                     point_color: [0.1, 0.85, 1.0, 1.0],
                     line_half_width_px: 1.8,
                     point_radius_px: 6.0,
+                    bin_colors: None,
                 },
             });
         }
@@ -3582,6 +4175,7 @@ impl ViewerApp {
                     point_color: [1.0, 0.8, 0.1, 1.0],
                     line_half_width_px: 1.8,
                     point_radius_px: 6.0,
+                    bin_colors: None,
                 },
             });
         }
@@ -3743,6 +4337,98 @@ pub(crate) fn build_rg_overlay(
 }
 
 /// Default border/line color: a darkened shade of the layer color.
+/// Curated, well-balanced palettes for the layer color pickers — picking
+/// from swatches beats the infinite color wheel for a data workbench.
+/// Rows: Tableau 10, ColorBrewer Dark2, ColorBrewer Set2 (soft).
+const SWATCH_ROWS: &[(&str, &[[u8; 3]])] = &[
+    ("Tableau", &[
+        [0x4E, 0x79, 0xA7], [0xF2, 0x8E, 0x2B], [0xE1, 0x57, 0x59], [0x76, 0xB7, 0xB2],
+        [0x59, 0xA1, 0x4F], [0xED, 0xC9, 0x48], [0xB0, 0x7A, 0xA1], [0xFF, 0x9D, 0xA7],
+        [0x9C, 0x75, 0x5F], [0xBA, 0xB0, 0xAC],
+    ]),
+    ("Dark", &[
+        [0x1B, 0x9E, 0x77], [0xD9, 0x5F, 0x02], [0x75, 0x70, 0xB3], [0xE7, 0x29, 0x8A],
+        [0x66, 0xA6, 0x1E], [0xE6, 0xAB, 0x02], [0xA6, 0x76, 0x1D], [0x66, 0x66, 0x66],
+    ]),
+    ("Soft", &[
+        [0x66, 0xC2, 0xA5], [0xFC, 0x8D, 0x62], [0x8D, 0xA0, 0xCB], [0xE7, 0x8A, 0xC3],
+        [0xA6, 0xD8, 0x54], [0xFF, 0xD9, 0x2F], [0xE5, 0xC4, 0x94], [0xB3, 0xB3, 0xB3],
+    ]),
+];
+
+/// Color button backed by the curated swatches: click opens a compact
+/// palette popup (with the free picker as "custom" fallback).
+/// Returns true when the color changed.
+fn swatch_color_button(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    color: &mut egui::Color32,
+    hover: &str,
+) -> bool {
+    let size = egui::vec2(20.0, 14.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let resp = resp.on_hover_text(hover);
+    let visuals = ui.style().interact(&resp);
+    ui.painter().rect_filled(rect, 2.0, *color);
+    ui.painter().rect_stroke(
+        rect,
+        2.0,
+        visuals.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    let mut changed = false;
+    let popup_id = egui::Id::new(("swatch_popup", id_salt));
+    // A plain popup (not a menu): menus close on any inner click, which
+    // would kill the inline custom picker; swatches close explicitly.
+    egui::Popup::from_toggle_button_response(&resp)
+        .id(popup_id)
+        .kind(egui::PopupKind::Popup)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+        for (name, row) in SWATCH_ROWS {
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    egui::vec2(44.0, 14.0),
+                    egui::Label::new(RichText::new(*name).weak().small()),
+                );
+                for c in *row {
+                    let col = Color32::from_rgb(c[0], c[1], c[2]);
+                    let (r, sw) =
+                        ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+                    let stroke = if *color == col {
+                        egui::Stroke::new(2.0, ui.visuals().strong_text_color())
+                    } else {
+                        ui.visuals().widgets.noninteractive.bg_stroke
+                    };
+                    ui.painter().rect_filled(r, 3.0, col);
+                    ui.painter().rect_stroke(r, 3.0, stroke, egui::StrokeKind::Inside);
+                    if sw.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        *color = col;
+                        changed = true;
+                        ui.close();
+                    }
+                }
+            });
+        }
+        ui.separator();
+        // Inline picker (no nested popup — those die with the parent).
+        egui::CollapsingHeader::new(RichText::new("custom").weak().small())
+            .id_salt("swatch_custom")
+            .show(ui, |ui| {
+                ui.set_max_width(220.0);
+                if egui::color_picker::color_picker_color32(
+                    ui,
+                    color,
+                    egui::color_picker::Alpha::Opaque,
+                ) {
+                    changed = true;
+                }
+            });
+    });
+    changed
+}
+
 fn derived_line_color(color: egui::Color32) -> egui::Color32 {
     let c = egui::Rgba::from(color);
     egui::Rgba::from_rgba_premultiplied(c.r() * 0.55, c.g() * 0.55, c.b() * 0.55, 1.0).into()
@@ -3758,6 +4444,7 @@ fn resolve_style(s: &crate::data::layer::LayerStyle) -> DrawStyle {
         point_color: [r, g, b, s.opacity],
         line_half_width_px: (s.line_width_px * 0.5).max(0.01),
         point_radius_px: s.point_radius_px.max(0.1),
+        bin_colors: s.style_by.as_ref().map(|sb| Arc::new(sb.bin_colors())),
     }
 }
 
@@ -3859,6 +4546,8 @@ impl eframe::App for ViewerApp {
         self.poll_optimizer();
         self.poll_picks();
         self.poll_repo();
+        self.poll_categories();
+        self.poll_classes();
         self.strip_uploaded_cpu_meshes(frame);
 
         // Drag & drop.
@@ -3943,6 +4632,7 @@ impl eframe::App for ViewerApp {
         self.optimize_window(&ctx);
         self.url_window(&ctx);
         self.repo_window(&ctx);
+        self.style_window(&ctx);
         self.poll_filters(&ctx);
         self.filter_window(&ctx);
         egui::CentralPanel::default()
@@ -4016,6 +4706,7 @@ mod tests {
                         point_color: [0.0; 4],
                         line_half_width_px: 0.5,
                         point_radius_px: 0.0,
+                        bin_colors: None,
                     },
                 },
                 crate::map::renderer::LayerDraw {
@@ -4028,6 +4719,7 @@ mod tests {
                         point_color: [0.0; 4],
                         line_half_width_px: 0.6,
                         point_radius_px: 0.0,
+                        bin_colors: None,
                     },
                 },
             ],

@@ -314,6 +314,7 @@ pub(crate) fn emit_bulk(
     items: &mut Vec<super::layer::PickItem>,
     bad: &mut usize,
     raw_bbox: &mut dyn FnMut(u64, [f64; 4]),
+    bins: Option<&[u8]>,
 ) -> usize {
     use super::geometry::FeatureRef;
     use super::layer::PickItem;
@@ -367,6 +368,9 @@ pub(crate) fn emit_bulk(
             continue;
         }
 
+        if let Some(b) = bins {
+            mb.bin = b[i];
+        }
         mb.expand_feature(wb);
         let mut needs_rtree = true;
         match ga.enc {
