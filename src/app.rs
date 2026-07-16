@@ -4115,8 +4115,6 @@ impl ViewerApp {
                 if total > 0 {
                     ui.monospace(format!("· {} features", fmt_count(total)));
                 }
-                let dt = ui.ctx().input(|i| i.unstable_dt);
-                ui.monospace(format!("{:.1} ms", dt * 1000.0));
                 if !self.errors.is_empty() {
                     let btn = egui::Button::new(
                         RichText::new(format!("⚠ {}", self.errors.len()))
