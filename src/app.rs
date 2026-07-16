@@ -1480,6 +1480,10 @@ impl ViewerApp {
             egui::ComboBox::from_id_salt("projection")
                 .selected_text(self.display.name.clone())
                 .width(200.0)
+                // The default CloseOnClick would dismiss the dropdown the
+                // moment the EPSG textbox is clicked; picks close it
+                // explicitly below instead.
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                 .show_ui(ui, |ui| {
                     if ui
                         .selectable_label(self.auto_projection, "Auto (fit first layer)")
@@ -1558,6 +1562,9 @@ impl ViewerApp {
                             }
                         }
                     });
+                    if pick.is_some() || picked_auto {
+                        ui.close();
+                    }
                 });
             if let Some(d) = pick {
                 self.auto_projection = picked_auto;
