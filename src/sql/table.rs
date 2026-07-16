@@ -154,7 +154,9 @@ impl TableProvider for LayerTable {
             .map(|f| {
                 let mut eq = Vec::new();
                 part_eq_constraints(f, &part_names, &mut eq);
-                if filter_bbox(f, self.geom_name()).is_some() || !eq.is_empty() {
+                let mut rects = Vec::new();
+                filter_rects(f, self.geom_name(), &mut rects);
+                if !rects.is_empty() || !eq.is_empty() {
                     // We only prune candidates; the exact predicate must
                     // still run on the surviving rows.
                     TableProviderFilterPushDown::Inexact
@@ -209,13 +211,22 @@ impl TableProvider for LayerTable {
 
         let n_groups = self.store.rg_starts().len().saturating_sub(1);
 
-        // Spatial pushdown: intersect the bboxes of every applicable
+        // Spatial pushdown: collect the required rects of every applicable
         // filter, then prune groups (metadata bboxes) and rows (covering
-        // bbox-leaf scan) exactly like a viewport load.
-        let bbox = filters
+        // bbox-leaf scan) exactly like a viewport load. When the rects'
+        // intersection is non-empty it is equivalent to intersect-all
+        // (1-D Helly per axis); when it is empty the predicates can still
+        // be satisfied by a geometry spanning both windows, so we fall
+        // back to group-level pruning against each rect.
+        let mut rects: Vec<[f64; 4]> = Vec::new();
+        for f in filters {
+            filter_rects(f, self.geom_name(), &mut rects);
+        }
+        let combined = rects
             .iter()
-            .filter_map(|f| filter_bbox(f, self.geom_name()))
+            .copied()
             .reduce(|a, b| [a[0].max(b[0]), a[1].max(b[1]), a[2].min(b[2]), a[3].min(b[3])]);
+        let bbox = combined.filter(|r| r[0] <= r[2] && r[1] <= r[3]);
 
         // Hive partition pruning: equality constraints on partition
         // columns skip whole files' row groups before any IO.
@@ -230,8 +241,8 @@ impl TableProvider for LayerTable {
                 .all(|(k, v)| self.store.part_value(g, *k) == Some(v.as_str()))
         };
 
-        let parts: Vec<GroupPart> = match bbox {
-            Some(r) if r[0] <= r[2] && r[1] <= r[3] => {
+        let parts: Vec<GroupPart> = match (bbox, rects.is_empty()) {
+            (Some(r), _) => {
                 let groups: Vec<u32> = match &self.rg_bboxes {
                     Some(b) => intersecting_rgs(b, r),
                     None => (0..n_groups as u32).collect(),
@@ -251,9 +262,27 @@ impl TableProvider for LayerTable {
                     })
                     .collect::<DfResult<_>>()?
             }
-            // Contradictory bbox (empty intersection): scan nothing.
-            Some(_) => Vec::new(),
-            None => (0..n_groups)
+            // Disjoint AND-ed windows: a matching geometry must span every
+            // rect, so keep groups whose bbox intersects ALL of them and
+            // let DataFusion apply the exact predicates (no row-level
+            // selection — a single rect can't represent the conjunction).
+            (None, false) => {
+                let intersects = |b: &[f64; 4], r: &[f64; 4]| {
+                    b[0] <= r[2] && b[2] >= r[0] && b[1] <= r[3] && b[3] >= r[1]
+                };
+                (0..n_groups)
+                    .filter(|&g| group_kept(g))
+                    .filter(|&g| match &self.rg_bboxes {
+                        Some(boxes) => rects.iter().all(|r| intersects(&boxes[g], r)),
+                        None => true,
+                    })
+                    .map(|g| GroupPart {
+                        group: g,
+                        ranges: None,
+                    })
+                    .collect()
+            }
+            (None, true) => (0..n_groups)
                 .filter(|&g| group_kept(g))
                 .map(|g| GroupPart {
                     group: g,
@@ -288,20 +317,18 @@ struct GroupPart {
     ranges: Option<Vec<(u32, u32)>>,
 }
 
-/// The pruning bbox implied by one pushed-down filter, if any: a spatial
-/// predicate relating the geometry column to a literal WKB geometry.
-/// Conjunctions recurse; any other shape yields None.
-fn filter_bbox(expr: &Expr, geom_name: &str) -> Option<[f64; 4]> {
+/// The pruning rects implied by one pushed-down filter: one per spatial
+/// predicate relating the geometry column to a literal WKB geometry, all
+/// of which a matching row must intersect. Conjunctions concatenate; any
+/// other shape contributes nothing. Kept as a LIST because collapsing
+/// AND-ed rects to their intersection is only sound when that
+/// intersection is non-empty (1-D Helly per axis) — a large geometry can
+/// intersect two disjoint windows.
+fn filter_rects(expr: &Expr, geom_name: &str, out: &mut Vec<[f64; 4]>) {
     match expr {
         Expr::BinaryExpr(b) if b.op == datafusion::logical_expr::Operator::And => {
-            let l = filter_bbox(&b.left, geom_name);
-            let r = filter_bbox(&b.right, geom_name);
-            match (l, r) {
-                (Some(a), Some(b)) => {
-                    Some([a[0].max(b[0]), a[1].max(b[1]), a[2].min(b[2]), a[3].min(b[3])])
-                }
-                (one, None) | (None, one) => one,
-            }
+            filter_rects(&b.left, geom_name, out);
+            filter_rects(&b.right, geom_name, out);
         }
         Expr::ScalarFunction(f) => {
             let name = f.func.name();
@@ -310,28 +337,31 @@ fn filter_bbox(expr: &Expr, geom_name: &str) -> Option<[f64; 4]> {
                 "st_intersects" | "st_within" | "st_contains" | "st_dwithin"
             );
             if !spatial {
-                return None;
+                return;
             }
             // One side must be the geometry column, the other a literal.
-            let (a, b) = (f.args.first()?, f.args.get(1)?);
-            let lit = if is_geom_column(a, geom_name) {
-                literal_geom_bbox(b)?
-            } else if is_geom_column(b, geom_name) {
-                literal_geom_bbox(a)?
-            } else {
-                return None;
+            let (Some(a), Some(b)) = (f.args.first(), f.args.get(1)) else {
+                return;
             };
+            let lit = if is_geom_column(a, geom_name) {
+                literal_geom_bbox(b)
+            } else if is_geom_column(b, geom_name) {
+                literal_geom_bbox(a)
+            } else {
+                None
+            };
+            let Some(lit) = lit else { return };
             let pad = if name == "st_dwithin" {
-                match f.args.get(2)? {
-                    Expr::Literal(ScalarValue::Float64(Some(d)), _) => d.abs(),
-                    _ => return None,
+                match f.args.get(2) {
+                    Some(Expr::Literal(ScalarValue::Float64(Some(d)), _)) => d.abs(),
+                    _ => return,
                 }
             } else {
                 0.0
             };
-            Some([lit[0] - pad, lit[1] - pad, lit[2] + pad, lit[3] + pad])
+            out.push([lit[0] - pad, lit[1] - pad, lit[2] + pad, lit[3] + pad]);
         }
-        _ => None,
+        _ => {}
     }
 }
 
@@ -733,16 +763,48 @@ mod tests {
         assert_eq!(scan.parts.len(), n_groups);
         assert!(scan.parts.iter().all(|p| p.ranges.is_none()));
 
-        // Two disjoint windows AND-ed: contradictory, nothing to scan.
+        // Two disjoint windows AND-ed: NOT contradictory — a geometry can
+        // span both. The scan must keep exactly the groups whose bbox
+        // intersects BOTH rects (none here, since `far` is outside the
+        // data extent), pruning by each rect rather than their empty
+        // intersection.
         let far = [b0[0] - 1e6, b0[1] - 1e6, b0[0] - 9e5, b0[1] - 9e5];
         let f2 = st_intersects.call(vec![
             col("geometry"),
             Expr::Literal(ScalarValue::Binary(Some(envelope_wkb(far))), None),
         ]);
         let plan = rt
-            .block_on(table.scan(&state, None, &[filter, f2], None))
+            .block_on(table.scan(&state, None, &[filter.clone(), f2], None))
             .unwrap();
         let scan = plan.downcast_ref::<LayerScanExec>().unwrap();
-        assert!(scan.parts.is_empty(), "disjoint bboxes scan nothing");
+        assert!(
+            scan.parts.is_empty(),
+            "no group bbox spans both disjoint windows here"
+        );
+        // Two disjoint windows both inside the data extent: groups whose
+        // bbox spans both must survive (full-group scan, exact predicate
+        // re-applied by DataFusion).
+        let all: Vec<[f64; 4]> = table.rg_bboxes.as_ref().unwrap().to_vec();
+        let g0 = all[0];
+        let west = [g0[0], g0[1], g0[0] + (g0[2] - g0[0]) * 0.1, g0[3]];
+        let east = [g0[2] - (g0[2] - g0[0]) * 0.1, g0[1], g0[2], g0[3]];
+        let fw = st_intersects.call(vec![
+            col("geometry"),
+            Expr::Literal(ScalarValue::Binary(Some(envelope_wkb(west))), None),
+        ]);
+        let fe = st_intersects.call(vec![
+            col("geometry"),
+            Expr::Literal(ScalarValue::Binary(Some(envelope_wkb(east))), None),
+        ]);
+        let plan = rt.block_on(table.scan(&state, None, &[fw, fe], None)).unwrap();
+        let scan = plan.downcast_ref::<LayerScanExec>().unwrap();
+        assert!(
+            !scan.parts.is_empty(),
+            "group 0 spans both disjoint windows and must be scanned"
+        );
+        assert!(
+            scan.parts.iter().all(|p| p.ranges.is_none()),
+            "disjoint conjunction scans whole groups (no single-rect row selection)"
+        );
     }
 }

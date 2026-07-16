@@ -294,6 +294,38 @@ deep zoom stays jitter-free.
 
 ## Roadmap ideas
 
+### Review backlog (2026-07 multi-agent deep review, confirmed findings)
+
+The 8 high-severity findings are fixed; these remain, in priority order:
+
+- [medium] `src/app.rs:1815` — Removing a layer orphans in-flight append/rebuild work; rebuilds are entirely uncancellable
+- [medium] `src/app.rs:2118` — Repo manifest results carry no dataset identity: a slow fetch for dataset A lands on dataset B's selection
+- [medium] `src/app.rs:906` — Stale auto-projection adoption overrides a projection the user picked mid-load
+- [medium] `src/app.rs:1993` — load_context does not cancel in-flight loads: pre-restore layers join the restored session and clobber the restored camera
+- [medium] `src/data/crs.rs:108` — from_geoparquet_crs silently relabels any id-less geographic CRS (incl. OGC:CRS27/NAD27) as 'WGS 84'
+- [medium] `src/data/geometry.rs:652` — split_oversized breaks the per-chunk LOD invariant: finish()'s alias step then deletes LOD line data and bounds_local mis-culls split parts
+- [medium] `src/data/loader.rs:1663` — Rect-filtered previews are recorded as plain Preview{stride}, so rebuilds and classification sampling target a different row set than was loaded
+- [medium] `src/data/loader.rs:1810` — Computed per-row-group bboxes silently skip groups with no decodable geometry, producing an index-misaligned boxes vector that refinement indexes by group id
+- [medium] `src/data/optimize.rs:542` — Optimize silently drops any source column named 'bbox', even when it is an ordinary attribute
+- [medium] `src/data/partition.rs:291` — sanitize_hive_value truncates non-ASCII codepoints to their low byte: partition collisions and corrupted values on reload
+- [medium] `src/data/repo.rs:262` — Repository probe runs ~117 blocking HEAD requests on the global rayon pool, starving tessellation
+- [medium] `src/data/source.rs:384` — Anonymous S3 object URLs are built without percent-encoding the key, so public objects with reserved characters fail (while the credentialed path works)
+- [medium] `src/data/source.rs:83` — redact_presign truncates the message at the query string, discarding the actual error cause for every S3 resolve failure
+- [medium] `src/data/store.rs:842` — percent_decode panics on '%' followed by multibyte UTF-8 (non-char-boundary str slice)
+- [medium] `src/picking.rs:82` — MultiPoint members outside their feature's bbox-center cell are unpickable
+- [medium] `src/sql/engine.rs:461` — detect_geometry picks the result CRS by substring match on the query text, choosing the wrong layer's CRS for prefix table names
+- [medium] `src/sql/engine.rs:283` — top_values/distinct_counts build SQL by interpolating raw column names: quotes break the query, lowercase-collisions silently query the wrong column
+- [low] `src/app.rs:3048` — OptMsg::Cardinalities carries no layer identity and can suppress or mislabel counts for a different layer's optimize dialog
+- [low] `src/app.rs:941` — Rebuilt message for a removed layer (or a late stale duplicate) still triggers pending_fit, jumping the camera
+- [low] `src/data/geometry.rs:759` — size_index starts at max_extent/2, so a chunk's largest features vanish while still 4-8 px on screen
+- [low] `src/data/loader.rs:1264` — Native geospatial statistics with antimeridian wraparound (xmin > xmax) turn into never-intersecting pruning boxes
+- [low] `src/data/optimize.rs:882` — geometry_types written without ' Z' suffix while pass-through WKB retains Z coordinates (invalid GeoParquet metadata)
+- [low] `src/data/repo.rs:176` — Non-atomic read-modify-write of repo_cache.json and repositories.json: concurrent sessions lose data, partial writes silently drop user repos
+- [low] `src/data/repo.rs:94` — exists() treats any transport error as 'dataset absent', so transient failures produce a silently incomplete dataset list that is persisted to the on-disk cache
+- [low] `src/sql/export.rs:167` — SQL export hardcodes PROJJSON type 'ProjectedCRS' for every EPSG code, including geographic CRSs
+
+### Features
+
 - Overview/pyramid levels for zoomed-out views of huge remote files
   (decimated previews bound memory today, but a world view of a huge
   remote file still downloads every candidate row group's coordinates)

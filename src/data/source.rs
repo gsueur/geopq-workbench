@@ -24,6 +24,15 @@ pub(crate) fn http_agent() -> &'static ureq::Agent {
     AGENT.get_or_init(|| {
         ureq::Agent::config_builder()
             .http_status_as_error(false)
+            // A stalled connection must never hang a load forever:
+            // cancellation flags are only checked between reads, so a
+            // blocked read would be uninterruptible. Individual range
+            // requests are bounded (windows ≤ 8 MB, prefetch segments
+            // split to ≤ 32 MB), so these are ample even on slow links.
+            .timeout_resolve(Some(std::time::Duration::from_secs(10)))
+            .timeout_connect(Some(std::time::Duration::from_secs(10)))
+            .timeout_recv_response(Some(std::time::Duration::from_secs(30)))
+            .timeout_recv_body(Some(std::time::Duration::from_secs(120)))
             .build()
             .into()
     })

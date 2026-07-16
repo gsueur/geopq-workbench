@@ -52,6 +52,9 @@ pub enum LoadMsg {
     },
     /// A row append ended without a result (error or user cancel).
     AppendEnded { layer_id: u64, error: String },
+    /// A projection/filter rebuild failed (the layer keeps its previous
+    /// geometry; the app must clear its rebuilding flag).
+    RebuildFailed { layer_id: u64, error: String },
     /// Additional rows loaded for an existing layer (new section).
     Appended {
         layer_id: u64,
@@ -615,10 +618,9 @@ pub fn spawn_rebuild(
                 stats_build_ms: t0.elapsed().as_millis() as u64,
                 bad_geoms: bad,
             }),
-            Err(e) => handle.send(LoadMsg::Failed {
-                job: u64::MAX,
-                source: store.source.label(),
-                error: format!("projection rebuild failed: {e}"),
+            Err(e) => handle.send(LoadMsg::RebuildFailed {
+                layer_id,
+                error: format!("{}: projection rebuild failed: {e}", store.source.label()),
             }),
         }
     });

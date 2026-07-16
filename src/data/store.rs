@@ -626,10 +626,27 @@ fn prefetch_columns(
     let reader = frag.source.open()?;
     let len = parquet::file::reader::Length::len(&reader);
     let mut fetched: Vec<(u64, Bytes)> = Vec::with_capacity(segments.len());
+    // Cap individual requests so the agent's body timeout can be tight
+    // without failing legitimate large transfers on slow links.
+    const REQUEST_CAP: u64 = 32 * 1024 * 1024;
     for (o, l) in segments {
-        let bytes = parquet::file::reader::ChunkReader::get_bytes(&reader, o, l as usize)
-            .map_err(|e| format!("prefetch failed: {e}"))?;
-        fetched.push((o, bytes));
+        if l <= REQUEST_CAP {
+            let bytes = parquet::file::reader::ChunkReader::get_bytes(&reader, o, l as usize)
+                .map_err(|e| format!("prefetch failed: {e}"))?;
+            fetched.push((o, bytes));
+            continue;
+        }
+        let mut buf = Vec::with_capacity(l as usize);
+        let mut pos = 0u64;
+        while pos < l {
+            let take = REQUEST_CAP.min(l - pos);
+            let part =
+                parquet::file::reader::ChunkReader::get_bytes(&reader, o + pos, take as usize)
+                    .map_err(|e| format!("prefetch failed: {e}"))?;
+            buf.extend_from_slice(&part);
+            pos += take;
+        }
+        fetched.push((o, Bytes::from(buf)));
     }
     log::debug!(
         "prefetched {} segment(s), {} B for {} column roots",

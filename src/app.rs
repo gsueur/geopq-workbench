@@ -20,8 +20,8 @@ const HIGHLIGHT_KEY: u64 = u64::MAX;
 /// Separate render layer for the SQL checked-rows selection, so picking a
 /// feature on the map doesn't wipe it.
 const SQL_HIGHLIGHT_KEY: u64 = u64::MAX - 1;
-const GRATICULE_KEY: u64 = u64::MAX - 1;
-const COASTLINE_KEY: u64 = u64::MAX - 2;
+const GRATICULE_KEY: u64 = u64::MAX - 2;
+const COASTLINE_KEY: u64 = u64::MAX - 3;
 /// Row-group bbox overlays: key = RG_OVERLAY_BASE | layer id.
 const RG_OVERLAY_BASE: u64 = 1 << 62;
 
@@ -968,14 +968,22 @@ impl ViewerApp {
                         }
                     }
                 }
+                LoadMsg::RebuildFailed { layer_id, error } => {
+                    // The layer keeps drawing its previous-generation
+                    // sections; without this the spinner and the rebuild
+                    // gate stayed on forever.
+                    self.rebuilding.remove(&layer_id);
+                    self.push_error(error);
+                }
                 LoadMsg::AppendEnded { layer_id, error } => {
                     self.appending.remove(&layer_id);
                     self.append_cancel.remove(&layer_id);
-                    if error == loader::CANCELLED {
-                        // Hold refinement until the camera moves, or the
-                        // same viewport would immediately respawn the job.
-                        self.refine_hold.insert(layer_id);
-                    } else {
+                    // Hold refinement until the camera moves — for cancels
+                    // AND failures: the unchanged viewport would otherwise
+                    // respawn the identical (failing) job every frame,
+                    // spamming errors and network requests.
+                    self.refine_hold.insert(layer_id);
+                    if error != loader::CANCELLED {
                         self.push_error(error);
                     }
                 }
@@ -1124,14 +1132,21 @@ impl ViewerApp {
             // Row-budget guard: refining a preview at a wide viewport
             // would decode the very load the preview avoided. Estimate
             // rect jobs by viewport/bbox area overlap and wait for a
-            // tighter zoom when the estimate exceeds the budget.
+            // tighter zoom when the estimate exceeds the budget. The
+            // area estimate is only meaningful when the store can subset
+            // rows per feature (covering column or x/y coordinates) —
+            // otherwise a Rect job decodes the WHOLE group.
+            let selectable =
+                l.store.covering.is_some() || l.store.xy_geom.is_some();
             let est: u64 = jobs
                 .iter()
                 .map(|j| match j {
                     GroupSel::Ranges(_, rs) => {
                         rs.iter().map(|&(s, e)| (e - s) as u64).sum()
                     }
-                    GroupSel::Rect(g, r) | GroupSel::Preview { group: g, rect: Some(r), .. } => {
+                    GroupSel::Rect(g, r) | GroupSel::Preview { group: g, rect: Some(r), .. }
+                        if selectable =>
+                    {
                         let gb = rg.boxes[*g as usize];
                         let n = starts[*g as usize + 1] - starts[*g as usize];
                         let (bw, bh) = (gb[2] - gb[0], gb[3] - gb[1]);
@@ -1143,8 +1158,14 @@ impl ViewerApp {
                             ((iw * ih) / (bw * bh) * n as f64).ceil() as u64
                         }
                     }
-                    GroupSel::All(g) | GroupSel::Preview { group: g, rect: None, .. } => {
-                        starts[*g as usize + 1] - starts[*g as usize]
+                    j => {
+                        let g = match j {
+                            GroupSel::All(g)
+                            | GroupSel::Rect(g, _)
+                            | GroupSel::Preview { group: g, .. } => *g,
+                            GroupSel::Ranges(g, _) => *g,
+                        };
+                        starts[g as usize + 1] - starts[g as usize]
                     }
                 })
                 .sum();
@@ -1885,7 +1906,7 @@ impl ViewerApp {
             use crate::data::loader::{complement_ranges, GroupSel};
             let ctx = ui.ctx().clone();
             if let Some(l) = self.layers.iter().find(|l| l.id == id) {
-                if !self.appending.contains(&id) {
+                if !self.appending.contains(&id) && !self.rebuilding.contains(&id) {
                     let starts = l.store.rg_starts();
                     let missing: Vec<GroupSel> = l
                         .loaded

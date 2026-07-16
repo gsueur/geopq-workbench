@@ -113,7 +113,13 @@ pub fn summarize_geo_meta(
                 }
                 if let Some(bbox) = col.get("bbox").and_then(Value::as_array) {
                     let v: Vec<f64> = bbox.iter().filter_map(Value::as_f64).collect();
-                    if v.len() >= 4 {
+                    // 6 elements = 3D per spec: [xmin, ymin, zmin, xmax,
+                    // ymax, zmax]. Taking the first four would put zmin/
+                    // xmax into the xmax/ymax slots (and this bbox feeds
+                    // row-group pruning as a fallback).
+                    if v.len() >= 6 {
+                        info.bbox = Some([v[0], v[1], v[3], v[4]]);
+                    } else if v.len() >= 4 {
                         info.bbox = Some([v[0], v[1], v[2], v[3]]);
                     }
                 }
@@ -153,4 +159,29 @@ pub fn summarize_geo_meta(
         }
     }
     info
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bbox_parses_2d_and_3d() {
+        let meta = |bbox: &str| -> GeoParquetInfo {
+            let m: Value = serde_json::from_str(&format!(
+                r#"{{"version":"1.0.0","primary_column":"geometry",
+                     "columns":{{"geometry":{{"encoding":"WKB","bbox":{bbox}}}}}}}"#
+            ))
+            .unwrap();
+            summarize_geo_meta(Some(&m), "geometry", "WGS 84", false)
+        };
+        // 2D bbox passes through.
+        assert_eq!(meta("[-5.0, 41.0, 10.0, 51.0]").bbox, Some([-5.0, 41.0, 10.0, 51.0]));
+        // 3D bbox is [xmin, ymin, zmin, xmax, ymax, zmax] per spec: the
+        // 2D box must be [xmin, ymin, xmax, ymax], not the first four.
+        assert_eq!(
+            meta("[-5.0, 41.0, 0.0, 10.0, 51.0, 200.0]").bbox,
+            Some([-5.0, 41.0, 10.0, 51.0])
+        );
+    }
 }
