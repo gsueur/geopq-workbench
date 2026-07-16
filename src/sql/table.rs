@@ -34,7 +34,6 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream,
 };
-use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 
 use crate::data::geoarrow::{GeomCol, GeomEncoding};
 use crate::data::loader::{covering_select, decode_wkb, intersecting_rgs};
@@ -119,11 +118,12 @@ impl LayerTable {
     }
 
     /// Table-schema names of the virtual hive partition columns (they sit
-    /// right after the base fields, before the row-index column).
+    /// after the base fields and the optional virtual x/y geometry,
+    /// before the row-index column).
     fn part_field_names(&self) -> Vec<String> {
-        let base = self.store.base_fields();
+        let first = self.store.first_part_index();
         (0..self.store.part_cols.len())
-            .map(|k| self.schema.field(base + k).name().clone())
+            .map(|k| self.schema.field(first + k).name().clone())
             .collect()
     }
 }
@@ -179,14 +179,15 @@ impl TableProvider for LayerTable {
         let out_schema = Arc::new(self.schema.project(&projection)?);
 
         // Columns are decoded in file order whatever the requested order;
-        // remember where each output column comes from — the decoded batch,
-        // a hive partition value, or the synthetic row-index (the latter
-        // two are not file columns).
-        let base = self.store.base_fields();
+        // remember where each output column comes from — the decoded batch
+        // (base fields and the virtual x/y geometry, both served by the
+        // group reader), a hive partition value, or the synthetic
+        // row-index.
+        let first_part = self.store.first_part_index();
         let mut read_cols: Vec<usize> = projection
             .iter()
             .copied()
-            .filter(|&p| p < base)
+            .filter(|&p| p < first_part)
             .collect();
         read_cols.sort_unstable();
         read_cols.dedup();
@@ -195,8 +196,8 @@ impl TableProvider for LayerTable {
             .map(|p| {
                 if Some(*p) == self.row_index_field {
                     ColSrc::RowIndex
-                } else if *p >= base {
-                    ColSrc::Part(*p - base)
+                } else if *p >= first_part {
+                    ColSrc::Part(*p - first_part)
                 } else {
                     ColSrc::Read(read_cols.binary_search(p).expect("projected col present"))
                 }
@@ -475,7 +476,7 @@ struct GroupIter {
     read_cols: Vec<usize>,
     reorder: Vec<ColSrc>,
     geom_read_idx: Option<usize>,
-    reader: Option<ParquetRecordBatchReader>,
+    reader: Option<crate::data::store::GroupReader>,
     done: bool,
     /// Row-index tracking through a range selection: (range idx, offset).
     sel_cursor: (usize, u32),

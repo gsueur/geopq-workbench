@@ -64,6 +64,10 @@ pub struct FeatureStore {
     pub encoding: GeomEncoding,
     /// Hive partition-key column names, in schema order (appended last).
     pub part_cols: Vec<String>,
+    /// Geometry synthesized from two coordinate columns (x/lon, y/lat base
+    /// field indices): the schema gains a virtual Struct{x,y} field right
+    /// after the base fields and `geom_col` points at it.
+    pub xy_geom: Option<(usize, usize)>,
     /// Rows per row group, global order across fragments.
     rg_rows: Vec<u64>,
     /// Cumulative start row of each row group (len = rg_rows.len() + 1).
@@ -82,6 +86,7 @@ impl FeatureStore {
         covering: Option<CoveringCol>,
         encoding: GeomEncoding,
         rg_rows: Vec<u64>,
+        xy_geom: Option<(usize, usize)>,
     ) -> Self {
         let frag = Fragment {
             source: source.clone(),
@@ -98,6 +103,7 @@ impl FeatureStore {
             schema,
             covering,
             encoding,
+            xy_geom,
         )
     }
 
@@ -113,6 +119,7 @@ impl FeatureStore {
         base_schema: SchemaRef,
         covering: Option<CoveringCol>,
         encoding: GeomEncoding,
+        xy_geom: Option<(usize, usize)>,
     ) -> Self {
         let mut fragments = Vec::with_capacity(frags.len());
         let mut rg_rows: Vec<u64> = Vec::new();
@@ -135,11 +142,22 @@ impl FeatureStore {
             s += r;
             rg_starts.push(s);
         }
-        let schema = if part_cols.is_empty() {
+        let base_len = base_schema.fields().len();
+        let mut geom_col = geom_col;
+        let schema = if part_cols.is_empty() && xy_geom.is_none() {
             base_schema
         } else {
             let mut fields: Vec<Field> =
                 base_schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+            if xy_geom.is_some() {
+                let name = if base_schema.index_of("geometry").is_ok() {
+                    "xy_geometry"
+                } else {
+                    "geometry"
+                };
+                fields.push(Field::new(name, DataType::Struct(xy_fields()), true));
+                geom_col = base_len;
+            }
             for name in &part_cols {
                 fields.push(Field::new(name, DataType::Utf8, true));
             }
@@ -153,6 +171,7 @@ impl FeatureStore {
             covering,
             encoding,
             part_cols,
+            xy_geom,
             rg_rows,
             rg_starts,
             rg_frag,
@@ -169,9 +188,16 @@ impl FeatureStore {
     }
 
     /// Fields that exist in the files (schema fields before the virtual
-    /// partition columns).
+    /// x/y geometry and partition columns).
     pub fn base_fields(&self) -> usize {
-        self.schema.fields().len() - self.part_cols.len()
+        self.schema.fields().len()
+            - self.part_cols.len()
+            - self.xy_geom.map_or(0, |_| 1)
+    }
+
+    /// Schema index of the first virtual partition column.
+    pub fn first_part_index(&self) -> usize {
+        self.base_fields() + self.xy_geom.map_or(0, |_| 1)
     }
 
     pub fn is_partitioned(&self) -> bool {
@@ -190,20 +216,42 @@ impl FeatureStore {
 
     /// Open a reader over one global row group (row-group pruned loading).
     /// `ranges`: group-relative [start, end) row spans to decode (sorted,
-    /// non-overlapping); None reads the whole group. `columns`: arrow root
-    /// field indices to project (base fields only — virtual partition
-    /// columns don't exist in the files), or None for all base fields.
+    /// non-overlapping); None reads the whole group. `columns`: arrow
+    /// schema indices to project — base fields plus, on x/y stores, the
+    /// virtual geometry (assembled per batch); None = all of those.
+    /// Virtual partition columns are not readable here.
     pub fn reader_for_group(
         &self,
         group: usize,
         batch_size: usize,
         ranges: Option<&[(u32, u32)]>,
         columns: Option<&[usize]>,
-    ) -> Result<ParquetRecordBatchReader, String> {
+    ) -> Result<GroupReader, String> {
+        let base = self.base_fields();
         debug_assert!(
-            columns.is_none_or(|c| c.iter().all(|&i| i < self.base_fields())),
+            columns.is_none_or(|c| c.iter().all(|&i| i < self.first_part_index())),
             "virtual partition columns cannot be read from files"
         );
+        let requested: Vec<usize> = match columns {
+            Some(c) => {
+                let mut c = c.to_vec();
+                c.sort_unstable();
+                c.dedup();
+                c
+            }
+            None => (0..self.first_part_index()).collect(),
+        };
+        // File columns to read: base fields, plus x/y when the virtual
+        // geometry is requested.
+        let geom_requested = self.xy_geom.is_some() && requested.contains(&base);
+        let mut reads: Vec<usize> = requested.iter().copied().filter(|&i| i < base).collect();
+        if geom_requested {
+            let (x, y) = self.xy_geom.unwrap();
+            reads.extend([x, y]);
+            reads.sort_unstable();
+            reads.dedup();
+        }
+
         let frag = self.frag_of_group(group);
         let local = group - frag.rg_offset;
         // Remote file without a page index: the reader would stream every
@@ -211,25 +259,48 @@ impl FeatureStore {
         // scans over wide remote files never finish that way). Prefetch
         // the group's projected chunks in a few coalesced range requests
         // instead. With a page index, per-page fetches are already exact.
-        if frag.source.is_remote() && frag.meta.metadata().offset_index().is_none() {
-            let roots: Vec<usize> = match columns {
-                Some(c) => c.to_vec(),
-                None => (0..self.base_fields()).collect(),
-            };
-            if let Some(cache) =
-                prefetch_columns(frag, &[local], &roots, GROUP_PREFETCH_MAX_BYTES)?
-            {
-                return open_file_group_reader(
-                    cache,
+        let inner = if frag.source.is_remote()
+            && frag.meta.metadata().offset_index().is_none()
+        {
+            match prefetch_columns(frag, &[local], &reads, GROUP_PREFETCH_MAX_BYTES)? {
+                Some(cache) => {
+                    open_file_group_reader(cache, &frag.meta, local, batch_size, ranges, Some(&reads))?
+                }
+                None => open_file_group_reader(
+                    frag.source.open()?,
                     &frag.meta,
                     local,
                     batch_size,
                     ranges,
-                    columns,
-                );
+                    Some(&reads),
+                )?,
             }
+        } else {
+            open_file_group_reader(frag.source.open()?, &frag.meta, local, batch_size, ranges, Some(&reads))?
+        };
+
+        if !geom_requested {
+            return Ok(GroupReader::Plain(inner));
         }
-        open_file_group_reader(frag.source.open()?, &frag.meta, local, batch_size, ranges, columns)
+        // Map each requested output column to the read batch / assembly.
+        let (x, y) = self.xy_geom.unwrap();
+        let pos = |i: usize| reads.binary_search(&i).expect("read col present");
+        let cols: Vec<XyColSrc> = requested
+            .iter()
+            .map(|&i| {
+                if i == base {
+                    XyColSrc::Geom { x: pos(x), y: pos(y) }
+                } else {
+                    XyColSrc::Read(pos(i))
+                }
+            })
+            .collect();
+        let schema = Arc::new(
+            self.schema
+                .project(&requested)
+                .map_err(|e| format!("projection: {e}"))?,
+        );
+        Ok(GroupReader::Xy { inner, schema, cols })
     }
 
     /// Fetch specific rows (global row indices, must be sorted and unique).
@@ -254,6 +325,7 @@ impl FeatureStore {
             }
         }
         let base = self.base_fields();
+        let first_part = self.first_part_index();
         let cols: Vec<usize> = match columns {
             Some(c) => {
                 let mut c = c.to_vec();
@@ -263,8 +335,19 @@ impl FeatureStore {
             }
             None => (0..self.schema.fields().len()).collect(),
         };
-        let real: Vec<usize> = cols.iter().copied().filter(|&i| i < base).collect();
-        let virt: Vec<usize> = cols.iter().copied().filter(|&i| i >= base).collect();
+        // File columns to read: base fields, plus x/y when the virtual
+        // geometry is requested.
+        let geom_requested =
+            self.xy_geom.is_some() && cols.iter().any(|&c| c == base);
+        let mut real: Vec<usize> = cols.iter().copied().filter(|&i| i < base).collect();
+        if geom_requested {
+            let (x, y) = self.xy_geom.unwrap();
+            real.extend([x, y]);
+            real.sort_unstable();
+            real.dedup();
+        }
+        let has_virtual =
+            geom_requested || cols.iter().any(|&c| c >= first_part) || real.len() != cols.len();
         let out_schema = Arc::new(
             self.schema
                 .project(&cols)
@@ -289,14 +372,23 @@ impl FeatureStore {
                 .collect();
             let batches = self.fetch_from_fragment(fi, &local, &real)?;
             for b in batches {
-                if virt.is_empty() && self.part_cols.is_empty() {
+                if !has_virtual {
                     out.push(b);
                     continue;
                 }
-                let mut arrays: Vec<ArrayRef> = b.columns().to_vec();
-                for &v in &virt {
-                    let val = frag.part_values.get(v - base).and_then(|o| o.as_deref());
-                    arrays.push(Arc::new(StringArray::from(vec![val; b.num_rows()])));
+                let pos = |i: usize| real.binary_search(&i).expect("read col present");
+                let mut arrays: Vec<ArrayRef> = Vec::with_capacity(cols.len());
+                for &c in &cols {
+                    if c < base {
+                        arrays.push(Arc::clone(b.column(pos(c))));
+                    } else if geom_requested && c == base {
+                        let (x, y) = self.xy_geom.unwrap();
+                        arrays.push(xy_struct(b.column(pos(x)), b.column(pos(y)))?);
+                    } else {
+                        let val =
+                            frag.part_values.get(c - first_part).and_then(|o| o.as_deref());
+                        arrays.push(Arc::new(StringArray::from(vec![val; b.num_rows()])));
+                    }
                 }
                 let opts = RecordBatchOptions::new().with_row_count(Some(b.num_rows()));
                 out.push(
@@ -569,6 +661,83 @@ impl parquet::file::reader::ChunkReader for Prefetched {
     }
 }
 
+/// Child fields of the virtual x/y geometry struct (GeoArrow "point"
+/// separated layout — the existing point accessor consumes it directly).
+fn xy_fields() -> arrow::datatypes::Fields {
+    vec![
+        Field::new("x", DataType::Float64, true),
+        Field::new("y", DataType::Float64, true),
+    ]
+    .into()
+}
+
+/// Assemble the virtual geometry struct from two coordinate arrays
+/// (cast to f64; a row is null when either coordinate is null).
+fn xy_struct(x: &ArrayRef, y: &ArrayRef) -> Result<ArrayRef, String> {
+    use arrow::array::StructArray;
+    use arrow::buffer::NullBuffer;
+    let cx = arrow::compute::cast(x, &DataType::Float64)
+        .map_err(|e| format!("x column cast: {e}"))?;
+    let cy = arrow::compute::cast(y, &DataType::Float64)
+        .map_err(|e| format!("y column cast: {e}"))?;
+    let nulls = NullBuffer::union(cx.nulls(), cy.nulls());
+    Ok(Arc::new(StructArray::new(xy_fields(), vec![cx, cy], nulls)))
+}
+
+/// Where one output column of a [`GroupReader::Xy`] batch comes from.
+pub(crate) enum XyColSrc {
+    /// Position in the decoded file batch.
+    Read(usize),
+    /// The virtual geometry, assembled from these batch positions.
+    Geom { x: usize, y: usize },
+}
+
+/// Batches of one row group; on x/y stores the virtual geometry struct is
+/// assembled into each batch.
+pub enum GroupReader {
+    Plain(ParquetRecordBatchReader),
+    Xy {
+        inner: ParquetRecordBatchReader,
+        schema: SchemaRef,
+        cols: Vec<XyColSrc>,
+    },
+}
+
+impl Iterator for GroupReader {
+    type Item = Result<RecordBatch, arrow::error::ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            GroupReader::Plain(r) => r.next(),
+            GroupReader::Xy { inner, schema, cols } => {
+                let batch = match inner.next()? {
+                    Ok(b) => b,
+                    Err(e) => return Some(Err(e)),
+                };
+                let arrays: Result<Vec<ArrayRef>, String> = cols
+                    .iter()
+                    .map(|c| match c {
+                        XyColSrc::Read(i) => Ok(Arc::clone(batch.column(*i))),
+                        XyColSrc::Geom { x, y } => {
+                            xy_struct(batch.column(*x), batch.column(*y))
+                        }
+                    })
+                    .collect();
+                let arrays = match arrays {
+                    Ok(a) => a,
+                    Err(e) => {
+                        return Some(Err(arrow::error::ArrowError::ComputeError(e)))
+                    }
+                };
+                let opts = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+                Some(
+                    RecordBatch::try_new_with_options(Arc::clone(schema), arrays, &opts)
+                )
+            }
+        }
+    }
+}
+
 /// Open a reader over one row group of one file (the single-file primitive
 /// behind [`FeatureStore::reader_for_group`]).
 fn open_file_group_reader<R: parquet::file::reader::ChunkReader + 'static>(
@@ -696,7 +865,7 @@ mod tests {
         assert!(rg_rows.len() > 1, "fixture should have several row groups");
         let geom_col = schema.index_of("geometry").unwrap();
         let store =
-            FeatureStore::new(source, meta, geom_col, schema, None, GeomEncoding::Wkb, rg_rows);
+            FeatureStore::new(source, meta, geom_col, schema, None, GeomEncoding::Wkb, rg_rows, None);
         assert_eq!(store.total_rows(), 1_000_000);
 
         // Rows spread across row groups, including group boundaries.

@@ -26,6 +26,9 @@ use super::store::{CoveringCol, FeatureStore};
 
 const BATCH_SIZE: usize = 64 * 1024;
 
+/// Error string of a user-cancelled load (the app treats it quietly).
+pub const CANCELLED: &str = "load cancelled";
+
 pub enum LoadMsg {
     Progress {
         job: u64,
@@ -47,6 +50,8 @@ pub enum LoadMsg {
         stats_build_ms: u64,
         bad_geoms: usize,
     },
+    /// A row append ended without a result (error or user cancel).
+    AppendEnded { layer_id: u64, error: String },
     /// Additional rows loaded for an existing layer (new section).
     Appended {
         layer_id: u64,
@@ -275,6 +280,7 @@ pub(crate) fn covering_select(
 /// `view_world`: current viewport in world space. When the file carries
 /// per-row-group bboxes in its metadata, row groups outside the viewport
 /// are pruned and stream in later on demand.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_load(
     handle: LoaderHandle,
     job: u64,
@@ -284,8 +290,11 @@ pub fn spawn_load(
     color: eframe::egui::Color32,
     view_world: [f64; 4],
     auto_project: bool,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    use std::sync::atomic::Ordering;
     std::thread::spawn(move || {
+        let cancelled = || cancel.load(Ordering::Relaxed);
         let t0 = Instant::now();
         // Resolve URLs / S3 credentials (content-length probe, presign)
         // off the UI thread.
@@ -311,8 +320,20 @@ pub fn spawn_load(
             frac: 0.02,
             stage: "reading file metadata".into(),
         });
+        if cancelled() {
+            handle.send(LoadMsg::Failed { job, source: label, error: CANCELLED.into() });
+            return;
+        }
         match open_store(&source) {
             Ok((store, crs, info, rg_meta)) => {
+                if cancelled() {
+                    handle.send(LoadMsg::Failed {
+                        job,
+                        source: source.label(),
+                        error: CANCELLED.into(),
+                    });
+                    return;
+                }
                 let store = Arc::new(store);
                 let n_rg = store.rg_starts().len().saturating_sub(1);
                 // The pruning rect is in the DATA CRS, so it stays valid
@@ -374,7 +395,8 @@ pub fn spawn_load(
                     })
                     .collect();
                 let build_t0 = Instant::now();
-                match build_geometry(&store, &crs, &display, Some((&handle, job)), sel) {
+                match build_geometry(&store, &crs, &display, Some((&handle, job)), sel, Some(&cancel))
+                {
                     Ok((geometry, rows, bad, rg_computed, resolved)) => {
                         // Extent only known post-build (no metadata bboxes):
                         // suggest the auto projection; the app rebuilds.
@@ -478,7 +500,7 @@ pub fn spawn_rebuild(
                 }
             })
             .collect();
-        match build_geometry(&store, &crs, &display, None, sel) {
+        match build_geometry(&store, &crs, &display, None, sel, None) {
             Ok((geometry, _rows, bad, _rg, _resolved)) => handle.send(LoadMsg::Rebuilt {
                 layer_id,
                 generation,
@@ -498,6 +520,7 @@ pub fn spawn_rebuild(
 /// Load additional rows for an existing layer (viewport refinement or
 /// "Load all"). `GroupSel::Ranges` here must be the complement of what is
 /// already loaded — the group is marked `Full` afterwards.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_append(
     handle: LoaderHandle,
     layer_id: u64,
@@ -506,9 +529,10 @@ pub fn spawn_append(
     crs: Crs,
     display: DisplayCrs,
     jobs: Vec<GroupSel>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 ) {
     std::thread::spawn(move || {
-        match build_geometry(&store, &crs, &display, None, jobs) {
+        match build_geometry(&store, &crs, &display, None, jobs, Some(&cancel)) {
             Ok((geometry, rows, _bad, _rg, resolved)) => handle.send(LoadMsg::Appended {
                 layer_id,
                 generation,
@@ -516,10 +540,13 @@ pub fn spawn_append(
                 rows,
                 loaded: resolved,
             }),
-            Err(e) => handle.send(LoadMsg::Failed {
-                job: u64::MAX,
-                source: store.source.label(),
-                error: format!("row append failed: {e}"),
+            Err(e) if e == CANCELLED => handle.send(LoadMsg::AppendEnded {
+                layer_id,
+                error: CANCELLED.into(),
+            }),
+            Err(e) => handle.send(LoadMsg::AppendEnded {
+                layer_id,
+                error: format!("{}: row append failed: {e}", store.source.label()),
             }),
         }
     });
@@ -544,6 +571,9 @@ struct FileOpen {
     rg_rows: Vec<u64>,
     rg_boxes: Option<(String, Vec<[f64; 4]>)>,
     info: FileInfo,
+    /// Point geometry synthesized from these coordinate columns (x, y)
+    /// when the file has no geometry column at all.
+    xy: Option<(usize, usize)>,
 }
 
 fn open_store(source: &Source) -> Result<StoreOpen, String> {
@@ -560,6 +590,7 @@ fn open_store(source: &Source) -> Result<StoreOpen, String> {
             f.covering,
             f.encoding,
             f.rg_rows,
+            f.xy,
         ),
         f.crs,
         f.info,
@@ -752,6 +783,7 @@ fn open_dir_store(source: &Source, dir: &std::path::Path) -> Result<StoreOpen, S
         first.schema,
         first.covering,
         first.encoding,
+        first.xy,
     );
     Ok((store, first.crs, info, rg_boxes))
 }
@@ -807,6 +839,7 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
     let schema = builder.schema().clone();
 
     let mut encoding = GeomEncoding::Wkb;
+    let mut xy: Option<(usize, usize)> = None;
     let (geom_name, crs) = match &geo_meta {
         Some(meta) => {
             let primary = meta
@@ -840,15 +873,37 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
                             )
                         })
                         .map(|f| f.name().clone())
-                })
-                .ok_or("no 'geo' metadata and no binary geometry column found")?;
-            (guess, Crs::wgs84())
+                });
+            match guess {
+                Some(name) => (name, Crs::wgs84()),
+                None => {
+                    // Last resort: coordinate columns → synthesized points.
+                    let (xi, yi) = xy_columns(&schema).ok_or(
+                        "no 'geo' metadata, no binary geometry column, and no \
+                         lon/lat or x/y coordinate columns found",
+                    )?;
+                    xy = Some((xi, yi));
+                    encoding = GeomEncoding::Point;
+                    let mut crs = Crs::wgs84();
+                    crs.name = format!(
+                        "assumed CRS84 (points from {}/{} columns)",
+                        schema.field(xi).name(),
+                        schema.field(yi).name()
+                    );
+                    (String::new(), crs)
+                }
+            }
         }
     };
 
-    let geom_col = schema
-        .index_of(&geom_name)
-        .map_err(|_| format!("geometry column '{geom_name}' not found in schema"))?;
+    let geom_col = match xy {
+        // The store appends the virtual geometry right after the base
+        // fields; this index is recomputed there.
+        Some(_) => schema.fields().len(),
+        None => schema
+            .index_of(&geom_name)
+            .map_err(|_| format!("geometry column '{geom_name}' not found in schema"))?,
+    };
 
     let total_rows = builder.metadata().file_metadata().num_rows();
     if total_rows >= u32::MAX as i64 {
@@ -924,9 +979,37 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
         files: 1,
     };
 
-    let rg_boxes =
-        rg_bboxes_from_metadata(&builder, geo_meta.as_ref(), geom_leaf, &geom_name, encoding);
+    let rg_boxes = match xy {
+        // Ordinary min/max statistics of the coordinate columns give a
+        // bbox per row group for free.
+        Some((xi, yi)) => xy_rg_boxes(
+            &builder,
+            leaf_of_root(schema.field(xi).name()),
+            leaf_of_root(schema.field(yi).name()),
+        ),
+        None => {
+            rg_bboxes_from_metadata(&builder, geo_meta.as_ref(), geom_leaf, &geom_name, encoding)
+        }
+    };
     let covering = covering_column(geo_meta.as_ref(), &geom_name, &schema);
+
+    let mut info = info;
+    if let Some((xi, yi)) = xy {
+        info.geo.version_label = "none (points synthesized from coordinate columns)".into();
+        info.geo.primary_column = "geometry (virtual)".into();
+        info.geo.encoding = format!(
+            "x/y columns: {}, {}",
+            schema.field(xi).name(),
+            schema.field(yi).name()
+        );
+        info.columns.push(ColumnInfo {
+            name: "geometry".into(),
+            arrow_type: "Struct(x, y)".into(),
+            compression: "(virtual)".into(),
+            logical: None,
+            is_geometry: true,
+        });
+    }
 
     Ok(FileOpen {
         meta: arrow_meta,
@@ -938,7 +1021,61 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
         rg_rows,
         rg_boxes,
         info,
+        xy,
     })
+}
+
+/// Coordinate-column pair (x/lon, y/lat) guessed from names, for files
+/// with no geometry column at all. Both must be floating point.
+fn xy_columns(schema: &arrow::datatypes::SchemaRef) -> Option<(usize, usize)> {
+    let find = |names: &[&str]| {
+        schema.fields().iter().position(|f| {
+            names.contains(&f.name().to_ascii_lowercase().as_str())
+                && matches!(f.data_type(), DataType::Float64 | DataType::Float32)
+        })
+    };
+    let x = find(&["lon", "longitude", "long", "lng", "x"])?;
+    let y = find(&["lat", "latitude", "y"])?;
+    (x != y).then_some((x, y))
+}
+
+/// Per-row-group bboxes from the coordinate columns' ordinary min/max
+/// statistics.
+fn xy_rg_boxes(
+    builder: &ParquetRecordBatchReaderBuilder<super::source::SourceReader>,
+    x_leaf: Option<usize>,
+    y_leaf: Option<usize>,
+) -> Option<(String, Vec<[f64; 4]>)> {
+    let (xi, yi) = (x_leaf?, y_leaf?);
+    let stat = |rg: &parquet::file::metadata::RowGroupMetaData,
+                idx: usize,
+                want_max: bool|
+     -> Option<f64> {
+        use parquet::file::statistics::Statistics;
+        match rg.columns().get(idx)?.statistics()? {
+            Statistics::Double(s) => Some(*if want_max { s.max_opt() } else { s.min_opt() }?),
+            Statistics::Float(s) => {
+                Some(*if want_max { s.max_opt() } else { s.min_opt() }? as f64)
+            }
+            _ => None,
+        }
+    };
+    let boxes: Option<Vec<[f64; 4]>> = builder
+        .metadata()
+        .row_groups()
+        .iter()
+        .map(|rg| {
+            Some([
+                stat(rg, xi, false)?,
+                stat(rg, yi, false)?,
+                stat(rg, xi, true)?,
+                stat(rg, yi, true)?,
+            ])
+        })
+        .collect();
+    boxes
+        .filter(|b| !b.is_empty())
+        .map(|b| ("coordinate column statistics (x/y)".into(), b))
 }
 
 /// Resolve the GeoParquet 1.1 covering bbox column: a single root struct
@@ -1152,7 +1289,11 @@ fn build_geometry(
     display: &DisplayCrs,
     progress: Option<(&LoaderHandle, u64)>,
     sel: Vec<GroupSel>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<BuildOutput, String> {
+    let cancelled = || {
+        cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    };
     let geom_col = store.geom_col;
     let rg_starts = store.rg_starts();
     let stream_error: Mutex<Option<String>> = Mutex::new(None);
@@ -1177,6 +1318,9 @@ fn build_geometry(
     // remote sources, where each group is a series of range requests) and
     // the flattened batches then tessellate in parallel.
     let per_group = move |job: GroupSel| -> Vec<(RowMap, RecordBatch)> {
+        if cancelled() {
+            return Vec::new();
+        }
         let g = job.group();
         let start = starts[g as usize];
         let group_rows = (starts[g as usize + 1] - start) as u32;
@@ -1231,6 +1375,9 @@ fn build_geometry(
         let mut out = Vec::new();
         let mut consumed = 0usize;
         for res in reader.into_iter().flatten() {
+            if cancelled() {
+                return out;
+            }
             match res {
                 Ok(batch) => {
                     let map = match &sparse {
@@ -1301,6 +1448,9 @@ fn build_geometry(
             },
         );
 
+    if cancelled() {
+        return Err(CANCELLED.into());
+    }
     if let Some(e) = stream_error.lock().unwrap().take() {
         return Err(format!("parquet decode error: {e}"));
     }
@@ -1586,7 +1736,7 @@ pub fn build_geometry_for_test_full(
     crs: &Crs,
     display: &DisplayCrs,
 ) -> Result<BuildOutput, String> {
-    build_geometry(store, crs, display, None, all_groups(store))
+    build_geometry(store, crs, display, None, all_groups(store), None)
 }
 
 #[cfg(test)]
@@ -1595,7 +1745,8 @@ pub fn build_geometry_for_test(
     crs: &Crs,
     display: &DisplayCrs,
 ) -> Result<(super::layer::LayerGeometry, usize, usize), String> {
-    build_geometry(store, crs, display, None, all_groups(store)).map(|(g, r, b, _, _)| (g, r, b))
+    build_geometry(store, crs, display, None, all_groups(store), None)
+        .map(|(g, r, b, _, _)| (g, r, b))
 }
 
 #[cfg(test)]
@@ -1641,7 +1792,7 @@ mod rg_bbox_tests {
         assert!(store.covering.is_none());
         let display = crate::data::crs::DisplayCrs::hobo_dyer();
         let (_geom, rows, _bad, computed, resolved) =
-            build_geometry(&store, &crs, &display, None, all_groups(&store)).unwrap();
+            build_geometry(&store, &crs, &display, None, all_groups(&store), None).unwrap();
         assert!(resolved.iter().all(|(_, st)| st.is_full()));
         assert_eq!(rows, 1_000_000);
         let n_rg = store.rg_starts().len() - 1;
@@ -1794,7 +1945,7 @@ mod pruning_tests {
         let display = crate::data::crs::DisplayCrs::hobo_dyer();
         let jobs: Vec<GroupSel> = sel.iter().map(|&g| GroupSel::All(g)).collect();
         let (geometry, rows, _bad, _rg, _resolved) =
-            build_geometry(&store, &crs, &display, None, jobs).unwrap();
+            build_geometry(&store, &crs, &display, None, jobs, None).unwrap();
         let expected: u64 = sel
             .iter()
             .map(|&g| store.rg_starts()[g as usize + 1] - store.rg_starts()[g as usize])
@@ -1820,7 +1971,7 @@ mod pruning_tests {
         assert_eq!(cov.children, ["xmin", "ymin", "xmax", "ymax"].map(String::from));
         let jobs: Vec<GroupSel> = sel.iter().map(|&g| GroupSel::Rect(g, rect)).collect();
         let (geometry_f, rows_f, _bad, _rg, resolved) =
-            build_geometry(&store, &crs, &display, None, jobs).unwrap();
+            build_geometry(&store, &crs, &display, None, jobs, None).unwrap();
         // Dense-urban viewport: still expect a substantial decode cut vs
         // the 4 whole groups (independently verified via DuckDB: 163,151
         // features intersect this rect).
@@ -1882,6 +2033,7 @@ mod pruning_tests {
             &display,
             None,
             vec![GroupSel::Ranges(*g0, comp.clone())],
+            None,
         )
         .unwrap();
         let selected: u32 = ranges.iter().map(|(s, e)| e - s).sum();
@@ -1927,9 +2079,9 @@ mod pruning_tests {
             sel.iter().map(|&g| GroupSel::Rect(g, rect)).collect()
         };
         let (_g, rows_r, bad_r, _rg, _res) =
-            build_geometry(&store_r, &crs_r, &display, None, jobs(())).unwrap();
+            build_geometry(&store_r, &crs_r, &display, None, jobs(()), None).unwrap();
         let (_g, rows_l, bad_l, _rg, _res) =
-            build_geometry(&store_l, &crs_l, &display, None, jobs(())).unwrap();
+            build_geometry(&store_l, &crs_l, &display, None, jobs(()), None).unwrap();
         assert_eq!((rows_r, bad_r), (rows_l, bad_l));
         assert!(rows_r > 0);
 
@@ -2046,7 +2198,7 @@ mod pruning_tests {
             let open_ms = t0.elapsed().as_millis();
             let t1 = std::time::Instant::now();
             let (geometry, rows, bad, _, _) =
-                build_geometry(&store, &crs, &display, None, all_groups(&store)).unwrap();
+                build_geometry(&store, &crs, &display, None, all_groups(&store), None).unwrap();
             eprintln!(
                 "run {run}: open {open_ms} ms, build {} ms, {rows} rows ({bad} bad), {} chunks, {} rgs",
                 t1.elapsed().as_millis(),
@@ -2120,7 +2272,7 @@ mod pruning_tests {
         let jobs: Vec<GroupSel> = sel.iter().map(|&g| GroupSel::Rect(g, rect)).collect();
         let display = crate::data::crs::DisplayCrs::hobo_dyer();
         let (geometry, rows, bad, _rg, _res) =
-            build_geometry(&store, &crs, &display, None, jobs).unwrap();
+            build_geometry(&store, &crs, &display, None, jobs, None).unwrap();
         eprintln!(
             "loaded {rows} features ({bad} bad) in {} ms, {} chunks",
             t1.elapsed().as_millis(),
@@ -2305,5 +2457,134 @@ mod hive_tests {
         let out =
             run_query_for_test("select state, count(*) c from t group by state", &layers).unwrap();
         assert_eq!(out.total_rows, 3);
+    }
+}
+
+#[cfg(test)]
+mod xy_tests {
+    use super::*;
+    use arrow::array::{Float64Array, Int64Array};
+    use arrow::datatypes::{Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use std::fs::File;
+
+    #[test]
+    fn lonlat_columns_synthesize_point_geometry() {
+        let dir = std::env::temp_dir().join("geopq_xy_open");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("grid.parquet");
+
+        // Plain table: lat, lon, value — no geo metadata, no geometry.
+        let n = 400usize;
+        let (mut lats, mut lons, mut ids) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            lons.push(-71.0 + (i % 20) as f64 * 0.01);
+            lats.push(42.0 + (i / 20) as f64 * 0.01);
+            ids.push(i as i64);
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("lat", DataType::Float64, false),
+            Field::new("lon", DataType::Float64, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Float64Array::from(lats.clone())),
+                Arc::new(Float64Array::from(lons.clone())),
+                Arc::new(Int64Array::from(ids)),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(128))
+            .build();
+        let mut w = ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let (store, crs, info, rg_meta) = open_store(&Source::Local(path)).unwrap();
+        assert_eq!(store.xy_geom, Some((1, 0)), "x=lon, y=lat");
+        assert!(crs.name.contains("assumed CRS84"), "{}", crs.name);
+        let geom_idx = store.schema.index_of("geometry").unwrap();
+        assert_eq!(geom_idx, store.geom_col);
+        assert_eq!(store.encoding, GeomEncoding::Point);
+        assert!(info.geo.version_label.contains("coordinate columns"));
+
+        // Row-group bboxes come from the coordinate column statistics.
+        let (label, boxes) = rg_meta.expect("stats-backed bboxes");
+        assert!(label.contains("x/y"), "{label}");
+        assert_eq!(boxes.len(), store.rg_starts().len() - 1);
+        assert!(boxes.iter().all(|b| b[0] >= -71.01 && b[3] <= 42.5));
+
+        // Geometry fetch: synthesized points match the source columns.
+        let rows = [0u32, 150, 399];
+        let geoms = store.fetch_geoms(&rows).unwrap();
+        for (row, g) in geoms {
+            match g.expect("point") {
+                geo_types::Geometry::Point(p) => {
+                    assert_eq!(p.x(), lons[row as usize], "row {row}");
+                    assert_eq!(p.y(), lats[row as usize], "row {row}");
+                }
+                other => panic!("expected point, got {other:?}"),
+            }
+        }
+
+        // Full-row fetch exposes the virtual struct for the info panel.
+        let row = store.fetch_row(5).unwrap();
+        assert!(row.schema().index_of("geometry").is_ok());
+
+        // Map build path: every row tessellates.
+        let display = crate::data::crs::DisplayCrs::hobo_dyer();
+        let (_geom, rows_built, bad) =
+            build_geometry_for_test(&store, &crs, &display).unwrap();
+        assert_eq!(rows_built, n);
+        assert_eq!(bad, 0);
+
+        // SQL over the synthesized geometry, including spatial pushdown
+        // through the stats-backed bboxes.
+        use crate::sql::engine::{run_query_for_test, SqlLayer};
+        let layers = vec![SqlLayer {
+            table: "t".into(),
+            store: Arc::new(store),
+            crs,
+            rg_bboxes: Some(Arc::new(boxes)),
+        }];
+        let count = |q: &str| -> i64 {
+            let out = run_query_for_test(q, &layers).unwrap();
+            out.batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(count("select count(*) from t"), n as i64);
+        assert_eq!(
+            count(
+                "select count(*) from t \
+                 where st_intersects(geometry, st_makeenvelope(-70.95, 41.9, -70.8, 42.05))"
+            ),
+            count(
+                "select count(*) from t \
+                 where lon >= -70.95 and lon <= -70.8 and lat <= 42.05"
+            )
+        );
+        // st_x/st_y read through the WKB normalization.
+        let out = run_query_for_test(
+            "select st_x(geometry) x from t where id = 21",
+            &layers,
+        )
+        .unwrap();
+        let x = out
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(x, lons[21]);
     }
 }

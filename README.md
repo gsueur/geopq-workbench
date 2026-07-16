@@ -36,7 +36,13 @@ Fixture-dependent tests self-skip when the files are absent.
   "multipolygon", ... — nested coordinate arrays) load through a dedicated
   accessor, with per-row-group bboxes derived from the x/y coordinate
   column statistics when no covering/geo stats exist. Files without `geo`
-  metadata fall back to a guessed WKB column + CRS84.
+  metadata fall back to a guessed WKB column + CRS84. Files with no
+  geometry column at all but lon/lat (or x/y, lng, latitude/longitude…)
+  float columns load as point layers: a virtual `Struct{x,y}` geometry is
+  synthesized at read time (CRS assumed CRS84, said so in the CRS name),
+  per-row-group bboxes come from the coordinate columns' ordinary min/max
+  statistics — so viewport pruning works — and the virtual column is
+  queryable in SQL like any geometry (WKB via the usual normalization).
 - **Hive-partitioned datasets as one layer**: open a directory (File →
   Open folder…, drag & drop, or a CLI argument) holding a multi-file
   GeoParquet dataset — including this viewer's own partitioned exports and

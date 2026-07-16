@@ -33,6 +33,9 @@ struct LoadingJob {
     /// arrival means the projection changed mid-load and the layer must
     /// rebuild (its world coordinates are in the old display's frame).
     display_gen: u64,
+    /// Set by the status-bar stop button; the loader checks it between
+    /// row groups and batches.
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 enum OptMsg {
@@ -127,6 +130,11 @@ pub struct ViewerApp {
     auto_projection: bool,
     /// Layers with a row-group append in flight.
     appending: HashSet<u64>,
+    /// Cancel flags of in-flight appends (layer id -> flag).
+    append_cancel: HashMap<u64, Arc<std::sync::atomic::AtomicBool>>,
+    /// Layers whose refinement was stopped by the user: paused until the
+    /// camera moves again (else the same viewport would respawn it).
+    refine_hold: HashSet<u64>,
     /// Last camera pose + when it last changed (for refinement debounce).
     last_cam: Option<([f64; 2], f64)>,
     cam_changed_at: f64,
@@ -380,6 +388,8 @@ impl ViewerApp {
             fit_bounds: None,
             auto_projection: true,
             appending: HashSet::new(),
+            append_cancel: HashMap::new(),
+            refine_hold: HashSet::new(),
             last_cam: None,
             cam_changed_at: 0.0,
             last_view_world: [-10.0, -10.0, 10.0, 10.0],
@@ -427,6 +437,7 @@ impl ViewerApp {
         self.next_layer_id += 1;
         let color = palette_color(self.palette_idx);
         self.palette_idx += 1;
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.loading.insert(
             job,
             LoadingJob {
@@ -434,6 +445,7 @@ impl ViewerApp {
                 frac: 0.0,
                 stage: "queued".into(),
                 display_gen: self.display_gen,
+                cancel: Arc::clone(&cancel),
             },
         );
         loader::spawn_load(
@@ -448,6 +460,7 @@ impl ViewerApp {
             color,
             self.last_view_world,
             auto_project,
+            cancel,
         );
         job
     }
@@ -887,6 +900,7 @@ impl ViewerApp {
                     loaded,
                 } => {
                     self.appending.remove(&layer_id);
+                    self.append_cancel.remove(&layer_id);
                     if let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) {
                         if l.generation == generation {
                             log::info!(
@@ -904,9 +918,23 @@ impl ViewerApp {
                         }
                     }
                 }
+                LoadMsg::AppendEnded { layer_id, error } => {
+                    self.appending.remove(&layer_id);
+                    self.append_cancel.remove(&layer_id);
+                    if error == loader::CANCELLED {
+                        // Hold refinement until the camera moves, or the
+                        // same viewport would immediately respawn the job.
+                        self.refine_hold.insert(layer_id);
+                    } else {
+                        self.push_error(error);
+                    }
+                }
                 LoadMsg::Failed { job, source, error } => {
                     self.loading.remove(&job);
-                    self.push_error(format!("{source}: {error}"));
+                    // User-initiated stop: not an error.
+                    if error != loader::CANCELLED {
+                        self.push_error(format!("{source}: {error}"));
+                    }
                 }
             }
         }
@@ -1004,6 +1032,7 @@ impl ViewerApp {
                 || !l.style.visible
                 || self.appending.contains(&l.id)
                 || self.rebuilding.contains(&l.id)
+                || self.refine_hold.contains(&l.id)
             {
                 continue;
             }
@@ -1038,6 +1067,8 @@ impl ViewerApp {
             }
             log::info!("{}: refining with {} row groups", l.name, jobs.len());
             self.appending.insert(l.id);
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.append_cancel.insert(l.id, Arc::clone(&cancel));
             loader::spawn_append(
                 LoaderHandle {
                     tx: self.load_tx.clone(),
@@ -1049,6 +1080,7 @@ impl ViewerApp {
                 l.crs.clone(),
                 self.display.clone(),
                 jobs,
+                cancel,
             );
         }
     }
@@ -1425,15 +1457,19 @@ impl ViewerApp {
                                         info_open = Some(l.id);
                                     }
                                     let single = !l.store.is_partitioned();
+                                    let can_opt = single && l.store.xy_geom.is_none();
                                     if ui
-                                        .add_enabled(single, egui::Button::new("Optimize…"))
-                                        .on_hover_text(if single {
+                                        .add_enabled(can_opt, egui::Button::new("Optimize…"))
+                                        .on_hover_text(if !single {
+                                            "Optimize works on single files; this layer is a \
+                                             multi-file dataset"
+                                        } else if !can_opt {
+                                            "This layer's geometry is synthesized from x/y \
+                                             columns; optimize needs a real geometry column"
+                                        } else {
                                             "Rewrite as a spatially sorted GeoParquet 1.1 or \
                                              2.0 file (Hilbert order, covering bbox / native \
                                              geo stats, bloom filters)"
-                                        } else {
-                                            "Optimize works on single files; this layer is a \
-                                             multi-file dataset"
                                         })
                                         .clicked()
                                     {
@@ -1617,6 +1653,17 @@ impl ViewerApp {
                             }
                             if self.appending.contains(&l.id) {
                                 ui.spinner();
+                                if ui
+                                    .small_button("✖")
+                                    .on_hover_text(
+                                        "Stop loading rows (resumes when the map moves)",
+                                    )
+                                    .clicked()
+                                {
+                                    if let Some(c) = self.append_cancel.get(&l.id) {
+                                        c.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
                             }
                         });
                     }
@@ -1717,6 +1764,8 @@ impl ViewerApp {
                         .collect();
                     if !missing.is_empty() {
                         self.appending.insert(id);
+                        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        self.append_cancel.insert(id, Arc::clone(&cancel));
                         loader::spawn_append(
                             LoaderHandle {
                                 tx: self.load_tx.clone(),
@@ -1728,6 +1777,7 @@ impl ViewerApp {
                             l.crs.clone(),
                             self.display.clone(),
                             missing,
+                            cancel,
                         );
                     }
                 }
@@ -3274,7 +3324,15 @@ impl ViewerApp {
                         self.show_errors = !self.show_errors;
                     }
                 }
-                for job in self.loading.values() {
+                for job in self.loading.values_mut() {
+                    if ui
+                        .small_button("✖")
+                        .on_hover_text("Stop loading this file")
+                        .clicked()
+                    {
+                        job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        job.stage = "cancelling".into();
+                    }
                     ui.add(
                         egui::ProgressBar::new(job.frac)
                             .desired_width(220.0)
@@ -3357,6 +3415,7 @@ impl ViewerApp {
             if self.last_cam != Some(pose) {
                 self.last_cam = Some(pose);
                 self.cam_changed_at = now;
+                self.refine_hold.clear();
             } else if now - self.cam_changed_at > 0.35 {
                 self.refine_partial_layers(&ctx);
             }
