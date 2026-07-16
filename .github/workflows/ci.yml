@@ -17,9 +17,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Linux system deps (winit/wayland headers)
+      - name: Linux system deps (winit/wayland headers + software Vulkan)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+        # mesa-vulkan-drivers provides lavapipe so the GPU render tests run
+        # for real on the headless runner instead of self-skipping.
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev mesa-vulkan-drivers
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test

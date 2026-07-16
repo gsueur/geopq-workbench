@@ -5032,13 +5032,10 @@ mod tests {
     }
 
     fn graticule_case(display: DisplayCrs, tag: &str) {
-        let instance = wgpu::Instance::default();
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-                .expect("adapter");
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .expect("device");
+        let Some((device, queue)) = crate::map::renderer::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let (w, h) = (512u32, 320u32);
 

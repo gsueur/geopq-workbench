@@ -963,6 +963,19 @@ impl egui_wgpu::CallbackTrait for MapCallback {
     }
 }
 
+
+/// Device + queue from any available adapter, or None on headless
+/// machines without a GPU driver — render tests self-skip then (CI
+/// installs a software rasterizer for real coverage).
+#[cfg(test)]
+pub(crate) fn test_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+    let instance = wgpu::Instance::default();
+    let adapter =
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .ok()?;
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -998,13 +1011,10 @@ mod tests {
             "segments per lod {lod_counts:?}, fill tris {total_fill}, points {total_pts}"
         );
 
-        let instance = wgpu::Instance::default();
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-                .expect("adapter");
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .expect("device");
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let (w, h) = (1600u32, 1000u32);
         let mut resources = egui_wgpu::CallbackResources::default();
@@ -1300,13 +1310,10 @@ mod tests {
         use crate::data::geometry::{FeatureRef, MeshBuilder};
         use std::time::Instant;
 
-        let instance = wgpu::Instance::default();
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-                .expect("adapter");
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .expect("device");
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let (w, h) = (1600u32, 1000u32);
 
@@ -1454,13 +1461,10 @@ mod tests {
     /// pipelines and assert colored pixels come back.
     #[test]
     fn pipelines_produce_pixels() {
-        let instance = wgpu::Instance::default();
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-                .expect("adapter");
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .expect("device");
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
 
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let size = 256u32;
