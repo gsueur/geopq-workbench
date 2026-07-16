@@ -2,6 +2,10 @@
 name = "geopq-viewer"
 version = "0.1.0"
 edition = "2024"
+description = "Fast native GeoParquet viewer: a technical workbench for geodata"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/gsueur/geopq-viewer"
+readme = "README.md"
 
 [dependencies]
 arrow = "58.3.0"
@@ -47,3 +51,9 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Distribution builds: thin LTO buys a smaller, slightly faster binary for
+# a modest compile-time cost; stripping drops the ~10x debug-symbol bloat.
+[profile.release]
+lto = "thin"
+strip = true

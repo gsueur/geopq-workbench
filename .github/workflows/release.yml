@@ -1,0 +1,75 @@
+name: Release
+
+# Tag-driven: `git tag v0.2.0 && git push origin v0.2.0` builds all four
+# platform archives and publishes them on a GitHub Release with checksums
+# and generated notes.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          # Intel runners are being retired; pure-Rust + cc deps
+          # cross-compile cleanly from the arm64 runner.
+          - os: macos-14
+            target: x86_64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux system deps (winit/wayland headers)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          NAME=geopq-viewer-${GITHUB_REF_NAME}-${{ matrix.target }}
+          mkdir "$NAME"
+          cp "target/${{ matrix.target }}/release/geopq-viewer" "$NAME/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$NAME/"
+          tar czf "$NAME.tar.gz" "$NAME"
+          shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "geopq-viewer-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/geopq-viewer.exe" $name/
+          Copy-Item README.md,LICENSE-MIT,LICENSE-APACHE $name/
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "$name.zip.sha256" -Value "$hash  $name.zip"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            geopq-viewer-*.tar.gz
+            geopq-viewer-*.tar.gz.sha256
+            geopq-viewer-*.zip
+            geopq-viewer-*.zip.sha256
+          generate_release_notes: true

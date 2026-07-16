@@ -9,6 +9,17 @@ once and only GPU-ready geometry is kept, so memory scales with vertex count
 (~12 bytes/point), not file size. 3.75M points load in ~180 ms and pan/zoom
 at vsync.
 
+## Install
+
+Prebuilt binaries for macOS (Apple Silicon and Intel), Linux x86_64 and
+Windows x86_64 are published on the
+[GitHub Releases](https://github.com/gsueur/geopq-viewer/releases) page,
+with SHA-256 checksums. Unpack and run — no installer, no dependencies
+(Linux needs a Wayland or X11 session; the file dialogs use the XDG
+desktop portal). The macOS binaries are not notarized: clear the
+quarantine flag once with
+`xattr -d com.apple.quarantine geopq-viewer` after unpacking.
+
 ## Run
 
 ```bash
@@ -329,3 +340,25 @@ deep zoom stays jitter-free.
 - Label rendering from attribute columns
 - GeoParquet 1.1 `edges: spherical`; 2.0 CRS read from the GEOMETRY
   logical type when `geo` metadata is absent
+
+## Releasing
+
+CI (`.github/workflows/ci.yml`) runs `cargo test` on Linux, macOS and
+Windows for every push and PR. Cutting a release is tag-driven:
+
+```bash
+# bump version in Cargo.toml, commit, then:
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow builds all four targets (macOS arm64 + x86_64 —
+the Intel binary is cross-compiled from the arm64 runner — Linux and
+Windows x86_64), packages each with the README and licenses, and
+publishes them on a GitHub Release with SHA-256 checksums and generated
+notes. Release binaries use thin LTO and are stripped.
+
+## License
+
+MIT OR Apache-2.0, at your option. Copyright Guillaume Sueur,
+Geomermaids.
