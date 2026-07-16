@@ -846,7 +846,6 @@ impl ViewerApp {
                         .get(&job)
                         .is_some_and(|j| j.display_gen != self.display_gen);
                     self.loading.remove(&job);
-                    let first = self.layers.is_empty();
                     if layer.stats.bad_geoms > 0 {
                         self.push_error(format!(
                             "{}: {} geometries could not be decoded/projected",
@@ -857,19 +856,10 @@ impl ViewerApp {
                     if let Some(name) = self.pending_names.remove(&job) {
                         layer.name = name;
                     }
-                    let restored = match self.pending_styles.remove(&job) {
-                        Some(style) => {
-                            layer.style = style;
-                            true
-                        }
-                        None => false,
-                    };
+                    if let Some(style) = self.pending_styles.remove(&job) {
+                        layer.style = style;
+                    }
                     let new_layer_id = layer.id;
-                    // A viewport-pruned load means the user was already
-                    // looking at their region of interest: fitting to the
-                    // loaded bounds (a lat/lon strip of a huge file) would
-                    // zoom out and trigger a full-extent reload.
-                    let partial = layer.is_partial();
                     if stale && adopt_display.is_none() {
                         layer.generation += 1;
                         self.rebuilding.insert(layer.id);
@@ -902,7 +892,6 @@ impl ViewerApp {
                     if let Some(f) = self.pending_filters.remove(&job) {
                         self.start_layer_filter(new_layer_id, f, ctx);
                     }
-                    let adopted = adopt_display.is_some();
                     match adopt_display {
                         // Geometry already built in the auto-adopted
                         // display — but layers that finished earlier are
@@ -915,13 +904,10 @@ impl ViewerApp {
                         Some((d, false)) => rebuild_display = Some(d),
                         None => {}
                     }
-                    // Skip the first-layer fit for viewport-pruned loads —
-                    // unless a projection was just adopted (the old camera
-                    // frame is meaningless there and the loaded bounds
-                    // approximate the viewport region anyway).
-                    if first && !restored && (!partial || adopted) {
-                        self.pending_fit = true;
-                    }
+                    // Never move the viewport because a layer finished
+                    // loading — a dense full-extent layer would yank the
+                    // user away (and could trigger a huge refinement).
+                    // Fit all layers / per-layer zoom are one click away.
                 }
                 LoadMsg::Rebuilt {
                     layer_id,
