@@ -825,7 +825,8 @@ fn open_file_group_reader<R: parquet::file::reader::ChunkReader + 'static>(
 }
 
 /// Hive path parsing: `key=value` directory segments of a relative path.
-/// Values are percent-decoded; the Hive NULL sentinel maps to None.
+/// Keys and values are percent-decoded; reserved markers preserve the
+/// distinction between Hive NULL and a present-but-empty string.
 pub fn hive_segments(rel: &std::path::Path) -> Vec<(String, Option<String>)> {
     let mut out = Vec::new();
     let n = rel.components().count();
@@ -840,12 +841,13 @@ pub fn hive_segments(rel: &std::path::Path) -> Vec<(String, Option<String>)> {
         if k.is_empty() {
             continue;
         }
+        let key = percent_decode(k);
         let value = if v == super::partition::NULL_PARTITION {
             None
         } else {
             Some(percent_decode(v))
         };
-        out.push((k.to_string(), value));
+        out.push((key, value));
     }
     out
 }
@@ -885,13 +887,14 @@ mod tests {
     #[test]
     fn hive_segment_parsing() {
         let segs = hive_segments(std::path::Path::new(
-            "state=New%20York/county=__HIVE_DEFAULT_PARTITION__/notakey/part-0.parquet",
+            "region%2Fname=New%20York/county=__HIVE_DEFAULT_PARTITION__/empty=/part-0.parquet",
         ));
         assert_eq!(
             segs,
             vec![
-                ("state".to_string(), Some("New York".to_string())),
+                ("region/name".to_string(), Some("New York".to_string())),
                 ("county".to_string(), None),
+                ("empty".to_string(), Some(String::new())),
             ]
         );
         // A bare file has no segments.
