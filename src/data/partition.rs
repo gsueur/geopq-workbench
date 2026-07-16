@@ -192,6 +192,19 @@ pub fn split_by_fields(
     order: &[u32],
     fields: &[(String, Vec<Option<String>>)],
 ) -> Result<Vec<(String, Vec<u32>)>, String> {
+    // Encode field names once, rather than once per output row. Parquet field
+    // names are unrestricted strings; raw '/' or '\\' here would otherwise
+    // become path separators when optimize joins this relative directory to
+    // the chosen output root.
+    let fields: Vec<(String, &[Option<String>])> = fields
+        .iter()
+        .map(|(name, values)| {
+            if name.is_empty() {
+                return Err("cannot partition by an empty field name".to_string());
+            }
+            Ok((encode_hive_component(name), values.as_slice()))
+        })
+        .collect::<Result<_, _>>()?;
     let mut parts: HashMap<String, Vec<u32>> = HashMap::new();
     for &r in order {
         let dir = fields
@@ -280,30 +293,31 @@ pub fn split_adaptive_h3(
     Ok(out)
 }
 
-/// Hive path values: keep alphanumerics and a safe subset, percent-encode
-/// the rest so the directory name is filesystem- and URL-safe. Encoding is
-/// per UTF-8 byte (not codepoint) and injective, so values round-trip
-/// exactly through `store::percent_decode` on reload — a lossy substitution
-/// (space → '_', low-byte truncation) would collide distinct values and
-/// break hive-equality pushdown.
-fn sanitize_hive_value(v: &str) -> String {
+/// Encode one Hive path component. Keep alphanumerics and a safe subset,
+/// percent-encoding everything else per UTF-8 byte (not codepoint).
+fn encode_hive_component(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
-    let mut buf = [0u8; 4];
-    for c in v.chars() {
-        match c {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => out.push(c),
-            other => {
-                for b in other.encode_utf8(&mut buf).bytes() {
-                    out.push_str(&format!("%{b:02X}"));
-                }
-            }
+    for &b in v.as_bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
         }
     }
-    if out.is_empty() {
-        NULL_PARTITION.to_string()
-    } else {
-        out
+    out
+}
+
+/// Hive path value encoding is injective across NULL, empty strings, the
+/// literal Hive NULL sentinel and ordinary values. A lossy substitution (or
+/// mapping empty to the NULL sentinel) would change equality pushdown and SQL
+/// grouping after an export/reload round trip.
+fn sanitize_hive_value(v: &str) -> String {
+    let mut out = encode_hive_component(v);
+    if out == NULL_PARTITION {
+        // The loader tests for the raw sentinel before percent-decoding.
+        // Escaping one otherwise-safe byte preserves this literal value.
+        out.replace_range(..1, "%5F");
     }
+    out
 }
 
 #[cfg(test)]
@@ -388,8 +402,20 @@ mod tests {
     #[test]
     fn hive_value_roundtrips_through_decode() {
         use crate::data::store::percent_decode;
-        for v in ["Zürich", "Ł", "New York", "New_York", "a/b=c%d", "München 2024"] {
-            assert_eq!(percent_decode(&sanitize_hive_value(v)), v, "roundtrip of {v:?}");
+        for v in [
+            "Zürich",
+            "Ł",
+            "New York",
+            "New_York",
+            "a/b=c%d",
+            "München 2024",
+            "__HIVE_DEFAULT_PARTITION__",
+        ] {
+            assert_eq!(
+                percent_decode(&sanitize_hive_value(v)),
+                v,
+                "roundtrip of {v:?}"
+            );
         }
         // Multibyte codepoints must encode all UTF-8 bytes, not the low
         // byte of the scalar ('Ł' → %C5%81, never %41 which collides with 'A').
@@ -407,6 +433,50 @@ mod tests {
         for bad in ['/', '\\', '=', '?', '#', ' '] {
             assert!(!s.contains(bad), "{s} must not contain {bad:?}");
         }
-        assert_eq!(sanitize_hive_value(""), NULL_PARTITION);
+        assert_eq!(sanitize_hive_value(""), "");
+        assert_eq!(sanitize_hive_value("~"), "%7E");
+    }
+
+    #[test]
+    fn hive_reserved_values_stay_distinct() {
+        let values = vec![(
+            "kind".to_string(),
+            vec![
+                None,
+                Some(String::new()),
+                Some(NULL_PARTITION.to_string()),
+                Some("ordinary".to_string()),
+            ],
+        )];
+        let parts = split_by_fields(&[0, 1, 2, 3], &values).unwrap();
+        assert_eq!(parts.len(), 4, "reserved values must not share a partition");
+        assert!(
+            parts
+                .iter()
+                .any(|(d, r)| d == "kind=__HIVE_DEFAULT_PARTITION__" && r == &[0])
+        );
+        assert!(parts.iter().any(|(d, r)| d == "kind=" && r == &[1]));
+        assert!(
+            parts
+                .iter()
+                .any(|(d, r)| d == "kind=%5F_HIVE_DEFAULT_PARTITION__" && r == &[2])
+        );
+    }
+
+    #[test]
+    fn hive_field_names_cannot_create_path_components() {
+        let name = "../outside/region\\name=value%";
+        let values = vec![(name.to_string(), vec![Some("MA".to_string())])];
+        let parts = split_by_fields(&[0], &values).unwrap();
+        let rel = &parts[0].0;
+        assert_eq!(std::path::Path::new(rel).components().count(), 1, "{rel}");
+        assert!(!rel.contains('/'), "{rel}");
+        assert!(!rel.contains('\\'), "{rel}");
+
+        let with_file = std::path::PathBuf::from(rel).join("part-0.parquet");
+        assert_eq!(
+            crate::data::store::hive_segments(&with_file),
+            vec![(name.to_string(), Some("MA".to_string()))]
+        );
     }
 }
