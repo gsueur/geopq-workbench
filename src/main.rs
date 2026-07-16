@@ -9,6 +9,20 @@ mod sql;
 
 use eframe::egui;
 
+/// Window/taskbar icon, embedded at build time (macOS Dock needs an .app
+/// bundle with assets/geopq-workbench.icns instead).
+fn app_icon() -> egui::IconData {
+    let img = image::load_from_memory(include_bytes!("../assets/icon-256.png"))
+        .expect("builtin icon")
+        .into_rgba8();
+    let (width, height) = img.dimensions();
+    egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    }
+}
+
 fn main() -> eframe::Result {
     env_logger::init();
     // Args: local paths or http(s) URLs.
@@ -39,7 +53,8 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1480.0, 940.0])
             .with_min_inner_size([800.0, 500.0])
-            .with_title("GeoPQ Workbench"),
+            .with_title("GeoPQ Workbench")
+            .with_icon(app_icon()),
         ..Default::default()
     };
 
