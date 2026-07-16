@@ -38,6 +38,16 @@ struct LoadingJob {
     cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// A load queued behind the first job's projection decision: batch loads
+/// must build in the display the first layer picks, not race it.
+struct DeferredLoad {
+    job: u64,
+    layer_id: u64,
+    source: Source,
+    color: Color32,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
 enum OptMsg {
     Progress(f32, String),
     Done(Box<crate::data::optimize::OptimizeReport>, PathBuf),
@@ -131,6 +141,15 @@ pub struct ViewerApp {
     auto_projection: bool,
     /// Layers with a row-group append in flight.
     appending: HashSet<u64>,
+    /// Job whose in-flight load decides the session projection
+    /// (auto-projection, first layer); later jobs wait for it.
+    projection_decider: Option<u64>,
+    deferred_loads: Vec<DeferredLoad>,
+    /// Has the user explicitly moved the camera (pan/zoom/fit) since
+    /// startup? The automatic empty-map world fit does not count: "still
+    /// the original full-world viewport" is what first-layer adoption
+    /// checks before fitting to the layer.
+    camera_moved: bool,
     /// Cancel flags of in-flight appends (layer id -> flag).
     append_cancel: HashMap<u64, Arc<std::sync::atomic::AtomicBool>>,
     /// Cancel flags of in-flight rebuilds (layer id -> flag). Spawning a
@@ -446,6 +465,9 @@ impl ViewerApp {
             fit_bounds: None,
             auto_projection: true,
             appending: HashSet::new(),
+            projection_decider: None,
+            deferred_loads: Vec::new(),
+            camera_moved: false,
             append_cancel: HashMap::new(),
             rebuild_cancel: HashMap::new(),
             fit_after_rebuilds: false,
@@ -491,16 +513,8 @@ impl ViewerApp {
 
     fn enqueue_load(&mut self, source: Source, ctx: &egui::Context) -> u64 {
         // Auto-projection only applies to the very first layer of a session
-        // (evaluated before this job is registered) — and only while the
-        // camera is still the untouched startup pose: adopting a projection
-        // keeps the camera's world coordinates, so under a viewport the
-        // user already framed it would silently show a different place.
-        let untouched = {
-            let d = crate::map::camera::Camera::default();
-            self.camera.center == d.center && self.camera.zoom == d.zoom
-        };
+        // (evaluated before this job is registered).
         let auto_project = self.auto_projection
-            && untouched
             && self.layers.is_empty()
             && self.loading.is_empty()
             && self.pending_styles.is_empty();
@@ -527,6 +541,45 @@ impl ViewerApp {
                 cancel: Arc::clone(&cancel),
             },
         );
+        if auto_project {
+            self.projection_decider = Some(job);
+        }
+        // Batch loads: while the first job's projection decision is in
+        // flight, later jobs wait for it — spawning them now would build
+        // their geometry in a display about to be replaced.
+        if self.projection_decider.is_some() && self.projection_decider != Some(job) {
+            if let Some(j) = self.loading.get_mut(&job) {
+                j.stage = "waiting for projection".into();
+            }
+            self.deferred_loads.push(DeferredLoad {
+                job,
+                layer_id,
+                source,
+                color,
+                cancel,
+            });
+            return job;
+        }
+        self.spawn_load_job(job, layer_id, source, color, cancel, auto_project, ctx);
+        job
+    }
+
+    fn spawn_load_job(
+        &mut self,
+        job: u64,
+        layer_id: u64,
+        source: Source,
+        color: Color32,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        auto_project: bool,
+        ctx: &egui::Context,
+    ) {
+        // Deferred jobs spawn later: stamp the display generation they
+        // actually build for.
+        if let Some(j) = self.loading.get_mut(&job) {
+            j.display_gen = self.display_gen;
+            j.stage = "queued".into();
+        }
         loader::spawn_load(
             LoaderHandle {
                 tx: self.load_tx.clone(),
@@ -544,7 +597,53 @@ impl ViewerApp {
             // build (pending style registered by the caller right after).
             None,
         );
-        job
+    }
+
+    /// Start the loads that waited on the projection decision.
+    fn flush_deferred_loads(&mut self, ctx: &egui::Context) {
+        for d in std::mem::take(&mut self.deferred_loads) {
+            self.spawn_load_job(d.job, d.layer_id, d.source, d.color, d.cancel, false, ctx);
+        }
+    }
+
+    /// Move the camera to the same geographic place after a projection
+    /// switch (center preserved, ground scale approximated by a short
+    /// east-west segment through it). Falls back to a layer fit when the
+    /// transform has no finite answer there.
+    fn transfer_camera(&mut self, old: &DisplayCrs) {
+        use crate::data::crs::transform_point;
+        let c = self.camera.center;
+        let (px, py) = old.projected_from_world(c);
+        let d = 1e-4; // measuring segment, world units in the old display
+        let (qx, qy) = old.projected_from_world([c[0] + d, c[1]]);
+        let moved = (|| {
+            let (cx, cy) = transform_point(&old.crs, &self.display.crs, px, py).ok()?;
+            let (ex, ey) = transform_point(&old.crs, &self.display.crs, qx, qy).ok()?;
+            let cw = self.display.world_from_projected(cx, cy);
+            let ew = self.display.world_from_projected(ex, ey);
+            let r = ((ew[0] - cw[0]).powi(2) + (ew[1] - cw[1]).powi(2)).sqrt() / d;
+            (cw[0].is_finite() && cw[1].is_finite() && r.is_finite() && r > 0.0)
+                .then_some((cw, r))
+        })();
+        match moved {
+            Some((cw, r)) => {
+                use crate::map::camera::{MAX_ZOOM, MIN_ZOOM};
+                self.camera.center = cw;
+                self.camera.zoom = (self.camera.zoom - r.log2()).clamp(MIN_ZOOM, MAX_ZOOM);
+            }
+            None => self.pending_fit = true,
+        }
+    }
+
+    /// Camera policy when the first layer's auto-projection lands: an
+    /// untouched startup camera fits to the layer; a user-framed one keeps
+    /// showing the same place, re-projected into the new display.
+    fn camera_after_adoption(&mut self, old: &DisplayCrs) {
+        if self.camera_moved {
+            self.transfer_camera(old);
+        } else {
+            self.pending_fit = true;
+        }
     }
 
     /// Highlight the SQL-checked features on the map (own render layer —
@@ -873,6 +972,7 @@ impl ViewerApp {
 
     fn poll_loader(&mut self, ctx: &egui::Context) {
         let mut rebuild_display: Option<DisplayCrs> = None;
+        let mut decider_done = false;
         while let Ok(msg) = self.load_rx.try_recv() {
             match msg {
                 LoadMsg::Progress { job, frac, stage } => {
@@ -958,17 +1058,23 @@ impl ViewerApp {
                         // display — but layers that finished earlier are
                         // still in the previous frame and must rebuild.
                         Some((d, true)) => {
+                            let old = self.display.clone();
                             self.adopt_display_lite(d);
                             self.rebuild_layers_for_display(Some(new_layer_id), ctx);
+                            self.camera_after_adoption(&old);
                         }
                         // Post-build suggestion: full projection rebuild.
                         Some((d, false)) => rebuild_display = Some(d),
                         None => {}
                     }
-                    // Never move the viewport because a layer finished
-                    // loading — a dense full-extent layer would yank the
-                    // user away (and could trigger a huge refinement).
-                    // Fit all layers / per-layer zoom are one click away.
+                    // Beyond first-layer projection adoption, never move
+                    // the viewport because a layer finished loading — a
+                    // dense full-extent layer would yank the user away
+                    // (and could trigger a huge refinement).
+                    if self.projection_decider == Some(job) {
+                        self.projection_decider = None;
+                        decider_done = true;
+                    }
                 }
                 LoadMsg::Rebuilt {
                     layer_id,
@@ -1062,6 +1168,10 @@ impl ViewerApp {
                 }
                 LoadMsg::Failed { job, source, error } => {
                     self.loading.remove(&job);
+                    if self.projection_decider == Some(job) {
+                        self.projection_decider = None;
+                        decider_done = true;
+                    }
                     // User-initiated stop: not an error.
                     if error != loader::CANCELLED {
                         self.push_error(format!("{source}: {error}"));
@@ -1070,7 +1180,21 @@ impl ViewerApp {
             }
         }
         if let Some(d) = rebuild_display {
+            // First-layer adoption via full rebuild: same camera policy as
+            // the lite path. When untouched, the fit waits for the
+            // projection rebuilds to finish (fit_after_rebuilds, armed by
+            // set_display); a framed camera transfers immediately instead.
+            let old = self.display.clone();
             self.set_display(d, ctx);
+            if self.camera_moved {
+                self.fit_after_rebuilds = false;
+                self.transfer_camera(&old);
+            }
+        }
+        // The projection decision landed (or died): start the loads that
+        // waited for it, in the display that decision produced.
+        if decider_done {
+            self.flush_deferred_loads(ctx);
         }
     }
 
@@ -1405,6 +1529,7 @@ impl ViewerApp {
                     .clicked()
                 {
                     self.pending_fit = true;
+                    self.camera_moved = true;
                 }
                 ui.separator();
                 ui.checkbox(&mut self.show_graticule, "Graticule");
@@ -1462,6 +1587,7 @@ impl ViewerApp {
                 .clicked()
             {
                 self.pending_fit = true;
+                self.camera_moved = true;
             }
             ui.toggle_value(&mut self.sql.open, "🖩 SQL")
                 .on_hover_text("Query loaded layers with SQL (ST_* spatial functions)");
@@ -2112,6 +2238,8 @@ impl ViewerApp {
                     c.store(true, Ordering::Relaxed);
                 }
                 self.rebuild_cancel.clear();
+                self.projection_decider = None;
+                self.deferred_loads.clear();
                 self.pending_styles.clear();
                 self.pending_filters.clear();
                 self.pending_names.clear();
@@ -2128,6 +2256,7 @@ impl ViewerApp {
         }
         self.camera.center = saved.camera_center;
         self.camera.zoom = saved.camera_zoom;
+        self.camera_moved = true;
         self.pending_fit = false;
         self.auto_projection = false;
         self.basemap = saved.basemap;
@@ -4167,6 +4296,9 @@ impl ViewerApp {
             || response.dragged_by(egui::PointerButton::Middle)
         {
             let d = response.drag_delta();
+            if d != egui::Vec2::ZERO {
+                self.camera_moved = true;
+            }
             self.camera.pan_px([d.x * ppp, d.y * ppp]);
         }
         let hover_px = response
@@ -4183,11 +4315,13 @@ impl ViewerApp {
             if dz != 0.0 {
                 let cursor = hover_px.unwrap_or([vp[0] * 0.5, vp[1] * 0.5]);
                 self.camera.zoom_about(dz, cursor, vp);
+                self.camera_moved = true;
             }
         }
         if response.double_clicked() {
             if let Some(cursor) = hover_px {
                 self.camera.zoom_about(1.0, cursor, vp);
+                self.camera_moved = true;
             }
         }
         if response.clicked() {
@@ -4200,6 +4334,7 @@ impl ViewerApp {
 
         if let Some(b) = self.fit_bounds.take() {
             self.camera.fit(b, vp, 40.0);
+            self.camera_moved = true;
             self.pending_fit = false;
         }
         if self.pending_fit {
