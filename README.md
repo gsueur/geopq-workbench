@@ -88,8 +88,11 @@ Fixture-dependent tests self-skip when the files are absent.
   intersecting the current viewport are opened (capped at 16 files per
   load — zoom in for the dense types like `building`, 512 parts / ~2.5B
   rows), then the usual covering-column row-group/feature pruning takes
-  over inside each part. Adding a repository whose URL ends in
-  `catalog.json` selects the STAC protocol automatically.
+  over inside each part. Part lists are cached on disk
+  (`stac_parts_cache.json` — release prefixes are dated and immutable),
+  so only the first load of a type pays the item-document fetch; the ⟳
+  button clears the repository's cache. Adding a repository whose URL
+  ends in `catalog.json` selects the STAC protocol automatically.
 - **Data-driven styling** (layer ☰ → Style by value…): color features by
   an attribute — numeric columns get a graduated ramp (Viridis / Turbo /
   Blue–Red) with a classification method: equal interval (bounds from the

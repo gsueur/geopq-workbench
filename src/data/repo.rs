@@ -58,8 +58,19 @@ pub fn default_repos() -> Vec<Repository> {
     ]
 }
 
-/// `~/.config/geopq-viewer/repositories.json`.
+/// `~/.config/geopq-viewer/repositories.json`. Tests read and write a
+/// per-process temp directory instead — cache tests must never touch (or
+/// depend on) the developer's real config.
 fn config_file() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        return Some(
+            std::env::temp_dir()
+                .join(format!("geopq_test_config_{}", std::process::id()))
+                .join("repositories.json"),
+        );
+    }
+    #[cfg(not(test))]
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(|h| {
@@ -503,7 +514,7 @@ pub fn stac_collection_url(base: &str, snapshot: &str, theme: &str, ty: &str) ->
 }
 
 /// One parquet part file of a STAC collection.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StacPart {
     /// HTTPS asset URL.
     pub url: String,
@@ -549,10 +560,56 @@ fn stac_bbox_2d(v: &Value) -> Option<[f64; 4]> {
     }
 }
 
-/// All parts of a type collection, from its item documents (parallel
-/// fetch on dedicated threads; any failure aborts — a silently partial
-/// part list would silently drop data).
+/// `~/.config/geopq-viewer/stac_parts_cache.json`: part lists per
+/// collection URL. STAC releases live under dated, immutable prefixes,
+/// so entries stay valid until the ⟳ button clears them.
+fn parts_cache_file() -> Option<PathBuf> {
+    config_file().map(|p| p.with_file_name("stac_parts_cache.json"))
+}
+
+fn read_parts_cache() -> std::collections::HashMap<String, Vec<StacPart>> {
+    parts_cache_file()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_parts_cache(cache: &std::collections::HashMap<String, Vec<StacPart>>) {
+    let Some(path) = parts_cache_file() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string(cache) {
+        let _ = write_atomic(&path, &json);
+    }
+}
+
+/// Drop cached part lists of one repository (all its collections).
+pub fn clear_cached_stac_parts(base: &str) {
+    let mut cache = read_parts_cache();
+    let n = cache.len();
+    cache.retain(|url, _| !url.starts_with(base));
+    if cache.len() != n {
+        write_parts_cache(&cache);
+    }
+}
+
+/// All parts of a type collection, served from the on-disk cache when
+/// present (release prefixes are immutable), else from its item documents
+/// (parallel fetch on dedicated threads; any failure aborts — a silently
+/// partial part list would silently drop data).
 pub fn fetch_stac_parts(collection_url: &str) -> Result<Vec<StacPart>, String> {
+    if let Some(parts) = read_parts_cache().remove(collection_url) {
+        return Ok(parts);
+    }
+    let parts = fetch_stac_parts_live(collection_url)?;
+    let mut cache = read_parts_cache();
+    cache.insert(collection_url.to_string(), parts.clone());
+    write_parts_cache(&cache);
+    Ok(parts)
+}
+
+fn fetch_stac_parts_live(collection_url: &str) -> Result<Vec<StacPart>, String> {
     let col = get_json(collection_url)?.ok_or_else(|| format!("{collection_url}: not found"))?;
     let dir = collection_url
         .rsplit_once('/')
@@ -973,6 +1030,25 @@ mod tests {
         // Generic parquet asset accepted; 6-element bbox collapsed to 2D.
         assert_eq!(parts[1].url, "https://other.example/p1.parquet");
         assert_eq!(parts[1].bbox, Some([5.0, 40.0, 10.0, 45.0]));
+    }
+
+    #[test]
+    fn stac_parts_come_from_cache_after_first_fetch() {
+        let (base, root) = spawn_stac_fixture();
+        let url = stac_collection_url(&base, "2026-06/", "buildings", "building");
+        let live = fetch_stac_parts(&url).unwrap();
+        assert_eq!(live.len(), 2);
+        // Remove the item documents: a second fetch can only succeed from
+        // the on-disk cache (release prefixes are immutable).
+        std::fs::remove_dir_all(root.join("2026-06/buildings/building/00000")).unwrap();
+        std::fs::remove_dir_all(root.join("2026-06/buildings/building/00001")).unwrap();
+        let cached = fetch_stac_parts(&url).unwrap();
+        assert_eq!(cached.len(), 2);
+        assert_eq!(cached[0].url, live[0].url);
+        assert_eq!(cached[1].bbox, live[1].bbox);
+        // ⟳ clears the repository's entries; the next fetch goes live again.
+        clear_cached_stac_parts(&base);
+        assert!(fetch_stac_parts(&url).is_err(), "cache cleared, items gone");
     }
 
     #[test]

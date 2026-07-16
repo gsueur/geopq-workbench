@@ -2180,6 +2180,9 @@ impl ViewerApp {
             ));
             if force {
                 repo::clear_cached_datasets(&base, &snapshot);
+                if kind == RepoKind::Stac {
+                    repo::clear_cached_stac_parts(&base);
+                }
             } else if let Some((ds, at)) = repo::cached_datasets(&base, &snapshot) {
                 let _ = tx.send(RepoMsg::Datasets(generation, Ok(ds), Some(at)));
                 ctx.request_repaint();
