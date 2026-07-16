@@ -3820,6 +3820,22 @@ impl ViewerApp {
                 .weak()
                 .small(),
         );
+        if let Some(m) = sel.measure {
+            let latlong = layer.crs.is_latlong;
+            let text = match m {
+                crate::picking::Measure::Length(l) => {
+                    format!("length {}", fmt_length(l))
+                }
+                crate::picking::Measure::Area { area, perimeter } => {
+                    format!("area {} · perimeter {}", fmt_area(area), fmt_length(perimeter))
+                }
+            };
+            ui.label(RichText::new(text).small()).on_hover_text(if latlong {
+                "geodesic on the WGS84 ellipsoid"
+            } else {
+                "planar, in the layer's CRS units (assumed meters)"
+            });
+        }
         if let Some((shown, total)) = self.attrs_truncated {
             ui.label(
                 RichText::new(format!("showing {shown} of {total} columns"))
@@ -4434,6 +4450,26 @@ fn swatch_color_button(
             });
     });
     changed
+}
+
+/// "832 m" / "12.42 km" (meters in; CRS units for projected layers).
+fn fmt_length(m: f64) -> String {
+    if m < 1000.0 {
+        format!("{m:.1} m")
+    } else {
+        format!("{:.2} km", m / 1000.0)
+    }
+}
+
+/// "512.3 m²" / "3.42 ha" / "18.75 km²".
+fn fmt_area(m2: f64) -> String {
+    if m2 < 10_000.0 {
+        format!("{m2:.1} m²")
+    } else if m2 < 1_000_000.0 {
+        format!("{:.2} ha", m2 / 10_000.0)
+    } else {
+        format!("{:.2} km²", m2 / 1_000_000.0)
+    }
 }
 
 fn derived_line_color(color: egui::Color32) -> egui::Color32 {

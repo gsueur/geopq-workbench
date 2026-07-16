@@ -16,6 +16,68 @@ pub struct Selection {
     pub feature: FeatureRef,
     /// Geometry in current world coordinates (for highlight rendering).
     pub world_geom: Geometry<f64>,
+    /// Physical measure of the feature, computed in the data CRS:
+    /// geodesic meters for lat/long layers, planar CRS units otherwise.
+    pub measure: Option<Measure>,
+}
+
+/// Length of a linear feature / area of an areal one.
+#[derive(Clone, Copy, Debug)]
+pub enum Measure {
+    Length(f64),
+    Area { area: f64, perimeter: f64 },
+}
+
+/// Measure a geometry in its data CRS. Geodesic (WGS84 ellipsoid) when
+/// the CRS is geographic, planar in CRS units when projected.
+pub fn measure_of(geom: &Geometry<f64>, latlong: bool) -> Option<Measure> {
+    use geo::{Area, Geodesic, GeodesicArea, Length};
+    let planar_ring_len = |ls: &geo_types::LineString<f64>| Euclidean.length(ls);
+    match geom {
+        Geometry::Line(_) | Geometry::LineString(_) | Geometry::MultiLineString(_) => {
+            let len = if latlong {
+                match geom {
+                    Geometry::Line(g) => Geodesic.length(g),
+                    Geometry::LineString(g) => Geodesic.length(g),
+                    Geometry::MultiLineString(g) => Geodesic.length(g),
+                    _ => unreachable!(),
+                }
+            } else {
+                match geom {
+                    Geometry::Line(g) => Euclidean.length(g),
+                    Geometry::LineString(g) => Euclidean.length(g),
+                    Geometry::MultiLineString(g) => Euclidean.length(g),
+                    _ => unreachable!(),
+                }
+            };
+            Some(Measure::Length(len))
+        }
+        Geometry::Polygon(_) | Geometry::MultiPolygon(_) | Geometry::Rect(_)
+        | Geometry::Triangle(_) => {
+            let polys: Vec<geo_types::Polygon<f64>> = match geom {
+                Geometry::Polygon(p) => vec![p.clone()],
+                Geometry::MultiPolygon(mp) => mp.0.clone(),
+                Geometry::Rect(r) => vec![r.to_polygon()],
+                Geometry::Triangle(t) => vec![t.to_polygon()],
+                _ => unreachable!(),
+            };
+            let (mut area, mut perim) = (0.0f64, 0.0f64);
+            for p in &polys {
+                if latlong {
+                    area += p.geodesic_area_unsigned();
+                    perim += p.geodesic_perimeter();
+                } else {
+                    area += p.unsigned_area();
+                    perim += planar_ring_len(p.exterior());
+                    for i in p.interiors() {
+                        perim += planar_ring_len(i);
+                    }
+                }
+            }
+            Some(Measure::Area { area, perimeter: perim })
+        }
+        _ => None,
+    }
 }
 
 /// Cheap snapshot of everything picking needs from a layer, so the whole
@@ -125,6 +187,7 @@ pub fn pick(
                 layer_id: layer.id,
                 feature: fref,
                 world_geom: Geometry::Point(Point::new(pos[0], pos[1])),
+                measure: None,
             });
         }
 
@@ -192,12 +255,64 @@ pub fn pick(
             }
         }
         if let Some((fref, geom)) = hit {
+            let measure = measure_of(&geom, layer.crs.is_latlong);
             return Some(Selection {
                 layer_id: layer.id,
                 feature: fref,
                 world_geom: to_world_geom(geom, &layer.crs, display),
+                measure,
             });
         }
     }
     None
+}
+
+#[cfg(test)]
+mod measure_tests {
+    use super::*;
+    use geo_types::{polygon, LineString};
+
+    #[test]
+    fn measures_are_plausible() {
+        // ~111 km of meridian at the equator (1° of latitude, geodesic).
+        let ls: Geometry<f64> =
+            Geometry::LineString(LineString::from(vec![(0.0, 0.0), (0.0, 1.0)]));
+        match measure_of(&ls, true) {
+            Some(Measure::Length(l)) => {
+                assert!((l - 110_574.0).abs() < 500.0, "meridian degree: {l}")
+            }
+            other => panic!("{other:?}"),
+        }
+        // Planar: 3-4-5 triangle path.
+        let ls2: Geometry<f64> =
+            Geometry::LineString(LineString::from(vec![(0.0, 0.0), (3.0, 4.0)]));
+        match measure_of(&ls2, false) {
+            Some(Measure::Length(l)) => assert!((l - 5.0).abs() < 1e-9),
+            other => panic!("{other:?}"),
+        }
+        // Planar unit square: area 1, perimeter 4.
+        let sq: Geometry<f64> = Geometry::Polygon(polygon![
+            (x: 0.0, y: 0.0), (x: 1.0, y: 0.0), (x: 1.0, y: 1.0), (x: 0.0, y: 1.0),
+        ]);
+        match measure_of(&sq, false) {
+            Some(Measure::Area { area, perimeter }) => {
+                assert!((area - 1.0).abs() < 1e-9);
+                assert!((perimeter - 4.0).abs() < 1e-9);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Geodesic ~0.01°x0.01° square near the equator ≈ 1.11 km x 1.11 km.
+        let gsq: Geometry<f64> = Geometry::Polygon(polygon![
+            (x: 0.0, y: 0.0), (x: 0.01, y: 0.0), (x: 0.01, y: 0.01), (x: 0.0, y: 0.01),
+        ]);
+        match measure_of(&gsq, true) {
+            Some(Measure::Area { area, .. }) => {
+                let expect = 1_106.0 * 1_113.0; // rough m²
+                assert!((area / expect - 1.0).abs() < 0.05, "geodesic area: {area}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Points measure nothing.
+        assert!(measure_of(&Geometry::Point(Point::new(0.0, 0.0)), true).is_none());
+    }
 }
