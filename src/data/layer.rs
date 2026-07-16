@@ -402,6 +402,81 @@ pub fn palette_color(i: usize) -> Color32 {
     PALETTE[i % PALETTE.len()]
 }
 
+/// Thematic default color guessed from a layer name ("rivers_france" →
+/// water blue, "building" → warm gray); None falls back to the rotating
+/// palette. Keywords match name tokens by prefix (so plurals work and
+/// "research" does not read as "sea"); keys containing '_' match the
+/// whole lowercased name, letting `land_cover`/`land_use` win over the
+/// bare `land` entry below them. First hit decides.
+pub fn name_color(name: &str) -> Option<Color32> {
+    type Keys = &'static [&'static str];
+    const TABLE: &[(Keys, (u8, u8, u8))] = &[
+        (&["bathymetry"], (48, 90, 148)),
+        (
+            &[
+                "water", "river", "lake", "stream", "ocean", "sea", "hydro", "wetland",
+                "reservoir", "canal", "flood", "precip", "rain", "coast",
+            ],
+            (66, 120, 179),
+        ),
+        (&["burn", "fire", "wildfire"], (196, 89, 48)),
+        // Before the vegetation group: "natural" is a prefix of both OSM
+        // natural themes, and only the areas are green.
+        (&["natural_feature"], (146, 116, 91)),
+        (
+            &[
+                "forest", "wood", "tree", "vegetation", "grass", "meadow", "park", "green",
+                "natural_area", "natural",
+            ],
+            (96, 138, 74),
+        ),
+        (&["land_cover", "landcover"], (140, 155, 90)),
+        (&["land_use", "landuse"], (165, 152, 84)),
+        (&["land"], (188, 178, 140)),
+        (&["building"], (146, 130, 120)),
+        (&["parcel", "cadastr", "lot"], (189, 157, 105)),
+        (&["rail", "train", "tram", "metro"], (94, 74, 96)),
+        (&["public_transport", "transit"], (58, 112, 132)),
+        (
+            &["road", "street", "highway", "motorway", "segment", "transportation"],
+            (86, 88, 94),
+        ),
+        (&["aeroway", "airport", "runway", "aerodrome", "heliport"], (154, 136, 170)),
+        (&["connector"], (128, 128, 128)),
+        (&["boundar", "division", "border", "admin"], (141, 94, 176)),
+        (&["place", "poi", "pois", "amenit", "shop"], (226, 138, 48)),
+        (&["address"], (186, 96, 125)),
+        (&["power", "pipeline", "utilit", "energy"], (168, 144, 62)),
+        (&["barrier", "fence", "wall"], (110, 96, 88)),
+        (&["infrastructure"], (108, 122, 148)),
+        (&["snow", "ice", "glacier"], (168, 200, 222)),
+        (&["sand", "beach", "desert", "bare"], (214, 189, 138)),
+    ];
+    let lower = name.to_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    for (keys, (r, g, b)) in TABLE {
+        let hit = keys.iter().any(|k| {
+            if k.contains('_') {
+                lower.contains(k)
+            } else {
+                // Short keys match whole tokens only: "sea" must not
+                // claim "seattle", while "building" still covers
+                // "buildings".
+                tokens
+                    .iter()
+                    .any(|t| if k.len() < 4 { t == k } else { t.starts_with(k) })
+            }
+        });
+        if hit {
+            return Some(Color32::from_rgb(*r, *g, *b));
+        }
+    }
+    None
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct LoadStats {
     pub read_ms: u64,
@@ -527,6 +602,62 @@ impl VectorLayer {
                 GroupLoad::None => 0,
             })
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod name_color_tests {
+    use super::*;
+
+    #[test]
+    fn thematic_names_get_thematic_colors() {
+        let water = name_color("water").unwrap();
+        // Prefix and token handling: plurals and composites match…
+        assert_eq!(name_color("rivers_france"), Some(water));
+        assert_eq!(name_color("EU_Hydro_Network"), Some(water));
+        assert_eq!(name_color("north-sea-wrecks"), Some(water));
+        // …but "sea" must not claim Seattle, nor "research".
+        let parcels = name_color("parcels").unwrap();
+        assert_eq!(name_color("seattle_parcels"), Some(parcels));
+        assert_ne!(name_color("research_sites"), Some(water));
+
+        // Overture types land on distinct entries.
+        let land = name_color("land").unwrap();
+        assert_ne!(name_color("land_cover"), Some(land));
+        assert_ne!(name_color("land_use"), Some(land));
+        assert_ne!(name_color("land_use"), name_color("land_cover"));
+        assert_eq!(name_color("buildings"), name_color("building"));
+        // Woodland reads as forest, wetland as water.
+        assert_eq!(name_color("woodland"), name_color("forest"));
+        assert_eq!(name_color("wetlands"), Some(water));
+
+        // No keyword: fall through to the rotating palette.
+        assert_eq!(name_color("mystery_dataset_42"), None);
+    }
+
+    /// Every theme of the geomermaids parquetry repositories resolves to
+    /// a thematic color, with the ambiguous pairs kept distinct.
+    #[test]
+    fn geomermaids_themes_are_all_covered() {
+        let themes = [
+            "buildings", "roads", "railways", "waterways", "water", "landuse",
+            "natural_areas", "natural_features", "places", "boundaries", "pois",
+            "amenities_polygons", "power", "aeroways", "barriers", "public_transport",
+        ];
+        for t in themes {
+            assert!(name_color(t).is_some(), "{t} has no thematic color");
+        }
+        // The pairs that must not collapse into one color.
+        assert_ne!(name_color("natural_areas"), name_color("natural_features"));
+        assert_eq!(name_color("natural_areas"), name_color("forest"));
+        assert_ne!(name_color("power"), name_color("infrastructure"));
+        assert_ne!(name_color("railways"), name_color("public_transport"));
+        assert_ne!(name_color("roads"), name_color("railways"));
+        // Both amenity spellings land with places/POIs.
+        assert_eq!(name_color("amenities_polygons"), name_color("pois"));
+        assert_eq!(name_color("amenity"), name_color("places"));
+        // Waterways and water share the water blue.
+        assert_eq!(name_color("waterways"), name_color("water"));
     }
 }
 

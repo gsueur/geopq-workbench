@@ -508,8 +508,14 @@ impl ViewerApp {
         self.next_job += 1;
         let layer_id = self.next_layer_id;
         self.next_layer_id += 1;
-        let color = palette_color(self.palette_idx);
-        self.palette_idx += 1;
+        // Thematic default when the name gives the game away ("rivers" →
+        // water blue); the rotating palette otherwise (not advanced on a
+        // thematic hit, so unrecognized layers keep their variety).
+        let color = crate::data::layer::name_color(&source.name()).unwrap_or_else(|| {
+            let c = palette_color(self.palette_idx);
+            self.palette_idx += 1;
+            c
+        });
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.loading.insert(
             job,
