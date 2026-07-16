@@ -826,6 +826,11 @@ impl ViewerApp {
                         None => false,
                     };
                     let new_layer_id = layer.id;
+                    // A viewport-pruned load means the user was already
+                    // looking at their region of interest: fitting to the
+                    // loaded bounds (a lat/lon strip of a huge file) would
+                    // zoom out and trigger a full-extent reload.
+                    let partial = layer.is_partial();
                     if stale && adopt_display.is_none() {
                         layer.generation += 1;
                         self.rebuilding.insert(layer.id);
@@ -857,6 +862,7 @@ impl ViewerApp {
                     if let Some(f) = self.pending_filters.remove(&job) {
                         self.start_layer_filter(new_layer_id, f, ctx);
                     }
+                    let adopted = adopt_display.is_some();
                     match adopt_display {
                         // Geometry already built in the auto-adopted
                         // display — but layers that finished earlier are
@@ -869,7 +875,11 @@ impl ViewerApp {
                         Some((d, false)) => rebuild_display = Some(d),
                         None => {}
                     }
-                    if first && !restored {
+                    // Skip the first-layer fit for viewport-pruned loads —
+                    // unless a projection was just adopted (the old camera
+                    // frame is meaningless there and the loaded bounds
+                    // approximate the viewport region anyway).
+                    if first && !restored && (!partial || adopted) {
                         self.pending_fit = true;
                     }
                 }

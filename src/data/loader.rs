@@ -232,6 +232,13 @@ pub(crate) fn covering_select(
 ) -> Result<Option<Vec<(u32, u32)>>, String> {
     use arrow::array::{Array, Float64Array, StructArray};
     let Some(cov) = &store.covering else {
+        // x/y point stores: the coordinate columns themselves are an
+        // exact covering — scan them for the in-rect row ranges. This is
+        // what keeps lat-ordered global grids from decoding a whole
+        // world-wide strip per row group.
+        if let Some((xi, yi)) = store.xy_geom {
+            return xy_select(store, group, rect, xi, yi).map(Some);
+        }
         return Ok(None);
     };
     let reader = store.reader_for_group(group as usize, BATCH_SIZE, None, Some(&[cov.root]))?;
@@ -272,6 +279,46 @@ pub(crate) fn covering_select(
         row += batch.num_rows() as u32;
     }
     Ok(Some(rows_to_ranges(rows.into_iter())))
+}
+
+/// In-rect row ranges of one group of an x/y point store, by scanning
+/// the two coordinate columns (the same bytes the decode would read, but
+/// only matching rows become geometry).
+fn xy_select(
+    store: &FeatureStore,
+    group: u32,
+    rect: [f64; 4],
+    xi: usize,
+    yi: usize,
+) -> Result<Vec<(u32, u32)>, String> {
+    use arrow::array::Float64Array;
+    let cols = if xi < yi { [xi, yi] } else { [yi, xi] };
+    let (xpos, ypos) = if xi < yi { (0, 1) } else { (1, 0) };
+    let reader = store.reader_for_group(group as usize, BATCH_SIZE, None, Some(&cols))?;
+    let mut rows: Vec<u32> = Vec::new();
+    let mut row = 0u32;
+    for res in reader {
+        let batch = res.map_err(|e| format!("coordinate scan error: {e}"))?;
+        let as_f64 = |i: usize| -> Result<Float64Array, String> {
+            arrow::compute::cast(batch.column(i), &DataType::Float64)
+                .map_err(|e| format!("coordinate cast: {e}"))
+                .map(|a| a.as_any().downcast_ref::<Float64Array>().unwrap().clone())
+        };
+        let (xs, ys) = (as_f64(xpos)?, as_f64(ypos)?);
+        for i in 0..batch.num_rows() {
+            if !xs.is_null(i)
+                && !ys.is_null(i)
+                && xs.value(i) >= rect[0]
+                && xs.value(i) <= rect[2]
+                && ys.value(i) >= rect[1]
+                && ys.value(i) <= rect[3]
+            {
+                rows.push(row + i as u32);
+            }
+        }
+        row += batch.num_rows() as u32;
+    }
+    Ok(rows_to_ranges(rows.into_iter()))
 }
 
 /// Load a GeoParquet file in a background thread. Only geometry-derived data
@@ -373,7 +420,7 @@ pub fn spawn_load(
                 }
                 // Per-feature covering selection: only when the viewport
                 // doesn't already cover the whole data extent.
-                let use_rect = store.covering.is_some()
+                let use_rect = (store.covering.is_some() || store.xy_geom.is_some())
                     && match (&rg_meta, rect) {
                         (Some((_, boxes)), Some(r)) => {
                             let mut u = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
@@ -2542,6 +2589,25 @@ mod xy_tests {
             build_geometry_for_test(&store, &crs, &display).unwrap();
         assert_eq!(rows_built, n);
         assert_eq!(bad, 0);
+
+        // Per-feature rect selection through the coordinate columns:
+        // only in-rect rows of a group are selected, so lat-ordered
+        // row groups don't decode as world-wide strips.
+        let rect = [-70.95, 42.05, -70.9, 42.1];
+        let ranges = covering_select(&store, 0, rect)
+            .unwrap()
+            .expect("x/y stores have an exact covering");
+        let selected: u32 = ranges.iter().map(|(s, e)| e - s).sum();
+        let expect = lons
+            .iter()
+            .zip(&lats)
+            .take(128) // group 0
+            .filter(|(x, y)| {
+                **x >= rect[0] && **x <= rect[2] && **y >= rect[1] && **y <= rect[3]
+            })
+            .count();
+        assert_eq!(selected as usize, expect);
+        assert!(selected > 0 && (selected as usize) < 128, "{selected}");
 
         // SQL over the synthesized geometry, including spatial pushdown
         // through the stats-backed bboxes.
