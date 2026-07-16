@@ -46,9 +46,9 @@ jobs:
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
-          NAME=geopq-viewer-${GITHUB_REF_NAME}-${{ matrix.target }}
+          NAME=geopq-workbench-${GITHUB_REF_NAME}-${{ matrix.target }}
           mkdir "$NAME"
-          cp "target/${{ matrix.target }}/release/geopq-viewer" "$NAME/"
+          cp "target/${{ matrix.target }}/release/geopq-workbench" "$NAME/"
           cp README.md LICENSE-MIT LICENSE-APACHE "$NAME/"
           tar czf "$NAME.tar.gz" "$NAME"
           shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
@@ -56,9 +56,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $name = "geopq-viewer-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          $name = "geopq-workbench-$env:GITHUB_REF_NAME-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $name | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/geopq-viewer.exe" $name/
+          Copy-Item "target/${{ matrix.target }}/release/geopq-workbench.exe" $name/
           Copy-Item README.md,LICENSE-MIT,LICENSE-APACHE $name/
           Compress-Archive -Path $name -DestinationPath "$name.zip"
           $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
@@ -68,8 +68,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            geopq-viewer-*.tar.gz
-            geopq-viewer-*.tar.gz.sha256
-            geopq-viewer-*.zip
-            geopq-viewer-*.zip.sha256
+            geopq-workbench-*.tar.gz
+            geopq-workbench-*.tar.gz.sha256
+            geopq-workbench-*.zip
+            geopq-workbench-*.zip.sha256
           generate_release_notes: true

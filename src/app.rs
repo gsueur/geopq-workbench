@@ -1428,7 +1428,7 @@ impl ViewerApp {
                     self.sql.open_with_help();
                 }
                 ui.label(
-                    RichText::new(concat!("geopq-viewer ", env!("CARGO_PKG_VERSION")))
+                    RichText::new(concat!("GeoPQ Workbench ", env!("CARGO_PKG_VERSION")))
                         .weak()
                         .small(),
                 );

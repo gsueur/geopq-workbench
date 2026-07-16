@@ -1,8 +1,8 @@
 [package]
-name = "geopq-viewer"
+name = "geopq-workbench"
 version = "0.1.0"
 edition = "2024"
-description = "Fast native GeoParquet viewer: a technical workbench for geodata"
+description = "GeoPQ Workbench: a fast native technical workbench for GeoParquet data"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/gsueur/geopq-viewer"
 readme = "README.md"

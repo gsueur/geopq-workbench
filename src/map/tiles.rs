@@ -8,7 +8,12 @@ use crate::map::camera::Camera;
 pub const TILE_PX: u32 = 256;
 const MAX_CACHED: usize = 600;
 const FETCH_THREADS: usize = 4;
-const USER_AGENT: &str = "geopq-viewer/0.1 (github.com/geopq-viewer)";
+const USER_AGENT: &str = concat!(
+    env!("CARGO_PKG_NAME"),
+    "/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/gsueur/geopq-viewer)"
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TileId {

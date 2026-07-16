@@ -39,12 +39,12 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1480.0, 940.0])
             .with_min_inner_size([800.0, 500.0])
-            .with_title("GeoParquet Viewer"),
+            .with_title("GeoPQ Workbench"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "geopq-viewer",
+        "geopq-workbench",
         native_options,
         Box::new(move |cc| Ok(Box::new(app::ViewerApp::new(cc, files)))),
     )

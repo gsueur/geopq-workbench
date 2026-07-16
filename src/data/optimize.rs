@@ -693,7 +693,11 @@ pub fn optimize(
             .set_compression(opts.codec.compression())
             .set_max_row_group_row_count(Some(opts.row_group_size))
             .set_statistics_enabled(EnabledStatistics::Page)
-            .set_created_by(format!("geopq-viewer {}", env!("CARGO_PKG_VERSION")));
+            .set_created_by(format!(
+                "{} {}",
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION")
+            ));
         if write_covering {
             // Small pages on the bbox leaves (~4k rows at 8 B/value) give
             // the page index sub-row-group granularity, so readers can

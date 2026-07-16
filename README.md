@@ -1,6 +1,6 @@
-# geopq-viewer
+# GeoPQ Workbench
 
-Fast native GeoParquet cartographic viewer, written in Rust (egui + wgpu).
+Fast native GeoParquet workbench, written in Rust (egui + wgpu).
 
 Loads GeoParquet directly (parquet → arrow → WKB), reprojects with pure-Rust
 proj4rs, tessellates on all cores with rayon/lyon, and renders through custom
@@ -18,7 +18,7 @@ with SHA-256 checksums. Unpack and run — no installer, no dependencies
 (Linux needs a Wayland or X11 session; the file dialogs use the XDG
 desktop portal). The macOS binaries are not notarized: clear the
 quarantine flag once with
-`xattr -d com.apple.quarantine geopq-viewer` after unpacking.
+`xattr -d com.apple.quarantine geopq-workbench` after unpacking.
 
 ## Run
 
@@ -88,7 +88,7 @@ Fixture-dependent tests self-skip when the files are absent.
   Geomermaids Parquetry (OSM North
   America: 101 regions × 16 themes, daily snapshots) is preconfigured;
   add or remove repositories in the dialog (persisted in
-  `~/.config/geopq-viewer/repositories.json`). Discovered dataset lists
+  `~/.config/geopq-workbench/repositories.json`). Discovered dataset lists
   are cached across sessions (`repo_cache.json`, "cached N h ago" shown
   in the dialog); the ⟳ button clears the cache and re-discovers.
 - **STAC repositories** (Overture Maps preconfigured): a static STAC

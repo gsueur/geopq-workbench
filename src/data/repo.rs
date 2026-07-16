@@ -21,7 +21,8 @@ use serde_json::Value;
 
 use super::source::http_agent;
 
-const USER_AGENT: &str = concat!("geopq-viewer/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str =
+    concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 /// Repository protocol.
 #[derive(Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -74,10 +75,14 @@ fn config_file() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(|h| {
-            PathBuf::from(h)
-                .join(".config")
-                .join("geopq-viewer")
-                .join("repositories.json")
+            let cfg = PathBuf::from(h).join(".config");
+            let dir = cfg.join("geopq-workbench");
+            // One-time migration from the pre-rename directory.
+            let old = cfg.join("geopq-viewer");
+            if !dir.exists() && old.exists() {
+                let _ = std::fs::rename(&old, &dir);
+            }
+            dir.join("repositories.json")
         })
 }
 

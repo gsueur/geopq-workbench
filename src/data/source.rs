@@ -14,7 +14,8 @@ use bytes::Bytes;
 use parquet::errors::{ParquetError, Result as PqResult};
 use parquet::file::reader::{ChunkReader, Length};
 
-const USER_AGENT: &str = concat!("geopq-viewer/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str =
+    concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 /// Shared agent: connection pooling across range requests. HTTP error
 /// statuses come back as responses (not `Err`), so callers can read
