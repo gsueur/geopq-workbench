@@ -58,6 +58,11 @@ pub enum Source {
         url: String,
         len: u64,
     },
+    /// A STAC type collection (collection.json URL): a multi-file remote
+    /// dataset resolved at open into the part files intersecting the
+    /// viewport; the store reads through per-part `Remote` sources, so
+    /// `open()` is never valid on this (like `Dir`).
+    Stac { url: String, name: String },
 }
 
 impl Source {
@@ -113,6 +118,7 @@ impl Source {
             Source::Local(p) | Source::Dir(p) => p.display().to_string(),
             Source::Remote { url, .. } => url.clone(),
             Source::S3 { uri, .. } => uri.clone(),
+            Source::Stac { url, .. } => url.clone(),
         }
     }
 
@@ -133,13 +139,14 @@ impl Source {
                 .filter(|s| !s.is_empty())
                 .map(|s| s.trim_end_matches(".parquet").to_string())
                 .unwrap_or_else(|| "remote".into()),
+            Source::Stac { name, .. } => name.clone(),
         }
     }
 
     pub fn size(&self) -> u64 {
         match self {
             Source::Local(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
-            Source::Dir(_) => 0, // aggregated per fragment by the store
+            Source::Dir(_) | Source::Stac { .. } => 0, // aggregated per fragment
             Source::Remote { len, .. } | Source::S3 { len, .. } => *len,
         }
     }
@@ -150,6 +157,9 @@ impl Source {
                 "{} is a dataset directory, not a file",
                 p.display()
             )),
+            Source::Stac { url, .. } => {
+                Err(format!("{url} is a STAC collection, not a file"))
+            }
             Source::Local(p) => {
                 let f = File::open(p).map_err(|e| format!("cannot open file: {e}"))?;
                 let len = f
@@ -802,6 +812,89 @@ pub(crate) mod testserver {
             bytes_served,
             requests,
         }
+    }
+
+    /// Serve a directory tree (files resolved from the request path, 404
+    /// on miss). Full GETs only — enough for STAC JSON documents plus
+    /// small parquet fixtures. Returns the base URL (no trailing slash).
+    pub fn spawn_dir(root: PathBuf) -> String {
+        use std::io::Read as _;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { continue };
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut b = [0u8; 1];
+                    while !buf.ends_with(b"\r\n\r\n") && buf.len() < 8192 {
+                        match conn.read(&mut b) {
+                            Ok(1) => buf.push(b[0]),
+                            _ => return,
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&buf);
+                    let is_head = text.starts_with("HEAD");
+                    let path = text
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .trim_start_matches('/')
+                        .to_string();
+                    // Fixture paths are test-authored; no traversal guard.
+                    let body = std::fs::read(root.join(&path)).ok();
+                    match body {
+                        None => {
+                            let _ = write!(
+                                conn,
+                                "HTTP/1.1 404 NF\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            );
+                        }
+                        Some(data) => {
+                            let range = text
+                                .lines()
+                                .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                                .and_then(|l| l.split_once(':'))
+                                .and_then(|(_, v)| v.trim().strip_prefix("bytes="))
+                                .and_then(|v| v.split_once('-'))
+                                .map(|(a, b)| {
+                                    let start: usize = a.parse().unwrap_or(0);
+                                    let end: usize =
+                                        b.parse().unwrap_or(data.len() - 1);
+                                    (start, end.min(data.len() - 1))
+                                });
+                            if is_head {
+                                let _ = write!(
+                                    conn,
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                                    data.len()
+                                );
+                                return;
+                            }
+                            let (status, extra, slice) = match range {
+                                Some((s, e)) => (
+                                    "206 Partial Content",
+                                    format!(
+                                        "Content-Range: bytes {s}-{e}/{}\r\n",
+                                        data.len()
+                                    ),
+                                    &data[s..=e],
+                                ),
+                                None => ("200 OK", String::new(), &data[..]),
+                            };
+                            let _ = write!(
+                                conn,
+                                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}Accept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                                slice.len()
+                            );
+                            let _ = conn.write_all(slice);
+                        }
+                    }
+                });
+            }
+        });
+        format!("http://127.0.0.1:{port}")
     }
 }
 

@@ -57,6 +57,11 @@ pub enum SourceCtx {
         profile: Option<String>,
         endpoint: Option<String>,
     },
+    /// A STAC type collection (parts re-selected for the viewport at load).
+    Stac {
+        url: String,
+        name: String,
+    },
 }
 
 impl SourceCtx {
@@ -79,6 +84,10 @@ impl SourceCtx {
                 profile: profile.clone(),
                 endpoint: endpoint.clone(),
             },
+            Source::Stac { url, name } => SourceCtx::Stac {
+                url: url.clone(),
+                name: name.clone(),
+            },
         }
     }
 
@@ -99,6 +108,7 @@ impl SourceCtx {
                 url: String::new(),
                 len: 0,
             },
+            SourceCtx::Stac { url, name } => Source::Stac { url, name },
         }
     }
 }

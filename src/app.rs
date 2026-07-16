@@ -2145,25 +2145,32 @@ impl ViewerApp {
         b.cache_age = None;
         let generation = b.generation;
         let base = b.repos[b.sel_repo].url.trim_end_matches('/').to_string();
+        let kind = b.repos[b.sel_repo].kind;
         let snapshot = b.snapshots[b.sel_snapshot].path.clone();
         let tx = self.repo_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            use crate::data::repo::{self, RepoKind};
             let _ = tx.send(RepoMsg::Snapshots(
                 generation,
-                crate::data::repo::fetch_snapshots(&base),
+                match kind {
+                    RepoKind::Parquetry => repo::fetch_snapshots(&base),
+                    RepoKind::Stac => repo::fetch_snapshots_stac(&base),
+                },
             ));
             if force {
-                crate::data::repo::clear_cached_datasets(&base, &snapshot);
-            } else if let Some((ds, at)) = crate::data::repo::cached_datasets(&base, &snapshot)
-            {
+                repo::clear_cached_datasets(&base, &snapshot);
+            } else if let Some((ds, at)) = repo::cached_datasets(&base, &snapshot) {
                 let _ = tx.send(RepoMsg::Datasets(generation, Ok(ds), Some(at)));
                 ctx.request_repaint();
                 return;
             }
-            let res = crate::data::repo::discover_datasets(&base, &snapshot);
+            let res = match kind {
+                RepoKind::Parquetry => repo::discover_datasets(&base, &snapshot),
+                RepoKind::Stac => repo::discover_datasets_stac(&base, &snapshot),
+            };
             if let Ok(ds) = &res {
-                crate::data::repo::store_datasets(&base, &snapshot, ds);
+                repo::store_datasets(&base, &snapshot, ds);
             }
             let _ = tx.send(RepoMsg::Datasets(generation, res, None));
             ctx.request_repaint();
@@ -2176,16 +2183,21 @@ impl ViewerApp {
         b.checked.clear();
         let generation = b.generation;
         let base = b.repos[b.sel_repo].url.trim_end_matches('/').to_string();
+        let kind = b.repos[b.sel_repo].kind;
         let snapshot = b.snapshots[b.sel_snapshot].path.clone();
         let Some(Ok(ds)) = &b.datasets else { return };
         let path = ds[ds_idx].path.clone();
         let tx = self.repo_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            use crate::data::repo::{self, RepoKind};
             let _ = tx.send(RepoMsg::Manifest(
                 generation,
                 ds_idx,
-                crate::data::repo::fetch_manifest(&base, &snapshot, &path),
+                match kind {
+                    RepoKind::Parquetry => repo::fetch_manifest(&base, &snapshot, &path),
+                    RepoKind::Stac => repo::fetch_stac_manifest(&base, &snapshot, &path),
+                },
             ));
             ctx.request_repaint();
         });
@@ -2228,10 +2240,11 @@ impl ViewerApp {
         let mut refetch = false;
         let mut force_refetch = false;
         let mut fetch_manifest: Option<usize> = None;
-        let mut load: Vec<(String, String)> = Vec::new(); // (url, layer name)
+        let mut load: Vec<(Source, String)> = Vec::new(); // (source, layer name)
 
         {
             let b = self.repo_browser.as_mut().unwrap();
+            let kind = b.repos[b.sel_repo].kind;
             egui::Window::new("GeoParquet repositories")
                 .id(egui::Id::new("repo_browser"))
                 .open(&mut open)
@@ -2392,10 +2405,15 @@ impl ViewerApp {
                                                 {
                                                     continue;
                                                 }
+                                                let row = if code == name {
+                                                    name.clone()
+                                                } else {
+                                                    format!("{name} ({code})")
+                                                };
                                                 if ui
                                                     .selectable_label(
                                                         sel_idx == Some(*i),
-                                                        format!("{name} ({code})"),
+                                                        row,
                                                     )
                                                     .clicked()
                                                 {
@@ -2469,10 +2487,17 @@ impl ViewerApp {
                                                                     b.checked.remove(theme);
                                                                 }
                                                             }
+                                                            let n = *count as usize;
                                                             ui.label(
-                                                                RichText::new(fmt_count(
-                                                                    *count as usize,
-                                                                ))
+                                                                RichText::new(match kind {
+                                                                    crate::data::repo::RepoKind::Stac => {
+                                                                        format!(
+                                                                            "{n} part{}",
+                                                                            if n == 1 { "" } else { "s" }
+                                                                        )
+                                                                    }
+                                                                    _ => fmt_count(n),
+                                                                })
                                                                 .weak(),
                                                             );
                                                             ui.end_row();
@@ -2492,14 +2517,30 @@ impl ViewerApp {
                                                 .clicked()
                                             {
                                                 for (theme, _) in &m.themes {
-                                                    if b.checked.contains(theme) {
-                                                        load.push((
-                                                            crate::data::repo::theme_url(
-                                                                &base, &snap, path, theme,
-                                                            ),
-                                                            format!("{code} {theme}"),
-                                                        ));
+                                                    if !b.checked.contains(theme) {
+                                                        continue;
                                                     }
+                                                    use crate::data::repo::{self, RepoKind};
+                                                    load.push(match kind {
+                                                        RepoKind::Parquetry => (
+                                                            Source::Remote {
+                                                                url: repo::theme_url(
+                                                                    &base, &snap, path, theme,
+                                                                ),
+                                                                len: 0,
+                                                            },
+                                                            format!("{code} {theme}"),
+                                                        ),
+                                                        RepoKind::Stac => (
+                                                            Source::Stac {
+                                                                url: repo::stac_collection_url(
+                                                                    &base, &snap, path, theme,
+                                                                ),
+                                                                name: theme.clone(),
+                                                            },
+                                                            theme.clone(),
+                                                        ),
+                                                    });
                                                 }
                                                 b.checked.clear();
                                             }
@@ -2514,6 +2555,17 @@ impl ViewerApp {
                                                 b.checked.clear();
                                             }
                                         });
+                                        if kind == crate::data::repo::RepoKind::Stac {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "loads the parts intersecting the current \
+                                                     view (max {} files per layer)",
+                                                    crate::data::loader::STAC_PART_CAP
+                                                ))
+                                                .weak()
+                                                .small(),
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -2544,9 +2596,17 @@ impl ViewerApp {
                             .add_enabled(valid, egui::Button::new("Add repository"))
                             .clicked()
                         {
+                            // A URL pasted with its catalog.json marks a
+                            // STAC repository; the base is its directory.
+                            let url = b.add.1.trim().trim_end_matches('/');
+                            let (url, kind) = match url.strip_suffix("/catalog.json") {
+                                Some(base) => (base, crate::data::repo::RepoKind::Stac),
+                                None => (url, crate::data::repo::RepoKind::Parquetry),
+                            };
                             b.repos.push(crate::data::repo::Repository {
                                 name: b.add.0.trim().to_string(),
-                                url: b.add.1.trim().trim_end_matches('/').to_string(),
+                                url: url.to_string(),
+                                kind,
                             });
                             b.add = (String::new(), String::new());
                             b.sel_repo = b.repos.len() - 1;
@@ -2577,8 +2637,8 @@ impl ViewerApp {
         if let Some(i) = fetch_manifest {
             self.repo_fetch_manifest(i, ctx);
         }
-        for (url, name) in load {
-            let job = self.enqueue_load(Source::Remote { url, len: 0 }, ctx);
+        for (source, name) in load {
+            let job = self.enqueue_load(source, ctx);
             self.pending_names.insert(job, name);
         }
         if !open {

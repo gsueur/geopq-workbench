@@ -23,18 +23,39 @@ use super::source::http_agent;
 
 const USER_AGENT: &str = concat!("geopq-viewer/", env!("CARGO_PKG_VERSION"));
 
+/// Repository protocol.
+#[derive(Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub enum RepoKind {
+    /// snapshots.json + per-folder _manifest.json + one file per theme.
+    #[default]
+    Parquetry,
+    /// A static STAC catalog: releases → themes → type collections whose
+    /// items are the parquet part files (Overture layout).
+    Stac,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Repository {
     pub name: String,
     /// Base URL, no trailing slash.
     pub url: String,
+    #[serde(default)]
+    pub kind: RepoKind,
 }
 
 pub fn default_repos() -> Vec<Repository> {
-    vec![Repository {
-        name: "Geomermaids Parquetry (OSM North America)".into(),
-        url: "https://parquetry.geomermaids.com".into(),
-    }]
+    vec![
+        Repository {
+            name: "Geomermaids Parquetry (OSM North America)".into(),
+            url: "https://parquetry.geomermaids.com".into(),
+            kind: RepoKind::Parquetry,
+        },
+        Repository {
+            name: "Overture Maps (STAC)".into(),
+            url: "https://stac.overturemaps.org".into(),
+            kind: RepoKind::Stac,
+        },
+    ]
 }
 
 /// `~/.config/geopq-viewer/repositories.json`.
@@ -360,6 +381,246 @@ pub fn theme_url(base: &str, snapshot: &str, path: &str, theme: &str) -> String 
     format!("{base}/{snapshot}{path}/{theme}.parquet")
 }
 
+// ---------------------------------------------------------------------
+// STAC repositories (Overture layout)
+// ---------------------------------------------------------------------
+//
+// {base}/catalog.json                 releases (children), `latest` field
+// {base}/{release}/catalog.json       themes (children)
+// {base}/{release}/{theme}/catalog.json      types (children)
+// .../{type}/collection.json          items = one parquet part each
+// .../{type}/NNNNN/NNNNN.json         item: bbox + num_rows + assets
+
+/// Child directory names of a STAC catalog ("./2026-06-17.0/catalog.json"
+/// → "2026-06-17.0"), in link order.
+fn stac_children(cat: &Value) -> Vec<String> {
+    cat.get("links")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|l| l.get("rel").and_then(Value::as_str) == Some("child"))
+        .filter_map(|l| l.get("href").and_then(Value::as_str))
+        .filter_map(|h| {
+            let mut segs = h.trim_start_matches("./").split('/');
+            let dir = segs.next()?;
+            (!dir.is_empty()).then(|| dir.to_string())
+        })
+        .collect()
+}
+
+/// Releases of a STAC repository, latest first ("2026-06-17.0/", …).
+/// Concrete directories only — no "latest" alias exists server-side.
+pub fn fetch_snapshots_stac(base: &str) -> Result<Vec<Snapshot>, String> {
+    let url = format!("{base}/catalog.json");
+    let cat = get_json(&url)?.ok_or_else(|| format!("{url}: not found"))?;
+    let latest = cat.get("latest").and_then(Value::as_str);
+    let mut dirs = stac_children(&cat);
+    if let Some(l) = latest {
+        if let Some(pos) = dirs.iter().position(|d| d == l) {
+            let d = dirs.remove(pos);
+            dirs.insert(0, d);
+        }
+    }
+    if dirs.is_empty() {
+        return Err(format!("{url}: no releases listed"));
+    }
+    Ok(dirs
+        .into_iter()
+        .map(|d| Snapshot {
+            label: d.clone(),
+            path: format!("{d}/"),
+        })
+        .collect())
+}
+
+/// Turn the browser's placeholder "latest/" into the concrete release
+/// directory (STAC has no server-side alias).
+fn stac_resolve_snapshot(base: &str, snapshot: &str) -> Result<String, String> {
+    if snapshot != "latest/" {
+        return Ok(snapshot.to_string());
+    }
+    let url = format!("{base}/catalog.json");
+    let cat = get_json(&url)?.ok_or_else(|| format!("{url}: not found"))?;
+    match cat.get("latest").and_then(Value::as_str) {
+        Some(l) => Ok(format!("{l}/")),
+        None => stac_children(&cat)
+            .first()
+            .map(|d| format!("{d}/"))
+            .ok_or_else(|| format!("{url}: no releases listed")),
+    }
+}
+
+/// STAC datasets = the release's themes (one row per theme).
+pub fn discover_datasets_stac(base: &str, snapshot: &str) -> Result<Vec<Dataset>, String> {
+    let snap = stac_resolve_snapshot(base, snapshot)?;
+    let url = format!("{base}/{snap}catalog.json");
+    let cat = get_json(&url)?.ok_or_else(|| format!("{url}: not found"))?;
+    let themes = stac_children(&cat);
+    if themes.is_empty() {
+        return Err(format!("{url}: no themes listed"));
+    }
+    Ok(themes
+        .into_iter()
+        .map(|t| Dataset {
+            code: t.clone(),
+            name: t.clone(),
+            path: t,
+        })
+        .collect())
+}
+
+/// "Manifest" of a STAC theme: its type collections with part counts
+/// (feature totals live in the per-part items — too many to fetch here).
+pub fn fetch_stac_manifest(base: &str, snapshot: &str, theme: &str) -> Result<Manifest, String> {
+    let snap = stac_resolve_snapshot(base, snapshot)?;
+    let url = format!("{base}/{snap}{theme}/catalog.json");
+    let cat = get_json(&url)?.ok_or_else(|| format!("{url}: not found"))?;
+    let mut themes = Vec::new();
+    for ty in stac_children(&cat) {
+        let curl = format!("{base}/{snap}{theme}/{ty}/collection.json");
+        let col = get_json(&curl)?.ok_or_else(|| format!("{curl}: not found"))?;
+        let parts = col
+            .get("links")
+            .and_then(Value::as_array)
+            .map(|ls| {
+                ls.iter()
+                    .filter(|l| l.get("rel").and_then(Value::as_str) == Some("item"))
+                    .count()
+            })
+            .unwrap_or(0);
+        themes.push((ty, parts as u64));
+    }
+    Ok(Manifest {
+        state_name: Some(theme.to_string()),
+        total_features: None,
+        themes,
+    })
+}
+
+/// collection.json URL of one type — the value a `Source::Stac` carries.
+pub fn stac_collection_url(base: &str, snapshot: &str, theme: &str, ty: &str) -> String {
+    format!("{base}/{snapshot}{theme}/{ty}/collection.json")
+}
+
+/// One parquet part file of a STAC collection.
+#[derive(Clone, Debug)]
+pub struct StacPart {
+    /// HTTPS asset URL.
+    pub url: String,
+    /// Item bbox (WGS84 lon/lat), for part-level viewport pruning.
+    pub bbox: Option<[f64; 4]>,
+    pub rows: u64,
+}
+
+/// The parquet asset of a STAC item: prefer the `aws` asset, else the
+/// first https parquet one.
+fn stac_item_asset(item: &Value) -> Option<String> {
+    let assets = item.get("assets").and_then(Value::as_object)?;
+    let href = |a: &Value| {
+        a.get("href")
+            .and_then(Value::as_str)
+            .filter(|h| h.starts_with("http://") || h.starts_with("https://"))
+            .map(String::from)
+    };
+    if let Some(a) = assets.get("aws").and_then(href) {
+        return Some(a);
+    }
+    assets.values().find_map(|a| {
+        let is_parquet = a.get("type").and_then(Value::as_str)
+            == Some("application/vnd.apache.parquet")
+            || a.get("href")
+                .and_then(Value::as_str)
+                .is_some_and(|h| h.ends_with(".parquet"));
+        if is_parquet {
+            href(a)
+        } else {
+            None
+        }
+    })
+}
+
+/// STAC bbox → 2D: 6 elements is [xmin, ymin, zmin, xmax, ymax, zmax].
+fn stac_bbox_2d(v: &Value) -> Option<[f64; 4]> {
+    let b: Vec<f64> = v.as_array()?.iter().filter_map(Value::as_f64).collect();
+    match b.len() {
+        4 => Some([b[0], b[1], b[2], b[3]]),
+        6 => Some([b[0], b[1], b[3], b[4]]),
+        _ => None,
+    }
+}
+
+/// All parts of a type collection, from its item documents (parallel
+/// fetch on dedicated threads; any failure aborts — a silently partial
+/// part list would silently drop data).
+pub fn fetch_stac_parts(collection_url: &str) -> Result<Vec<StacPart>, String> {
+    let col = get_json(collection_url)?.ok_or_else(|| format!("{collection_url}: not found"))?;
+    let dir = collection_url
+        .rsplit_once('/')
+        .map(|(d, _)| d)
+        .unwrap_or(collection_url);
+    let item_urls: Vec<String> = col
+        .get("links")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|l| l.get("rel").and_then(Value::as_str) == Some("item"))
+        .filter_map(|l| l.get("href").and_then(Value::as_str))
+        .map(|h| format!("{dir}/{}", h.trim_start_matches("./")))
+        .collect();
+    if item_urls.is_empty() {
+        return Err(format!("{collection_url}: no items listed"));
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    const FETCH_THREADS: usize = 8;
+    let next = AtomicUsize::new(0);
+    let parts = Mutex::new(vec![None::<StacPart>; item_urls.len()]);
+    let first_err = Mutex::new(None::<String>);
+    std::thread::scope(|s| {
+        for _ in 0..FETCH_THREADS.min(item_urls.len()) {
+            s.spawn(|| loop {
+                if first_err.lock().unwrap().is_some() {
+                    break;
+                }
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(url) = item_urls.get(i) else { break };
+                let item = match get_json(url) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        first_err.lock().unwrap().get_or_insert(format!("{url}: not found"));
+                        continue;
+                    }
+                    Err(e) => {
+                        first_err.lock().unwrap().get_or_insert(e);
+                        continue;
+                    }
+                };
+                let Some(asset) = stac_item_asset(&item) else {
+                    first_err
+                        .lock()
+                        .unwrap()
+                        .get_or_insert(format!("{url}: no parquet asset"));
+                    continue;
+                };
+                parts.lock().unwrap()[i] = Some(StacPart {
+                    url: asset,
+                    bbox: item.get("bbox").and_then(stac_bbox_2d),
+                    rows: item
+                        .get("properties")
+                        .and_then(|p| p.get("num_rows"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                });
+            });
+        }
+    });
+    if let Some(e) = first_err.into_inner().unwrap() {
+        return Err(format!("listing parts: {e}"));
+    }
+    Ok(parts.into_inner().unwrap().into_iter().flatten().collect())
+}
+
 /// ISO 3166-2 regions probed when a repository has no index.json.
 /// 404s drop out, so over-listing is harmless.
 const REGIONS: &[(&str, &str, &str)] = &[
@@ -584,6 +845,143 @@ mod tests {
         let json = serde_json::to_string(&repos).unwrap();
         let back: Vec<Repository> = serde_json::from_str(&json).unwrap();
         assert_eq!(back[0].url, "https://parquetry.geomermaids.com");
+    }
+
+    fn write_json(root: &Path, rel: &str, v: serde_json::Value) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, v.to_string()).unwrap();
+    }
+
+    /// A minimal Overture-shaped STAC tree on disk, served over loopback.
+    fn spawn_stac_fixture() -> (String, std::path::PathBuf) {
+        use serde_json::json;
+        // Unique per call: tests run in parallel in one process.
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "geopq_stac_fix_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        write_json(
+            &root,
+            "catalog.json",
+            json!({"latest": "2026-06", "links": [
+                {"rel": "root", "href": "./catalog.json"},
+                {"rel": "child", "href": "./2026-05/catalog.json"},
+                {"rel": "child", "href": "./2026-06/catalog.json"},
+            ]}),
+        );
+        write_json(
+            &root,
+            "2026-06/catalog.json",
+            json!({"links": [
+                {"rel": "child", "href": "./buildings/catalog.json"},
+                {"rel": "child", "href": "./places/catalog.json"},
+            ]}),
+        );
+        write_json(
+            &root,
+            "2026-06/buildings/catalog.json",
+            json!({"links": [
+                {"rel": "child", "href": "./building/collection.json"},
+                {"rel": "child", "href": "./building_part/collection.json"},
+            ]}),
+        );
+        write_json(
+            &root,
+            "2026-06/buildings/building/collection.json",
+            json!({"links": [
+                {"rel": "item", "href": "./00000/00000.json"},
+                {"rel": "item", "href": "./00001/00001.json"},
+            ]}),
+        );
+        write_json(
+            &root,
+            "2026-06/buildings/building_part/collection.json",
+            json!({"links": [{"rel": "item", "href": "./00000/00000.json"}]}),
+        );
+        write_json(
+            &root,
+            "2026-06/buildings/building/00000/00000.json",
+            json!({
+                "bbox": [-10.0, 40.0, -5.0, 45.0],
+                "properties": {"num_rows": 123},
+                "assets": {
+                    "azure": {"href": "https://azure.example/p0.parquet"},
+                    "aws": {"href": "https://aws.example/p0.parquet"},
+                }
+            }),
+        );
+        write_json(
+            &root,
+            "2026-06/buildings/building/00001/00001.json",
+            json!({
+                // 6-element bbox: [xmin, ymin, zmin, xmax, ymax, zmax].
+                "bbox": [5.0, 40.0, 0.0, 10.0, 45.0, 100.0],
+                "properties": {"num_rows": 456},
+                "assets": {
+                    "data": {
+                        "href": "https://other.example/p1.parquet",
+                        "type": "application/vnd.apache.parquet",
+                    }
+                }
+            }),
+        );
+        let base = crate::data::source::testserver::spawn_dir(root.clone());
+        (base, root)
+    }
+
+    #[test]
+    fn stac_snapshots_latest_first_and_alias_resolution() {
+        let (base, _root) = spawn_stac_fixture();
+        let snaps = fetch_snapshots_stac(&base).unwrap();
+        assert_eq!(
+            snaps.iter().map(|s| s.path.as_str()).collect::<Vec<_>>(),
+            vec!["2026-06/", "2026-05/"],
+            "latest release first"
+        );
+        // The browser's placeholder resolves through the root catalog.
+        let ds = discover_datasets_stac(&base, "latest/").unwrap();
+        assert_eq!(
+            ds.iter().map(|d| d.path.as_str()).collect::<Vec<_>>(),
+            vec!["buildings", "places"]
+        );
+    }
+
+    #[test]
+    fn stac_manifest_lists_types_with_part_counts() {
+        let (base, _root) = spawn_stac_fixture();
+        let m = fetch_stac_manifest(&base, "2026-06/", "buildings").unwrap();
+        assert_eq!(m.state_name.as_deref(), Some("buildings"));
+        assert_eq!(
+            m.themes,
+            vec![("building".to_string(), 2), ("building_part".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn stac_parts_prefer_aws_and_parse_bboxes() {
+        let (base, _root) = spawn_stac_fixture();
+        let url = stac_collection_url(&base, "2026-06/", "buildings", "building");
+        let parts = fetch_stac_parts(&url).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].url, "https://aws.example/p0.parquet");
+        assert_eq!(parts[0].bbox, Some([-10.0, 40.0, -5.0, 45.0]));
+        assert_eq!(parts[0].rows, 123);
+        // Generic parquet asset accepted; 6-element bbox collapsed to 2D.
+        assert_eq!(parts[1].url, "https://other.example/p1.parquet");
+        assert_eq!(parts[1].bbox, Some([5.0, 40.0, 10.0, 45.0]));
+    }
+
+    #[test]
+    fn stac_parts_fail_loud_on_missing_item() {
+        let (base, _root) = spawn_stac_fixture();
+        // building_part's collection lists an item that was never written.
+        let url = stac_collection_url(&base, "2026-06/", "buildings", "building_part");
+        let err = fetch_stac_parts(&url).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
     }
 
     #[test]

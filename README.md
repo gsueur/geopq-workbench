@@ -80,6 +80,16 @@ Fixture-dependent tests self-skip when the files are absent.
   `~/.config/geopq-viewer/repositories.json`). Discovered dataset lists
   are cached across sessions (`repo_cache.json`, "cached N h ago" shown
   in the dialog); the ⟳ button clears the cache and re-discovers.
+- **STAC repositories** (Overture Maps preconfigured): a static STAC
+  catalog is browsed the same way — releases as snapshots, themes as
+  datasets, type collections as the checkable rows. Loading a type opens
+  it as one multi-fragment remote layer built from the collection's part
+  files: the STAC items carry each part's bbox, so only the parts
+  intersecting the current viewport are opened (capped at 16 files per
+  load — zoom in for the dense types like `building`, 512 parts / ~2.5B
+  rows), then the usual covering-column row-group/feature pruning takes
+  over inside each part. Adding a repository whose URL ends in
+  `catalog.json` selects the STAC protocol automatically.
 - **Data-driven styling** (layer ☰ → Style by value…): color features by
   an attribute — numeric columns get a graduated ramp (Viridis / Turbo /
   Blue–Red) with a classification method: equal interval (bounds from the
@@ -299,7 +309,10 @@ deep zoom stays jitter-free.
 - Overview/pyramid levels for zoomed-out views of huge remote files
   (decimated previews bound memory today, but a world view of a huge
   remote file still downloads every candidate row group's coordinates)
-- Remote hive datasets (s3:// / https:// prefix listing; local dirs work)
+- Remote hive datasets (s3:// / https:// prefix listing; local dirs and
+  STAC-listed collections work)
+- STAC V2: lazy part-append on camera move (today the part selection is
+  fixed at load; pan past it and reload instead)
 - Optimize over a multi-file dataset (single files only today)
 - Streaming (external-sort) optimize for files beyond the 8 GB in-memory cap
 - Page-index (footer-only) pruning for 2.0 native-stats files without a

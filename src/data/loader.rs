@@ -405,7 +405,12 @@ pub fn spawn_load(
             handle.send(LoadMsg::Failed { job, source: label, error: CANCELLED.into() });
             return;
         }
-        match open_store(&source) {
+        // STAC part pruning happens at open, before any CRS is known; item
+        // bboxes are WGS84 lon/lat by spec.
+        let stac_rect = matches!(source, Source::Stac { .. })
+            .then(|| viewport_to_data_bbox(view_world, &display, &Crs::wgs84()))
+            .flatten();
+        match open_store_with_view(&source, stac_rect) {
             Ok((store, crs, info, rg_meta)) => {
                 if cancelled() {
                     handle.send(LoadMsg::Failed {
@@ -716,8 +721,20 @@ struct FileOpen {
 }
 
 fn open_store(source: &Source) -> Result<StoreOpen, String> {
+    open_store_with_view(source, None)
+}
+
+/// `stac_rect`: current viewport in WGS84 lon/lat, for part-level pruning
+/// of STAC collections (their item bboxes are WGS84 by spec).
+fn open_store_with_view(
+    source: &Source,
+    stac_rect: Option<[f64; 4]>,
+) -> Result<StoreOpen, String> {
     if let Source::Dir(dir) = source {
         return open_dir_store(source, dir);
+    }
+    if let Source::Stac { url, .. } = source {
+        return open_stac_store(source, url, stac_rect);
     }
     let f = open_file(source)?;
     Ok((
@@ -770,22 +787,100 @@ fn list_dataset_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, 
 }
 
 /// Open a directory of (possibly hive-partitioned) GeoParquet files as one
-/// multi-fragment store. All files must share the schema, CRS, geometry
-/// column and encoding; hive `key=value` path segments become virtual
+/// multi-fragment store. Hive `key=value` path segments become virtual
 /// partition columns.
 fn open_dir_store(source: &Source, dir: &std::path::Path) -> Result<StoreOpen, String> {
-    use super::store::{hive_segments, Fragment};
+    use super::store::hive_segments;
 
-    let files = list_dataset_files(dir)?;
-    if files.is_empty() {
+    let paths = list_dataset_files(dir)?;
+    if paths.is_empty() {
         return Err(format!("no .parquet files under {}", dir.display()));
     }
-
-    // Hive keys, in first-appearance order across all paths.
-    let hive: Vec<Vec<(String, Option<String>)>> = files
+    let hive: Vec<Vec<(String, Option<String>)>> = paths
         .iter()
         .map(|p| hive_segments(p.strip_prefix(dir).unwrap_or(p)))
         .collect();
+    let files: Vec<(Source, String)> = paths
+        .into_iter()
+        .map(|p| {
+            let short = p
+                .strip_prefix(dir)
+                .unwrap_or(&p)
+                .display()
+                .to_string();
+            (Source::Local(p), short)
+        })
+        .collect();
+    open_multi_store(source, files, hive)
+}
+
+/// Cap on part files a STAC load opens: each part costs a content-length
+/// probe plus a footer fetch, so a world view of a 512-part collection
+/// must zoom in rather than stream half a terabyte of metadata.
+pub const STAC_PART_CAP: usize = 16;
+
+/// Open a STAC type collection as one multi-fragment remote store: fetch
+/// the item list, keep the parts whose bbox intersects the viewport, cap.
+fn open_stac_store(
+    source: &Source,
+    collection_url: &str,
+    rect: Option<[f64; 4]>,
+) -> Result<StoreOpen, String> {
+    let parts = crate::data::repo::fetch_stac_parts(collection_url)?;
+    let total = parts.len();
+    let keep: Vec<_> = parts
+        .into_iter()
+        .filter(|p| match (rect, p.bbox) {
+            (Some(r), Some(b)) => b[0] <= r[2] && b[2] >= r[0] && b[1] <= r[3] && b[3] >= r[1],
+            _ => true,
+        })
+        .collect();
+    if keep.is_empty() {
+        return Err("no parts of this collection intersect the current view".into());
+    }
+    if keep.len() > STAC_PART_CAP {
+        return Err(format!(
+            "{} of {total} parts intersect the current view (cap {STAC_PART_CAP} \
+             files per load) — zoom in and retry",
+            keep.len()
+        ));
+    }
+    if keep.len() < total {
+        log::info!(
+            "{}: part pruning {total} -> {} files",
+            source.label(),
+            keep.len()
+        );
+    }
+    let mut files = Vec::with_capacity(keep.len());
+    for p in keep {
+        let short = p
+            .url
+            .rsplit('/')
+            .next()
+            .unwrap_or(p.url.as_str())
+            .to_string();
+        let src = Source::Remote { url: p.url, len: 0 }
+            .resolve()
+            .map_err(|e| format!("{short}: {e}"))?;
+        files.push((src, short));
+    }
+    let hive = vec![Vec::new(); files.len()];
+    open_multi_store(source, files, hive)
+}
+
+/// Open a set of same-schema parquet files as one multi-fragment store.
+/// All files must share the schema, CRS, geometry column and encoding;
+/// `hive` carries each file's `key=value` path segments (empty when the
+/// dataset has none).
+fn open_multi_store(
+    source: &Source,
+    files: Vec<(Source, String)>,
+    hive: Vec<Vec<(String, Option<String>)>>,
+) -> Result<StoreOpen, String> {
+    use super::store::Fragment;
+
+    // Hive keys, in first-appearance order across all paths.
     let mut part_cols: Vec<String> = Vec::new();
     for segs in &hive {
         for (k, _) in segs {
@@ -795,11 +890,8 @@ fn open_dir_store(source: &Source, dir: &std::path::Path) -> Result<StoreOpen, S
         }
     }
 
-    let short = |p: &std::path::Path| -> String {
-        p.strip_prefix(dir).unwrap_or(p).display().to_string()
-    };
-    let first = open_file(&Source::Local(files[0].clone()))
-        .map_err(|e| format!("{}: {e}", short(&files[0])))?;
+    let first =
+        open_file(&files[0].0).map_err(|e| format!("{}: {e}", files[0].1))?;
     // A hive key shadowed by a real column stays path-only.
     part_cols.retain(|k| {
         !first
@@ -816,13 +908,12 @@ fn open_dir_store(source: &Source, dir: &std::path::Path) -> Result<StoreOpen, S
     info.files = files.len();
     let mut total_rows = 0u64;
 
-    for (i, path) in files.iter().enumerate() {
-        let src = Source::Local(path.clone());
+    for (i, (src, short)) in files.iter().enumerate() {
         let f = if i == 0 {
             // Reuse the already parsed first file (moved below).
             None
         } else {
-            Some(open_file(&src).map_err(|e| format!("{}: {e}", short(path)))?)
+            Some(open_file(src).map_err(|e| format!("{short}: {e}"))?)
         };
         let f = match &f {
             Some(f) => f,
@@ -830,19 +921,16 @@ fn open_dir_store(source: &Source, dir: &std::path::Path) -> Result<StoreOpen, S
         };
         if i > 0 {
             schema_compatible(&first.schema, &f.schema)
-                .map_err(|e| format!("{}: {e}", short(path)))?;
+                .map_err(|e| format!("{short}: {e}"))?;
             if !f.crs.same_as(&first.crs) {
                 return Err(format!(
-                    "{}: CRS '{}' differs from the dataset's '{}'",
-                    short(path),
-                    f.crs.name,
-                    first.crs.name
+                    "{short}: CRS '{}' differs from the dataset's '{}'",
+                    f.crs.name, first.crs.name
                 ));
             }
             if f.encoding != first.encoding || f.geom_col != first.geom_col {
                 return Err(format!(
-                    "{}: geometry column/encoding differs from the dataset's",
-                    short(path)
+                    "{short}: geometry column/encoding differs from the dataset's"
                 ));
             }
             info.file_size += f.info.file_size;
@@ -886,7 +974,7 @@ fn open_dir_store(source: &Source, dir: &std::path::Path) -> Result<StoreOpen, S
             .collect();
         frags.push((
             Fragment {
-                source: src,
+                source: src.clone(),
                 meta: f.meta.clone(),
                 part_values,
                 rg_offset: 0,
@@ -2976,6 +3064,165 @@ mod hive_tests {
         let out =
             run_query_for_test("select state, count(*) c from t group by state", &layers).unwrap();
         assert_eq!(out.total_rows, 3);
+    }
+}
+
+#[cfg(test)]
+mod stac_tests {
+    use super::*;
+    use arrow::array::{BinaryArray, Int64Array};
+    use arrow::datatypes::{Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use std::fs::File;
+
+    fn wkb_point(x: f64, y: f64) -> Vec<u8> {
+        let mut b = vec![1u8];
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&x.to_le_bytes());
+        b.extend_from_slice(&y.to_le_bytes());
+        b
+    }
+
+    /// One STAC part: `n` points around (cx, cy), file-level geo bbox.
+    fn write_part(path: &std::path::Path, n: usize, cx: f64, cy: f64) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {
+                "encoding": "WKB",
+                "geometry_types": ["Point"],
+                "bbox": [cx - 1.0, cy - 1.0, cx + 1.0, cy + 1.0],
+            }},
+        });
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let wkbs: Vec<Vec<u8>> = (0..n)
+            .map(|i| wkb_point(cx + (i % 10) as f64 * 0.01, cy + (i / 10) as f64 * 0.01))
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(wkbs.iter())),
+                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(128))
+            .build();
+        let mut w =
+            ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(props)).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    fn write_json(root: &std::path::Path, rel: &str, body: String) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    /// End-to-end: a two-part STAC collection over loopback HTTP opens as
+    /// one multi-fragment remote store, pruned to the viewport's parts.
+    #[test]
+    fn stac_collection_opens_viewport_parts() {
+        let root = std::env::temp_dir().join(format!("geopq_stac_open_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_part(&root.join("west.parquet"), 200, -10.0, 45.0);
+        write_part(&root.join("east.parquet"), 300, 10.0, 45.0);
+        write_json(
+            &root,
+            "collection.json",
+            r#"{"links": [
+                {"rel": "item", "href": "./items/west.json"},
+                {"rel": "item", "href": "./items/east.json"}
+            ]}"#
+            .into(),
+        );
+        let base = crate::data::source::testserver::spawn_dir(root.clone());
+        for (name, bbox, rows) in [
+            ("west", "[-11.0, 44.0, -9.0, 46.0]", 200),
+            ("east", "[9.0, 44.0, 11.0, 46.0]", 300),
+        ] {
+            write_json(
+                &root,
+                &format!("items/{name}.json"),
+                format!(
+                    r#"{{"bbox": {bbox}, "properties": {{"num_rows": {rows}}},
+                        "assets": {{"aws": {{"href": "{base}/{name}.parquet"}}}}}}"#
+                ),
+            );
+        }
+        let source = Source::Stac {
+            url: format!("{base}/collection.json"),
+            name: "building".into(),
+        };
+
+        // No viewport: every part joins the store.
+        let (store, crs, info, rg_meta) = open_store_with_view(&source, None).unwrap();
+        assert!(crs.is_latlong);
+        assert_eq!(store.fragments.len(), 2);
+        assert_eq!(store.total_rows(), 500);
+        assert!(store.part_cols.is_empty(), "no hive columns on STAC parts");
+        assert_eq!(info.files, 2);
+        let (_, boxes) = rg_meta.expect("file-level geo bboxes back pruning");
+        assert_eq!(boxes.len(), store.rg_starts().len() - 1);
+
+        // A viewport over the west part only opens that file.
+        let (store, _, info, _) =
+            open_store_with_view(&source, Some([-12.0, 43.0, -8.0, 47.0])).unwrap();
+        assert_eq!(store.fragments.len(), 1);
+        assert_eq!(store.total_rows(), 200);
+        assert_eq!(info.files, 1);
+
+        // A viewport intersecting nothing is a load error, not an empty map.
+        let Err(err) = open_store_with_view(&source, Some([100.0, 0.0, 110.0, 5.0])) else {
+            panic!("disjoint viewport must not open a store");
+        };
+        assert!(err.contains("no parts"), "{err}");
+    }
+
+    /// Live probe against the public Overture STAC catalog (network):
+    ///   cargo test --release stac_live_probe -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn stac_live_probe() {
+        use crate::data::repo;
+        let base = "https://stac.overturemaps.org";
+        let snaps = repo::fetch_snapshots_stac(base).unwrap();
+        println!("releases: {:?}", snaps.iter().map(|s| &s.label).collect::<Vec<_>>());
+        let ds = repo::discover_datasets_stac(base, "latest/").unwrap();
+        println!("themes: {:?}", ds.iter().map(|d| &d.name).collect::<Vec<_>>());
+        let snap = &snaps[0].path;
+        let m = repo::fetch_stac_manifest(base, snap, "divisions").unwrap();
+        println!("divisions types: {:?}", m.themes);
+        // Open division_area around Paris; item pruning + footer reads live.
+        let source = Source::Stac {
+            url: repo::stac_collection_url(base, snap, "divisions", "division_area"),
+            name: "division_area".into(),
+        };
+        let t = Instant::now();
+        let (store, crs, info, rg_meta) =
+            open_store_with_view(&source, Some([2.0, 48.5, 3.0, 49.2])).unwrap();
+        println!(
+            "opened {} parts / {} rows / {} rgs in {:?} (crs {})",
+            info.files,
+            store.total_rows(),
+            store.rg_starts().len() - 1,
+            t.elapsed(),
+            crs.name,
+        );
+        assert!(crs.is_latlong);
+        assert!(info.files >= 1);
+        assert!(rg_meta.is_some(), "covering stats expected on Overture");
     }
 }
 
