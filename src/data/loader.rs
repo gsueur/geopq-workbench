@@ -50,6 +50,17 @@ pub enum LoadMsg {
         stats_build_ms: u64,
         bad_geoms: usize,
     },
+    /// Full drop-and-reload restricted to the viewport: replaces the
+    /// sections AND the per-group decode state.
+    Reloaded {
+        layer_id: u64,
+        generation: u64,
+        geometry: LayerGeometry,
+        loaded: Vec<GroupLoad>,
+        rows: usize,
+        bad_geoms: usize,
+        build_ms: u64,
+    },
     /// A row append ended without a result (error or user cancel).
     AppendEnded { layer_id: u64, error: String },
     /// A projection/filter rebuild ended without geometry (error or
@@ -445,70 +456,12 @@ pub fn spawn_load(
                 // Prune only with metadata-sourced boxes: a pruned first load
                 // never sees the skipped row groups, so computed boxes can't
                 // drive it.
-                let groups: Vec<u32> = match (&rg_meta, rect) {
-                    (Some((_, boxes)), Some(r)) => intersecting_rgs(boxes, r),
-                    _ => (0..n_rg as u32).collect(),
-                };
-                if groups.len() < n_rg {
-                    log::info!(
-                        "{}: row-group pruning {} -> {} groups",
-                        source.label(),
-                        n_rg,
-                        groups.len()
-                    );
-                }
-                // Per-feature covering selection: only when the viewport
-                // doesn't already cover the whole data extent.
-                let use_rect = (store.covering.is_some() || store.xy_geom.is_some())
-                    && match (&rg_meta, rect) {
-                        (Some((_, boxes)), Some(r)) => {
-                            let mut u = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
-                            for b in boxes {
-                                u = [u[0].min(b[0]), u[1].min(b[1]), u[2].max(b[2]), u[3].max(b[3])];
-                            }
-                            !(r[0] <= u[0] && r[1] <= u[1] && r[2] >= u[2] && r[3] >= u[3])
-                        }
-                        _ => false,
-                    };
-                let mut sel: Vec<GroupSel> = groups
-                    .iter()
-                    .map(|&g| {
-                        if use_rect {
-                            GroupSel::Rect(g, rect.unwrap())
-                        } else {
-                            GroupSel::All(g)
-                        }
-                    })
-                    .collect();
-                // Row budget: a selection that could decode more rows than
-                // the budget becomes a decimated preview (an upper bound —
-                // rect selections may resolve smaller, but a preview that
-                // refines on zoom beats an out-of-memory tessellation).
-                let est: u64 = groups
-                    .iter()
-                    .map(|&g| {
-                        store.rg_starts()[g as usize + 1] - store.rg_starts()[g as usize]
-                    })
-                    .sum();
-                if est > MAX_BUILD_ROWS {
-                    let stride = est.div_ceil(PREVIEW_TARGET_ROWS).max(2) as u32;
-                    log::info!(
-                        "{}: {est} candidate rows exceed the budget — preview at 1/{stride}",
-                        source.label()
-                    );
-                    sel = sel
-                        .into_iter()
-                        .map(|s| match s {
-                            GroupSel::All(g) => {
-                                GroupSel::Preview { group: g, rect: None, stride }
-                            }
-                            GroupSel::Rect(g, r) => {
-                                GroupSel::Preview { group: g, rect: Some(r), stride }
-                            }
-                            other => other,
-                        })
-                        .collect();
-                }
+                let sel = plan_viewport_selection(
+                    &store,
+                    &source.label(),
+                    rg_meta.as_ref().map(|(_, b)| b.as_slice()),
+                    rect,
+                );
                 let build_t0 = Instant::now();
                 let style_sel = style.as_ref().and_then(|sb| resolve_style(&store, sb));
                 match build_geometry(
@@ -718,6 +671,132 @@ struct FileOpen {
     /// Point geometry synthesized from these coordinate columns (x, y)
     /// when the file has no geometry column at all.
     xy: Option<(usize, usize)>,
+}
+
+/// Load planning shared by first loads and viewport reloads: which row
+/// groups intersect the viewport and how each is read — whole, per-feature
+/// rect selection (covering/xy), or a decimated preview when the candidate
+/// rows exceed the build budget.
+fn plan_viewport_selection(
+    store: &FeatureStore,
+    label: &str,
+    boxes: Option<&[[f64; 4]]>,
+    rect: Option<[f64; 4]>,
+) -> Vec<GroupSel> {
+    let n_rg = store.rg_starts().len().saturating_sub(1);
+    let groups: Vec<u32> = match (boxes, rect) {
+        (Some(b), Some(r)) => intersecting_rgs(b, r),
+        _ => (0..n_rg as u32).collect(),
+    };
+    if groups.len() < n_rg {
+        log::info!("{label}: row-group pruning {n_rg} -> {} groups", groups.len());
+    }
+    // Per-feature covering selection: only when the viewport doesn't
+    // already cover the whole data extent.
+    let use_rect = (store.covering.is_some() || store.xy_geom.is_some())
+        && match (boxes, rect) {
+            (Some(bs), Some(r)) => {
+                let mut u = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+                for b in bs {
+                    u = [u[0].min(b[0]), u[1].min(b[1]), u[2].max(b[2]), u[3].max(b[3])];
+                }
+                !(r[0] <= u[0] && r[1] <= u[1] && r[2] >= u[2] && r[3] >= u[3])
+            }
+            _ => false,
+        };
+    let mut sel: Vec<GroupSel> = groups
+        .iter()
+        .map(|&g| {
+            if use_rect {
+                GroupSel::Rect(g, rect.unwrap())
+            } else {
+                GroupSel::All(g)
+            }
+        })
+        .collect();
+    // Row budget: a selection that could decode more rows than the budget
+    // becomes a decimated preview (an upper bound — rect selections may
+    // resolve smaller, but a preview that refines on zoom beats an
+    // out-of-memory tessellation).
+    let est: u64 = groups
+        .iter()
+        .map(|&g| store.rg_starts()[g as usize + 1] - store.rg_starts()[g as usize])
+        .sum();
+    if est > MAX_BUILD_ROWS {
+        let stride = est.div_ceil(PREVIEW_TARGET_ROWS).max(2) as u32;
+        log::info!("{label}: {est} candidate rows exceed the budget — preview at 1/{stride}");
+        sel = sel
+            .into_iter()
+            .map(|s| match s {
+                GroupSel::All(g) => GroupSel::Preview { group: g, rect: None, stride },
+                GroupSel::Rect(g, r) => GroupSel::Preview { group: g, rect: Some(r), stride },
+                other => other,
+            })
+            .collect();
+    }
+    sel
+}
+
+/// Drop-and-reload: run the initial-load planning against the current
+/// viewport on an already open store and rebuild the layer from scratch —
+/// the memory-relief counterpart of refinement. Everything outside the
+/// view is simply not decoded.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_reload(
+    handle: LoaderHandle,
+    layer_id: u64,
+    generation: u64,
+    store: Arc<FeatureStore>,
+    crs: Crs,
+    boxes: Option<Vec<[f64; 4]>>,
+    display: DisplayCrs,
+    view_world: [f64; 4],
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    style: Option<crate::data::layer::StyleBy>,
+) {
+    std::thread::spawn(move || {
+        let t0 = Instant::now();
+        let n_rg = store.rg_starts().len().saturating_sub(1);
+        let rect = viewport_to_data_bbox(view_world, &display, &crs);
+        let sel =
+            plan_viewport_selection(&store, &store.source.label(), boxes.as_deref(), rect);
+        let style_sel = style.as_ref().and_then(|sb| resolve_style(&store, sb));
+        match build_geometry(
+            &store,
+            &crs,
+            &display,
+            None,
+            sel,
+            Some(&cancel),
+            style_sel.as_ref(),
+        ) {
+            Ok((geometry, rows, bad, _boxes, resolved)) => {
+                let mut loaded = vec![GroupLoad::None; n_rg];
+                for (g, st) in resolved {
+                    loaded[g as usize] = st;
+                }
+                log::info!(
+                    "reloaded {}: {rows} features in {} ms",
+                    store.source.name(),
+                    t0.elapsed().as_millis()
+                );
+                handle.send(LoadMsg::Reloaded {
+                    layer_id,
+                    generation,
+                    geometry,
+                    loaded,
+                    rows,
+                    bad_geoms: bad,
+                    build_ms: t0.elapsed().as_millis() as u64,
+                });
+            }
+            Err(error) => handle.send(LoadMsg::RebuildFailed {
+                layer_id,
+                generation,
+                error,
+            }),
+        }
+    });
 }
 
 fn open_store(source: &Source) -> Result<StoreOpen, String> {
@@ -3064,6 +3143,80 @@ mod hive_tests {
         let out =
             run_query_for_test("select state, count(*) c from t group by state", &layers).unwrap();
         assert_eq!(out.total_rows, 3);
+    }
+}
+
+#[cfg(test)]
+mod reload_plan_tests {
+    use super::*;
+    use arrow::array::{BinaryArray, Int64Array};
+    use arrow::datatypes::{Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use std::fs::File;
+
+    fn wkb_point(x: f64, y: f64) -> Vec<u8> {
+        let mut b = vec![1u8];
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&x.to_le_bytes());
+        b.extend_from_slice(&y.to_le_bytes());
+        b
+    }
+
+    /// Reload planning: pruning by the supplied boxes, whole-group reads
+    /// without a covering column, everything without a rect.
+    #[test]
+    fn plan_prunes_and_selects_whole_groups() {
+        let path = std::env::temp_dir().join(format!(
+            "geopq_reload_plan_{}.parquet",
+            std::process::id()
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let wkbs: Vec<Vec<u8>> = (0..300).map(|i| wkb_point(i as f64 * 0.1, 0.0)).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(wkbs.iter())),
+                Arc::new(Int64Array::from((0..300i64).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(128))
+            .build();
+        let mut w =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let (store, ..) = open_store(&Source::Local(path)).unwrap();
+        assert_eq!(store.rg_starts().len() - 1, 3, "3 row groups expected");
+
+        let boxes = vec![
+            [0.0, 0.0, 1.0, 1.0],
+            [10.0, 0.0, 11.0, 1.0],
+            [20.0, 0.0, 21.0, 1.0],
+        ];
+        // Rect over the middle box only: one group, read whole (no
+        // covering column, so no per-feature selection).
+        let sel = plan_viewport_selection(
+            &store,
+            "t",
+            Some(&boxes),
+            Some([9.5, -1.0, 12.0, 2.0]),
+        );
+        assert!(matches!(sel.as_slice(), [GroupSel::All(1)]), "{sel:?}");
+        // Disjoint rect: nothing to read.
+        let sel =
+            plan_viewport_selection(&store, "t", Some(&boxes), Some([50.0, 0.0, 60.0, 1.0]));
+        assert!(sel.is_empty(), "{sel:?}");
+        // No rect: everything.
+        let sel = plan_viewport_selection(&store, "t", Some(&boxes), None);
+        assert_eq!(sel.len(), 3);
+        assert!(matches!(sel[0], GroupSel::All(0)));
+        assert!(matches!(sel[2], GroupSel::All(2)));
     }
 }
 

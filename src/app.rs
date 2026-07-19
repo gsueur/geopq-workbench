@@ -290,6 +290,27 @@ fn fresh_cancel(
     c
 }
 
+/// Ask the allocator to hand freed pages back to the OS. Tessellation
+/// churn leaves gigabytes of empty malloc depots parked in free lists on
+/// macOS, and Activity Monitor keeps counting them as app memory; the
+/// explicit relief makes "Reload to viewport" and layer removal visibly
+/// free what they free. Worker thread — walking a large heap takes tens
+/// of milliseconds. No-op on other platforms.
+fn release_freed_memory() {
+    #[cfg(target_os = "macos")]
+    std::thread::spawn(|| {
+        unsafe extern "C" {
+            /// libmalloc; NULL zone = every zone, goal 0 = everything.
+            fn malloc_zone_pressure_relief(
+                zone: *mut std::ffi::c_void,
+                goal: usize,
+            ) -> usize;
+        }
+        let freed = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+        log::info!("malloc pressure relief: {} MB returned to the OS", freed >> 20);
+    });
+}
+
 /// Draw-order category of a geometry kind: polygons under lines under
 /// points (mixed/unknown sink to the bottom with the polygons).
 fn kind_rank(k: crate::data::geometry::GeomKind) -> u8 {
@@ -782,6 +803,49 @@ impl ViewerApp {
     }
 
     /// Remove a layer's filter: everything loads again.
+    /// Drop every layer's loaded geometry and reload only what intersects
+    /// the current viewport — memory relief after loading large extents.
+    /// Uses the same planning as a first load (row-group pruning,
+    /// per-feature selection, preview fallback), so a dense viewport still
+    /// lands within the row budget.
+    fn reload_layers_to_viewport(&mut self, ctx: &egui::Context) {
+        use std::sync::atomic::Ordering;
+        self.clear_selection();
+        for l in &mut self.layers {
+            // A reload supersedes any in-flight refinement.
+            self.appending.remove(&l.id);
+            if let Some(c) = self.append_cancel.remove(&l.id) {
+                c.store(true, Ordering::Relaxed);
+            }
+            self.refine_hold.remove(&l.id);
+            // Row filters select rows the reload will not decode; clear
+            // them rather than silently showing a different subset.
+            l.filter = None;
+            l.generation += 1;
+            // Free the old meshes immediately — that is the point.
+            l.sections = Vec::new();
+            let n = l.store.rg_starts().len().saturating_sub(1);
+            l.loaded = vec![crate::data::layer::GroupLoad::None; n];
+            self.rebuilding.insert(l.id);
+            loader::spawn_reload(
+                LoaderHandle {
+                    tx: self.load_tx.clone(),
+                    egui_ctx: ctx.clone(),
+                },
+                l.id,
+                l.generation,
+                l.store.clone(),
+                l.crs.clone(),
+                l.rg_bboxes.as_ref().map(|r| r.boxes.clone()),
+                self.display.clone(),
+                self.last_view_world,
+                fresh_cancel(&mut self.rebuild_cancel, l.id),
+                l.style.style_by.clone(),
+            );
+        }
+        release_freed_memory();
+    }
+
     fn clear_layer_filter(&mut self, layer_id: u64, ctx: &egui::Context) {
         let display = self.display.clone();
         let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) else {
@@ -1105,6 +1169,31 @@ impl ViewerApp {
                     if self.rebuilding.is_empty() {
                         self.fit_after_rebuilds = false;
                     }
+                }
+                LoadMsg::Reloaded {
+                    layer_id,
+                    generation,
+                    geometry,
+                    loaded,
+                    rows,
+                    bad_geoms,
+                    build_ms,
+                } => {
+                    if let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) {
+                        if l.generation == generation {
+                            l.sections = vec![geometry];
+                            l.loaded = loaded;
+                            l.feature_count = rows;
+                            l.stats.build_ms = build_ms;
+                            l.stats.bad_geoms = bad_geoms;
+                            self.rebuilding.remove(&layer_id);
+                            self.rebuild_cancel.remove(&layer_id);
+                            if self.rebuilding.is_empty() {
+                                release_freed_memory();
+                            }
+                        }
+                    }
+                    // A reload never moves the viewport.
                 }
                 LoadMsg::Appended {
                     layer_id,
@@ -1530,6 +1619,21 @@ impl ViewerApp {
                 {
                     self.pending_fit = true;
                     self.camera_moved = true;
+                }
+                if ui
+                    .add_enabled(
+                        !self.layers.is_empty(),
+                        egui::Button::new("↺ Reload to viewport"),
+                    )
+                    .on_hover_text(
+                        "Drop all loaded geometry and reload only what intersects the \
+                         current viewport — frees memory after loading large extents. \
+                         Layer row filters are cleared.",
+                    )
+                    .clicked()
+                {
+                    let ctx = ui.ctx().clone();
+                    self.reload_layers_to_viewport(&ctx);
                 }
                 ui.separator();
                 ui.checkbox(&mut self.show_graticule, "Graticule");
@@ -2050,6 +2154,7 @@ impl ViewerApp {
             if self.selection.as_ref().map(|s| s.layer_id) == Some(id) {
                 self.clear_selection();
             }
+            release_freed_memory();
         }
         if let Some(b) = fit_to {
             self.fit_bounds = Some(b);

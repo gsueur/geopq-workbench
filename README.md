@@ -118,6 +118,12 @@ Fixture-dependent tests self-skip when the files are absent.
   bin, each drawn with its own uniform color), so ramp swaps are free and
   only column/break changes rebuild. Fills, outlines (darkened ramp) and
   points all follow; persisted in saved contexts.
+- **Reload to viewport** (View menu): drop all loaded geometry and
+  reload only what intersects the current viewport — reclaims memory
+  after loading large extents. Same planning as a first load (row-group
+  pruning, per-feature covering selection, decimated-preview fallback
+  for dense views), so it never blows the row budget; row filters are
+  cleared, styles and layer order stay.
 - **File info panel**: per-layer Info button — detected GeoParquet version,
   encoding, CRS, metadata bbox, covering/edges, column types + compression,
   row-group layout, raw `geo` JSON with copy.
@@ -320,6 +326,10 @@ deep zoom stays jitter-free.
 
 ### Features
 
+- Memory: freed heap stays resident after heavy loads even with
+  malloc_zone_pressure_relief (vmmap shows GB-scale "MALLOC_SMALL
+  (empty)" depots). Verify nothing retains the chunk Arcs, then try an
+  alternative allocator (mimalloc/jemalloc with aggressive decommit)
 - Overview/pyramid levels for zoomed-out views of huge remote files
   (decimated previews bound memory today, but a world view of a huge
   remote file still downloads every candidate row group's coordinates)
