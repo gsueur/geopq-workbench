@@ -79,6 +79,8 @@ pub enum LoadMsg {
         error: String,
     },
     /// Additional rows loaded for an existing layer (new section).
+    /// Appends stream in batches — the first lands fast so refinement
+    /// is visible while the rest decodes; `done` marks the last one.
     Appended {
         layer_id: u64,
         generation: u64,
@@ -86,6 +88,7 @@ pub enum LoadMsg {
         rows: usize,
         /// New decode state per touched row group.
         loaded: Vec<(u32, GroupLoad)>,
+        done: bool,
     },
     Failed {
         job: u64,
@@ -816,25 +819,93 @@ pub fn spawn_append(
             jobs
         };
         let style_sel = style.as_ref().and_then(|sb| resolve_style(&store, sb));
-        match build_geometry(&store, &crs, &display, None, jobs, Some(&cancel), style_sel.as_ref())
-        {
-            Ok((geometry, rows, _bad, _rg, resolved)) => handle.send(LoadMsg::Appended {
-                layer_id,
-                generation,
-                geometry,
-                rows,
-                loaded: resolved,
-            }),
-            Err(e) if e == CANCELLED => handle.send(LoadMsg::AppendEnded {
-                layer_id,
-                error: CANCELLED.into(),
-            }),
-            Err(e) => handle.send(LoadMsg::AppendEnded {
-                layer_id,
-                error: format!("{}: row append failed: {e}", store.source.label()),
-            }),
+        // Stream the append: content appears within ~a second instead of
+        // after the whole (up to budget-sized) build.
+        let batches = append_batches(&store, jobs);
+        let last = batches.len().saturating_sub(1);
+        for (bi, batch) in batches.into_iter().enumerate() {
+            match build_geometry(
+                &store,
+                &crs,
+                &display,
+                None,
+                batch,
+                Some(&cancel),
+                style_sel.as_ref(),
+            ) {
+                Ok((geometry, rows, _bad, _rg, resolved)) => handle.send(LoadMsg::Appended {
+                    layer_id,
+                    generation,
+                    geometry,
+                    rows,
+                    loaded: resolved,
+                    done: bi == last,
+                }),
+                Err(e) if e == CANCELLED => {
+                    handle.send(LoadMsg::AppendEnded {
+                        layer_id,
+                        error: CANCELLED.into(),
+                    });
+                    return;
+                }
+                Err(e) => {
+                    handle.send(LoadMsg::AppendEnded {
+                        layer_id,
+                        error: format!("{}: row append failed: {e}", store.source.label()),
+                    });
+                    return;
+                }
+            }
         }
     });
+}
+
+/// Streamed-append batch sizes: the first batch lands fast so the user
+/// sees refinement content almost immediately; later batches amortize
+/// per-batch overhead.
+const APPEND_FIRST_BATCH_ROWS: u64 = 80_000;
+const APPEND_BATCH_ROWS: u64 = 250_000;
+
+/// Split resolved append jobs into row-bounded batches, order preserved.
+/// Splitting never goes below job (row group) granularity.
+fn append_batches(store: &FeatureStore, jobs: Vec<GroupSel>) -> Vec<Vec<GroupSel>> {
+    append_batches_with(store, jobs, APPEND_FIRST_BATCH_ROWS, APPEND_BATCH_ROWS)
+}
+
+fn append_batches_with(
+    store: &FeatureStore,
+    jobs: Vec<GroupSel>,
+    first_target: u64,
+    later_target: u64,
+) -> Vec<Vec<GroupSel>> {
+    let starts = store.rg_starts();
+    let rows_of = |j: &GroupSel| -> u64 {
+        let g = j.group() as usize;
+        let group_rows = starts[g + 1] - starts[g];
+        match j {
+            GroupSel::Ranges(_, r) | GroupSel::ResolvedRect { ranges: r, .. } => {
+                r.iter().map(|&(s, e)| (e - s) as u64).sum()
+            }
+            GroupSel::Preview { stride, .. } => group_rows.div_ceil((*stride).max(2) as u64),
+            _ => group_rows,
+        }
+    };
+    let mut out: Vec<Vec<GroupSel>> = Vec::new();
+    let mut cur: Vec<GroupSel> = Vec::new();
+    let mut cur_rows = 0u64;
+    for j in jobs {
+        cur_rows += rows_of(&j);
+        cur.push(j);
+        let target = if out.is_empty() { first_target } else { later_target };
+        if cur_rows >= target {
+            out.push(std::mem::take(&mut cur));
+            cur_rows = 0;
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 enum RefinePlan {
@@ -3513,6 +3584,24 @@ mod hive_tests {
         ));
         w.write(&batch).unwrap();
         w.close().unwrap();
+    }
+
+    /// Streamed appends: small first batch, later ones at the full
+    /// target, order preserved, every job delivered exactly once.
+    #[test]
+    fn append_batches_small_first_then_full() {
+        let path = std::env::temp_dir().join("geopq_append_batches.parquet");
+        // 600 rows in 128-row groups -> groups of 128,128,128,128,88.
+        write_part(&path, 600, 0, 2.0, 48.0);
+        let (store, _crs, _info, _rg) = open_store(&Source::Local(path)).unwrap();
+        let jobs: Vec<GroupSel> = (0..5).map(GroupSel::All).collect();
+        let batches = super::append_batches_with(&store, jobs, 100, 256);
+        let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+        // First batch closes at >=100 rows (one group), later at >=256
+        // (two groups each), remainder flushed.
+        assert_eq!(sizes, vec![1, 2, 2]);
+        let order: Vec<u32> = batches.iter().flatten().map(|j| j.group()).collect();
+        assert_eq!(order, vec![0, 1, 2, 3, 4]);
     }
 
     /// The byte-scan envelope must agree with the full geo-types decode

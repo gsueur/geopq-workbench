@@ -384,6 +384,10 @@ Windows x86_64), packages each with the README and licenses, and
 publishes them on a GitHub Release with SHA-256 checksums and generated
 notes. Release binaries use thin LTO and are stripped.
 
+## Credits
+
+GeoPQ Workbench is created by [Geomermaids](https://www.geomermaids.com).
+
 ## License
 
 MIT OR Apache-2.0, at your option. Copyright Guillaume Sueur,

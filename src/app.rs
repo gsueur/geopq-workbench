@@ -200,6 +200,12 @@ pub struct ViewerApp {
     /// an idle app would otherwise never strip (meshes stay resident
     /// twice). Armed by loader messages, counts down to zero.
     strip_probe: u8,
+    about_open: bool,
+    /// Decoded app icon for the About dialog (lazy).
+    about_icon: Option<egui::TextureHandle>,
+    /// Map panel rect (points) of the last frame, for cropping the
+    /// Export image… screenshot to map content only.
+    map_rect: egui::Rect,
     /// Loads paused at the quality gate, waiting for the user's answer
     /// (docs/OPEN_POLICY.md). The dialog shows the front entry.
     quality_gates: Vec<QualityGateState>,
@@ -537,6 +543,9 @@ impl ViewerApp {
             refine_hold: HashSet::new(),
             refine_deferred: HashMap::new(),
             strip_probe: 0,
+            about_open: false,
+            about_icon: None,
+            map_rect: egui::Rect::ZERO,
             quality_gates: Vec::new(),
             direct_files: load_direct_files(),
             last_cam: None,
@@ -1317,9 +1326,14 @@ impl ViewerApp {
                     geometry,
                     rows,
                     loaded,
+                    done,
                 } => {
-                    self.appending.remove(&layer_id);
-                    self.append_cancel.remove(&layer_id);
+                    // Appends stream in batches; the layer stays "appending"
+                    // (no re-refine, spinner shown) until the last one.
+                    if done {
+                        self.appending.remove(&layer_id);
+                        self.append_cancel.remove(&layer_id);
+                    }
                     if let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) {
                         if l.generation == generation {
                             log::info!(
@@ -1721,6 +1735,27 @@ impl ViewerApp {
                 {
                     self.load_context(&ctx);
                 }
+                ui.separator();
+                if ui
+                    .button("🖼 Export map image…")
+                    .on_hover_text(
+                        "Save the current map view as a PNG (print-friendly; \
+                         panels and menus are cropped out)",
+                    )
+                    .clicked()
+                {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+                        egui::UserData::default(),
+                    ));
+                }
+                ui.separator();
+                let quit_shortcut = if cfg!(target_os = "macos") { "⌘Q" } else { "Ctrl+Q" };
+                if ui
+                    .add(egui::Button::new("Quit").shortcut_text(quit_shortcut))
+                    .clicked()
+                {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             });
             ui.menu_button("View", |ui| {
                 if ui
@@ -1766,11 +1801,10 @@ impl ViewerApp {
                 if ui.button("ST_* function reference").clicked() {
                     self.sql.open_with_help();
                 }
-                ui.label(
-                    RichText::new(concat!("GeoPQ Workbench ", env!("CARGO_PKG_VERSION")))
-                        .weak()
-                        .small(),
-                );
+                ui.separator();
+                if ui.button("About GeoPQ Workbench…").clicked() {
+                    self.about_open = true;
+                }
             });
         });
     }
@@ -4210,6 +4244,100 @@ impl ViewerApp {
         }
     }
 
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+        // App icon, decoded once on first open.
+        if self.about_icon.is_none()
+            && let Ok(img) =
+                image::load_from_memory(include_bytes!("../assets/icon-256.png"))
+        {
+            let rgba = img.into_rgba8();
+            let (w, h) = rgba.dimensions();
+            let ci = egui::ColorImage::from_rgba_unmultiplied(
+                [w as usize, h as usize],
+                rgba.as_raw(),
+            );
+            self.about_icon = Some(ctx.load_texture("about_icon", ci, Default::default()));
+        }
+        let mut open = true;
+        egui::Window::new("About GeoPQ Workbench")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(10.0);
+                    if let Some(tex) = &self.about_icon {
+                        ui.add(
+                            egui::Image::new(tex).fit_to_exact_size(egui::vec2(64.0, 64.0)),
+                        );
+                        ui.add_space(8.0);
+                    }
+                    ui.label(RichText::new("GeoPQ Workbench").strong().size(20.0));
+                    ui.label(
+                        RichText::new(concat!("version ", env!("CARGO_PKG_VERSION")))
+                            .weak()
+                            .small(),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        "A native workbench for GeoParquet:\n\
+                         inspect, display, query and optimize.",
+                    );
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(format!("© {} Geomermaids", current_year())).strong(),
+                    );
+                    ui.hyperlink_to("www.geomermaids.com", "https://www.geomermaids.com");
+                    ui.add_space(10.0);
+                });
+            });
+        if !open {
+            self.about_open = false;
+        }
+    }
+
+    /// A window screenshot arrived (File → Export image…): crop it to
+    /// the map panel — the deliverable is the map, not the UI chrome —
+    /// then pick a destination and write the PNG.
+    fn save_screenshot(&mut self, ctx: &egui::Context) {
+        let shot = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        let Some(img) = shot else { return };
+        let img = if self.map_rect.width() >= 1.0 {
+            img.region(&self.map_rect, Some(ctx.pixels_per_point()))
+        } else {
+            (*img).clone()
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name("geopq-map.png")
+            .add_filter("PNG image", &["png"])
+            .save_file()
+        else {
+            return;
+        };
+        let [w, h] = img.size;
+        let raw: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
+        match image::RgbaImage::from_raw(w as u32, h as u32, raw) {
+            Some(png) => {
+                if let Err(e) = png.save(&path) {
+                    self.push_error(format!("could not save {}: {e}", path.display()));
+                }
+            }
+            None => self.push_error("screenshot buffer size mismatch".into()),
+        }
+    }
+
     /// Quality-gate dialog (docs/OPEN_POLICY.md): a non-indexable file too
     /// big for a full build waits here for Optimize / Load all / Cancel.
     fn quality_gate_window(&mut self, ctx: &egui::Context) {
@@ -4759,6 +4887,7 @@ impl ViewerApp {
         let ctx = ui.ctx().clone();
         let size = ui.available_size();
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+        self.map_rect = rect;
         let ppp = ctx.pixels_per_point();
         let vp = [rect.width() * ppp, rect.height() * ppp];
 
@@ -5310,6 +5439,31 @@ fn geom_summary(
     }
 }
 
+#[cfg(test)]
+mod year_tests {
+    #[test]
+    fn current_year_is_sane() {
+        let y = super::current_year();
+        assert!((2026..2200).contains(&y), "{y}");
+    }
+}
+
+/// Civil year from the system clock, no date dependency (days-from-epoch
+/// conversion, Howard Hinnant's algorithm). Good enough for a © line.
+fn current_year() -> i64 {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0) as i64;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let y = yoe + era * 400;
+    if doy >= 306 { y + 1 } else { y }
+}
+
 /// Settings sidecar for the quality gate's decline memory: one small
 /// JSON file in the home directory (the app has no other persistence).
 /// Unknown keys are preserved for forward compatibility.
@@ -5500,6 +5654,27 @@ impl eframe::App for ViewerApp {
         self.errors_window(&ctx);
         self.info_window(&ctx);
         self.quality_gate_window(&ctx);
+        self.about_window(&ctx);
+        self.save_screenshot(&ctx);
+        // Desktop-standard shortcuts: Cmd/Ctrl+O opens files, Ctrl+Q quits
+        // (macOS handles ⌘Q natively).
+        let open_files = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)
+        });
+        if open_files
+            && let Some(paths) = rfd::FileDialog::new()
+                .add_filter("GeoParquet", &["parquet", "geoparquet", "pq"])
+                .pick_files()
+        {
+            for p in paths {
+                self.enqueue_load(Source::Local(p), &ctx);
+            }
+        }
+        if !cfg!(target_os = "macos")
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Q))
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         self.optimize_window(&ctx);
         self.url_window(&ctx);
         self.repo_window(&ctx);
