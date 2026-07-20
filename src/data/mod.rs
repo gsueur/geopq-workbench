@@ -8,6 +8,7 @@ pub mod loader;
 pub mod national;
 pub mod optimize;
 pub mod partition;
+pub mod quality;
 pub mod repo;
 pub mod source;
 pub mod store;

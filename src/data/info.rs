@@ -50,6 +50,9 @@ pub struct FileInfo {
     pub geo: GeoParquetInfo,
     /// Files in the dataset (1 for a plain file, N for a directory).
     pub files: usize,
+    /// Footer-only display-readiness analysis (docs/OPEN_POLICY.md);
+    /// None only for stores that never went through a parquet footer.
+    pub quality: Option<super::quality::QualityReport>,
 }
 
 pub fn fmt_bytes(b: u64) -> String {

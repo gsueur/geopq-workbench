@@ -63,6 +63,12 @@ pub enum LoadMsg {
     },
     /// A row append ended without a result (error or user cancel).
     AppendEnded { layer_id: u64, error: String },
+    /// Exact viewport selection is still too large for a safe refinement.
+    /// This is not an error: retry after the camera moves to a tighter view.
+    RefineDeferred {
+        layer_id: u64,
+        at_least_rows: u64,
+    },
     /// A projection/filter rebuild ended without geometry (error or
     /// cancel). The layer keeps its previous sections; the app clears its
     /// rebuilding flag only when `generation` is still the layer's current
@@ -86,6 +92,26 @@ pub enum LoadMsg {
         source: String,
         error: String,
     },
+    /// A non-indexable file too big for a full build opened under
+    /// `LoadMode::Auto`: the app must ask the user (Optimize / load all /
+    /// cancel) before anything is decoded (docs/OPEN_POLICY.md). Carries
+    /// the opened store so the chosen path resumes without reopening.
+    QualityGate {
+        job: u64,
+        layer_id: u64,
+        opened: Box<OpenedStore>,
+        color: eframe::egui::Color32,
+        auto_project: bool,
+    },
+}
+
+/// A store opened up to (and including) metadata analysis, before any
+/// data pages are read — the resume point after the quality gate.
+pub struct OpenedStore {
+    pub store: Arc<FeatureStore>,
+    pub crs: Crs,
+    pub info: FileInfo,
+    pub rg_meta: Option<(String, Vec<[f64; 4]>)>,
 }
 
 pub struct LoaderHandle {
@@ -211,6 +237,14 @@ pub enum GroupSel {
     /// resolved to row ranges by a bbox-leaf scan in the worker. Falls back
     /// to the whole group when the file has no covering column.
     Rect(u32, [f64; 4]),
+    /// A rect selection whose covering/x-y scan has already been resolved.
+    /// Used by refinement so its budget is based on the exact visible rows
+    /// and the expensive selection scan is not repeated during decoding.
+    ResolvedRect {
+        group: u32,
+        rect: [f64; 4],
+        ranges: Vec<(u32, u32)>,
+    },
     /// Explicit group-relative [start, end) row ranges (rebuilds of
     /// partially loaded groups, complement appends).
     Ranges(u32, Vec<(u32, u32)>),
@@ -227,7 +261,7 @@ impl GroupSel {
     fn group(&self) -> u32 {
         match self {
             GroupSel::All(g) | GroupSel::Rect(g, _) | GroupSel::Ranges(g, _) => *g,
-            GroupSel::Preview { group, .. } => *group,
+            GroupSel::Preview { group, .. } | GroupSel::ResolvedRect { group, .. } => *group,
         }
     }
 }
@@ -432,116 +466,42 @@ pub fn spawn_load(
                     return;
                 }
                 let store = Arc::new(store);
-                let n_rg = store.rg_starts().len().saturating_sub(1);
-                // The pruning rect is in the DATA CRS, so it stays valid
-                // across a display switch — compute it with the display the
-                // viewport coordinates are expressed in.
-                let rect = viewport_to_data_bbox(view_world, &display, &crs);
-                // Auto projection: pick a best-fit display before building
-                // when the extent is known from metadata (projected data CRS
-                // needs no extent at all).
-                let mut display = display;
-                let mut adopt_display: Option<(DisplayCrs, bool)> = None;
-                if auto_project {
-                    let bbox = rg_meta
-                        .as_ref()
-                        .filter(|_| crs.is_latlong)
-                        .and_then(|(_, boxes)| union_of(boxes));
-                    if let Some(d) = DisplayCrs::auto_for(&crs, bbox) {
-                        log::info!("auto projection: {}", d.name);
-                        display = d.clone();
-                        adopt_display = Some((d, true));
-                    }
-                }
-                // Prune only with metadata-sourced boxes: a pruned first load
-                // never sees the skipped row groups, so computed boxes can't
-                // drive it.
-                let sel = plan_viewport_selection(
-                    &store,
-                    &source.label(),
-                    rg_meta.as_ref().map(|(_, b)| b.as_slice()),
-                    rect,
-                );
-                let build_t0 = Instant::now();
-                let style_sel = style.as_ref().and_then(|sb| resolve_style(&store, sb));
-                match build_geometry(
-                    &store,
-                    &crs,
-                    &display,
-                    Some((&handle, job)),
-                    sel,
-                    Some(&cancel),
-                    style_sel.as_ref(),
-                ) {
-                    Ok((geometry, rows, bad, rg_computed, resolved)) => {
-                        // Extent only known post-build (no metadata bboxes):
-                        // suggest the auto projection; the app rebuilds.
-                        if auto_project && adopt_display.is_none() && crs.is_latlong {
-                            if let Some(d) =
-                                DisplayCrs::auto_for(&crs, union_of(&rg_computed))
-                            {
-                                log::info!("auto projection (post-build): {}", d.name);
-                                adopt_display = Some((d, false));
-                            }
-                        }
-                        let mut loaded = vec![GroupLoad::None; n_rg];
-                        for (g, st) in resolved {
-                            loaded[g as usize] = st;
-                        }
-                        let rg_bboxes = rg_meta
-                            .or_else(|| {
-                                // At least one real (non-sentinel) box.
-                                rg_computed
-                                    .iter()
-                                    .any(|b| b[0] <= b[2])
-                                    .then(|| ("computed at load".to_string(), rg_computed))
-                            })
-                            .map(|(source, boxes)| {
-                                let avg_overlap = bbox_overlap_metric(&boxes);
-                                RgBboxes {
-                                    source,
-                                    boxes,
-                                    avg_overlap,
-                                }
-                            });
-                        let stats = LoadStats {
-                            read_ms: 0,
-                            build_ms: build_t0.elapsed().as_millis() as u64,
-                            rows,
-                            bad_geoms: bad,
-                        };
-                        let name = source.name();
-                        log::info!(
-                            "loaded {name}: {rows} features in {} ms",
-                            t0.elapsed().as_millis()
-                        );
-                        let layer = VectorLayer {
-                            id: layer_id,
-                            generation: 0,
-                            name,
-                            store,
-                            crs,
-                            sections: vec![geometry],
-                            style: super::layer::LayerStyle::new(color),
-                            feature_count: rows,
-                            stats,
-                            info,
-                            rg_bboxes,
-                            loaded,
-                            filter: None,
-                        };
-                        handle.send(LoadMsg::Loaded {
-                            job,
-                            layer: Box::new(layer),
-                            adopt_display,
-                        });
-                    }
-                    Err(e) => handle.send(LoadMsg::Failed {
+                // Non-indexable file too big for a full build: hand the
+                // opened store to the app for the quality-gate dialog (or
+                // an instant resume when the file has a remembered answer)
+                // instead of silently previewing.
+                let gate = info.quality.as_ref().is_some_and(|q| !q.indexable)
+                    && store.total_rows() > MAX_BUILD_ROWS;
+                let opened = OpenedStore {
+                    store,
+                    crs,
+                    info,
+                    rg_meta,
+                };
+                if gate {
+                    handle.send(LoadMsg::QualityGate {
                         job,
-                        source: source.label(),
-                        error: e,
-                    }),
+                        layer_id,
+                        opened: Box::new(opened),
+                        color,
+                        auto_project,
+                    });
+                    return;
                 }
+                build_opened(
+                    &handle,
+                    job,
+                    layer_id,
+                    opened,
+                    display,
+                    color,
+                    view_world,
+                    auto_project,
+                    &cancel,
+                    style,
+                    false,
+                    t0,
+                );
             }
             Err(e) => handle.send(LoadMsg::Failed {
                 job,
@@ -550,6 +510,196 @@ pub fn spawn_load(
             }),
         }
     });
+}
+
+/// Resume a load the quality gate paused: the user chose "load all"
+/// (`direct` true) or the file's remembered answer applied.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_load_gated(
+    handle: LoaderHandle,
+    job: u64,
+    layer_id: u64,
+    opened: OpenedStore,
+    display: DisplayCrs,
+    color: eframe::egui::Color32,
+    view_world: [f64; 4],
+    auto_project: bool,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    style: Option<crate::data::layer::StyleBy>,
+    direct: bool,
+) {
+    std::thread::spawn(move || {
+        build_opened(
+            &handle,
+            job,
+            layer_id,
+            opened,
+            display,
+            color,
+            view_world,
+            auto_project,
+            &cancel,
+            style,
+            direct,
+            Instant::now(),
+        );
+    });
+}
+
+/// Plan + build + send for an opened store: the shared tail of first
+/// loads, whichever side of the quality gate they took.
+#[allow(clippy::too_many_arguments)]
+fn build_opened(
+    handle: &LoaderHandle,
+    job: u64,
+    layer_id: u64,
+    opened: OpenedStore,
+    display: DisplayCrs,
+    color: eframe::egui::Color32,
+    view_world: [f64; 4],
+    auto_project: bool,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+    style: Option<crate::data::layer::StyleBy>,
+    direct: bool,
+    t0: Instant,
+) {
+    let OpenedStore {
+        store,
+        crs,
+        info,
+        rg_meta,
+    } = opened;
+    let n_rg = store.rg_starts().len().saturating_sub(1);
+    // The pruning rect is in the DATA CRS, so it stays valid
+    // across a display switch — compute it with the display the
+    // viewport coordinates are expressed in.
+    let rect = viewport_to_data_bbox(view_world, &display, &crs);
+    // Auto projection: pick a best-fit display before building
+    // when the extent is known from metadata (projected data CRS
+    // needs no extent at all).
+    let mut display = display;
+    let mut adopt_display: Option<(DisplayCrs, bool)> = None;
+    if auto_project {
+        let mut bbox = rg_meta
+            .as_ref()
+            .filter(|_| crs.is_latlong)
+            .and_then(|(_, boxes)| union_of(boxes));
+        // No metadata extent (raw WKB files): probe it with an
+        // envelope-only scan so the single build happens directly in
+        // the adopted projection. The post-build fallback below would
+        // otherwise tessellate and upload the whole layer twice.
+        if bbox.is_none() && crs.is_latlong && store.encoding.is_wkb() {
+            handle.send(LoadMsg::Progress {
+                job,
+                frac: 0.04,
+                stage: "scanning extent".into(),
+            });
+            bbox = scan_wkb_extent(&store, cancel);
+        }
+        if let Some(d) = DisplayCrs::auto_for(&crs, bbox) {
+            log::info!("auto projection: {}", d.name);
+            display = d.clone();
+            adopt_display = Some((d, true));
+        }
+    }
+    let sel = if direct {
+        // Direct mode: every group in full — no viewport planning, no
+        // preview fallback (docs/OPEN_POLICY.md).
+        (0..n_rg as u32).map(GroupSel::All).collect()
+    } else {
+        // Prune only with metadata-sourced boxes: a pruned first load
+        // never sees the skipped row groups, so computed boxes can't
+        // drive it.
+        plan_viewport_selection(
+            &store,
+            &store.source.label(),
+            rg_meta.as_ref().map(|(_, b)| b.as_slice()),
+            rect,
+        )
+    };
+    let build_t0 = Instant::now();
+    let style_sel = style.as_ref().and_then(|sb| resolve_style(&store, sb));
+    match build_geometry(
+        &store,
+        &crs,
+        &display,
+        Some((handle, job)),
+        sel,
+        Some(cancel),
+        style_sel.as_ref(),
+    ) {
+        Ok((geometry, rows, bad, rg_computed, resolved)) => {
+            // Extent only known post-build (no metadata bboxes):
+            // suggest the auto projection; the app rebuilds.
+            if auto_project && adopt_display.is_none() && crs.is_latlong {
+                if let Some(d) = DisplayCrs::auto_for(&crs, union_of(&rg_computed)) {
+                    log::info!("auto projection (post-build): {}", d.name);
+                    adopt_display = Some((d, false));
+                }
+            }
+            let mut loaded = vec![GroupLoad::None; n_rg];
+            for (g, st) in resolved {
+                loaded[g as usize] = st;
+            }
+            let rg_bboxes = rg_meta
+                .or_else(|| {
+                    // At least one real (non-sentinel) box.
+                    rg_computed
+                        .iter()
+                        .any(|b| b[0] <= b[2])
+                        .then(|| ("computed at load".to_string(), rg_computed))
+                })
+                .map(|(source, boxes)| {
+                    let avg_overlap = bbox_overlap_metric(&boxes);
+                    RgBboxes {
+                        source,
+                        boxes,
+                        avg_overlap,
+                    }
+                });
+            let stats = LoadStats {
+                read_ms: 0,
+                build_ms: build_t0.elapsed().as_millis() as u64,
+                rows,
+                bad_geoms: bad,
+            };
+            let name = store.source.name();
+            log::info!(
+                "loaded {name}: {rows} features in {} ms",
+                t0.elapsed().as_millis()
+            );
+            let layer = VectorLayer {
+                id: layer_id,
+                generation: 0,
+                name,
+                store,
+                crs,
+                sections: vec![geometry],
+                style: super::layer::LayerStyle::new(color),
+                feature_count: rows,
+                stats,
+                info,
+                rg_bboxes,
+                loaded,
+                filter: None,
+                mode: if direct {
+                    super::layer::LayerMode::Direct
+                } else {
+                    super::layer::LayerMode::Indexed
+                },
+            };
+            handle.send(LoadMsg::Loaded {
+                job,
+                layer: Box::new(layer),
+                adopt_display,
+            });
+        }
+        Err(e) => handle.send(LoadMsg::Failed {
+            job,
+            source: store.source.label(),
+            error: e,
+        }),
+    }
 }
 
 /// Rebuild geometry for an existing layer under a new display projection,
@@ -614,6 +764,11 @@ pub fn spawn_rebuild(
 /// Load additional rows for an existing layer (viewport refinement or
 /// "Load all"). `GroupSel::Ranges` here must be the complement of what is
 /// already loaded — the group is marked `Full` afterwards.
+///
+/// With `refinement_budget`, rect jobs are first resolved against the real
+/// covering/x-y values in this worker. This avoids both the old bbox-area
+/// guess and a second covering scan during geometry decoding. `None` is used
+/// by the explicit "Load all" action, which must not be silently budgeted.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_append(
     handle: LoaderHandle,
@@ -625,8 +780,41 @@ pub fn spawn_append(
     jobs: Vec<GroupSel>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     style: Option<crate::data::layer::StyleBy>,
+    refinement_budget: Option<u64>,
 ) {
     std::thread::spawn(move || {
+        let jobs = if let Some(budget) = refinement_budget {
+            match prepare_refinement_jobs(&store, jobs, budget, &cancel) {
+                Ok(RefinePlan::Ready(jobs)) => jobs,
+                Ok(RefinePlan::Deferred(at_least_rows)) => {
+                    log::debug!(
+                        "{}: exact refinement exceeds {budget} rows (at least {at_least_rows}) — zoom in further",
+                        store.source.label()
+                    );
+                    handle.send(LoadMsg::RefineDeferred {
+                        layer_id,
+                        at_least_rows,
+                    });
+                    return;
+                }
+                Err(e) if e == CANCELLED => {
+                    handle.send(LoadMsg::AppendEnded {
+                        layer_id,
+                        error: CANCELLED.into(),
+                    });
+                    return;
+                }
+                Err(e) => {
+                    handle.send(LoadMsg::AppendEnded {
+                        layer_id,
+                        error: format!("{}: viewport selection failed: {e}", store.source.label()),
+                    });
+                    return;
+                }
+            }
+        } else {
+            jobs
+        };
         let style_sel = style.as_ref().and_then(|sb| resolve_style(&store, sb));
         match build_geometry(&store, &crs, &display, None, jobs, Some(&cancel), style_sel.as_ref())
         {
@@ -647,6 +835,85 @@ pub fn spawn_append(
             }),
         }
     });
+}
+
+enum RefinePlan {
+    Ready(Vec<GroupSel>),
+    Deferred(u64),
+}
+
+/// Resolve viewport rects and enforce the refinement budget using the exact
+/// number of selected features. The previous area-ratio estimate could stay
+/// above the budget indefinitely for clustered or overlapping row groups,
+/// leaving the every-Nth-row preview visible even at street-level zooms.
+fn prepare_refinement_jobs(
+    store: &FeatureStore,
+    jobs: Vec<GroupSel>,
+    budget: u64,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<RefinePlan, String> {
+    let starts = store.rg_starts();
+    let mut rows = 0u64;
+    let mut resolved = Vec::with_capacity(jobs.len());
+
+    for job in jobs {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(CANCELLED.into());
+        }
+        let group = job.group();
+        let group_rows = starts[group as usize + 1] - starts[group as usize];
+        let (count, job) = match job {
+            GroupSel::Rect(group, rect) => match covering_select(store, group, rect)? {
+                Some(ranges) => {
+                    let count = ranges.iter().map(|&(s, e)| (e - s) as u64).sum();
+                    if ranges.as_slice() == [(0, group_rows as u32)] {
+                        (count, GroupSel::All(group))
+                    } else {
+                        (
+                            count,
+                            GroupSel::ResolvedRect {
+                                group,
+                                rect,
+                                ranges,
+                            },
+                        )
+                    }
+                }
+                // No covering/x-y selector: a rect decode reads the whole
+                // group, so count and represent it honestly.
+                None => (group_rows, GroupSel::All(group)),
+            },
+            GroupSel::ResolvedRect {
+                group,
+                rect,
+                ranges,
+            } => {
+                let count = ranges.iter().map(|&(s, e)| (e - s) as u64).sum();
+                (
+                    count,
+                    GroupSel::ResolvedRect {
+                        group,
+                        rect,
+                        ranges,
+                    },
+                )
+            }
+            GroupSel::Ranges(group, ranges) => {
+                let count = ranges.iter().map(|&(s, e)| (e - s) as u64).sum();
+                (count, GroupSel::Ranges(group, ranges))
+            }
+            GroupSel::All(group) => (group_rows, GroupSel::All(group)),
+            preview @ GroupSel::Preview { stride, .. } => {
+                (group_rows.div_ceil(stride.max(2) as u64), preview)
+            }
+        };
+        rows = rows.saturating_add(count);
+        if rows > budget {
+            return Ok(RefinePlan::Deferred(rows));
+        }
+        resolved.push(job);
+    }
+    Ok(RefinePlan::Ready(resolved))
 }
 
 /// Parse file metadata: geometry column, CRS, row-group layout. Reads no data.
@@ -671,6 +938,38 @@ struct FileOpen {
     /// Point geometry synthesized from these coordinate columns (x, y)
     /// when the file has no geometry column at all.
     xy: Option<(usize, usize)>,
+    /// Every column chunk carries a page index.
+    page_index: bool,
+    /// Uncompressed bytes of the geometry leaves (decode-size proxy).
+    geom_bytes: u64,
+}
+
+/// Quality analysis over an opened file / merged dataset (footer facts
+/// only). `boxes` are the merged per-row-group bboxes.
+fn quality_report(
+    info: &FileInfo,
+    boxes: Option<&(String, Vec<[f64; 4]>)>,
+    encoding: GeomEncoding,
+    xy_synthesized: bool,
+    page_index: bool,
+    geom_bytes: u64,
+) -> super::quality::QualityReport {
+    super::quality::analyze(&super::quality::QualityInput {
+        rows: info.rows,
+        row_groups: info.row_groups,
+        rg_rows_max: info.rg_rows_max,
+        boxes: boxes.map(|(s, b)| (s.as_str(), b.as_slice())),
+        encoding,
+        xy_synthesized,
+        page_index,
+        geom_compression: info
+            .columns
+            .iter()
+            .find(|c| c.is_geometry)
+            .map(|c| c.compression.as_str()),
+        geo: &info.geo,
+        geom_bytes,
+    })
 }
 
 /// Load planning shared by first loads and viewport reloads: which row
@@ -815,7 +1114,15 @@ fn open_store_with_view(
     if let Source::Stac { url, .. } = source {
         return open_stac_store(source, url, stac_rect);
     }
-    let f = open_file(source)?;
+    let mut f = open_file(source)?;
+    f.info.quality = Some(quality_report(
+        &f.info,
+        f.rg_boxes.as_ref(),
+        f.encoding,
+        f.xy.is_some(),
+        f.page_index,
+        f.geom_bytes,
+    ));
     Ok((
         FeatureStore::new(
             source.clone(),
@@ -986,6 +1293,8 @@ fn open_multi_store(
     let mut info = first.info.clone();
     info.files = files.len();
     let mut total_rows = 0u64;
+    let mut page_index = true;
+    let mut geom_bytes = 0u64;
 
     for (i, (src, short)) in files.iter().enumerate() {
         let f = if i == 0 {
@@ -1021,6 +1330,8 @@ fn open_multi_store(
             info.uncompressed_bytes += f.info.uncompressed_bytes;
         }
         total_rows += f.rg_rows.iter().sum::<u64>();
+        page_index &= f.page_index;
+        geom_bytes += f.geom_bytes;
 
         // Per-fragment row-group boxes; a file-level bbox from the geo
         // metadata is a valid (coarse) fallback for all its groups.
@@ -1081,6 +1392,14 @@ fn open_multi_store(
     let rg_boxes = boxes
         .filter(|b| !b.is_empty())
         .map(|b| (box_source.unwrap_or_else(|| "mixed".into()), b));
+    info.quality = Some(quality_report(
+        &info,
+        rg_boxes.as_ref(),
+        first.encoding,
+        first.xy.is_some(),
+        page_index,
+        geom_bytes,
+    ));
     let store = FeatureStore::from_fragments(
         source.clone(),
         frags,
@@ -1270,6 +1589,32 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
             acc.1 + rg.total_byte_size().max(0) as u64,
         )
     });
+    // Facts for the quality report: page-index presence and the
+    // uncompressed size of the geometry leaves (all leaves under the
+    // geometry root; for x/y files, the two coordinate columns).
+    let page_index = meta
+        .row_groups()
+        .iter()
+        .all(|rg| rg.columns().iter().all(|c| c.offset_index_offset().is_some()));
+    let geom_leaves: Vec<usize> = match xy {
+        Some((xi, yi)) => [xi, yi]
+            .iter()
+            .filter_map(|&i| leaf_of_root(schema.field(i).name()))
+            .collect(),
+        None => pq_columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                c.path().parts().first().map(String::as_str) == Some(geom_name.as_str())
+            })
+            .map(|(i, _)| i)
+            .collect(),
+    };
+    let geom_bytes: u64 = meta
+        .row_groups()
+        .iter()
+        .flat_map(|rg| geom_leaves.iter().map(|&l| rg.column(l).uncompressed_size().max(0) as u64))
+        .sum();
     let info = FileInfo {
         file_size: source.size(),
         parquet_format_version: fmd.version(),
@@ -1283,6 +1628,7 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
         columns,
         geo: summarize_geo_meta(geo_meta.as_ref(), &geom_name, &crs.name, has_native_geometry),
         files: 1,
+        quality: None,
     };
 
     let rg_boxes = match xy {
@@ -1333,6 +1679,8 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
         rg_boxes,
         info,
         xy,
+        page_index,
+        geom_bytes,
     })
 }
 
@@ -1865,6 +2213,13 @@ fn build_geometry(
         let (ranges, state): (Option<Vec<(u32, u32)>>, GroupLoad) = match &job {
             GroupSel::All(_) => (None, GroupLoad::Full),
             GroupSel::Ranges(_, r) => (Some(r.clone()), GroupLoad::Full),
+            GroupSel::ResolvedRect { rect, ranges, .. } => (
+                Some(ranges.clone()),
+                GroupLoad::Rows {
+                    ranges: ranges.clone(),
+                    rect: *rect,
+                },
+            ),
             GroupSel::Rect(_, rect) => {
                 match covering_select(store, g, *rect) {
                     Ok(Some(r)) if r == [(0, group_rows)] => (None, GroupLoad::Full),
@@ -2233,6 +2588,128 @@ impl<'a> BinCol<'a> {
             Self::View(a) => (!a.is_null(i)).then(|| a.value(i)),
         }
     }
+}
+
+/// Grow `b` by one WKB value's envelope: a direct byte scan with no
+/// geo-types allocation. Handles both endiannesses, ISO Z/M/ZM type
+/// codes, EWKB flag bits (+SRID), and nested multis/collections.
+/// Returns None on malformed input (the caller skips the feature).
+fn grow_wkb_envelope(buf: &[u8], b: &mut [f64; 4]) -> Option<()> {
+    fn geom(buf: &[u8], pos: &mut usize, b: &mut [f64; 4], depth: u8) -> Option<()> {
+        if depth > 8 {
+            return None;
+        }
+        let le = match *buf.get(*pos)? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        *pos += 1;
+        let read_u32 = |p: &mut usize| -> Option<u32> {
+            let s: [u8; 4] = buf.get(*p..*p + 4)?.try_into().ok()?;
+            *p += 4;
+            Some(if le { u32::from_le_bytes(s) } else { u32::from_be_bytes(s) })
+        };
+        let mut ty = read_u32(pos)?;
+        let (mut z, mut m) = (ty & 0x8000_0000 != 0, ty & 0x4000_0000 != 0);
+        if ty & 0x2000_0000 != 0 {
+            *pos += 4; // EWKB SRID
+        }
+        ty &= 0x0FFF_FFFF;
+        match (ty / 1000) % 10 {
+            1 => z = true,
+            2 => m = true,
+            3 => (z, m) = (true, true),
+            _ => {}
+        }
+        let dims = 2 + z as usize + m as usize;
+        let mut coords = |n: usize, pos: &mut usize| -> Option<()> {
+            let bytes = n.checked_mul(dims * 8)?;
+            let end = pos.checked_add(bytes).filter(|&e| e <= buf.len())?;
+            for c in buf[*pos..end].chunks_exact(dims * 8) {
+                let f = |s: &[u8]| -> f64 {
+                    let a: [u8; 8] = s.try_into().unwrap();
+                    if le { f64::from_le_bytes(a) } else { f64::from_be_bytes(a) }
+                };
+                let (x, y) = (f(&c[0..8]), f(&c[8..16]));
+                if x.is_finite() && y.is_finite() {
+                    b[0] = b[0].min(x);
+                    b[1] = b[1].min(y);
+                    b[2] = b[2].max(x);
+                    b[3] = b[3].max(y);
+                }
+            }
+            *pos = end;
+            Some(())
+        };
+        match ty % 1000 {
+            1 => coords(1, pos),
+            2 => {
+                let n = read_u32(pos)? as usize;
+                coords(n, pos)
+            }
+            3 => {
+                let rings = read_u32(pos)? as usize;
+                for _ in 0..rings {
+                    let n = read_u32(pos)? as usize;
+                    coords(n, pos)?;
+                }
+                Some(())
+            }
+            4..=7 => {
+                let n = read_u32(pos)? as usize;
+                for _ in 0..n {
+                    geom(buf, pos, b, depth + 1)?;
+                }
+                Some(())
+            }
+            _ => None,
+        }
+    }
+    let mut pos = 0;
+    geom(buf, &mut pos, b, 0)
+}
+
+/// Whole-dataset extent from a geometry-only WKB scan: no tessellation,
+/// no per-feature allocations, rayon over row groups. Cheap enough to
+/// run before the first build so the display projection can be adopted
+/// up front — a post-build adoption would tessellate, upload and hold
+/// the whole layer twice (the 15 GB peak on large unindexed files).
+fn scan_wkb_extent(
+    store: &FeatureStore,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<[f64; 4]> {
+    use rayon::prelude::*;
+    let n_rg = store.rg_starts().len().saturating_sub(1);
+    let boxes: Vec<[f64; 4]> = (0..n_rg)
+        .into_par_iter()
+        .map(|g| {
+            let mut b = EMPTY_BBOX;
+            if cancel.load(Ordering::Relaxed) {
+                return b;
+            }
+            let Ok(reader) = store.reader_for_group(g, 4096, None, Some(&[store.geom_col]))
+            else {
+                return b;
+            };
+            for batch in reader {
+                let Ok(batch) = batch else { break };
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Some(col) = BinCol::new(batch.column(0).as_ref()) else {
+                    break;
+                };
+                for i in 0..batch.num_rows() {
+                    if let Some(buf) = col.value(i) {
+                        let _ = grow_wkb_envelope(buf, &mut b);
+                    }
+                }
+            }
+            b
+        })
+        .collect();
+    union_of(&boxes)
 }
 
 /// Decode WKB into geo-types (drops Z/M).
@@ -3038,6 +3515,91 @@ mod hive_tests {
         w.close().unwrap();
     }
 
+    /// The byte-scan envelope must agree with the full geo-types decode
+    /// for every geometry family the writer produces.
+    #[test]
+    fn wkb_envelope_matches_decoded_bounds() {
+        use geo::BoundingRect;
+        let geoms: Vec<geo_types::Geometry<f64>> = vec![
+            geo_types::Point::new(2.5, 41.0).into(),
+            geo_types::LineString::from(vec![(0.0, 0.0), (3.0, -1.0), (2.0, 5.0)]).into(),
+            geo_types::Polygon::new(
+                geo_types::LineString::from(vec![
+                    (0.0, 0.0),
+                    (10.0, 0.0),
+                    (10.0, 8.0),
+                    (0.0, 8.0),
+                    (0.0, 0.0),
+                ]),
+                vec![geo_types::LineString::from(vec![
+                    (2.0, 2.0),
+                    (4.0, 2.0),
+                    (4.0, 4.0),
+                    (2.0, 2.0),
+                ])],
+            )
+            .into(),
+            geo_types::MultiPolygon(vec![
+                geo_types::Polygon::new(
+                    geo_types::LineString::from(vec![
+                        (-70.0, 45.0),
+                        (-69.0, 45.0),
+                        (-69.0, 46.0),
+                        (-70.0, 45.0),
+                    ]),
+                    vec![],
+                ),
+                geo_types::Polygon::new(
+                    geo_types::LineString::from(vec![
+                        (-60.0, 50.0),
+                        (-59.0, 50.0),
+                        (-59.0, 51.0),
+                        (-60.0, 50.0),
+                    ]),
+                    vec![],
+                ),
+            ])
+            .into(),
+            geo_types::Geometry::GeometryCollection(geo_types::GeometryCollection(vec![
+                geo_types::Point::new(-1.0, -2.0).into(),
+                geo_types::LineString::from(vec![(5.0, 5.0), (6.0, 7.0)]).into(),
+            ])),
+        ];
+        for g in geoms {
+            let mut buf = Vec::new();
+            wkb::writer::write_geometry(&mut buf, &g, &wkb::writer::WriteOptions::default())
+                .unwrap();
+            let mut env = EMPTY_BBOX;
+            grow_wkb_envelope(&buf, &mut env).expect("scan succeeds");
+            let r = g.bounding_rect().unwrap();
+            let want = [r.min().x, r.min().y, r.max().x, r.max().y];
+            assert_eq!(env, want, "envelope mismatch for {g:?}");
+        }
+        // Malformed input must not panic or grow the box.
+        let mut env = EMPTY_BBOX;
+        assert!(grow_wkb_envelope(&[1u8, 2, 0], &mut env).is_none());
+        assert_eq!(env, EMPTY_BBOX);
+    }
+
+    /// A DuckDB-style export (WKB, geo 1.0 metadata, no covering column)
+    /// must come out of open_store with a failing quality verdict: C1 has
+    /// no bbox source and WKB stats are unusable (docs/OPEN_POLICY.md).
+    #[test]
+    fn wkb_without_covering_is_not_indexable() {
+        use crate::data::quality::Status;
+        let path = std::env::temp_dir().join("geopq_quality_wkb.parquet");
+        write_part(&path, 500, 0, 2.0, 48.0);
+        let (_store, _crs, info, rg_meta) = open_store(&Source::Local(path)).unwrap();
+        assert!(rg_meta.is_none(), "WKB without covering has no rg boxes");
+        let q = info.quality.expect("quality report attached");
+        assert!(!q.indexable);
+        let check = |code: &str| q.checks.iter().find(|c| c.code == code).unwrap().status;
+        assert_eq!(check("C1"), Status::Fail);
+        assert_eq!(check("C2"), Status::Fail);
+        assert_eq!(check("C4"), Status::Warn, "WKB encoding is advisory only");
+        assert!(q.geom_bytes > 0, "geometry decode-size proxy measured");
+    }
+
     #[test]
     fn hive_dataset_loads_as_single_layer() {
         let root = std::env::temp_dir().join("geopq_hive_open");
@@ -3546,6 +4108,10 @@ mod xy_tests {
         assert!(opt_store.covering.is_some(), "covering written");
         assert!(opt_info.geo.version_label.contains("GeoParquet"));
         assert!(opt_crs.is_latlong);
+        // The optimizer's own output must pass the quality gate.
+        let q = opt_info.quality.as_ref().expect("quality report");
+        assert!(q.indexable, "optimized output must be indexable: {:?}", q.checks);
+        assert!(q.geom_bytes > 0);
         // Original lon/lat stay as ordinary attribute columns.
         assert!(opt_store.schema.index_of("lon").is_ok());
         let g = opt_store.fetch_geoms(&[0]).unwrap();
@@ -3658,16 +4224,51 @@ mod preview_rect_tests {
         // truth the loader must reproduce.
         let rect = [-70.95, 42.0, -70.85, 42.06];
         let stride = 3u32;
-        let expected: Vec<u32> = (0..128u32)
+        let in_rect: Vec<u32> = (0..128u32)
             .filter(|&i| {
                 let (x, y) = (lons[i as usize], lats[i as usize]);
                 x >= rect[0] && x <= rect[2] && y >= rect[1] && y <= rect[3]
             })
-            .collect::<Vec<u32>>()
-            .into_iter()
+            .collect();
+        let expected: Vec<u32> = in_rect
+            .iter()
+            .copied()
             .step_by(stride as usize)
             .collect();
         assert!(expected.len() > 3, "fixture must select several rows");
+
+        // Refinement budgets use the exact coordinate selection, not a
+        // row-group bbox area estimate. The resolved ranges are then reused
+        // by geometry decoding rather than scanning the coordinates twice.
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let plan = prepare_refinement_jobs(
+            &store,
+            vec![GroupSel::Rect(0, rect)],
+            in_rect.len() as u64,
+            &cancel,
+        )
+        .unwrap();
+        match plan {
+            RefinePlan::Ready(jobs) => match jobs.as_slice() {
+                [GroupSel::ResolvedRect { ranges, .. }] => {
+                    let selected: usize =
+                        ranges.iter().map(|&(s, e)| (e - s) as usize).sum();
+                    assert_eq!(selected, in_rect.len());
+                }
+                _ => panic!("expected an exact resolved rect"),
+            },
+            RefinePlan::Deferred(_) => panic!("selection unexpectedly deferred"),
+        }
+        assert!(matches!(
+            prepare_refinement_jobs(
+                &store,
+                vec![GroupSel::Rect(0, rect)],
+                in_rect.len() as u64 - 1,
+                &cancel,
+            )
+            .unwrap(),
+            RefinePlan::Deferred(_)
+        ));
 
         let display = crate::data::crs::DisplayCrs::hobo_dyer();
         let sel = vec![GroupSel::Preview { group: 0, rect: Some(rect), stride }];

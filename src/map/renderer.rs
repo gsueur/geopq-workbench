@@ -69,6 +69,9 @@ struct ChunkGpu {
     bounds_world: [f64; 4],
     fill_vbuf: Option<wgpu::Buffer>,
     fill_ibuf: Option<wgpu::Buffer>,
+    /// Uint16 when the chunk has ≤ 65536 fill vertices (half the index
+    /// bytes — most chunks), Uint32 otherwise.
+    fill_index_format: wgpu::IndexFormat,
     fill_index_count: u32,
     /// Index 0 = full detail, 1.. = simplified LODs (see LINE_LOD_TOLERANCE).
     /// Each entry: buffer + feature-size prefix index (see LineLod).
@@ -111,6 +114,52 @@ fn line_count_for_scale(index: &[(f32, u32)], scale: f64) -> u32 {
 
 struct LayerGpu {
     chunks: Vec<ChunkGpu>,
+}
+
+/// Convert a LOD's 16 B/segment `[x0,y0,x1,y1]` list into a shared point
+/// stream (8 B/point): consecutive segments that chain (`prev.b == cur.a`,
+/// the common case — ring order survives the stable extent sort) share
+/// their joint point, and a NaN sentinel separates runs (its quads collapse
+/// to nothing in the vertex shader). Instance `i` reads `points[i]` from
+/// slot 0 and `points[i+1]` from slot 1 (same buffer bound at +8 bytes),
+/// so segment counts in the size index translate to instance counts here.
+/// Net: ~9 B/segment instead of 16.
+fn line_point_stream(
+    lod: &crate::data::geometry::LineLod,
+) -> (Vec<[f32; 2]>, Vec<(f32, u32)>) {
+    let segs = &lod.segments;
+    if segs.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut points: Vec<[f32; 2]> = Vec::with_capacity(segs.len() + segs.len() / 8);
+    // Instance index of each segment (transient; only the size-index
+    // prefixes need translating).
+    let mut seg_instance: Vec<u32> = Vec::with_capacity(segs.len());
+    for s in segs {
+        let (a, b) = ([s[0], s[1]], [s[2], s[3]]);
+        // A NaN sentinel never equals `a`, so it breaks runs naturally.
+        if points.last() != Some(&a) {
+            if !points.is_empty() {
+                points.push([f32::NAN, f32::NAN]);
+            }
+            points.push(a);
+        }
+        seg_instance.push((points.len() - 1) as u32);
+        points.push(b);
+    }
+    let total_instances = (points.len() - 1) as u32;
+    let index = lod
+        .size_index
+        .iter()
+        .map(|&(threshold, prefix)| {
+            let instances = seg_instance
+                .get(prefix as usize)
+                .copied()
+                .unwrap_or(total_instances);
+            (threshold, instances)
+        })
+        .collect();
+    (points, index)
 }
 
 struct TileGpu {
@@ -328,11 +377,20 @@ impl MapResources {
             &vector_layout,
             "vs_line",
             "fs_line",
-            &[wgpu::VertexBufferLayout {
-                array_stride: 16,
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x4],
-            }],
+            // One shared point stream bound twice, slot 1 offset by one
+            // point: instance i reads its segment as points[i], points[i+1].
+            &[
+                wgpu::VertexBufferLayout {
+                    array_stride: 8,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: 8,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![1 => Float32x2],
+                },
+            ],
         );
         let point_pipeline = make_pipeline(
             "point",
@@ -580,20 +638,40 @@ impl MapResources {
                         wgpu::BufferUsages::VERTEX,
                         "fill verts",
                     ),
-                    fill_ibuf: mk_buf(
-                        bytemuck::cast_slice(&c.fill_indices),
-                        wgpu::BufferUsages::INDEX,
-                        "fill idx",
-                    ),
+                    fill_ibuf: if c.fill_vertices.len() <= (u16::MAX as usize) + 1 {
+                        // Half-width indices; pad to a 4-byte buffer size.
+                        let mut idx: Vec<u16> =
+                            c.fill_indices.iter().map(|&i| i as u16).collect();
+                        if idx.len() % 2 == 1 {
+                            idx.push(0);
+                        }
+                        mk_buf(
+                            bytemuck::cast_slice(&idx),
+                            wgpu::BufferUsages::INDEX,
+                            "fill idx u16",
+                        )
+                    } else {
+                        mk_buf(
+                            bytemuck::cast_slice(&c.fill_indices),
+                            wgpu::BufferUsages::INDEX,
+                            "fill idx",
+                        )
+                    },
+                    fill_index_format: if c.fill_vertices.len() <= (u16::MAX as usize) + 1 {
+                        wgpu::IndexFormat::Uint16
+                    } else {
+                        wgpu::IndexFormat::Uint32
+                    },
                     fill_index_count: c.fill_indices.len() as u32,
                     line_bufs: {
                         let mk_lines = |lod: &crate::data::geometry::LineLod| {
+                            let (points, index) = line_point_stream(lod);
                             mk_buf(
-                                bytemuck::cast_slice(&lod.segments),
+                                bytemuck::cast_slice(&points),
                                 wgpu::BufferUsages::VERTEX,
-                                "lines",
+                                "line points",
                             )
-                            .map(|b| (b, lod.size_index.clone()))
+                            .map(|b| (b, index))
                         };
                         let mut bufs: [Option<(wgpu::Buffer, Vec<(f32, u32)>)>;
                             LINE_LODS_TOTAL] = Default::default();
@@ -892,7 +970,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                 };
                 pass.set_bind_group(0, &res.uniform_bg, &[*uoffset]);
                 pass.set_vertex_buffer(0, vb.slice(..));
-                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.set_index_buffer(ib.slice(..), c.fill_index_format);
                 pass.draw_indexed(0..c.fill_index_count, 0, 0..1);
             }
         }
@@ -942,6 +1020,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                     pass.set_pipeline(&res.line_pipeline);
                     pass.set_bind_group(0, &res.uniform_bg, &[*uoffset]);
                     pass.set_vertex_buffer(0, buf.slice(..));
+                    pass.set_vertex_buffer(1, buf.slice(8..));
                     pass.draw(0..6, 0..*count);
                 }
                 DrawCmd::Point {

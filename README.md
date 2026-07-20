@@ -41,6 +41,22 @@ Fixture-dependent tests self-skip when the files are absent.
 
 ## Features
 
+- **Quality gate & display-readiness scorecard** (docs/OPEN_POLICY.md):
+  every file is analyzed at open from its parquet footer alone — spatial
+  index availability (covering column / native geo statistics / coordinate
+  statistics), spatial ordering (row-group bbox overlap), row-group
+  granularity, plus advisory checks (encoding, page index, compression,
+  metadata hygiene). The verdict and per-check details render as a
+  scorecard in the File info panel. Files that pass load with the full
+  viewport machinery (pruning, per-feature selection, refinement). Files
+  that fail and exceed the row budget pause at a dialog: **Optimize** it
+  (rewrites with Hilbert sort + bbox covering; GeoArrow coordinate
+  arrays are pre-selected whenever a single geometry family fits, WKB
+  otherwise — then opens the optimized copy), **Load all** (decode every
+  feature up front — slower to open,
+  complete and exact at every zoom afterwards, remembered per file in
+  `~/.geopq-workbench.json`), or Cancel. No silent decimation: an
+  unoptimized file is never left stuck in a preview it cannot refine.
 - **GeoParquet 1.0 / 1.1 / 2.0**: `geo` metadata (primary column, PROJJSON
   CRS); 2.0 files with native GEOMETRY logical types are detected and load
   through the WKB path; GeoArrow-native 1.1 encodings ("point",

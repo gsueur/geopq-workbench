@@ -47,10 +47,13 @@ struct LineOut {
 @vertex
 fn vs_line(
     @builtin(vertex_index) vi: u32,
-    @location(0) seg: vec4<f32>,
+    @location(0) seg_a: vec2<f32>,
+    @location(1) seg_b: vec2<f32>,
 ) -> LineOut {
-    let a_px = ndc_to_px(seg.xy * u.ab + u.t);
-    let b_px = ndc_to_px(seg.zw * u.ab + u.t);
+    // NaN in either endpoint (run sentinel in the shared point stream)
+    // yields NaN corners: the primitive is clipped, drawing nothing.
+    let a_px = ndc_to_px(seg_a * u.ab + u.t);
+    let b_px = ndc_to_px(seg_b * u.ab + u.t);
     var dir = b_px - a_px;
     let len = length(dir);
     if (len < 1e-6) {

@@ -521,6 +521,20 @@ pub struct VectorLayer {
     /// `loaded` holds exactly the matching row ranges (with an infinite
     /// coverage rect, so viewport refinement never adds rows back).
     pub filter: Option<LayerFilter>,
+    pub mode: LayerMode,
+}
+
+/// How this layer loads and displays (docs/OPEN_POLICY.md). Decided once
+/// at open; never changes for the life of the layer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LayerMode {
+    /// Viewport machinery: row-group pruning, per-feature selection,
+    /// preview fallback, refinement on camera settle.
+    #[default]
+    Indexed,
+    /// Everything decoded up front (user's choice for a non-indexable
+    /// file): no previews, no refinement, no viewport reloads.
+    Direct,
 }
 
 /// A persistent SQL predicate restricting the layer to a subset of rows.

@@ -69,6 +69,22 @@ impl GpVersion {
             GpVersion::V2_0 => "GeoParquet 2.0 (native GEOMETRY + geo stats)",
         }
     }
+
+    /// Recommended output format for a source with these declared
+    /// geometry types: GeoArrow whenever a single geometry family can
+    /// hold them — the display-optimal habit this workbench wants to
+    /// teach — and WKB + covering when the families are mixed, unknown
+    /// or not GeoArrow-storable (maximum interoperability instead).
+    pub fn preferred(geometry_types: &[String]) -> Self {
+        let fits_geoarrow = !geometry_types.is_empty()
+            && super::geoarrow::target_encoding(geometry_types.iter().map(String::as_str))
+                .is_ok();
+        if fits_geoarrow {
+            GpVersion::V1_1GeoArrow
+        } else {
+            GpVersion::V1_1
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2148,5 +2164,31 @@ mod tests {
             let step = x0.abs_diff(x1) + y0.abs_diff(y1);
             assert_eq!(step, 1, "curve jumps from ({x0},{y0}) to ({x1},{y1})");
         }
+    }
+
+    /// GeoArrow is the recommended default whenever one geometry family
+    /// fits; mixed, exotic or undeclared types fall back to WKB.
+    #[test]
+    fn preferred_version_prefers_geoarrow() {
+        let types = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            GpVersion::preferred(&types(&["MultiPolygon"])),
+            GpVersion::V1_1GeoArrow
+        );
+        assert_eq!(
+            GpVersion::preferred(&types(&["Polygon", "MultiPolygon"])),
+            GpVersion::V1_1GeoArrow,
+            "singles promote into their multi variant"
+        );
+        assert_eq!(
+            GpVersion::preferred(&types(&["Point", "Polygon"])),
+            GpVersion::V1_1,
+            "mixed families cannot be GeoArrow"
+        );
+        assert_eq!(
+            GpVersion::preferred(&types(&["GeometryCollection"])),
+            GpVersion::V1_1
+        );
+        assert_eq!(GpVersion::preferred(&[]), GpVersion::V1_1, "unknown types");
     }
 }

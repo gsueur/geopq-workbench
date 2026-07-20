@@ -66,6 +66,28 @@ enum PartMode {
     AdaptiveH3,
 }
 
+/// A load the loader paused at the quality gate: the opened store plus
+/// everything needed to resume it (docs/OPEN_POLICY.md).
+struct QualityGateState {
+    job: u64,
+    layer_id: u64,
+    opened: loader::OpenedStore,
+    color: Color32,
+    auto_project: bool,
+}
+
+impl QualityGateState {
+    /// Decline-memory key: enough to survive renames-in-place staying
+    /// the "same" file only while the size matches.
+    fn key(&self) -> String {
+        format!(
+            "{}|{}",
+            self.opened.store.source.label(),
+            self.opened.info.file_size
+        )
+    }
+}
+
 struct OptimizeState {
     layer_id: u64,
     layer_name: String,
@@ -86,6 +108,12 @@ struct OptimizeState {
     part_mode: PartMode,
     part_fields: Vec<String>,
     adaptive_target: usize,
+    /// Quality-gate flow: when the export completes, open the optimized
+    /// file as a layer automatically.
+    open_result: bool,
+    /// Format pre-selected from the source's geometry types (GeoArrow
+    /// when one family fits); tagged "recommended" in the picker.
+    recommended: crate::data::optimize::GpVersion,
     /// Distinct counts per candidate partition field (computed on demand).
     cardinalities: Option<std::collections::HashMap<String, usize>>,
     card_pending: bool,
@@ -164,6 +192,20 @@ pub struct ViewerApp {
     /// Layers whose refinement was stopped by the user: paused until the
     /// camera moves again (else the same viewport would respawn it).
     refine_hold: HashSet<u64>,
+    /// Last RefineDeferred row counts (layer id -> at_least_rows), for
+    /// the "viewport too dense" badge. Cleared with refine_hold.
+    refine_deferred: HashMap<u64, u64>,
+    /// Frames still owed after new geometry arrived: uploads happen in
+    /// paint and CPU-mesh stripping observes them in the NEXT update, so
+    /// an idle app would otherwise never strip (meshes stay resident
+    /// twice). Armed by loader messages, counts down to zero.
+    strip_probe: u8,
+    /// Loads paused at the quality gate, waiting for the user's answer
+    /// (docs/OPEN_POLICY.md). The dialog shows the front entry.
+    quality_gates: Vec<QualityGateState>,
+    /// Files the user answered "load all" for (key: label|size), so the
+    /// gate never re-asks. Persisted to disk.
+    direct_files: HashSet<String>,
     /// Last camera pose + when it last changed (for refinement debounce).
     last_cam: Option<([f64; 2], f64)>,
     cam_changed_at: f64,
@@ -493,6 +535,10 @@ impl ViewerApp {
             rebuild_cancel: HashMap::new(),
             fit_after_rebuilds: false,
             refine_hold: HashSet::new(),
+            refine_deferred: HashMap::new(),
+            strip_probe: 0,
+            quality_gates: Vec::new(),
+            direct_files: load_direct_files(),
             last_cam: None,
             cam_changed_at: 0.0,
             last_view_world: [-10.0, -10.0, 10.0, 10.0],
@@ -618,6 +664,44 @@ impl ViewerApp {
             // build (pending style registered by the caller right after).
             None,
         );
+    }
+
+    /// Resume a quality-gated load in Direct mode (decode everything).
+    fn resume_gated(&mut self, gate: QualityGateState, ctx: &egui::Context) {
+        let cancel = self
+            .loading
+            .get(&gate.job)
+            .map(|j| Arc::clone(&j.cancel))
+            .unwrap_or_default();
+        if let Some(j) = self.loading.get_mut(&gate.job) {
+            j.stage = "loading all rows".into();
+        }
+        loader::spawn_load_gated(
+            LoaderHandle {
+                tx: self.load_tx.clone(),
+                egui_ctx: ctx.clone(),
+            },
+            gate.job,
+            gate.layer_id,
+            gate.opened,
+            self.display.clone(),
+            gate.color,
+            self.last_view_world,
+            gate.auto_project,
+            cancel,
+            None,
+            true,
+        );
+    }
+
+    /// Abandon a quality-gated load (dialog Cancel, or Optimize taking
+    /// over): same cleanup as a failed load, without an error.
+    fn drop_gated(&mut self, gate: &QualityGateState, ctx: &egui::Context) {
+        self.loading.remove(&gate.job);
+        if self.projection_decider == Some(gate.job) {
+            self.projection_decider = None;
+            self.flush_deferred_loads(ctx);
+        }
     }
 
     /// Start the loads that waited on the projection decision.
@@ -812,12 +896,19 @@ impl ViewerApp {
         use std::sync::atomic::Ordering;
         self.clear_selection();
         for l in &mut self.layers {
+            // Direct layers hold everything by design; a viewport reload
+            // could not prune them (no usable spatial index) and would
+            // only re-decode the whole file.
+            if l.mode == crate::data::layer::LayerMode::Direct {
+                continue;
+            }
             // A reload supersedes any in-flight refinement.
             self.appending.remove(&l.id);
             if let Some(c) = self.append_cancel.remove(&l.id) {
                 c.store(true, Ordering::Relaxed);
             }
             self.refine_hold.remove(&l.id);
+            self.refine_deferred.remove(&l.id);
             // Row filters select rows the reload will not decode; clear
             // them rather than silently showing a different subset.
             l.filter = None;
@@ -1037,7 +1128,13 @@ impl ViewerApp {
     fn poll_loader(&mut self, ctx: &egui::Context) {
         let mut rebuild_display: Option<DisplayCrs> = None;
         let mut decider_done = false;
+        let mut first_layer_fit = false;
         while let Ok(msg) = self.load_rx.try_recv() {
+            // New geometry may arrive: owe the frames that upload it,
+            // strip the CPU copies, evict superseded GPU buffers and let
+            // wgpu's deferred destroy actually run — none of which happen
+            // while the app idles without repaint requests.
+            self.strip_probe = 8;
             match msg {
                 LoadMsg::Progress { job, frac, stage } => {
                     if let Some(j) = self.loading.get_mut(&job) {
@@ -1069,6 +1166,7 @@ impl ViewerApp {
                     if let Some(name) = self.pending_names.remove(&job) {
                         layer.name = name;
                     }
+                    let context_restored = self.pending_styles.contains_key(&job);
                     if let Some(style) = self.pending_styles.remove(&job) {
                         layer.style = style;
                     }
@@ -1116,6 +1214,24 @@ impl ViewerApp {
                     // Context-restored filter: compute once the layer exists.
                     if let Some(f) = self.pending_filters.remove(&job) {
                         self.start_layer_filter(new_layer_id, f, ctx);
+                    }
+                    // The only layer on the map always gets framed once its
+                    // geometry is in the current display's coordinates —
+                    // even if the camera was touched while it loaded (long
+                    // direct loads invite panning around the empty world)
+                    // and even without projection adoption. Restored
+                    // contexts keep their saved camera instead.
+                    if self.layers.len() == 1 && !context_restored {
+                        first_layer_fit = true;
+                        match &adopt {
+                            // World coordinates are about to change: the
+                            // fit must wait for the projection rebuild.
+                            Some((_, false)) => {}
+                            _ if self.rebuilding.contains(&new_layer_id) => {
+                                self.fit_after_rebuilds = true;
+                            }
+                            _ => self.pending_fit = true,
+                        }
                     }
                     match adopt {
                         // Geometry already built in the auto-adopted
@@ -1255,6 +1371,42 @@ impl ViewerApp {
                         self.push_error(error);
                     }
                 }
+                LoadMsg::RefineDeferred {
+                    layer_id,
+                    at_least_rows,
+                } => {
+                    self.appending.remove(&layer_id);
+                    self.append_cancel.remove(&layer_id);
+                    // The exact covering scan proved this viewport is still
+                    // over budget. Retry only after the camera moves; say
+                    // so in the layer block instead of a silent debug log.
+                    self.refine_hold.insert(layer_id);
+                    self.refine_deferred.insert(layer_id, at_least_rows);
+                }
+                LoadMsg::QualityGate {
+                    job,
+                    layer_id,
+                    opened,
+                    color,
+                    auto_project,
+                } => {
+                    let gate = QualityGateState {
+                        job,
+                        layer_id,
+                        opened: *opened,
+                        color,
+                        auto_project,
+                    };
+                    if self.direct_files.contains(&gate.key()) {
+                        // Standing "load all" answer for this file.
+                        self.resume_gated(gate, ctx);
+                    } else {
+                        if let Some(j) = self.loading.get_mut(&job) {
+                            j.stage = "file not optimized — waiting for your answer".into();
+                        }
+                        self.quality_gates.push(gate);
+                    }
+                }
                 LoadMsg::Failed { job, source, error } => {
                     self.loading.remove(&job);
                     if self.projection_decider == Some(job) {
@@ -1269,13 +1421,14 @@ impl ViewerApp {
             }
         }
         if let Some(d) = rebuild_display {
-            // First-layer adoption via full rebuild: same camera policy as
-            // the lite path. When untouched, the fit waits for the
+            // First-layer adoption via full rebuild: the fit waits for the
             // projection rebuilds to finish (fit_after_rebuilds, armed by
-            // set_display); a framed camera transfers immediately instead.
+            // set_display). A touched camera normally transfers its framing
+            // instead — but not for the map's only layer, which the user
+            // always wants framed once it appears.
             let old = self.display.clone();
             self.set_display(d, ctx);
-            if self.camera_moved {
+            if self.camera_moved && !first_layer_fit {
                 self.fit_after_rebuilds = false;
                 self.transfer_camera(&old);
             }
@@ -1377,6 +1530,7 @@ impl ViewerApp {
         let view = self.last_view_world;
         for l in &self.layers {
             if !l.is_partial()
+                || l.mode == crate::data::layer::LayerMode::Direct
                 || !l.style.visible
                 || self.appending.contains(&l.id)
                 || self.rebuilding.contains(&l.id)
@@ -1418,54 +1572,9 @@ impl ViewerApp {
             if jobs.is_empty() {
                 continue;
             }
-            // Row-budget guard: refining a preview at a wide viewport
-            // would decode the very load the preview avoided. Estimate
-            // rect jobs by viewport/bbox area overlap and wait for a
-            // tighter zoom when the estimate exceeds the budget. The
-            // area estimate is only meaningful when the store can subset
-            // rows per feature (covering column or x/y coordinates) —
-            // otherwise a Rect job decodes the WHOLE group.
-            let selectable =
-                l.store.covering.is_some() || l.store.xy_geom.is_some();
-            let est: u64 = jobs
-                .iter()
-                .map(|j| match j {
-                    GroupSel::Ranges(_, rs) => {
-                        rs.iter().map(|&(s, e)| (e - s) as u64).sum()
-                    }
-                    GroupSel::Rect(g, r) | GroupSel::Preview { group: g, rect: Some(r), .. }
-                        if selectable =>
-                    {
-                        let gb = rg.boxes[*g as usize];
-                        let n = starts[*g as usize + 1] - starts[*g as usize];
-                        let (bw, bh) = (gb[2] - gb[0], gb[3] - gb[1]);
-                        let iw = (r[2].min(gb[2]) - r[0].max(gb[0])).max(0.0);
-                        let ih = (r[3].min(gb[3]) - r[1].max(gb[1])).max(0.0);
-                        if bw <= 0.0 || bh <= 0.0 {
-                            n
-                        } else {
-                            ((iw * ih) / (bw * bh) * n as f64).ceil() as u64
-                        }
-                    }
-                    j => {
-                        let g = match j {
-                            GroupSel::All(g)
-                            | GroupSel::Rect(g, _)
-                            | GroupSel::Preview { group: g, .. } => *g,
-                            GroupSel::Ranges(g, _) => *g,
-                        };
-                        starts[g as usize + 1] - starts[g as usize]
-                    }
-                })
-                .sum();
-            if est > crate::data::loader::MAX_BUILD_ROWS {
-                log::debug!(
-                    "{}: refinement estimate {est} rows over budget — zoom in further",
-                    l.name
-                );
-                continue;
-            }
-            log::info!("{}: refining with {} row groups", l.name, jobs.len());
+            // The worker resolves covering/x-y rows exactly before it
+            // applies the budget; never gate refinement on bbox area.
+            log::info!("{}: checking {} row groups for refinement", l.name, jobs.len());
             self.appending.insert(l.id);
             let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
             self.append_cancel.insert(l.id, Arc::clone(&cancel));
@@ -1481,8 +1590,9 @@ impl ViewerApp {
                 self.display.clone(),
                 jobs,
                 cancel,
-            l.style.style_by.clone(),
-                        );
+                l.style.style_by.clone(),
+                Some(crate::data::loader::MAX_BUILD_ROWS),
+            );
         }
     }
 
@@ -2074,6 +2184,28 @@ impl ViewerApp {
                             }
                         }
                     }
+                    if l.mode == crate::data::layer::LayerMode::Direct {
+                        ui.label(
+                            RichText::new(format!(
+                                "loaded fully ({} rows) — unoptimized file, \
+                                 viewport loading unavailable",
+                                fmt_count(l.feature_count)
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    }
+                    if let Some(rows) = self.refine_deferred.get(&l.id) {
+                        ui.label(
+                            RichText::new(format!(
+                                "viewport too dense to refine (≥{} rows) — \
+                                 zoom in",
+                                fmt_count(*rows as usize)
+                            ))
+                            .color(Color32::from_rgb(242, 140, 26))
+                            .small(),
+                        );
+                    }
                     if l.is_partial() && l.filter.is_none() {
                         ui.horizontal(|ui| {
                             let preview = l.preview_rgs();
@@ -2143,6 +2275,7 @@ impl ViewerApp {
             self.rebuilding.remove(&id);
             self.appending.remove(&id);
             self.refine_hold.remove(&id);
+            self.refine_deferred.remove(&id);
             // Stop the removed layer's in-flight workers instead of letting
             // them stream/rebuild into the void.
             if let Some(c) = self.append_cancel.remove(&id) {
@@ -2166,6 +2299,9 @@ impl ViewerApp {
             let already_running = self.optimize.as_ref().is_some_and(|o| o.running);
             if !already_running {
                 if let Some(l) = self.layers.iter().find(|l| l.id == id) {
+                    let recommended = crate::data::optimize::GpVersion::preferred(
+                        &l.info.geo.geometry_types,
+                    );
                     self.optimize = Some(OptimizeState {
                         layer_id: l.id,
                         layer_name: l.name.clone(),
@@ -2175,6 +2311,7 @@ impl ViewerApp {
                         viewport_only: false,
                         opts: crate::data::optimize::OptimizeOptions {
                             xy_geom: l.store.xy_geom,
+                            version: recommended,
                             ..Default::default()
                         },
                         running: false,
@@ -2189,6 +2326,8 @@ impl ViewerApp {
                         adaptive_target: 1_000_000,
                         cardinalities: None,
                         card_pending: false,
+                        open_result: false,
+                        recommended,
                     });
                 }
             }
@@ -2255,7 +2394,8 @@ impl ViewerApp {
                             self.display.clone(),
                             missing,
                             cancel,
-                        l.style.style_by.clone(),
+                            l.style.style_by.clone(),
+                            None,
                         );
                     }
                 }
@@ -3458,13 +3598,19 @@ impl ViewerApp {
         }
     }
 
-    fn poll_optimizer(&mut self) {
+    fn poll_optimizer(&mut self, ctx: &egui::Context) {
+        let mut open_result: Option<PathBuf> = None;
         while let Ok(msg) = self.opt_rx.try_recv() {
             let Some(o) = &mut self.optimize else { continue };
             match msg {
                 OptMsg::Progress(f, s) => o.progress = (f, s),
                 OptMsg::Done(report, path) => {
                     o.running = false;
+                    // Quality-gate flow: the optimized copy opens as the
+                    // layer the original never became.
+                    if o.open_result {
+                        open_result = Some(path.clone());
+                    }
                     o.report = Some((*report, path));
                 }
                 OptMsg::Failed(e) => {
@@ -3478,6 +3624,9 @@ impl ViewerApp {
                     }
                 }
             }
+        }
+        if let Some(path) = open_result {
+            self.enqueue_load(Source::Local(path), ctx);
         }
     }
 
@@ -3696,8 +3845,23 @@ impl ViewerApp {
                 }
 
                 ui.add_enabled_ui(!o.running, |ui| {
+                    let label = |v: GpVersion, rec: GpVersion| {
+                        if v == rec {
+                            format!("{} — recommended", v.label())
+                        } else {
+                            v.label().to_string()
+                        }
+                    };
                     if ui
-                        .radio(o.opts.version == GpVersion::V1_1, GpVersion::V1_1.label())
+                        .radio(
+                            o.opts.version == GpVersion::V1_1,
+                            label(GpVersion::V1_1, o.recommended),
+                        )
+                        .on_hover_text(
+                            "WKB opens everywhere; the covering bbox column drives\n\
+                             row/page pruning and per-feature viewport selection.\n\
+                             The safe choice for files that travel.",
+                        )
                         .clicked()
                     {
                         o.opts.version = GpVersion::V1_1;
@@ -3706,7 +3870,7 @@ impl ViewerApp {
                     if ui
                         .radio(
                             o.opts.version == GpVersion::V1_1GeoArrow,
-                            GpVersion::V1_1GeoArrow.label(),
+                            label(GpVersion::V1_1GeoArrow, o.recommended),
                         )
                         .on_hover_text(
                             "Geometry as raw coordinate arrays: fastest decode, x/y column\n\
@@ -3719,7 +3883,10 @@ impl ViewerApp {
                         o.opts.covering = true;
                     }
                     if ui
-                        .radio(o.opts.version == GpVersion::V2_0, GpVersion::V2_0.label())
+                        .radio(
+                            o.opts.version == GpVersion::V2_0,
+                            label(GpVersion::V2_0, o.recommended),
+                        )
                         .on_hover_text(
                             "Native geo statistics replace the covering column for pruning;\n\
                              needs GeoParquet 2.0 aware readers",
@@ -4043,6 +4210,167 @@ impl ViewerApp {
         }
     }
 
+    /// Quality-gate dialog (docs/OPEN_POLICY.md): a non-indexable file too
+    /// big for a full build waits here for Optimize / Load all / Cancel.
+    fn quality_gate_window(&mut self, ctx: &egui::Context) {
+        use crate::data::info::fmt_bytes;
+        use crate::data::quality::{DIRECT_MAX_GEOM_BYTES, DIRECT_MAX_ROWS};
+        let Some(gate) = self.quality_gates.first() else {
+            return;
+        };
+        let info = &gate.opened.info;
+        let name = gate.opened.store.source.name();
+        let (rows, geom_bytes) = (
+            info.rows,
+            info.quality.as_ref().map_or(0, |q| q.geom_bytes),
+        );
+        let too_big = rows > DIRECT_MAX_ROWS || geom_bytes > DIRECT_MAX_GEOM_BYTES;
+        enum Action {
+            None,
+            Optimize,
+            LoadAll,
+            Cancel,
+        }
+        let mut action = Action::None;
+        egui::Window::new(format!("File not optimized — {name}"))
+            .id(egui::Id::new("quality_gate").with(gate.job))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "{} rows in {} row groups — {}",
+                    fmt_count(rows as usize),
+                    info.row_groups,
+                    fmt_bytes(info.file_size),
+                ));
+                ui.add_space(6.0);
+                if let Some(q) = &info.quality {
+                    for c in q.failures() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new("✘")
+                                    .color(Color32::from_rgb(220, 60, 60))
+                                    .strong(),
+                            );
+                            ui.label(&c.detail);
+                        });
+                    }
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    "Viewport-based loading is not possible on this file: the \
+                     viewer cannot tell which rows are on screen without \
+                     decoding them.",
+                );
+                ui.add_space(4.0);
+                ui.label(format!(
+                    "Optimize rewrites it once (spatial sort + bbox index) and \
+                     opens the optimized copy. Load all decodes every feature \
+                     up front (~{} of geometry) — slower to open, complete \
+                     and exact after that.",
+                    fmt_bytes(geom_bytes),
+                ));
+                if gate.opened.store.source.is_remote() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Remote source: either choice downloads effectively \
+                             the whole file.",
+                        )
+                        .color(Color32::from_rgb(242, 140, 26)),
+                    );
+                }
+                if too_big {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Too large to load in full ({} rows / {} geometry — \
+                             limits {} / {}). Optimize is the only path.",
+                            fmt_count(rows as usize),
+                            fmt_bytes(geom_bytes),
+                            fmt_count(DIRECT_MAX_ROWS as usize),
+                            fmt_bytes(DIRECT_MAX_GEOM_BYTES),
+                        ))
+                        .color(Color32::from_rgb(220, 60, 60)),
+                    );
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Optimize…").clicked() {
+                        action = Action::Optimize;
+                    }
+                    if ui
+                        .add_enabled(
+                            !too_big,
+                            egui::Button::new(format!(
+                                "Load all {}",
+                                fmt_count(rows as usize)
+                            )),
+                        )
+                        .on_hover_text("Remembered for this file: it will load fully without asking again")
+                        .clicked()
+                    {
+                        action = Action::LoadAll;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        action = Action::Cancel;
+                    }
+                });
+            });
+        match action {
+            Action::None => {}
+            Action::LoadAll => {
+                let gate = self.quality_gates.remove(0);
+                self.direct_files.insert(gate.key());
+                save_direct_files(&self.direct_files);
+                self.resume_gated(gate, ctx);
+            }
+            Action::Cancel => {
+                let gate = self.quality_gates.remove(0);
+                self.drop_gated(&gate, ctx);
+            }
+            Action::Optimize => {
+                let gate = self.quality_gates.remove(0);
+                if self.optimize.as_ref().is_none_or(|o| !o.running) {
+                    let o = &gate.opened;
+                    let recommended = crate::data::optimize::GpVersion::preferred(
+                        &o.info.geo.geometry_types,
+                    );
+                    self.optimize = Some(OptimizeState {
+                        layer_id: u64::MAX, // no layer behind this export
+                        layer_name: o.store.source.name(),
+                        src: o.store.source.clone(),
+                        epsg: o.crs.epsg,
+                        crs: o.crs.clone(),
+                        viewport_only: false,
+                        opts: crate::data::optimize::OptimizeOptions {
+                            xy_geom: o.store.xy_geom,
+                            version: recommended,
+                            ..Default::default()
+                        },
+                        running: false,
+                        progress: (0.0, String::new()),
+                        report: None,
+                        error: None,
+                        admin_layer: None,
+                        admin_column: String::new(),
+                        admin_out: "admin".into(),
+                        part_mode: PartMode::None,
+                        part_fields: Vec::new(),
+                        adaptive_target: 1_000_000,
+                        cardinalities: None,
+                        card_pending: false,
+                        open_result: true,
+                        recommended,
+                    });
+                }
+                self.drop_gated(&gate, ctx);
+            }
+        }
+    }
+
     fn info_window(&mut self, ctx: &egui::Context) {
         use crate::data::info::fmt_bytes;
         let Some(id) = self.info_open else { return };
@@ -4109,6 +4437,12 @@ impl ViewerApp {
                             );
                         }
                     });
+
+                    if let Some(q) = &info.quality {
+                        ui.add_space(8.0);
+                        ui.separator();
+                        Self::quality_scorecard(ui, q);
+                    }
 
                     ui.add_space(8.0);
                     ui.separator();
@@ -4217,6 +4551,38 @@ impl ViewerApp {
         if !open {
             self.info_open = None;
         }
+    }
+
+    /// Display-readiness scorecard (docs/OPEN_POLICY.md): one line per
+    /// check, verdict on top.
+    fn quality_scorecard(ui: &mut egui::Ui, q: &crate::data::quality::QualityReport) {
+        use crate::data::quality::Status;
+        let green = Color32::from_rgb(80, 200, 120);
+        let amber = Color32::from_rgb(242, 140, 26);
+        let red = Color32::from_rgb(220, 60, 60);
+        let (verdict, color) = if q.indexable {
+            ("Display readiness: optimized — viewport loading active", green)
+        } else {
+            (
+                "Display readiness: not optimized — viewport loading unavailable",
+                red,
+            )
+        };
+        ui.label(RichText::new(verdict).strong().color(color));
+        ui.add_space(4.0);
+        egui::Grid::new("quality_grid").num_columns(3).striped(true).show(ui, |ui| {
+            for c in &q.checks {
+                let (icon, color) = match c.status {
+                    Status::Pass => ("✔", green),
+                    Status::Warn => ("!", amber),
+                    Status::Fail => ("✘", red),
+                };
+                ui.label(RichText::new(icon).color(color).strong());
+                ui.label(RichText::new(format!("{} {}", c.code, c.title)).strong());
+                ui.add(egui::Label::new(&c.detail).wrap());
+                ui.end_row();
+            }
+        });
     }
 
     fn attributes_panel(&mut self, ui: &mut egui::Ui) {
@@ -4463,6 +4829,7 @@ impl ViewerApp {
                 self.last_cam = Some(pose);
                 self.cam_changed_at = now;
                 self.refine_hold.clear();
+                self.refine_deferred.clear();
             } else if now - self.cam_changed_at > 0.35 {
                 self.refine_partial_layers(&ctx);
             }
@@ -4943,6 +5310,37 @@ fn geom_summary(
     }
 }
 
+/// Settings sidecar for the quality gate's decline memory: one small
+/// JSON file in the home directory (the app has no other persistence).
+/// Unknown keys are preserved for forward compatibility.
+fn settings_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(PathBuf::from(home).join(".geopq-workbench.json"))
+}
+
+fn load_direct_files() -> HashSet<String> {
+    let read = || -> Option<HashSet<String>> {
+        let txt = std::fs::read_to_string(settings_path()?).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
+        serde_json::from_value(v.get("direct_files")?.clone()).ok()
+    };
+    read().unwrap_or_default()
+}
+
+fn save_direct_files(files: &HashSet<String>) {
+    let Some(p) = settings_path() else { return };
+    let mut root = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    root["direct_files"] = serde_json::json!(files);
+    if let Ok(txt) = serde_json::to_string_pretty(&root) {
+        if let Err(e) = std::fs::write(&p, txt) {
+            log::warn!("could not save {}: {e}", p.display());
+        }
+    }
+}
+
 fn fmt_count(n: usize) -> String {
     if n >= 1_000_000 {
         format!("{:.2}M", n as f64 / 1e6)
@@ -5011,12 +5409,16 @@ impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_loader(&ctx);
-        self.poll_optimizer();
+        self.poll_optimizer(&ctx);
         self.poll_picks();
         self.poll_repo();
         self.poll_categories();
         self.poll_classes();
         self.strip_uploaded_cpu_meshes(frame);
+        if self.strip_probe > 0 {
+            self.strip_probe -= 1;
+            ctx.request_repaint();
+        }
 
         // Drag & drop.
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -5097,6 +5499,7 @@ impl eframe::App for ViewerApp {
         }
         self.errors_window(&ctx);
         self.info_window(&ctx);
+        self.quality_gate_window(&ctx);
         self.optimize_window(&ctx);
         self.url_window(&ctx);
         self.repo_window(&ctx);
