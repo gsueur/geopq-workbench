@@ -133,7 +133,9 @@ jobs:
             id=$(printf '%s' "$out" | sed -n 's/.*"id" *: *"\([^"]*\)".*/\1/p' | head -1)
             [ -n "$id" ] || { echo "no submission id in: $out"; return 1; }
             echo "submission $id"
-            for a in $(seq 1 60); do
+            # Generous cap: a new Developer account's first submissions
+            # can sit In Progress for an hour; later ones take minutes.
+            for a in $(seq 1 360); do
               sleep 15
               status=$(xcrun notarytool info "$id" --key "$KEYFILE" \
                 --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
@@ -148,7 +150,7 @@ jobs:
                   return 1 ;;
               esac
             done
-            echo "notarization timed out after 15 min"
+            echo "notarization timed out after 90 min"
             return 1
           }
 
