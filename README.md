@@ -252,8 +252,10 @@ larger files are on the roadmap.
   with equal-interval, quantile, half-std-dev or Jenks classification;
   text columns get a categorical palette of the most frequent values.
 - **Basemaps**: Carto Light/Dark/Voyager and OSM raster tiles (Web
-  Mercator), plus an embedded Natural Earth coastline and graticule that
-  follow any projection.
+  Mercator), plus a Natural Earth coastline and graticule that follow
+  any projection. The coastline is zoom-dependent: the embedded 1:50m
+  version is swapped for the 1:10m one when you zoom in (fetched once,
+  ~3 MB, cached on disk; the app quietly stays on 1:50m offline).
 - **Layer filters** (⋮ → Filter…): a persistent SQL predicate per layer;
   only matching rows are decoded, drawn, picked and queried until you
   clear it. Spatial predicates prune at the file level, so a location

@@ -1172,6 +1172,8 @@ pub fn spawn_reload(
     });
 }
 
+/// Un-gated open with no viewport, used by the test helpers below.
+#[cfg(test)]
 fn open_store(source: &Source) -> Result<StoreOpen, String> {
     open_store_with_view(source, None)
 }

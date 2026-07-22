@@ -1,3 +1,6 @@
 /target
 /testdata/*.parquet
 .DS_Store
+
+# Generated locally by make_coastline_bin.py; hosted as a release asset
+/assets/ne_10m_coastline.bin

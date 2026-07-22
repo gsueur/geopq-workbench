@@ -142,6 +142,9 @@ pub struct ViewerApp {
     graticule_generation: u64,
     show_graticule: bool,
     show_coastline: bool,
+    /// Coastline generation the overlay chunks are currently built from
+    /// (embedded 1:50m at world zoom, fetched 1:10m when zoomed in).
+    coast_level: crate::data::coastline::CoastLevel,
     /// Cached row-group bbox overlays per layer id: (layer generation,
     /// chunks, world-space label anchors).
     rg_overlays: HashMap<u64, (u64, Arc<Vec<crate::data::geometry::ChunkMesh>>, Vec<[f64; 2]>)>,
@@ -563,6 +566,7 @@ impl ViewerApp {
             graticule_generation: 0,
             show_graticule: true,
             show_coastline: true,
+            coast_level: Default::default(),
             rg_overlays: HashMap::new(),
             tiles: TileCache::new(cc.egui_ctx.clone()),
             basemap: Some(0),
@@ -1508,7 +1512,8 @@ impl ViewerApp {
         self.display = d;
         self.clear_selection();
         self.graticule_chunks = build_graticule(&self.display);
-        self.coastline_chunks = crate::data::coastline::build_coastline(&self.display);
+        self.coastline_chunks =
+            crate::data::coastline::build_coastline_at(&self.display, self.coast_level);
         self.graticule_generation += 1;
         self.rg_overlays.clear();
     }
@@ -1545,7 +1550,8 @@ impl ViewerApp {
         self.sql_highlight_chunks = None;
         self.sql_highlight_generation += 1;
         self.graticule_chunks = build_graticule(&self.display);
-        self.coastline_chunks = crate::data::coastline::build_coastline(&self.display);
+        self.coastline_chunks =
+            crate::data::coastline::build_coastline_at(&self.display, self.coast_level);
         self.graticule_generation += 1;
         self.rebuild_layers_for_display(None, ctx);
         if self.layers.is_empty() {
@@ -3726,6 +3732,47 @@ impl ViewerApp {
         }
     }
 
+    /// Zoom-dependent coastline detail: switch the overlay between the
+    /// embedded 1:50m and the fetched 1:10m generation, with hysteresis
+    /// (in at zoom ≥ 6, out at zoom ≤ 5) so the boundary never thrashes.
+    /// The first time the detailed level is wanted it is fetched in the
+    /// background (disk-cached); the embedded coastline stays up until
+    /// the switch, and a failed fetch quietly stays there for good.
+    fn update_coastline_detail(&mut self, ctx: &egui::Context) {
+        use crate::data::coastline::{self, CoastLevel};
+        if !self.show_coastline {
+            return;
+        }
+        let want = match self.coast_level {
+            CoastLevel::Embedded if self.camera.zoom >= 6.0 => CoastLevel::Detailed,
+            CoastLevel::Detailed if self.camera.zoom <= 5.0 => CoastLevel::Embedded,
+            cur => cur,
+        };
+        if want == self.coast_level {
+            return;
+        }
+        if want == CoastLevel::Detailed && coastline::detailed_lines().is_none() {
+            // Not fetched yet: kick it off and stay on the embedded
+            // lines. The repaint on completion re-enters here.
+            let ctx2 = ctx.clone();
+            coastline::request_detailed(move || ctx2.request_repaint());
+            return;
+        }
+        self.coast_level = want;
+        self.coastline_chunks =
+            coastline::build_coastline_at(&self.display, self.coast_level);
+        self.graticule_generation += 1; // new draw key -> fresh GPU upload
+        let segs: usize =
+            self.coastline_chunks.iter().map(|c| c.lines[0].segments.len()).sum();
+        log::info!(
+            "coastline: overlay switched to {} ({segs} segments)",
+            match self.coast_level {
+                coastline::CoastLevel::Embedded => "1:50m (embedded)",
+                coastline::CoastLevel::Detailed => "1:10m",
+            }
+        );
+    }
+
     fn gpkg_import_window(&mut self, ctx: &egui::Context) {
         if self.gpkg_import.is_none() {
             return;
@@ -5806,6 +5853,7 @@ impl eframe::App for ViewerApp {
         let ctx = ui.ctx().clone();
         self.poll_loader(&ctx);
         self.poll_optimizer(&ctx);
+        self.update_coastline_detail(&ctx);
         self.poll_picks();
         self.poll_repo();
         self.poll_categories();

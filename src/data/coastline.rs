@@ -90,6 +90,143 @@ pub fn build_coastline(display: &DisplayCrs) -> Arc<Vec<ChunkMesh>> {
     project_overlay_lines(display, coastline_lines().iter().map(|l| l.as_slice()))
 }
 
+// --- zoom-dependent detail: Natural Earth 1:10m, fetched on demand ------
+
+/// NEC1-packed 1:10m coastline (~3.3 MB), published as a release asset
+/// (regenerate with `assets/make_coastline_bin.py 10m`).
+pub const DETAIL_URL: &str =
+    "https://github.com/gsueur/geopq-workbench/releases/download/assets/ne_10m_coastline.bin";
+
+/// Which coastline generation the overlay chunks are built from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CoastLevel {
+    /// Embedded 1:50m — always available.
+    #[default]
+    Embedded,
+    /// Fetched 1:10m — used when zoomed in, once available.
+    Detailed,
+}
+
+/// Parsed WGS84 polylines, shared between the fetch thread and builds.
+type SharedLines = Arc<Vec<Vec<(f64, f64)>>>;
+
+enum DetailState {
+    Idle,
+    Fetching,
+    Ready(SharedLines),
+    /// Fetch failed: stay on the embedded coastline for this session
+    /// (no retry storm; a restart tries again).
+    Failed,
+}
+
+fn detail_state() -> &'static std::sync::Mutex<DetailState> {
+    static S: OnceLock<std::sync::Mutex<DetailState>> = OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(DetailState::Idle))
+}
+
+/// `~/.config/geopq-workbench/ne_10m_coastline.bin` (tests: temp dir).
+fn detail_cache_path() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    {
+        return Some(
+            std::env::temp_dir()
+                .join(format!("geopq_test_coast_{}", std::process::id()))
+                .join("ne_10m_coastline.bin"),
+        );
+    }
+    #[cfg(not(test))]
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|h| {
+            std::path::PathBuf::from(h)
+                .join(".config")
+                .join("geopq-workbench")
+                .join("ne_10m_coastline.bin")
+        })
+}
+
+/// The 1:10m lines, when already fetched.
+pub fn detailed_lines() -> Option<SharedLines> {
+    match &*detail_state().lock().unwrap() {
+        DetailState::Ready(l) => Some(l.clone()),
+        _ => None,
+    }
+}
+
+/// Kick off the one-time background fetch (disk cache first, then the
+/// release asset). `on_ready` fires once on success — use it to request
+/// a repaint. No-op while fetching, after success, or after a failure.
+pub fn request_detailed(on_ready: impl FnOnce() + Send + 'static) {
+    {
+        let mut st = detail_state().lock().unwrap();
+        match *st {
+            DetailState::Idle => *st = DetailState::Fetching,
+            _ => return,
+        }
+    }
+    std::thread::spawn(move || {
+        let loaded = load_detail();
+        let mut st = detail_state().lock().unwrap();
+        match loaded {
+            Some(lines) => {
+                log::info!(
+                    "coastline: 1:10m detail ready ({} lines)",
+                    lines.len()
+                );
+                *st = DetailState::Ready(Arc::new(lines));
+                drop(st);
+                on_ready();
+            }
+            None => {
+                log::warn!("coastline: 1:10m fetch failed, staying on 1:50m");
+                *st = DetailState::Failed;
+            }
+        }
+    });
+}
+
+fn load_detail() -> Option<Vec<Vec<(f64, f64)>>> {
+    let cache = detail_cache_path();
+    if let Some(p) = &cache
+        && let Ok(bytes) = std::fs::read(p)
+    {
+        if let Some(lines) = parse_nec1(&bytes) {
+            return Some(lines);
+        }
+        let _ = std::fs::remove_file(p); // corrupt cache: refetch
+    }
+    log::info!("coastline: fetching 1:10m detail");
+    let res = crate::data::source::http_agent().get(DETAIL_URL).call().ok()?;
+    if res.status().as_u16() != 200 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    use std::io::Read;
+    res.into_body().into_reader().read_to_end(&mut bytes).ok()?;
+    let lines = parse_nec1(&bytes)?;
+    if let Some(p) = &cache {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(p, &bytes);
+    }
+    Some(lines)
+}
+
+/// Build the coastline overlay at a given level; a not-yet-fetched
+/// Detailed level falls back to the embedded lines.
+pub fn build_coastline_at(display: &DisplayCrs, level: CoastLevel) -> Arc<Vec<ChunkMesh>> {
+    match level {
+        CoastLevel::Detailed => match detailed_lines() {
+            Some(lines) => {
+                project_overlay_lines(display, lines.iter().map(|l| l.as_slice()))
+            }
+            None => build_coastline(display),
+        },
+        CoastLevel::Embedded => build_coastline(display),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +244,34 @@ mod tests {
                 assert!((-90.01..=90.01).contains(&lat), "lat {lat}");
             }
         }
+    }
+
+    #[test]
+    fn detail_falls_back_and_reads_cache() {
+        // Before any fetch, the Detailed level builds the embedded lines.
+        let display = DisplayCrs::hobo_dyer();
+        let segs = |c: &Arc<Vec<ChunkMesh>>| -> usize {
+            c.iter().map(|c| c.lines[0].segments.len()).sum()
+        };
+        let a = build_coastline(&display);
+        let b = build_coastline_at(&display, CoastLevel::Detailed);
+        assert_eq!(segs(&a), segs(&b));
+
+        // A valid cached NEC1 file loads without touching the network.
+        let p = detail_cache_path().unwrap();
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let mut bytes: Vec<u8> = b"NEC1".to_vec();
+        bytes.extend(1u32.to_le_bytes());
+        bytes.extend(3u32.to_le_bytes());
+        for (x, y) in [(0.0f32, 0.0f32), (1.0, 1.0), (2.0, 0.5)] {
+            bytes.extend(x.to_le_bytes());
+            bytes.extend(y.to_le_bytes());
+        }
+        std::fs::write(&p, &bytes).unwrap();
+        let lines = load_detail().expect("cache hit");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), 3);
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
