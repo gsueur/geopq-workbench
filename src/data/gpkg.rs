@@ -6,19 +6,15 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
-};
+use arrow::array::{ArrayRef, BinaryBuilder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::json;
 
-const BATCH_ROWS: usize = 65_536;
+use super::import::{AttrBuilder, Cell, IMPORT_BATCH_ROWS as BATCH_ROWS};
 
 /// One feature table of a GeoPackage.
 #[derive(Clone)]
@@ -200,14 +196,9 @@ pub fn convert(
     };
 
     let out = std::fs::File::create(dst).map_err(|e| format!("cannot create output: {e}"))?;
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
-        .set_max_row_group_row_count(Some(BATCH_ROWS))
-        .set_statistics_enabled(EnabledStatistics::Page)
-        .set_created_by(format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
-        .build();
     let mut writer =
-        ArrowWriter::try_new(out, schema.clone(), Some(props)).map_err(|e| e.to_string())?;
+        ArrowWriter::try_new(out, schema.clone(), Some(super::import::writer_props()))
+            .map_err(|e| e.to_string())?;
 
     let mut geom_types: std::collections::BTreeSet<String> = Default::default();
     let mut bbox = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
@@ -246,7 +237,7 @@ pub fn convert(
                 _ => geom_b.append_null(),
             }
             for (i, b) in attr_b.iter_mut().enumerate() {
-                b.push(row.get_ref(i + 1).map_err(|e| e.to_string())?);
+                b.push(cell(row.get_ref(i + 1).map_err(|e| e.to_string())?));
             }
             in_batch += 1;
         }
@@ -296,63 +287,15 @@ pub fn convert(
     Ok(written)
 }
 
-/// Typed column builder with per-cell coercion (SQLite cells are
-/// dynamically typed; mismatches become nulls rather than errors).
-enum AttrBuilder {
-    Int(Int64Builder),
-    Float(Float64Builder),
-    Bool(BooleanBuilder),
-    Text(StringBuilder),
-    Blob(BinaryBuilder),
-}
-
-impl AttrBuilder {
-    fn new(dt: &DataType) -> Self {
-        match dt {
-            DataType::Int64 => Self::Int(Int64Builder::new()),
-            DataType::Float64 => Self::Float(Float64Builder::new()),
-            DataType::Boolean => Self::Bool(BooleanBuilder::new()),
-            DataType::Binary => Self::Blob(BinaryBuilder::new()),
-            _ => Self::Text(StringBuilder::new()),
-        }
-    }
-
-    fn push(&mut self, v: ValueRef<'_>) {
-        match self {
-            Self::Int(b) => match v {
-                ValueRef::Integer(i) => b.append_value(i),
-                _ => b.append_null(),
-            },
-            Self::Float(b) => match v {
-                ValueRef::Real(f) => b.append_value(f),
-                ValueRef::Integer(i) => b.append_value(i as f64),
-                _ => b.append_null(),
-            },
-            Self::Bool(b) => match v {
-                ValueRef::Integer(i) => b.append_value(i != 0),
-                _ => b.append_null(),
-            },
-            Self::Text(b) => match v {
-                ValueRef::Text(t) => b.append_value(String::from_utf8_lossy(t)),
-                ValueRef::Integer(i) => b.append_value(i.to_string()),
-                ValueRef::Real(f) => b.append_value(f.to_string()),
-                _ => b.append_null(),
-            },
-            Self::Blob(b) => match v {
-                ValueRef::Blob(x) => b.append_value(x),
-                _ => b.append_null(),
-            },
-        }
-    }
-
-    fn finish(&mut self) -> ArrayRef {
-        match self {
-            Self::Int(b) => Arc::new(b.finish()),
-            Self::Float(b) => Arc::new(b.finish()),
-            Self::Bool(b) => Arc::new(b.finish()),
-            Self::Text(b) => Arc::new(b.finish()),
-            Self::Blob(b) => Arc::new(b.finish()),
-        }
+/// SQLite value -> shared import cell (SQLite is dynamically typed;
+/// the shared builder coerces or nulls per the declared column type).
+fn cell(v: ValueRef<'_>) -> Cell<'_> {
+    match v {
+        ValueRef::Null => Cell::Null,
+        ValueRef::Integer(i) => Cell::Int(i),
+        ValueRef::Real(f) => Cell::Float(f),
+        ValueRef::Text(t) => Cell::Str(String::from_utf8_lossy(t)),
+        ValueRef::Blob(b) => Cell::Bytes(b),
     }
 }
 

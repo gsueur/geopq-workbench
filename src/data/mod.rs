@@ -1,8 +1,10 @@
 pub mod coastline;
 pub mod crs;
 pub mod geoarrow;
+pub mod geojson;
 pub mod geometry;
 pub mod gpkg;
+pub mod import;
 pub mod info;
 pub mod layer;
 pub mod loader;
@@ -11,5 +13,6 @@ pub mod optimize;
 pub mod partition;
 pub mod quality;
 pub mod repo;
+pub mod shp;
 pub mod source;
 pub mod store;

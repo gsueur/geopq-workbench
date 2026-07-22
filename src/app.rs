@@ -203,8 +203,8 @@ pub struct ViewerApp {
     /// an idle app would otherwise never strip (meshes stay resident
     /// twice). Armed by loader messages, counts down to zero.
     strip_probe: u8,
-    /// GeoPackage import dialog / conversion in flight.
-    gpkg_import: Option<GpkgImportState>,
+    /// Vector import dialog / conversion in flight.
+    gpkg_import: Option<ImportState>,
     about_open: bool,
     /// Decoded app icon for the About dialog (lazy).
     about_icon: Option<egui::TextureHandle>,
@@ -318,19 +318,22 @@ enum RepoMsg {
 /// need one range request per column chunk on remote sources.
 const ATTR_COLS_CAP: usize = 256;
 
-/// GeoPackage import dialog state: table picker, then a background
-/// conversion to GeoParquet whose output opens as a layer.
-struct GpkgImportState {
+/// Vector-import dialog state (GeoPackage / Shapefile / GeoJSON): an
+/// optional table picker (GeoPackage only), then a background conversion
+/// to GeoParquet whose output opens as a layer.
+struct ImportState {
+    format: crate::data::import::ImportFormat,
     src: PathBuf,
+    /// GeoPackage feature tables; empty for single-table formats.
     tables: Vec<crate::data::gpkg::GpkgTable>,
     selected: usize,
     running: bool,
     progress: f32,
     error: Option<String>,
-    rx: Option<std::sync::mpsc::Receiver<GpkgMsg>>,
+    rx: Option<std::sync::mpsc::Receiver<ImportMsg>>,
 }
 
-enum GpkgMsg {
+enum ImportMsg {
     Progress(f32),
     Done(PathBuf),
     Failed(String),
@@ -1791,22 +1794,32 @@ impl ViewerApp {
                     }
                 });
                 if ui
-                    .button("🗄 Import GeoPackage…")
+                    .button("🗄 Import vector file…")
                     .on_hover_text(
-                        "Convert a GeoPackage feature table to GeoParquet \
-                         (pure Rust, no GDAL) and open it",
+                        "Convert a GeoPackage, Shapefile or GeoJSON file to \
+                         GeoParquet (pure Rust, no GDAL) and open it",
                     )
                     .clicked()
                     && self.gpkg_import.is_none()
                     && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("GeoPackage", &["gpkg"])
+                        .add_filter(
+                            "Vector data (GeoPackage, Shapefile, GeoJSON)",
+                            &["gpkg", "shp", "geojson", "json"],
+                        )
                         .pick_file()
                 {
-                    let (tables, error) = match crate::data::gpkg::list_tables(&path) {
-                        Ok(t) => (t, None),
-                        Err(e) => (Vec::new(), Some(e)),
+                    use crate::data::import::ImportFormat;
+                    let format = ImportFormat::from_path(&path);
+                    let (tables, error) = match format {
+                        Some(ImportFormat::Gpkg) => match crate::data::gpkg::list_tables(&path) {
+                            Ok(t) => (t, None),
+                            Err(e) => (Vec::new(), Some(e)),
+                        },
+                        Some(_) => (Vec::new(), None),
+                        None => (Vec::new(), Some("unsupported file type".into())),
                     };
-                    self.gpkg_import = Some(GpkgImportState {
+                    self.gpkg_import = Some(ImportState {
+                        format: format.unwrap_or(ImportFormat::Gpkg),
                         src: path,
                         tables,
                         selected: 0,
@@ -3785,9 +3798,9 @@ impl ViewerApp {
             if let Some(rx) = &st.rx {
                 while let Ok(msg) = rx.try_recv() {
                     match msg {
-                        GpkgMsg::Progress(f) => st.progress = f,
-                        GpkgMsg::Done(p) => done = Some(p),
-                        GpkgMsg::Failed(e) => failed = Some(e),
+                        ImportMsg::Progress(f) => st.progress = f,
+                        ImportMsg::Done(p) => done = Some(p),
+                        ImportMsg::Failed(e) => failed = Some(e),
                     }
                 }
             }
@@ -3803,10 +3816,12 @@ impl ViewerApp {
             return;
         }
 
+        use crate::data::import::ImportFormat;
         let mut open = true;
-        let mut start: Option<(PathBuf, crate::data::gpkg::GpkgTable, PathBuf)> = None;
+        let mut start: Option<(PathBuf, Option<crate::data::gpkg::GpkgTable>, PathBuf)> = None;
         let st = self.gpkg_import.as_mut().unwrap();
-        egui::Window::new("Import GeoPackage")
+        let title = format!("Import {}", st.format.label());
+        egui::Window::new(title)
             .id(egui::Id::new("gpkg_import"))
             .open(&mut open)
             .default_width(430.0)
@@ -3817,39 +3832,53 @@ impl ViewerApp {
                     ui.colored_label(egui::Color32::from_rgb(220, 60, 60), e);
                     return;
                 }
-                ui.add_enabled_ui(!st.running, |ui| {
-                    let label = |t: &crate::data::gpkg::GpkgTable| {
-                        format!("{} ({} rows, {})", t.name, fmt_count(t.rows as usize), t.srs_name)
-                    };
-                    egui::ComboBox::from_label("feature table")
-                        .selected_text(label(&st.tables[st.selected]))
-                        .show_ui(ui, |ui| {
-                            for (i, t) in st.tables.iter().enumerate() {
-                                ui.selectable_value(&mut st.selected, i, label(t));
-                            }
-                        });
-                });
-                let t = &st.tables[st.selected];
-                let stem = st.src.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                let dst = st.src.with_file_name(format!("{stem}.{}.parquet", t.name));
-                ui.label(
-                    RichText::new(format!("→ {}", dst.display())).weak().small(),
-                )
-                .on_hover_text(
-                    "Converted to plain WKB GeoParquet (raw import: the quality \
-                     scorecard and Optimize take it from there)",
-                );
+                let table = if st.format == ImportFormat::Gpkg {
+                    ui.add_enabled_ui(!st.running, |ui| {
+                        let label = |t: &crate::data::gpkg::GpkgTable| {
+                            format!(
+                                "{} ({} rows, {})",
+                                t.name,
+                                fmt_count(t.rows as usize),
+                                t.srs_name
+                            )
+                        };
+                        egui::ComboBox::from_label("feature table")
+                            .selected_text(label(&st.tables[st.selected]))
+                            .show_ui(ui, |ui| {
+                                for (i, t) in st.tables.iter().enumerate() {
+                                    ui.selectable_value(&mut st.selected, i, label(t));
+                                }
+                            });
+                    });
+                    Some(st.tables[st.selected].clone())
+                } else {
+                    None
+                };
+                let dst = match &table {
+                    Some(t) => {
+                        let stem =
+                            st.src.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                        st.src.with_file_name(format!("{stem}.{}.parquet", t.name))
+                    }
+                    None => st.src.with_extension("parquet"),
+                };
+                ui.label(RichText::new(format!("→ {}", dst.display())).weak().small())
+                    .on_hover_text(
+                        "Converted to plain WKB GeoParquet (raw import: the quality \
+                         scorecard and Optimize take it from there)",
+                    );
                 ui.add_space(4.0);
                 if st.running {
                     ui.add(egui::ProgressBar::new(st.progress).show_percentage());
                     ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 } else if ui.button("Import").clicked() {
-                    start = Some((st.src.clone(), t.clone(), dst));
+                    start = Some((st.src.clone(), table, dst));
                 }
             });
         if let Some((src, table, dst)) = start {
             let (tx, rx) = std::sync::mpsc::channel();
             let st = self.gpkg_import.as_mut().unwrap();
+            let format = st.format;
             st.rx = Some(rx);
             st.running = true;
             st.progress = 0.0;
@@ -3857,12 +3886,23 @@ impl ViewerApp {
             std::thread::spawn(move || {
                 let tx_prog = tx.clone();
                 let prog = move |f: f32| {
-                    let _ = tx_prog.send(GpkgMsg::Progress(f));
+                    let _ = tx_prog.send(ImportMsg::Progress(f));
                 };
-                let res = crate::data::gpkg::convert(&src, &table, &dst, &prog);
+                let res = match (format, &table) {
+                    (ImportFormat::Gpkg, Some(t)) => {
+                        crate::data::gpkg::convert(&src, t, &dst, &prog)
+                    }
+                    (ImportFormat::Shapefile, _) => {
+                        crate::data::shp::convert(&src, &dst, &prog)
+                    }
+                    (ImportFormat::GeoJson, _) => {
+                        crate::data::geojson::convert(&src, &dst, &prog)
+                    }
+                    (ImportFormat::Gpkg, None) => Err("no table selected".into()),
+                };
                 let _ = tx.send(match res {
-                    Ok(_) => GpkgMsg::Done(dst),
-                    Err(e) => GpkgMsg::Failed(e),
+                    Ok(_) => ImportMsg::Done(dst),
+                    Err(e) => ImportMsg::Failed(e),
                 });
                 ctx2.request_repaint();
             });

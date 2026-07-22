@@ -47,7 +47,8 @@ so it doubles as a hands-on guide to GeoParquet best practices.
   choice per dataset, ~30 official national grids, data-driven styling
   with Viridis/Turbo ramps, Jenks/quantile classification, basemaps.
 - **No barriers to entry**: built-in sample datasets and a pure-Rust
-  GeoPackage importer (no GDAL) if your data is not in GeoParquet yet.
+  importer for GeoPackage, Shapefile and GeoJSON (no GDAL) if your data
+  is not in GeoParquet yet.
 
 ## Install
 
@@ -133,8 +134,8 @@ cargo build --release   # binary in target/release/geopq-workbench
 2. **Get data on the map.** Drag & drop `.parquet` files or a dataset
    folder onto the window, or use File → Open… / Open folder… / Open
    URL… No GeoParquet at hand? **File → Open sample dataset** streams
-   small hosted samples, and **File → Import GeoPackage…** converts a
-   `.gpkg` feature table on the spot.
+   small hosted samples, and **File → Import vector file…** converts a
+   GeoPackage table, a Shapefile or a GeoJSON file on the spot.
 3. **Click around.** Click any feature for its attributes (fetched from
    the file on demand, nothing preloaded). The status bar shows
    coordinates, zoom, frame time and load progress.
@@ -160,7 +161,7 @@ geopq-workbench file.parquet dataset_dir/ https://host/data.parquet
 | HTTPS | File → Open URL… — needs range-request support on the server |
 | S3 (`s3://bucket/key`) | File → Open URL… — profiles from `~/.aws`, custom endpoints (MinIO etc.), anonymous access to public buckets |
 | Catalogs (Overture Maps, Parquetry, your own) | File → Repositories… — browse snapshots, check layers, they load with sensible names and stacking order |
-| GeoPackage | File → Import GeoPackage… — pure-Rust conversion to GeoParquet, then opens normally |
+| GeoPackage / Shapefile / GeoJSON | File → Import vector file… — pure-Rust conversion to GeoParquet (no GDAL), then opens normally |
 | Sample data | File → Open sample dataset |
 
 Format-wise, anything in the GeoParquet family works: 1.0, 1.1 with WKB
@@ -324,7 +325,7 @@ inside an egui shell. No GDAL, no web view, no server process.
 | `data/store.rs` | lazy row access (attributes, geometry) over row-group/page selections |
 | `data/source.rs` | local / HTTPS / S3 readers with windowed range requests |
 | `data/optimize.rs` | the Optimize rewrite (Hilbert sort, covering, 1.1/2.0 flavors, partitioning) |
-| `data/gpkg.rs` | GeoPackage import (bundled SQLite) |
+| `data/gpkg.rs`, `data/shp.rs`, `data/geojson.rs` | vector imports (bundled SQLite, pure-Rust shapefile, serde_json) over shared machinery in `data/import.rs` |
 | `data/crs.rs` | PROJJSON → EPSG → proj4rs, projection selection |
 | `map/` | wgpu pipelines, tiles, chunked f64-origin geometry for jitter-free deep zoom |
 | `sql/` | DataFusion integration, ST_* UDFs, spatial pushdown, console UI |
