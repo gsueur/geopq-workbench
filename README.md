@@ -215,7 +215,13 @@ Fixture-dependent tests self-skip when the files are absent.
     run ~7-8% larger.
   - **GeoParquet 2.0**: parquet-native GEOMETRY logical type (CRS carried in
     the type), with native geospatial statistics written per row group — no
-    covering column needed, smaller file.
+    covering column needed, smaller file. Selecting it applies the official
+    recommended settings; two flavor extras remain available: the `bbox`
+    covering column (the only current mechanism for page-level spatial
+    pruning) and an auxiliary GeoArrow coordinate-array column written next
+    to the native GEOMETRY primary (the file stays conformant 2.0; the
+    workbench and other GeoArrow-aware readers decode the fast column,
+    at the cost of storing geometry twice).
   Geometry transcodes in any direction (WKB ↔ GeoArrow ↔ native type).
   A "viewport only" option exports just the features intersecting the
   current map viewport (bbox-based, metadata bbox shrinks accordingly).

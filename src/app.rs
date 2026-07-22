@@ -3102,7 +3102,11 @@ impl ViewerApp {
             .fields()
             .iter()
             .enumerate()
-            .filter(|(i, _)| *i != store.geom_col && *i < store.base_fields())
+            .filter(|(i, _)| {
+                *i != store.geom_col
+                    && Some(*i) != store.hidden_wkb
+                    && *i < store.base_fields()
+            })
             .filter_map(|(_, f)| match f.data_type() {
                 DT::Int8 | DT::Int16 | DT::Int32 | DT::Int64 | DT::UInt8 | DT::UInt16
                 | DT::UInt32 | DT::UInt64 | DT::Float16 | DT::Float32 | DT::Float64 => {
@@ -3900,6 +3904,7 @@ impl ViewerApp {
                     {
                         o.opts.version = GpVersion::V1_1;
                         o.opts.covering = true;
+                        o.opts.geoarrow_aux = false;
                     }
                     if ui
                         .radio(
@@ -3915,6 +3920,7 @@ impl ViewerApp {
                     {
                         o.opts.version = GpVersion::V1_1GeoArrow;
                         o.opts.covering = true;
+                        o.opts.geoarrow_aux = false;
                     }
                     if ui
                         .radio(
@@ -3923,12 +3929,46 @@ impl ViewerApp {
                         )
                         .on_hover_text(
                             "Native geo statistics replace the covering column for pruning;\n\
-                             needs GeoParquet 2.0 aware readers",
+                             needs GeoParquet 2.0 aware readers.\n\
+                             Selecting it applies the official recommended settings;\n\
+                             the flavor options below are workbench extras.",
                         )
                         .clicked()
                     {
+                        // Official recommended settings: native GEOMETRY
+                        // (WKB) + native stats only. The flavor checkboxes
+                        // below opt back into the extras.
                         o.opts.version = GpVersion::V2_0;
                         o.opts.covering = false;
+                        o.opts.geoarrow_aux = false;
+                    }
+                    if o.opts.version == GpVersion::V2_0 {
+                        let fits = o.recommended == GpVersion::V1_1GeoArrow;
+                        ui.indent("v2_flavor", |ui| {
+                            let resp = ui
+                                .add_enabled(
+                                    fits,
+                                    egui::Checkbox::new(
+                                        &mut o.opts.geoarrow_aux,
+                                        "GeoArrow geometry column (extra)",
+                                    ),
+                                )
+                                .on_hover_text(
+                                    "A decode format, not an index: also writes the \
+                                     geometry as GeoArrow coordinate arrays in a \
+                                     second column next to the official native \
+                                     GEOMETRY (WKB) one. The file stays valid 2.0; \
+                                     this workbench and other GeoArrow-aware readers \
+                                     decode the fast column with no per-feature WKB \
+                                     parsing. Roughly doubles geometry storage.",
+                                );
+                            if !fits {
+                                resp.on_disabled_hover_text(
+                                    "Needs a single geometry family (points, lines \
+                                     or polygons; singles promote to multi)",
+                                );
+                            }
+                        });
                     }
                     ui.separator();
                     egui::Grid::new("opt_opts").num_columns(2).show(ui, |ui| {
@@ -3969,7 +4009,13 @@ impl ViewerApp {
                     ui.checkbox(&mut o.opts.hilbert_sort, "Hilbert spatial sort")
                         .on_hover_text("Reorder features along a Hilbert curve over bbox centers");
                     ui.checkbox(&mut o.opts.covering, "bbox covering column")
-                        .on_hover_text("Per-feature bbox struct column (GeoParquet 1.1 covering)");
+                        .on_hover_text(
+                            "A spatial index: per-feature bboxes drive exact viewport \
+                             selection and page-level pruning (native 2.0 stats only \
+                             prune whole row groups). Cheap — about 32 bytes per \
+                             feature before compression. Independent of the GeoArrow \
+                             column, which changes the decode format, not the index.",
+                        );
                     ui.checkbox(&mut o.viewport_only, "viewport only")
                         .on_hover_text(
                             "Export only features intersecting the current map viewport",
@@ -4728,6 +4774,10 @@ impl ViewerApp {
             .field(layer.store.geom_col)
             .name()
             .clone();
+        let hidden_name = layer
+            .store
+            .hidden_wkb
+            .map(|i| layer.store.schema.field(i).name().clone());
         let encoding = layer.store.encoding;
         let layer_name = layer.name.clone();
         ui.label(
@@ -4773,6 +4823,9 @@ impl ViewerApp {
                             use arrow::util::display::{ArrayFormatter, FormatOptions};
                             let opts = FormatOptions::default().with_display_error(true);
                             for (i, field) in batch.schema().fields().iter().enumerate() {
+                                if Some(field.name()) == hidden_name.as_ref() {
+                                    continue; // display decodes the GeoArrow sibling
+                                }
                                 ui.label(RichText::new(field.name()).strong());
                                 if field.name() == &geom_name {
                                     ui.label(

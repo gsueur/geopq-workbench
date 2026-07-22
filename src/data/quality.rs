@@ -268,7 +268,9 @@ pub fn analyze(inp: &QualityInput) -> QualityReport {
 
     // C6 — compression (advisory).
     let comp = inp.geom_compression.unwrap_or("?");
-    let uncompressed = comp.to_ascii_uppercase().contains("UNCOMPRESSED");
+    let comp_upper = comp.to_ascii_uppercase();
+    let uncompressed = comp_upper.contains("UNCOMPRESSED");
+    let zstd = comp_upper.contains("ZSTD");
     checks.push(Check {
         code: "C6",
         title: "compression",
@@ -276,8 +278,12 @@ pub fn analyze(inp: &QualityInput) -> QualityReport {
         gating: false,
         detail: if uncompressed {
             "geometry column is uncompressed".into()
-        } else {
+        } else if zstd {
             format!("geometry column: {comp}")
+        } else {
+            format!(
+                "geometry column: {comp}; zstd recommended for distribution"
+            )
         },
     });
 

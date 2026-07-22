@@ -68,6 +68,9 @@ pub struct FeatureStore {
     /// field indices): the schema gains a virtual Struct{x,y} field right
     /// after the base fields and `geom_col` points at it.
     pub xy_geom: Option<(usize, usize)>,
+    /// WKB primary column superseded for display by a GeoArrow sibling
+    /// (`geom_col` points at the sibling): hidden from attribute UIs.
+    pub hidden_wkb: Option<usize>,
     /// Rows per row group, global order across fragments.
     rg_rows: Vec<u64>,
     /// Cumulative start row of each row group (len = rg_rows.len() + 1).
@@ -172,6 +175,7 @@ impl FeatureStore {
             encoding,
             part_cols,
             xy_geom,
+            hidden_wkb: None,
             rg_rows,
             rg_starts,
             rg_frag,

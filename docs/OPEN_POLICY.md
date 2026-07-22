@@ -1,6 +1,17 @@
 # File quality gate and display policy
 
-Status: DRAFT for review. No code yet.
+Status: implemented (dc1d453). Checks and optimizer defaults are
+aligned with the upstream [best practices for distributing
+GeoParquet](https://github.com/opengeospatial/geoparquet/blob/main/format-specs/distributing-geoparquet.md):
+zstd 15, 50k–150k-row row groups, spatial ordering, page index.
+Selecting 2.0 in the optimizer applies the official recommended
+settings (native GEOMETRY + native stats only); two opt-in flavor
+extras exist: the bbox covering column (the only current mechanism for
+page-level spatial pruning, which that document lists as unsolved) and
+an auxiliary GeoArrow coordinate-array sibling column
+(`{primary}_geoarrow`, undeclared in `geo` so the file stays
+conformant 2.0; the loader adopts it for decode and hides the
+redundant WKB primary from attribute UIs).
 
 ## 1. Problem
 
@@ -58,7 +69,7 @@ metadata. Produces a `QualityReport` attached to `FileInfo`.
 | C3 | Row-group granularity: max rows per group | ≤ `RG_ROWS_MAX` | < `RG_ROWS_MIN` (footer bloat) | > `RG_ROWS_MAX` | **yes** |
 | C4 | Geometry encoding | GeoArrow / native GEOMETRY | WKB | — | no |
 | C5 | Page index (offset + column index) present | yes | no | — | no |
-| C6 | Compression | zstd/snappy/lz4 | uncompressed | — | no |
+| C6 | Compression | zstd/snappy/lz4 (non-zstd notes "zstd recommended for distribution") | uncompressed | — | no |
 | C7 | Metadata hygiene: geo version, declared `geometry_types`, CRS present, file bbox | all present | any missing | — | no |
 
 Verdict = C1 ∧ C2 ∧ C3. C4–C7 are advisory lines on the scorecard

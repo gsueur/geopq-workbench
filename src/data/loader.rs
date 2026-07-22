@@ -1013,6 +1013,9 @@ struct FileOpen {
     page_index: bool,
     /// Uncompressed bytes of the geometry leaves (decode-size proxy).
     geom_bytes: u64,
+    /// WKB primary superseded by a GeoArrow sibling (`geom_col` points at
+    /// the sibling; this is the primary's index, hidden from attribute UIs).
+    hidden_wkb: Option<usize>,
 }
 
 /// Quality analysis over an opened file / merged dataset (footer facts
@@ -1194,21 +1197,18 @@ fn open_store_with_view(
         f.page_index,
         f.geom_bytes,
     ));
-    Ok((
-        FeatureStore::new(
-            source.clone(),
-            f.meta,
-            f.geom_col,
-            f.schema,
-            f.covering,
-            f.encoding,
-            f.rg_rows,
-            f.xy,
-        ),
-        f.crs,
-        f.info,
-        f.rg_boxes,
-    ))
+    let mut store = FeatureStore::new(
+        source.clone(),
+        f.meta,
+        f.geom_col,
+        f.schema,
+        f.covering,
+        f.encoding,
+        f.rg_rows,
+        f.xy,
+    );
+    store.hidden_wkb = f.hidden_wkb;
+    Ok((store, f.crs, f.info, f.rg_boxes))
 }
 
 /// All parquet files under a dataset directory, in stable path order.
@@ -1471,7 +1471,7 @@ fn open_multi_store(
         page_index,
         geom_bytes,
     ));
-    let store = FeatureStore::from_fragments(
+    let mut store = FeatureStore::from_fragments(
         source.clone(),
         frags,
         part_cols,
@@ -1481,6 +1481,7 @@ fn open_multi_store(
         first.encoding,
         first.xy,
     );
+    store.hidden_wkb = first.hidden_wkb;
     Ok((store, first.crs, info, rg_boxes))
 }
 
@@ -1601,6 +1602,20 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
             .map_err(|_| format!("geometry column '{geom_name}' not found in schema"))?,
     };
 
+    // A WKB primary with a GeoArrow sibling column (the optimizer's 2.0
+    // flavor export): decode from the coordinate arrays instead, and hide
+    // the redundant WKB blob from attribute UIs. The `geo` metadata keeps
+    // declaring the primary, so metadata lookups below stay on its name.
+    let primary_name = geom_name.clone();
+    let mut hidden_wkb: Option<usize> = None;
+    let (geom_name, geom_col, encoding) = match aux_geoarrow_column(&schema, &geom_name) {
+        Some((i, enc)) if encoding.is_wkb() && xy.is_none() => {
+            hidden_wkb = Some(geom_col);
+            (schema.field(i).name().clone(), i, enc)
+        }
+        _ => (geom_name, geom_col, encoding),
+    };
+
     let total_rows = builder.metadata().file_metadata().num_rows();
     if total_rows >= u32::MAX as i64 {
         return Err(format!("file has {total_rows} rows; max supported is {}", u32::MAX - 1));
@@ -1624,6 +1639,9 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
             .position(|c| c.path().parts().first().map(String::as_str) == Some(name))
     };
     let geom_leaf = leaf_of_root(&geom_name);
+    // The native GEOMETRY logical type lives on the declared primary even
+    // when display decodes from a GeoArrow sibling.
+    let native_probe = hidden_wkb.unwrap_or(geom_col);
     let mut has_native_geometry = false;
     let columns: Vec<ColumnInfo> = schema
         .fields()
@@ -1634,7 +1652,7 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
             let logical = leaf.and_then(|l| {
                 pq_columns[l].logical_type_ref().map(|lt| format!("{lt:?}"))
             });
-            if i == geom_col {
+            if i == native_probe {
                 if let Some(l) = &logical {
                     if l.starts_with("Geometry") || l.starts_with("Geography") {
                         has_native_geometry = true;
@@ -1697,7 +1715,7 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
         compressed_bytes,
         uncompressed_bytes,
         columns,
-        geo: summarize_geo_meta(geo_meta.as_ref(), &geom_name, &crs.name, has_native_geometry),
+        geo: summarize_geo_meta(geo_meta.as_ref(), &primary_name, &crs.name, has_native_geometry),
         files: 1,
         quality: None,
     };
@@ -1719,9 +1737,12 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
             crs.is_latlong,
         ),
     };
-    let covering = covering_column(geo_meta.as_ref(), &geom_name, &schema);
+    let covering = covering_column(geo_meta.as_ref(), &primary_name, &schema);
 
     let mut info = info;
+    if hidden_wkb.is_some() {
+        info.geo.encoding = format!("{} + GeoArrow column (used for display)", info.geo.encoding);
+    }
     if let Some((xi, yi)) = xy {
         info.geo.version_label = "none (points synthesized from coordinate columns)".into();
         info.geo.primary_column = "geometry (virtual)".into();
@@ -1752,6 +1773,34 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
         xy,
         page_index,
         geom_bytes,
+        hidden_wkb,
+    })
+}
+
+/// GeoArrow sibling of a WKB primary (`{primary}_geoarrow*`), as written
+/// by the optimizer's 2.0 flavor export: (schema index, encoding). Strict
+/// structural match against our canonical layout — the extension name is
+/// written for interop but layouts we can't decode must not be adopted.
+fn aux_geoarrow_column(
+    schema: &arrow::datatypes::SchemaRef,
+    primary: &str,
+) -> Option<(usize, GeomEncoding)> {
+    let prefix = format!("{primary}_geoarrow");
+    schema.fields().iter().enumerate().find_map(|(i, f)| {
+        if !f.name().starts_with(prefix.as_str()) {
+            return None;
+        }
+        let enc = [
+            GeomEncoding::Point,
+            GeomEncoding::LineString,
+            GeomEncoding::Polygon,
+            GeomEncoding::MultiPoint,
+            GeomEncoding::MultiLineString,
+            GeomEncoding::MultiPolygon,
+        ]
+        .into_iter()
+        .find(|&e| super::geoarrow::data_type(e) == *f.data_type())?;
+        Some((i, enc))
     })
 }
 

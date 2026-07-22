@@ -104,7 +104,10 @@ impl Codec {
     }
     fn compression(&self) -> Compression {
         match self {
-            Codec::Zstd => Compression::ZSTD(ZstdLevel::try_new(3).unwrap()),
+            // Level 15 per the GeoParquet distribution best practices:
+            // decompression cost is flat across zstd levels, so readers
+            // never pay for it and the write is one-time.
+            Codec::Zstd => Compression::ZSTD(ZstdLevel::try_new(15).unwrap()),
             Codec::Snappy => Compression::SNAPPY,
             Codec::Uncompressed => Compression::UNCOMPRESSED,
         }
@@ -141,6 +144,12 @@ pub struct OptimizeOptions {
     /// Write a `bbox` covering struct column (always useful for 1.1
     /// readers; redundant but allowed alongside 2.0 native stats).
     pub covering: bool,
+    /// 2.0 flavor: also write a `{primary}_geoarrow` coordinate-array
+    /// column next to the native GEOMETRY primary. The file stays
+    /// conformant 2.0 (the sibling is a plain data column, not declared
+    /// in `geo`); GeoArrow-aware readers decode it directly. Geometry is
+    /// stored twice. Needs a single geometry family; ignored for 1.1.
+    pub geoarrow_aux: bool,
     pub bloom: BloomMode,
     /// Export only features whose bbox intersects this rect (data CRS).
     pub filter_rect: Option<[f64; 4]>,
@@ -162,6 +171,7 @@ impl Default for OptimizeOptions {
             codec: Codec::Zstd,
             hilbert_sort: true,
             covering: true,
+            geoarrow_aux: false,
             bloom: BloomMode::Preserve,
             filter_rect: None,
             h3_resolution: None,
@@ -550,6 +560,17 @@ pub fn optimize(
         (GeomOut::PassThrough, GpVersion::V1_1GeoArrow) => src_encoding,
         _ => GeomEncoding::Wkb,
     };
+    // Auxiliary GeoArrow column (2.0 flavor): coordinate arrays next to
+    // the native GEOMETRY primary, for GeoArrow-aware readers.
+    let aux_target: Option<GeomEncoding> = if opts.geoarrow_aux
+        && opts.version == GpVersion::V2_0
+    {
+        Some(geoarrow::target_encoding(
+            geom_types.iter().map(|t| t.trim_end_matches(" Z")),
+        )?)
+    } else {
+        None
+    };
 
     // --- output schema ---
     let write_covering = opts.covering;
@@ -632,6 +653,20 @@ pub fn optimize(
             DataType::Struct(bbox_fields.clone()),
             true,
         ));
+    }
+    if let Some(t) = aux_target {
+        let mut name = format!("{primary}_geoarrow");
+        let mut k = 0usize;
+        while fields.iter().any(|f| f.name() == &name) {
+            k += 1;
+            name = format!("{primary}_geoarrow_{k}");
+        }
+        let mut f = Field::new(name.as_str(), geoarrow::data_type(t), true);
+        f.set_metadata(std::collections::HashMap::from([(
+            "ARROW:extension:name".to_string(),
+            format!("geoarrow.{}", t.geo_name()),
+        )]));
+        fields.push(f);
     }
     // Derived columns (skipped when hive uses them as path-only keys).
     let write_h3 = h3_name
@@ -828,6 +863,13 @@ pub fn optimize(
             if write_covering {
                 cols.push(build_bbox_column(chunk, &row_bboxes, &bbox_fields));
             }
+            if let Some(t) = aux_target {
+                cols.push(transcode_geometry(
+                    gathered.column(geom_idx).as_ref(),
+                    src_encoding,
+                    &GeomOut::ToGa(t),
+                )?);
+            }
             if write_h3.is_some() {
                 let vals = h3_vals.as_ref().unwrap();
                 cols.push(Arc::new(arrow::array::UInt64Array::from_iter(
@@ -870,7 +912,11 @@ pub fn optimize(
         overlap_before,
         overlap_after,
         bloom_columns,
-        version_label: opts.version.label().into(),
+        version_label: if aux_target.is_some() {
+            format!("{} + GeoArrow column", opts.version.label())
+        } else {
+            opts.version.label().into()
+        },
         elapsed_ms: t0.elapsed().as_millis() as u64,
         files: parts.len(),
     })
@@ -1764,6 +1810,81 @@ mod tests {
             crate::data::loader::open_store_for_test(&dst11).unwrap();
         assert_eq!(crs11.epsg, Some(2154));
         assert!(info11.geo.version_label.contains("1.1"), "{}", info11.geo.version_label);
+    }
+
+    /// 2.0 flavor: auxiliary GeoArrow column next to the native GEOMETRY
+    /// primary. The file stays conformant 2.0 (sibling undeclared in geo
+    /// metadata) and the reader adopts the sibling for decode.
+    #[test]
+    fn v2_0_geoarrow_aux_column_round_trip() {
+        let dir = std::env::temp_dir().join("geopq_optimize_v20_aux");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = write_scrambled(40_000, &dir);
+        let dst = dir.join("out_v20_aux.parquet");
+
+        let opts = OptimizeOptions {
+            version: GpVersion::V2_0,
+            row_group_size: 2048,
+            covering: true,
+            geoarrow_aux: true,
+            ..Default::default()
+        };
+        let report =
+            optimize(&Source::Local(src.clone()), &dst, &opts, None, None, &|_, _| {}).unwrap();
+        assert_eq!(report.rows, 40_000);
+        assert!(
+            report.version_label.contains("GeoArrow column"),
+            "{}",
+            report.version_label
+        );
+
+        // Conformant 2.0: the primary keeps the GEOMETRY logical type, the
+        // geo metadata declares only the primary, and the sibling is a
+        // plain column tagged with the GeoArrow extension name.
+        let b = ParquetRecordBatchReaderBuilder::try_new(File::open(&dst).unwrap()).unwrap();
+        let geom = b.metadata().row_groups()[0]
+            .columns()
+            .iter()
+            .find(|c| c.column_descr().name() == "geometry")
+            .expect("primary");
+        assert!(matches!(
+            geom.column_descr().logical_type_ref(),
+            Some(parquet::basic::LogicalType::Geometry { .. })
+        ));
+        let geo: serde_json::Value = serde_json::from_str(
+            b.metadata()
+                .file_metadata()
+                .key_value_metadata()
+                .unwrap()
+                .iter()
+                .find(|kv| kv.key == "geo")
+                .unwrap()
+                .value
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(geo["version"], "2.0.0");
+        assert!(geo["columns"].get("geometry_geoarrow").is_none());
+        let aux = b.schema().field_with_name("geometry_geoarrow").expect("aux field");
+        assert_eq!(
+            aux.metadata().get("ARROW:extension:name").map(String::as_str),
+            Some("geoarrow.point")
+        );
+
+        // Reader adopts the sibling: native encoding, WKB primary hidden.
+        let (store, _crs, info, rg_meta) =
+            crate::data::loader::open_store_for_test(&dst).unwrap();
+        assert_eq!(store.encoding, GeomEncoding::Point);
+        assert_eq!(store.schema.field(store.geom_col).name(), "geometry_geoarrow");
+        assert_eq!(
+            store.hidden_wkb.map(|i| store.schema.field(i).name().clone()).as_deref(),
+            Some("geometry")
+        );
+        assert!(info.geo.encoding.contains("GeoArrow column"), "{}", info.geo.encoding);
+        assert!(info.quality.expect("quality").indexable);
+        rg_meta.expect("rg bboxes");
+        assert_rows_consistent(&dst);
     }
 
     /// Viewport-only export: only features intersecting the rect survive,
