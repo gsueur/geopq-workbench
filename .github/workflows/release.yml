@@ -72,4 +72,7 @@ jobs:
             geopq-workbench-*.tar.gz.sha256
             geopq-workbench-*.zip
             geopq-workbench-*.zip.sha256
-          generate_release_notes: true
+          # Only one matrix job generates the notes: with all four doing
+          # it, each appended its own copy to the shared release body.
+          generate_release_notes: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+          make_latest: true
