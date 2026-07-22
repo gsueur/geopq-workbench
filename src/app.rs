@@ -4,6 +4,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
 use eframe::egui::{self, Color32, RichText};
+use egui_phosphor::regular as ph;
 use eframe::egui_wgpu;
 
 use crate::data::crs::{world_to_lonlat, BulkTransformer, Crs, DisplayCrs, DisplayKind};
@@ -206,6 +207,7 @@ pub struct ViewerApp {
     /// Vector import dialog / conversion in flight.
     gpkg_import: Option<ImportState>,
     about_open: bool,
+    cookbook_open: bool,
     /// Decoded app icon for the About dialog (lazy).
     about_icon: Option<egui::TextureHandle>,
     /// Map panel rect (points) of the last frame, for cropping the
@@ -532,6 +534,7 @@ struct FilterDialog {
 
 impl ViewerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<Source>) -> Self {
+        crate::theme::apply(&cc.egui_ctx);
         let rs = cc
             .wgpu_render_state
             .as_ref()
@@ -598,6 +601,7 @@ impl ViewerApp {
             refine_deferred: HashMap::new(),
             strip_probe: 0,
             about_open: false,
+            cookbook_open: false,
             about_icon: None,
             map_rect: egui::Rect::ZERO,
             quality_gates: Vec::new(),
@@ -1029,6 +1033,7 @@ impl ViewerApp {
 
     /// The layer-filter dialog: predicate editor with autocomplete.
     fn filter_window(&mut self, ctx: &egui::Context) {
+        let floating_area = self.floating_area(ctx);
         let Some(layer_id) = self.filter_dialog.as_ref().map(|d| d.layer_id) else {
             return;
         };
@@ -1063,7 +1068,7 @@ impl ViewerApp {
             .id(egui::Id::new("layer_filter"))
             .open(&mut open)
             .default_width(460.0)
-            .show(ctx, |ui| {
+            .constrain_to(floating_area).show(ctx, |ui| {
                 ui.label(
                     RichText::new(
                         "Persistent SQL predicate: the layer shows only matching \
@@ -1735,7 +1740,7 @@ impl ViewerApp {
         let ctx = ui.ctx().clone();
         egui::containers::menu::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("📂 Open…").clicked() {
+                if ui.button(format!("{} Open…", ph::FOLDER_OPEN)).clicked() {
                     if let Some(paths) = rfd::FileDialog::new()
                         .add_filter("GeoParquet", &["parquet", "geoparquet", "pq"])
                         .pick_files()
@@ -1746,7 +1751,7 @@ impl ViewerApp {
                     }
                 }
                 if ui
-                    .button("📂 Open folder…")
+                    .button(format!("{} Open folder…", ph::FOLDERS))
                     .on_hover_text(
                         "Load a directory of GeoParquet files (hive-partitioned or not) \
                          as a single layer; key=value path segments become columns",
@@ -1757,7 +1762,7 @@ impl ViewerApp {
                         self.enqueue_load(Source::Dir(dir), &ctx);
                     }
                 }
-                if ui.button("🌐 Open URL…").clicked() && self.url_input.is_none() {
+                if ui.button(format!("{} Open URL…", ph::GLOBE)).clicked() && self.url_input.is_none() {
                     self.url_input = Some((
                         String::new(),
                         None,
@@ -1766,7 +1771,7 @@ impl ViewerApp {
                     ));
                 }
                 if ui
-                    .button("🌐 Repositories…")
+                    .button(format!("{} Repositories…", ph::GLOBE_HEMISPHERE_WEST))
                     .on_hover_text(
                         "Browse preconfigured GeoParquet repositories and load \
                          their layers directly",
@@ -1776,7 +1781,7 @@ impl ViewerApp {
                 {
                     self.open_repo_browser(&ctx);
                 }
-                ui.menu_button("🧪 Open sample dataset", |ui| {
+                ui.menu_button(format!("{} Open sample dataset", ph::FLASK), |ui| {
                     ui.label(
                         RichText::new("Hosted samples, streamed over HTTP").weak().small(),
                     );
@@ -1794,7 +1799,7 @@ impl ViewerApp {
                     }
                 });
                 if ui
-                    .button("🗄 Import vector file…")
+                    .button(format!("{} Import vector file…", ph::TRAY_ARROW_DOWN))
                     .on_hover_text(
                         "Convert a GeoPackage, Shapefile or GeoJSON file to \
                          GeoParquet (pure Rust, no GDAL) and open it",
@@ -1831,14 +1836,14 @@ impl ViewerApp {
                 }
                 ui.separator();
                 if ui
-                    .button("💾 Save context…")
+                    .button(format!("{} Save context…", ph::FLOPPY_DISK))
                     .on_hover_text("Save layers, styles, camera and projection to a JSON file")
                     .clicked()
                 {
                     self.save_context();
                 }
                 if ui
-                    .button("📥 Load context…")
+                    .button(format!("{} Load context…", ph::DOWNLOAD_SIMPLE))
                     .on_hover_text("Restore a saved context (replaces current layers)")
                     .clicked()
                 {
@@ -1846,7 +1851,7 @@ impl ViewerApp {
                 }
                 ui.separator();
                 if ui
-                    .button("🖼 Export map image…")
+                    .button(format!("{} Export map image…", ph::CAMERA))
                     .on_hover_text(
                         "Save the current map view as a PNG (print-friendly; \
                          panels and menus are cropped out)",
@@ -1868,7 +1873,7 @@ impl ViewerApp {
             });
             ui.menu_button("View", |ui| {
                 if ui
-                    .add_enabled(!self.layers.is_empty(), egui::Button::new("🌍 Fit all layers"))
+                    .add_enabled(!self.layers.is_empty(), egui::Button::new(format!("{} Fit all layers", ph::CORNERS_OUT)))
                     .clicked()
                 {
                     self.pending_fit = true;
@@ -1907,11 +1912,20 @@ impl ViewerApp {
                 ui.checkbox(&mut self.sql.open, "SQL console");
             });
             ui.menu_button("Help", |ui| {
-                if ui.button("ST_* function reference").clicked() {
+                if ui
+                    .button(format!("{} GeoParquet cookbook", ph::BOOK_OPEN))
+                    .on_hover_text(
+                        "Versions, geometry encodings, and what makes a file fast",
+                    )
+                    .clicked()
+                {
+                    self.cookbook_open = true;
+                }
+                if ui.button(format!("{} ST_* function reference", ph::TABLE)).clicked() {
                     self.sql.open_with_help();
                 }
                 ui.separator();
-                if ui.button("About GeoPQ Workbench…").clicked() {
+                if ui.button(format!("{} About GeoPQ Workbench…", ph::INFO)).clicked() {
                     self.about_open = true;
                 }
             });
@@ -1921,7 +1935,7 @@ impl ViewerApp {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
-            if ui.button("📂 Open…").clicked() {
+            if ui.button(format!("{} Open…", ph::FOLDER_OPEN)).clicked() {
                 if let Some(paths) = rfd::FileDialog::new()
                     .add_filter("GeoParquet", &["parquet", "geoparquet", "pq"])
                     .pick_files()
@@ -1931,7 +1945,7 @@ impl ViewerApp {
                     }
                 }
             }
-            if ui.button("🌐 URL…").clicked() && self.url_input.is_none() {
+            if ui.button(format!("{} URL…", ph::GLOBE)).clicked() && self.url_input.is_none() {
                 self.url_input = Some((
                     String::new(),
                     None,
@@ -1940,13 +1954,13 @@ impl ViewerApp {
                 ));
             }
             if ui
-                .add_enabled(!self.layers.is_empty(), egui::Button::new("🌍 Fit all"))
+                .add_enabled(!self.layers.is_empty(), egui::Button::new(format!("{} Fit all", ph::CORNERS_OUT)))
                 .clicked()
             {
                 self.pending_fit = true;
                 self.camera_moved = true;
             }
-            ui.toggle_value(&mut self.sql.open, "🖩 SQL")
+            ui.toggle_value(&mut self.sql.open, format!("{} SQL", ph::TERMINAL_WINDOW))
                 .on_hover_text("Query loaded layers with SQL (ST_* spatial functions)");
         });
     }
@@ -2063,8 +2077,12 @@ impl ViewerApp {
         ui.heading("Layers");
         ui.separator();
         if self.layers.is_empty() && self.loading.is_empty() {
-            ui.add_space(12.0);
-            ui.label(RichText::new("Drop .parquet files here\nor use Open…").weak());
+            ui.vertical_centered(|ui| {
+                ui.add_space(28.0);
+                ui.label(RichText::new(ph::STACK).size(30.0).weak());
+                ui.add_space(4.0);
+                ui.label(RichText::new("Drop .parquet files here\nor use Open…").weak());
+            });
         }
 
         let mut remove: Option<u64> = None;
@@ -2078,13 +2096,14 @@ impl ViewerApp {
         let mut filter_clear: Option<u64> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
+            crate::theme::compact(ui);
             // Top-most layer first in the list.
             let rebuilding = &self.rebuilding;
             let filter_pending = &self.filter_pending;
             let n_layers = self.layers.len();
             for (idx, l) in self.layers.iter_mut().enumerate().rev() {
                 let is_rebuilding = rebuilding.contains(&l.id);
-                egui::Frame::group(ui.style()).show(ui, |ui| {
+                crate::theme::card(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut l.style.visible, "");
                         geom_kind_icon(ui, l.kind());
@@ -2124,7 +2143,7 @@ impl ViewerApp {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                ui.menu_button("☰", |ui| {
+                                ui.menu_button(ph::LIST, |ui| {
                                     if ui.button("Info…").clicked() {
                                         info_open = Some(l.id);
                                     }
@@ -2198,7 +2217,7 @@ impl ViewerApp {
                                     );
                                 });
                                 if ui
-                                    .small_button("🔍")
+                                    .small_button(ph::MAGNIFYING_GLASS)
                                     .on_hover_text("Zoom to layer")
                                     .clicked()
                                 {
@@ -2786,6 +2805,7 @@ impl ViewerApp {
     }
 
     fn repo_window(&mut self, ctx: &egui::Context) {
+        let floating_area = self.floating_area(ctx);
         if self.repo_browser.is_none() {
             return;
         }
@@ -2802,7 +2822,7 @@ impl ViewerApp {
                 .id(egui::Id::new("repo_browser"))
                 .open(&mut open)
                 .default_width(560.0)
-                .show(ctx, |ui| {
+                .constrain_to(floating_area).show(ctx, |ui| {
                     // --- repository + snapshot row ---
                     ui.horizontal(|ui| {
                         let before = b.sel_repo;
@@ -2833,7 +2853,7 @@ impl ViewerApp {
                             refetch = true;
                         }
                         if ui
-                            .button("⟳")
+                            .button(ph::ARROWS_CLOCKWISE)
                             .on_hover_text("Clear the cached dataset list and re-discover")
                             .clicked()
                         {
@@ -3370,6 +3390,7 @@ impl ViewerApp {
     }
 
     fn style_window(&mut self, ctx: &egui::Context) {
+        let floating_area = self.floating_area(ctx);
         use crate::data::layer::{Ramp, StyleBy, StyleMode};
         if self.style_dialog.is_none() {
             return;
@@ -3392,7 +3413,7 @@ impl ViewerApp {
                 .id(egui::Id::new("style_dialog"))
                 .open(&mut open)
                 .default_width(360.0)
-                .show(ctx, |ui| {
+                .constrain_to(floating_area).show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("column:");
                         let before = d.column.clone();
@@ -3663,6 +3684,7 @@ impl ViewerApp {
     }
 
     fn url_window(&mut self, ctx: &egui::Context) {
+        let floating_area = self.floating_area(ctx);
         let Some((url, profile, profiles, endpoint)) = &mut self.url_input else { return };
         let mut open = true;
         let mut submit: Option<Source> = None;
@@ -3670,7 +3692,7 @@ impl ViewerApp {
             .id(egui::Id::new("open_url"))
             .open(&mut open)
             .default_width(440.0)
-            .show(ctx, |ui| {
+            .constrain_to(floating_area).show(ctx, |ui| {
                 ui.label("GeoParquet over HTTP(S) (needs range requests) or s3://bucket/key:");
                 let edit = ui.add(
                     egui::TextEdit::singleline(url)
@@ -3786,7 +3808,23 @@ impl ViewerApp {
         );
     }
 
+    /// Where floating windows may live: full width, but between the top
+    /// bars and the status bar (from the map rect measured last frame),
+    /// so no window ever slides under the chrome.
+    fn floating_area(&self, ctx: &egui::Context) -> egui::Rect {
+        let screen = ctx.content_rect();
+        if self.map_rect.width() >= 1.0 {
+            egui::Rect::from_min_max(
+                egui::pos2(screen.min.x, self.map_rect.min.y),
+                egui::pos2(screen.max.x, self.map_rect.max.y),
+            )
+        } else {
+            screen
+        }
+    }
+
     fn gpkg_import_window(&mut self, ctx: &egui::Context) {
+        let floating_area = self.floating_area(ctx);
         if self.gpkg_import.is_none() {
             return;
         }
@@ -3826,7 +3864,7 @@ impl ViewerApp {
             .open(&mut open)
             .default_width(430.0)
             .collapsible(false)
-            .show(ctx, |ui| {
+            .constrain_to(floating_area).show(ctx, |ui| {
                 ui.label(RichText::new(st.src.display().to_string()).weak().small());
                 if let Some(e) = &st.error {
                     ui.colored_label(egui::Color32::from_rgb(220, 60, 60), e);
@@ -4015,6 +4053,7 @@ impl ViewerApp {
     }
 
     fn optimize_window(&mut self, ctx: &egui::Context) {
+        let floating_area = self.floating_area(ctx);
         use crate::data::optimize::{BloomMode, Codec, GpVersion};
         // Gathered before the dialog borrow: partition-field candidates of
         // the exported layer and polygon layers usable for admin joins.
@@ -4096,7 +4135,7 @@ impl ViewerApp {
             .id(egui::Id::new("optimize_dialog"))
             .open(&mut open)
             .default_width(400.0)
-            .show(ctx, |ui| {
+            .constrain_to(floating_area).show(ctx, |ui| {
                 if let Some((rep, path)) = &o.report {
                     use crate::data::info::fmt_bytes;
                     ui.label(
@@ -4567,6 +4606,7 @@ impl ViewerApp {
     }
 
     fn about_window(&mut self, ctx: &egui::Context) {
+        let floating_area = self.floating_area(ctx);
         if !self.about_open {
             return;
         }
@@ -4590,7 +4630,7 @@ impl ViewerApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .default_width(320.0)
-            .show(ctx, |ui| {
+            .constrain_to(floating_area).show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(10.0);
                     if let Some(tex) = &self.about_icon {
@@ -4663,6 +4703,7 @@ impl ViewerApp {
     /// Quality-gate dialog (docs/OPEN_POLICY.md): a non-indexable file too
     /// big for a full build waits here for Optimize / Load all / Cancel.
     fn quality_gate_window(&mut self, ctx: &egui::Context) {
+        let floating_area = self.floating_area(ctx);
         use crate::data::info::fmt_bytes;
         use crate::data::quality::{DIRECT_MAX_GEOM_BYTES, DIRECT_MAX_ROWS};
         let Some(gate) = self.quality_gates.first() else {
@@ -4688,7 +4729,7 @@ impl ViewerApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .default_width(520.0)
-            .show(ctx, |ui| {
+            .constrain_to(floating_area).show(ctx, |ui| {
                 ui.label(format!(
                     "{} rows in {} row groups — {}",
                     fmt_count(rows as usize),
@@ -4822,6 +4863,7 @@ impl ViewerApp {
     }
 
     fn info_window(&mut self, ctx: &egui::Context) {
+        let floating_area = self.floating_area(ctx);
         use crate::data::info::fmt_bytes;
         let Some(id) = self.info_open else { return };
         let Some(layer) = self.layers.iter().find(|l| l.id == id) else {
@@ -4834,7 +4876,7 @@ impl ViewerApp {
             .id(egui::Id::new("file_info").with(id))
             .open(&mut open)
             .default_width(460.0)
-            .show(ctx, |ui| {
+            .constrain_to(floating_area).show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.label(
                         RichText::new(&info.geo.version_label)
@@ -5131,6 +5173,7 @@ impl ViewerApp {
     }
 
     fn errors_window(&mut self, ctx: &egui::Context) {
+        let floating_area = self.floating_area(ctx);
         if !self.show_errors || self.errors.is_empty() {
             return;
         }
@@ -5138,7 +5181,7 @@ impl ViewerApp {
         egui::Window::new("Problems")
             .open(&mut open)
             .default_width(420.0)
-            .show(ctx, |ui| {
+            .constrain_to(floating_area).show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .max_height(240.0)
                     .show(ui, |ui| {
@@ -5967,6 +6010,7 @@ impl eframe::App for ViewerApp {
             // opening it must not resize the viewport.
             let map_corner =
                 ui.available_rect_before_wrap().right_top() + egui::vec2(-12.0, 12.0);
+            let floating_area = self.floating_area(&ctx);
             let mut open = true;
             egui::Window::new("Feature")
                 .id(egui::Id::new("feature_attrs"))
@@ -5976,7 +6020,7 @@ impl eframe::App for ViewerApp {
                 .default_width(300.0)
                 .resizable(true)
                 .collapsible(false)
-                .show(&ctx, |ui| self.attributes_panel(ui));
+                .constrain_to(floating_area).show(&ctx, |ui| self.attributes_panel(ui));
             if !open {
                 self.clear_selection();
             }
@@ -5985,6 +6029,8 @@ impl eframe::App for ViewerApp {
         self.info_window(&ctx);
         self.quality_gate_window(&ctx);
         self.about_window(&ctx);
+        let cookbook_area = self.floating_area(&ctx);
+        crate::cookbook::window(&ctx, &mut self.cookbook_open, cookbook_area);
         self.save_screenshot(&ctx);
         // Desktop-standard shortcuts: Cmd/Ctrl+O opens files, Ctrl+Q quits
         // (macOS handles ⌘Q natively).

@@ -2,10 +2,12 @@
 
 mod app;
 mod context;
+mod cookbook;
 mod data;
 mod map;
 mod picking;
 mod sql;
+mod theme;
 
 use eframe::egui;
 
