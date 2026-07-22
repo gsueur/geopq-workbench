@@ -17,6 +17,8 @@ database export that performs far below what the format allows. The
 workbench shows you what your file is missing and fixes it in one click,
 so it doubles as a hands-on guide to GeoParquet best practices.
 
+![GeoPQ Workbench: 193k building polygons with the Optimize dialog open](assets/screenshot.jpg)
+
 ## Highlights
 
 - **Fast**: 3.75M points load in ~180 ms and pan/zoom at vsync. Memory
