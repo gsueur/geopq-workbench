@@ -118,9 +118,38 @@ jobs:
 
           KEYFILE="$RUNNER_TEMP/notary.p8"
           printf '%s' "$NOTARY_KEY" > "$KEYFILE"
+          # Submit, then poll with short retried info calls: notarytool's
+          # --wait long-poll dies on transient runner network blips (the
+          # submission itself survives on Apple's side).
           notary() {
-            xcrun notarytool submit "$1" --key "$KEYFILE" \
-              --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" --wait
+            local out id status a
+            for a in 1 2 3; do
+              out=$(xcrun notarytool submit "$1" --key "$KEYFILE" \
+                --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
+                --output-format json) && break
+              echo "submit attempt $a failed; retrying in 20s"
+              sleep 20
+            done
+            id=$(printf '%s' "$out" | sed -n 's/.*"id" *: *"\([^"]*\)".*/\1/p' | head -1)
+            [ -n "$id" ] || { echo "no submission id in: $out"; return 1; }
+            echo "submission $id"
+            for a in $(seq 1 60); do
+              sleep 15
+              status=$(xcrun notarytool info "$id" --key "$KEYFILE" \
+                --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
+                --output-format json 2>/dev/null \
+                | sed -n 's/.*"status" *: *"\([^"]*\)".*/\1/p' || true)
+              echo "status: ${status:-unreachable}"
+              case "$status" in
+                Accepted) return 0 ;;
+                Invalid|Rejected)
+                  xcrun notarytool log "$id" --key "$KEYFILE" \
+                    --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" || true
+                  return 1 ;;
+              esac
+            done
+            echo "notarization timed out after 15 min"
+            return 1
           }
 
           # Notarize + staple the app, then a DMG built from the stapled
