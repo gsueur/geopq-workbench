@@ -2714,7 +2714,7 @@ impl<'a> BinCol<'a> {
 /// geo-types allocation. Handles both endiannesses, ISO Z/M/ZM type
 /// codes, EWKB flag bits (+SRID), and nested multis/collections.
 /// Returns None on malformed input (the caller skips the feature).
-fn grow_wkb_envelope(buf: &[u8], b: &mut [f64; 4]) -> Option<()> {
+pub(crate) fn grow_wkb_envelope(buf: &[u8], b: &mut [f64; 4]) -> Option<()> {
     fn geom(buf: &[u8], pos: &mut usize, b: &mut [f64; 4], depth: u8) -> Option<()> {
         if depth > 8 {
             return None;

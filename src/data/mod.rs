@@ -2,6 +2,7 @@ pub mod coastline;
 pub mod crs;
 pub mod geoarrow;
 pub mod geometry;
+pub mod gpkg;
 pub mod info;
 pub mod layer;
 pub mod loader;

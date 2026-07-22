@@ -11,14 +11,81 @@ at vsync.
 
 ## Install
 
-Prebuilt binaries for macOS (Apple Silicon and Intel), Linux x86_64 and
-Windows x86_64 are published on the
+Prebuilt binaries for all four desktop targets are on the
 [GitHub Releases](https://github.com/gsueur/geopq-workbench/releases) page,
-with SHA-256 checksums. Unpack and run — no installer, no dependencies
-(Linux needs a Wayland or X11 session; the file dialogs use the XDG
-desktop portal). The macOS binaries are not notarized: clear the
-quarantine flag once with
-`xattr -d com.apple.quarantine geopq-workbench` after unpacking.
+each with a SHA-256 checksum. No installer, no runtime dependencies —
+unpack the archive and run the binary inside. The builds are not
+code-signed (no Apple notarization, no Windows certificate), so each OS
+needs its one-time "yes, I trust this" step, spelled out below.
+
+| Platform | Archive |
+|---|---|
+| macOS Apple Silicon | `geopq-workbench-<version>-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `geopq-workbench-<version>-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 | `geopq-workbench-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `geopq-workbench-<version>-x86_64-pc-windows-msvc.zip` |
+
+### macOS
+
+```bash
+# 1. Extract (if starting from the .tar)
+tar -xf geopq-workbench-v0.2.0-aarch64-apple-darwin.tar
+
+# 2. Fix the missing execute bit on the extracted directory
+#    (tarball packed dirs as 0666 -> can't traverse without +x)
+#    Capital X adds x only to dirs / already-executable files
+chmod -R u+rwX geopq-workbench-v0.2.0-aarch64-apple-darwin
+
+# 3. Strip macOS quarantine so Gatekeeper doesn't block the binary
+xattr -dr com.apple.quarantine geopq-workbench-v0.2.0-aarch64-apple-darwin
+
+# 4. Launch
+cd geopq-workbench-v0.2.0-aarch64-apple-darwin
+./geopq-workbench
+```
+
+Intel Macs: same steps with the `x86_64-apple-darwin` archive. If
+Gatekeeper still complains, right-click the binary → Open once, or allow
+it under System Settings → Privacy & Security.
+
+### Windows
+
+Unzip (right-click → Extract All, or `Expand-Archive` in PowerShell) and
+run `geopq-workbench.exe`. SmartScreen will warn about an unrecognized
+app the first time: click **More info → Run anyway**. If the window opens
+blank or not at all, update your GPU driver — the renderer needs a
+working Direct3D 12 or Vulkan stack.
+
+### Linux
+
+```bash
+tar xzf geopq-workbench-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
+cd geopq-workbench-v0.2.0-x86_64-unknown-linux-gnu
+./geopq-workbench
+```
+
+Needs a Wayland or X11 session and Vulkan drivers (`mesa-vulkan-drivers`
+on Debian/Ubuntu). File dialogs go through the XDG desktop portal —
+present on any mainstream desktop, may need
+`xdg-desktop-portal-gtk`/`-kde` on minimal setups. The binary is built on
+Ubuntu 22.04, so it runs on distributions with glibc 2.35 or newer; for
+older ones, build from source.
+
+### Verify a download
+
+```bash
+shasum -a 256 -c geopq-workbench-<version>-<target>.tar.gz.sha256
+```
+
+### Build from source
+
+Any platform with stable Rust:
+
+```bash
+git clone https://github.com/gsueur/geopq-workbench
+cd geopq-workbench
+cargo build --release   # binary in target/release/geopq-workbench
+```
 
 ## Run
 
@@ -27,7 +94,10 @@ cargo run --release [file.parquet | dataset_dir/ | https://host/file.parquet ...
 ```
 
 Or drag & drop `.parquet` files (or a dataset directory) onto the window /
-use **Open…** / **Open folder…**.
+use **Open…** / **Open folder…**. No GeoParquet at hand? **File → Open
+sample dataset** streams small hosted samples, and **File → Import
+GeoPackage…** converts a `.gpkg` feature table on the spot (pure Rust,
+no GDAL).
 
 Test fixtures (DuckDB spatial) live in `testdata/` but are not committed
 (~600 MB, generated). Rebuild them with:
@@ -73,6 +143,17 @@ Fixture-dependent tests self-skip when the files are absent.
   Optimize… materializes such layers into real GeoParquet (synthesized
   WKB points + the full Hilbert/covering treatment; lon/lat stay as
   attribute columns).
+- **Sample datasets**: File → Open sample dataset streams small hosted
+  synthetic files over HTTP (a raw 1M-point export for the quality
+  scorecard / Optimize story, lines, and Lambert-93 polygons for CRS
+  handling) — nothing to prepare on first launch.
+- **GeoPackage import, no GDAL**: File → Import GeoPackage… converts any
+  feature table to GeoParquet in pure Rust (bundled SQLite; the GPKG
+  binary header is stripped and the embedded WKB passes through, header
+  envelopes feed the metadata bbox, EPSG ids map from
+  `gpkg_spatial_ref_sys`). The output is a faithful raw export in
+  insertion order: the scorecard then shows what is missing and Optimize
+  finishes the job.
 - **Hive-partitioned datasets as one layer**: open a directory (File →
   Open folder…, drag & drop, or a CLI argument) holding a multi-file
   GeoParquet dataset — including this viewer's own partitioned exports and
