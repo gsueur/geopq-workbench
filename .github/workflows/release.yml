@@ -43,6 +43,36 @@ jobs:
           key: ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }}
 
+      # ---- macOS code signing + notarized DMG -------------------------
+      # Every step is gated on the signing secrets: without them the
+      # release still ships the unsigned tarballs exactly as before.
+      - name: Import Developer ID certificate
+        if: runner.os == 'macOS' && env.HAVE_CERT != ''
+        env:
+          HAVE_CERT: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KC="$RUNNER_TEMP/sign.keychain-db"
+          security create-keychain -p ci "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p ci "$KC"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci "$KC"
+          security list-keychains -d user -s "$KC" login.keychain-db
+          ID=$(security find-identity -v -p codesigning "$KC" \
+            | grep -o '"Developer ID Application[^"]*"' | head -1 | tr -d '"')
+          [ -n "$ID" ] || { echo "no Developer ID identity in p12"; exit 1; }
+          echo "SIGN_ID=$ID" >> "$GITHUB_ENV"
+
+      - name: Sign binary
+        if: runner.os == 'macOS' && env.SIGN_ID != ''
+        run: |
+          codesign --force --options runtime --timestamp \
+            --sign "$SIGN_ID" "target/${{ matrix.target }}/release/geopq-workbench"
+
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
@@ -52,6 +82,64 @@ jobs:
           cp README.md LICENSE-MIT LICENSE-APACHE "$NAME/"
           tar czf "$NAME.tar.gz" "$NAME"
           shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+
+      - name: App bundle, notarize, DMG (macOS)
+        if: runner.os == 'macOS' && env.SIGN_ID != ''
+        env:
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+          NOTARY_KEY: ${{ secrets.NOTARY_KEY }}
+        run: |
+          set -euo pipefail
+          VERSION=${GITHUB_REF_NAME#v}
+          APP="GeoPQ Workbench.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "target/${{ matrix.target }}/release/geopq-workbench" "$APP/Contents/MacOS/"
+          cp assets/geopq-workbench.icns "$APP/Contents/Resources/"
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>GeoPQ Workbench</string>
+            <key>CFBundleDisplayName</key><string>GeoPQ Workbench</string>
+            <key>CFBundleIdentifier</key><string>com.geomermaids.geopq-workbench</string>
+            <key>CFBundleExecutable</key><string>geopq-workbench</string>
+            <key>CFBundleIconFile</key><string>geopq-workbench</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
+            <key>CFBundleVersion</key><string>$VERSION</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict></plist>
+          EOF
+          plutil -lint "$APP/Contents/Info.plist"
+          codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$APP"
+
+          KEYFILE="$RUNNER_TEMP/notary.p8"
+          printf '%s' "$NOTARY_KEY" > "$KEYFILE"
+          notary() {
+            xcrun notarytool submit "$1" --key "$KEYFILE" \
+              --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" --wait
+          }
+
+          # Notarize + staple the app, then a DMG built from the stapled
+          # app, so both verify offline.
+          ditto -c -k --keepParent "$APP" app.zip
+          notary app.zip
+          xcrun stapler staple "$APP"
+
+          NAME=geopq-workbench-${GITHUB_REF_NAME}-${{ matrix.target }}
+          STAGE="$RUNNER_TEMP/dmg"
+          mkdir -p "$STAGE"
+          cp -R "$APP" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "GeoPQ Workbench" -srcfolder "$STAGE" \
+            -ov -format UDZO "$NAME.dmg"
+          codesign --force --timestamp --sign "$SIGN_ID" "$NAME.dmg"
+          notary "$NAME.dmg"
+          xcrun stapler staple "$NAME.dmg"
+          shasum -a 256 "$NAME.dmg" > "$NAME.dmg.sha256"
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -70,6 +158,8 @@ jobs:
           files: |
             geopq-workbench-*.tar.gz
             geopq-workbench-*.tar.gz.sha256
+            geopq-workbench-*.dmg
+            geopq-workbench-*.dmg.sha256
             geopq-workbench-*.zip
             geopq-workbench-*.zip.sha256
           # Only one matrix job generates the notes: with all four doing
