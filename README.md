@@ -165,10 +165,15 @@ geopq-workbench file.parquet dataset_dir/ https://host/data.parquet
 | Sample data | File → Open sample dataset |
 
 Format-wise, anything in the GeoParquet family works: 1.0, 1.1 with WKB
-or GeoArrow coordinate arrays, 2.0 with native GEOMETRY logical types,
-plus untagged parquet with a guessable geometry column, and tables with
-only lon/lat (or x/y) columns, which load as point layers directly.
-Mixed CRS across layers is fine; everything reprojects onto one map.
+or GeoArrow coordinate arrays, 2.0 with native GEOMETRY/GEOGRAPHY
+logical types (including files whose CRS lives only in the logical
+type, with no `geo` metadata at all), plus untagged parquet with a
+guessable geometry column, and tables with only lon/lat (or x/y)
+columns, which load as point layers directly. Mixed CRS across layers
+is fine; everything reprojects onto one map. Data declared with
+`edges: spherical` (or a GEOGRAPHY column) gets its long segments
+densified along great circles before projection, so spherical edges
+render as the curves they are.
 
 One tip for very large remote files: zoom to your area of interest
 before or right after opening. The viewport drives what gets
@@ -218,10 +223,10 @@ recommends, page indexes, bloom filters. Three output flavors:
 - **GeoParquet 2.0 (native GEOMETRY)**: the new Parquet-native
   geospatial type with built-in statistics; picking it applies the
   official recommended settings. Two optional extras: keep the bbox
-  column (still the only way to get page-level spatial pruning and
-  exact viewport selection) and/or add an auxiliary GeoArrow column so
-  GeoArrow-aware readers get the fast decode path from a fully
-  conformant 2.0 file.
+  column (page-level spatial pruning, and the cheapest exact viewport
+  selection — without it the workbench falls back to scanning WKB
+  envelopes) and/or add an auxiliary GeoArrow column so GeoArrow-aware
+  readers get the fast decode path from a fully conformant 2.0 file.
 
 Beyond the rewrite itself:
 

@@ -6,8 +6,10 @@ GeoParquet](https://github.com/opengeospatial/geoparquet/blob/main/format-specs/
 zstd 15, 50k–150k-row row groups, spatial ordering, page index.
 Selecting 2.0 in the optimizer applies the official recommended
 settings (native GEOMETRY + native stats only); two opt-in flavor
-extras exist: the bbox covering column (the only current mechanism for
-page-level spatial pruning, which that document lists as unsolved) and
+extras exist: the bbox covering column (page-level spatial pruning —
+which that document lists as unsolved — and the cheapest exact viewport
+selection; without it, WKB files fall back to a per-group WKB envelope
+scan for rect resolution) and
 an auxiliary GeoArrow coordinate-array sibling column
 (`{primary}_geoarrow`, undeclared in `geo` so the file stays
 conformant 2.0; the loader adopts it for decode and hides the

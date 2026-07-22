@@ -71,6 +71,9 @@ pub struct FeatureStore {
     /// WKB primary column superseded for display by a GeoArrow sibling
     /// (`geom_col` points at the sibling): hidden from attribute UIs.
     pub hidden_wkb: Option<usize>,
+    /// GeoParquet `edges: spherical`: segments are great-circle arcs, so
+    /// long edges are densified on the sphere before projection.
+    pub spherical_edges: bool,
     /// Rows per row group, global order across fragments.
     rg_rows: Vec<u64>,
     /// Cumulative start row of each row group (len = rg_rows.len() + 1).
@@ -176,6 +179,7 @@ impl FeatureStore {
             part_cols,
             xy_geom,
             hidden_wkb: None,
+            spherical_edges: false,
             rg_rows,
             rg_starts,
             rg_frag,

@@ -320,6 +320,13 @@ pub(crate) fn covering_select(
         if let Some((xi, yi)) = store.xy_geom {
             return xy_select(store, group, rect, xi, yi).map(Some);
         }
+        // WKB (incl. 2.0 native GEOMETRY) without a covering column:
+        // scan the geometry column's envelopes byte-wise. Reads the same
+        // column the decode would, but only matching rows become
+        // geometry — the win is decode/tessellation work and memory.
+        if store.encoding.is_wkb() {
+            return wkb_envelope_select(store, group, rect).map(Some);
+        }
         return Ok(None);
     };
     let reader = store.reader_for_group(group as usize, BATCH_SIZE, None, Some(&[cov.root]))?;
@@ -360,6 +367,41 @@ pub(crate) fn covering_select(
         row += batch.num_rows() as u32;
     }
     Ok(Some(rows_to_ranges(rows.into_iter())))
+}
+
+/// In-rect row ranges of one group by scanning the WKB envelopes (byte
+/// parse, no geometry allocation). Null and unparseable geometries are
+/// not selected.
+fn wkb_envelope_select(
+    store: &FeatureStore,
+    group: u32,
+    rect: [f64; 4],
+) -> Result<Vec<(u32, u32)>, String> {
+    let reader =
+        store.reader_for_group(group as usize, BATCH_SIZE, None, Some(&[store.geom_col]))?;
+    let mut rows: Vec<u32> = Vec::new();
+    let mut row = 0u32;
+    for res in reader {
+        let batch = res.map_err(|e| format!("geometry scan error: {e}"))?;
+        let col = BinCol::new(batch.column(0).as_ref())
+            .ok_or("geometry column is not binary")?;
+        for i in 0..batch.num_rows() {
+            if let Some(buf) = col.value(i) {
+                let mut env =
+                    [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+                if grow_wkb_envelope(buf, &mut env).is_some()
+                    && env[0] <= rect[2]
+                    && env[2] >= rect[0]
+                    && env[1] <= rect[3]
+                    && env[3] >= rect[1]
+                {
+                    rows.push(row + i as u32);
+                }
+            }
+        }
+        row += batch.num_rows() as u32;
+    }
+    Ok(rows_to_ranges(rows.into_iter()))
 }
 
 /// In-rect row ranges of one group of an x/y point store, by scanning
@@ -1016,6 +1058,8 @@ struct FileOpen {
     /// WKB primary superseded by a GeoArrow sibling (`geom_col` points at
     /// the sibling; this is the primary's index, hidden from attribute UIs).
     hidden_wkb: Option<usize>,
+    /// `edges: spherical` metadata, or a GEOGRAPHY logical type.
+    spherical_edges: bool,
 }
 
 /// Quality analysis over an opened file / merged dataset (footer facts
@@ -1066,7 +1110,9 @@ fn plan_viewport_selection(
     }
     // Per-feature covering selection: only when the viewport doesn't
     // already cover the whole data extent.
-    let use_rect = (store.covering.is_some() || store.xy_geom.is_some())
+    let use_rect = (store.covering.is_some()
+        || store.xy_geom.is_some()
+        || store.encoding.is_wkb())
         && match (boxes, rect) {
             (Some(bs), Some(r)) => {
                 let mut u = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
@@ -1210,6 +1256,7 @@ fn open_store_with_view(
         f.xy,
     );
     store.hidden_wkb = f.hidden_wkb;
+    store.spherical_edges = f.spherical_edges;
     Ok((store, f.crs, f.info, f.rg_boxes))
 }
 
@@ -1484,6 +1531,7 @@ fn open_multi_store(
         first.xy,
     );
     store.hidden_wkb = first.hidden_wkb;
+    store.spherical_edges = first.spherical_edges;
     Ok((store, first.crs, info, rg_boxes))
 }
 
@@ -1539,6 +1587,7 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
 
     let mut encoding = GeomEncoding::Wkb;
     let mut xy: Option<(usize, usize)> = None;
+    let mut spherical_edges = false;
     let (geom_name, crs) = match &geo_meta {
         Some(meta) => {
             let primary = meta
@@ -1551,9 +1600,20 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
                 let enc = cm.get("encoding").and_then(Value::as_str).unwrap_or("WKB");
                 encoding = GeomEncoding::parse(enc)
                     .ok_or_else(|| format!("geometry encoding '{enc}' not supported"))?;
+                spherical_edges =
+                    cm.get("edges").and_then(Value::as_str) == Some("spherical");
             }
             let crs = Crs::from_geoparquet_crs(col_meta.and_then(|c| c.get("crs")))?;
             (primary, crs)
+        }
+        None if native_geometry_column(&builder).is_some() => {
+            // Native GEOMETRY/GEOGRAPHY logical type without `geo`
+            // metadata (2.0 writers may omit it): the column and its CRS
+            // come from the logical type itself. GEOGRAPHY means edges
+            // are great-circle arcs.
+            let (name, crs_str, geography) = native_geometry_column(&builder).unwrap();
+            spherical_edges = geography;
+            (name, crs_from_type_string(crs_str.as_deref())?)
         }
         None => {
             // Not GeoParquet-tagged: guess a WKB column, assume CRS84.
@@ -1776,6 +1836,7 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
         page_index,
         geom_bytes,
         hidden_wkb,
+        spherical_edges,
     })
 }
 
@@ -1804,6 +1865,65 @@ fn aux_geoarrow_column(
         .find(|&e| super::geoarrow::data_type(e) == *f.data_type())?;
         Some((i, enc))
     })
+}
+
+/// First column carrying a native GEOMETRY/GEOGRAPHY logical type:
+/// (root name, crs string from the type, is GEOGRAPHY).
+fn native_geometry_column(
+    builder: &ParquetRecordBatchReaderBuilder<super::source::SourceReader>,
+) -> Option<(String, Option<String>, bool)> {
+    use parquet::basic::LogicalType;
+    builder.parquet_schema().columns().iter().find_map(|c| {
+        let (crs, geography) = match c.logical_type_ref() {
+            Some(LogicalType::Geometry { crs }) => (crs.clone(), false),
+            Some(LogicalType::Geography { crs, .. }) => (crs.clone(), true),
+            _ => return None,
+        };
+        Some((c.path().parts().first()?.clone(), crs, geography))
+    })
+}
+
+/// CRS recorded in a GEOMETRY/GEOGRAPHY logical type. The parquet spec
+/// leaves it a free-form string: PROJJSON, "EPSG:nnnn" and the CRS84
+/// spellings are recognized; anything else renders as CRS84 with an
+/// honest name.
+fn crs_from_type_string(s: Option<&str>) -> Result<Crs, String> {
+    let Some(t) = s.map(str::trim) else {
+        return Ok(Crs::wgs84()); // absent = CRS84 per spec
+    };
+    if t.is_empty()
+        || t.eq_ignore_ascii_case("OGC:CRS84")
+        || t.eq_ignore_ascii_case("CRS84")
+        || t.eq_ignore_ascii_case("EPSG:4326")
+    {
+        return Ok(Crs::wgs84());
+    }
+    // The string may itself be JSON: a PROJJSON object, or a JSON-quoted
+    // plain string (writers differ).
+    if t.starts_with('{') {
+        if let Ok(v) = serde_json::from_str::<Value>(t) {
+            return Crs::from_geoparquet_crs(Some(&v));
+        }
+    }
+    if t.starts_with('"') {
+        if let Ok(Value::String(inner)) = serde_json::from_str::<Value>(t) {
+            return crs_from_type_string(Some(&inner));
+        }
+    }
+    if let Some(code) = t
+        .strip_prefix("EPSG:")
+        .or_else(|| t.strip_prefix("epsg:"))
+        .and_then(|c| c.parse::<u32>().ok())
+    {
+        return Crs::from_epsg(code);
+    }
+    let mut crs = Crs::wgs84();
+    crs.name = format!(
+        "unknown CRS '{}' (rendered as CRS84)",
+        t.chars().take(40).collect::<String>()
+    );
+    crs.epsg = None;
+    Ok(crs)
 }
 
 /// Coordinate-column pair (x/lon, y/lat) guessed from names, for files
@@ -2318,6 +2438,8 @@ fn build_geometry(
     let done = AtomicUsize::new(0);
 
     let encoding = store.encoding;
+    // Spherical edges only mean something on a geographic CRS.
+    let spherical = store.spherical_edges && crs.is_latlong;
     let err_ref = &stream_error;
     let resolved_ref = &resolved;
     let starts = rg_starts;
@@ -2451,6 +2573,7 @@ fn build_geometry(
                 &batch, &map, encoding, &tr, display, &mut mb, &mut items, &mut bad,
                 rg_starts, &mut rg_boxes, geom_pos,
                 style.map(|st| (style_pos.unwrap(), &st.binning)),
+                spherical,
             );
             if let Some((handle, job)) = progress {
                 let d = done.fetch_add(rows, Ordering::Relaxed) + rows;
@@ -2588,6 +2711,7 @@ fn process_batch(
     rg_boxes: &mut std::collections::HashMap<u32, [f64; 4]>,
     geom_pos: usize,
     style: Option<(usize, &Binning)>,
+    spherical: bool,
 ) -> usize {
     let col = batch.column(geom_pos);
     let Some(get) = GeomCol::new(col.as_ref(), encoding) else {
@@ -2601,7 +2725,9 @@ fn process_batch(
 
     // GeoArrow: bulk path — one linear reprojection pass over the whole
     // coordinate buffer, features emitted straight from the arrow offsets.
-    if let GeomCol::Ga(ga) = &get {
+    // Spherical-edges data skips it: densification needs per-feature
+    // geometry (the per-row path below handles GeoArrow too).
+    if let (GeomCol::Ga(ga), false) = (&get, spherical) {
         return super::geoarrow::emit_bulk(
             ga,
             batch.num_rows(),
@@ -2645,6 +2771,9 @@ fn process_batch(
 
         match get.geometry(row) {
             Some(mut geom) => {
+                if spherical {
+                    densify_spherical(&mut geom, SPHERICAL_MAX_SEG_DEG);
+                }
                 {
                     use geo::BoundingRect;
                     if let Some(r) = geom.bounding_rect() {
@@ -2835,6 +2964,78 @@ fn scan_wkb_extent(
 }
 
 /// Decode WKB into geo-types (drops Z/M).
+/// Max great-circle arc per segment for `edges: spherical` data, in
+/// degrees. At 1° the chord-vs-arc deviation is negligible at any zoom
+/// where the curve is distinguishable.
+const SPHERICAL_MAX_SEG_DEG: f64 = 1.0;
+
+/// Densify long segments along great circles: spherical edges project
+/// as curves, not straight chords. Only segments spanning more than
+/// `max_deg` of arc gain vertices (slerp on the unit sphere).
+pub(crate) fn densify_spherical(g: &mut geo_types::Geometry<f64>, max_deg: f64) {
+    use geo_types::Geometry::*;
+    match g {
+        Point(_) | MultiPoint(_) | Line(_) | Rect(_) | Triangle(_) => {}
+        LineString(ls) => densify_ls(ls, max_deg),
+        MultiLineString(mls) => mls.0.iter_mut().for_each(|l| densify_ls(l, max_deg)),
+        Polygon(p) => densify_poly(p, max_deg),
+        MultiPolygon(mp) => mp.0.iter_mut().for_each(|p| densify_poly(p, max_deg)),
+        GeometryCollection(gc) => {
+            gc.0.iter_mut().for_each(|g| densify_spherical(g, max_deg))
+        }
+    }
+}
+
+fn densify_poly(p: &mut geo_types::Polygon<f64>, max_deg: f64) {
+    p.exterior_mut(|e| densify_ls(e, max_deg));
+    p.interiors_mut(|ints| ints.iter_mut().for_each(|l| densify_ls(l, max_deg)));
+}
+
+fn densify_ls(ls: &mut geo_types::LineString<f64>, max_deg: f64) {
+    let pts = &ls.0;
+    if pts.len() < 2 {
+        return;
+    }
+    let mut out: Vec<geo_types::Coord<f64>> = Vec::with_capacity(pts.len());
+    out.push(pts[0]);
+    for w in pts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let (va, vb) = (sphere_unit(a), sphere_unit(b));
+        let dot = (va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2]).clamp(-1.0, 1.0);
+        let omega = dot.acos();
+        let arc_deg = omega.to_degrees();
+        if arc_deg > max_deg && omega.sin() > 1e-9 {
+            let n = (arc_deg / max_deg).ceil() as usize;
+            let so = omega.sin();
+            for k in 1..n {
+                let t = k as f64 / n as f64;
+                let (s1, s2) = (((1.0 - t) * omega).sin() / so, (t * omega).sin() / so);
+                out.push(sphere_lonlat([
+                    va[0] * s1 + vb[0] * s2,
+                    va[1] * s1 + vb[1] * s2,
+                    va[2] * s1 + vb[2] * s2,
+                ]));
+            }
+        }
+        out.push(b);
+    }
+    if out.len() > pts.len() {
+        ls.0 = out;
+    }
+}
+
+fn sphere_unit(c: geo_types::Coord<f64>) -> [f64; 3] {
+    let (lon, lat) = (c.x.to_radians(), c.y.to_radians());
+    [lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin()]
+}
+
+fn sphere_lonlat(v: [f64; 3]) -> geo_types::Coord<f64> {
+    geo_types::Coord {
+        x: v[1].atan2(v[0]).to_degrees(),
+        y: v[2].atan2((v[0] * v[0] + v[1] * v[1]).sqrt()).to_degrees(),
+    }
+}
+
 pub fn decode_wkb(buf: &[u8]) -> Option<geo_types::Geometry<f64>> {
     let wkb = wkb::reader::read_wkb(buf).ok()?;
     wkb.try_to_geometry()
@@ -3849,6 +4050,156 @@ mod hive_tests {
 }
 
 #[cfg(test)]
+mod native_2_0_tests {
+    use super::*;
+    use arrow::array::BinaryArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use std::fs::File;
+    use std::sync::Arc;
+
+    fn wkb_point(x: f64, y: f64) -> Vec<u8> {
+        let mut b = vec![1u8];
+        b.extend(1u32.to_le_bytes());
+        b.extend(x.to_le_bytes());
+        b.extend(y.to_le_bytes());
+        b
+    }
+
+    /// 256 points on a grid, in 128-row groups. `geo_meta` None writes no
+    /// geo key; the geometry field optionally carries the native
+    /// GEOMETRY logical type with a CRS string.
+    fn write_points(
+        path: &std::path::Path,
+        geo_meta: Option<serde_json::Value>,
+        native_crs: Option<&str>,
+    ) {
+        let mut geom = Field::new("geometry", DataType::Binary, false);
+        if native_crs.is_some() {
+            let md = parquet_geospatial::WkbMetadata::new(native_crs, None);
+            geom.try_with_extension_type(parquet_geospatial::WkbType::new(Some(md)))
+                .unwrap();
+        }
+        let schema = Arc::new(Schema::new(vec![geom]));
+        let wkbs: Vec<Vec<u8>> = (0..256)
+            .map(|i| wkb_point(2.0 + (i % 16) as f64 * 0.01, 48.0 + (i / 16) as f64 * 0.01))
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(BinaryArray::from_iter_values(wkbs.iter()))],
+        )
+        .unwrap();
+        let props = WriterProperties::builder().set_max_row_group_row_count(Some(128)).build();
+        let mut w = ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(props)).unwrap();
+        if let Some(geo) = geo_meta {
+            w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+                "geo".to_string(),
+                geo.to_string(),
+            ));
+        }
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    /// No geo metadata at all: the CRS comes from the GEOMETRY logical
+    /// type, EPSG:nnnn form.
+    #[test]
+    fn crs_from_logical_type_without_geo_metadata() {
+        let path = std::env::temp_dir().join("geopq_native_crs.parquet");
+        write_points(&path, None, Some("EPSG:2154"));
+        let (store, crs, info, _rg) = open_store(&Source::Local(path)).unwrap();
+        assert_eq!(crs.epsg, Some(2154));
+        assert!(store.encoding.is_wkb());
+        assert!(!store.spherical_edges);
+        assert!(
+            info.geo.version_label.contains("2.0") || info.geo.encoding.contains("GEOMETRY"),
+            "{} / {}",
+            info.geo.version_label,
+            info.geo.encoding
+        );
+    }
+
+    /// Absent / CRS84-spelled crs strings mean CRS84.
+    #[test]
+    fn crs_string_spellings() {
+        for s in [None, Some("OGC:CRS84"), Some("EPSG:4326"), Some("")] {
+            let crs = super::crs_from_type_string(s).unwrap();
+            assert_eq!(crs.epsg, Some(4326), "{s:?}");
+        }
+        let crs = super::crs_from_type_string(Some("weird")).unwrap();
+        assert_eq!(crs.epsg, None);
+        assert!(crs.name.contains("rendered as CRS84"));
+    }
+
+    /// A 2.0-style file with no covering column still gets exact
+    /// per-feature rect selection via the WKB envelope scan.
+    #[test]
+    fn wkb_envelope_scan_selects_subset() {
+        let path = std::env::temp_dir().join("geopq_wkb_rect.parquet");
+        write_points(&path, None, Some("OGC:CRS84"));
+        let (store, _crs, _info, _rg) = open_store(&Source::Local(path)).unwrap();
+        // Grid spans x 2.00..2.15, y 48.00..48.15; select the lower-left
+        // quadrant (8 columns x 8 rows of the 16x16 grid).
+        let rect = [1.99, 47.99, 2.074, 48.074];
+        let ranges = covering_select(&store, 0, rect).unwrap().expect("scan supported");
+        let selected: u32 = ranges.iter().map(|(a, b)| b - a).sum();
+        assert_eq!(selected, 64, "{ranges:?}");
+        // And the planner uses Rect for a sub-extent viewport.
+        let boxes = vec![[2.0, 48.0, 2.15, 48.15], [2.0, 48.0, 2.15, 48.15]];
+        let sel = plan_viewport_selection(&store, "t", Some(&boxes), Some(rect));
+        assert!(
+            sel.iter().all(|s| matches!(s, GroupSel::Rect(_, _))),
+            "{sel:?}"
+        );
+    }
+
+    /// `edges: spherical` is read from geo metadata, and densification
+    /// bows a long parallel-following segment poleward.
+    #[test]
+    fn spherical_edges_flag_and_densify() {
+        let path = std::env::temp_dir().join("geopq_spherical.parquet");
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {
+                "encoding": "WKB", "geometry_types": ["Point"],
+                "edges": "spherical",
+            }},
+        });
+        write_points(&path, Some(geo), None);
+        let (store, crs, _info, _rg) = open_store(&Source::Local(path)).unwrap();
+        assert!(store.spherical_edges);
+        assert!(crs.is_latlong);
+
+        let mut g = geo_types::Geometry::LineString(geo_types::LineString(vec![
+            geo_types::Coord { x: 0.0, y: 60.0 },
+            geo_types::Coord { x: 90.0, y: 60.0 },
+        ]));
+        densify_spherical(&mut g, SPHERICAL_MAX_SEG_DEG);
+        let geo_types::Geometry::LineString(ls) = &g else { unreachable!() };
+        assert!(ls.0.len() > 20, "densified: {}", ls.0.len());
+        // The great circle between (0°E, 60°N) and (90°E, 60°N) peaks at
+        // asin(1.732/1.871) ≈ 67.8°N.
+        let max_lat = ls.0.iter().map(|c| c.y).fold(f64::MIN, f64::max);
+        assert!(max_lat > 67.0 && max_lat < 68.5, "max lat {max_lat}");
+        // Endpoints intact.
+        assert_eq!(ls.0.first().unwrap().x, 0.0);
+        assert_eq!(ls.0.last().unwrap().x, 90.0);
+
+        // An equator-following segment stays on the equator.
+        let mut eq = geo_types::Geometry::LineString(geo_types::LineString(vec![
+            geo_types::Coord { x: 0.0, y: 0.0 },
+            geo_types::Coord { x: 40.0, y: 0.0 },
+        ]));
+        densify_spherical(&mut eq, SPHERICAL_MAX_SEG_DEG);
+        let geo_types::Geometry::LineString(els) = &eq else { unreachable!() };
+        assert!(els.0.iter().all(|c| c.y.abs() < 1e-9));
+    }
+}
+
+#[cfg(test)]
 mod reload_plan_tests {
     use super::*;
     use arrow::array::{BinaryArray, Int64Array};
@@ -3901,15 +4252,16 @@ mod reload_plan_tests {
             [10.0, 0.0, 11.0, 1.0],
             [20.0, 0.0, 21.0, 1.0],
         ];
-        // Rect over the middle box only: one group, read whole (no
-        // covering column, so no per-feature selection).
+        // Rect over the middle box only: one group, per-feature rect
+        // selection (WKB files resolve it via the envelope scan even
+        // without a covering column).
         let sel = plan_viewport_selection(
             &store,
             "t",
             Some(&boxes),
             Some([9.5, -1.0, 12.0, 2.0]),
         );
-        assert!(matches!(sel.as_slice(), [GroupSel::All(1)]), "{sel:?}");
+        assert!(matches!(sel.as_slice(), [GroupSel::Rect(1, _)]), "{sel:?}");
         // Disjoint rect: nothing to read.
         let sel =
             plan_viewport_selection(&store, "t", Some(&boxes), Some([50.0, 0.0, 60.0, 1.0]));
