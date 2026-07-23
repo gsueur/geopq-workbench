@@ -162,6 +162,14 @@ jobs:
           notary app.zip
           xcrun stapler staple "$APP"
 
+          # The runner disk is nearly full after an LTO release build:
+          # drop the build tree and the notarization zip before hdiutil
+          # needs scratch space (the binary already lives in the .app,
+          # and the tarball was packaged earlier).
+          rm -f app.zip
+          rm -rf target
+          df -h . | tail -1
+
           NAME=geopq-workbench-${GITHUB_REF_NAME}-${{ matrix.target }}
           STAGE="$RUNNER_TEMP/dmg"
           mkdir -p "$STAGE"
