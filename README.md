@@ -54,40 +54,21 @@ so it doubles as a hands-on guide to GeoParquet best practices.
 
 Prebuilt binaries for all four desktop targets are on the
 [GitHub Releases](https://github.com/gsueur/geopq-workbench/releases) page,
-each with a SHA-256 checksum. No installer, no runtime dependencies —
-unpack the archive and run the binary inside. The builds are not
-code-signed (no Apple notarization, no Windows certificate), so each OS
-needs its one-time "yes, I trust this" step, spelled out below.
+each with a SHA-256 checksum. No installer, no runtime dependencies.
 
-| Platform | Archive |
+| Platform | Download |
 |---|---|
-| macOS Apple Silicon | `geopq-workbench-<version>-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `geopq-workbench-<version>-x86_64-apple-darwin.tar.gz` |
+| macOS Apple Silicon | `geopq-workbench-<version>-aarch64-apple-darwin.dmg` |
+| macOS Intel | `geopq-workbench-<version>-x86_64-apple-darwin.dmg` |
 | Linux x86_64 | `geopq-workbench-<version>-x86_64-unknown-linux-gnu.tar.gz` |
 | Windows x86_64 | `geopq-workbench-<version>-x86_64-pc-windows-msvc.zip` |
 
 ### macOS
 
-```bash
-# 1. Extract (if starting from the .tar)
-tar -xf geopq-workbench-v0.2.0-aarch64-apple-darwin.tar
-
-# 2. Fix the missing execute bit on the extracted directory
-#    (tarball packed dirs as 0666 -> can't traverse without +x)
-#    Capital X adds x only to dirs / already-executable files
-chmod -R u+rwX geopq-workbench-v0.2.0-aarch64-apple-darwin
-
-# 3. Strip macOS quarantine so Gatekeeper doesn't block the binary
-xattr -dr com.apple.quarantine geopq-workbench-v0.2.0-aarch64-apple-darwin
-
-# 4. Launch
-cd geopq-workbench-v0.2.0-aarch64-apple-darwin
-./geopq-workbench
-```
-
-Intel Macs: same steps with the `x86_64-apple-darwin` archive. If
-Gatekeeper still complains, right-click the binary → Open once, or allow
-it under System Settings → Privacy & Security.
+Open the DMG, drag **GeoPQ Workbench** to Applications, launch. The
+app is signed and notarized — no security prompts, no terminal
+required. (A `.tar.gz` with the bare signed binary also exists for
+scripted installs.)
 
 ### Windows
 
