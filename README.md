@@ -193,7 +193,7 @@ The full policy is written up in
 
 ## Making files fast
 
-Per-layer **Optimize…** rewrites any loaded file (local or remote) as a
+Per-layer **Export…** rewrites any loaded file (local or remote) as a
 best-practice GeoParquet: features sorted along a Hilbert curve, tuned
 row groups, zstd compression at the level the
 [GeoParquet distribution guidance](https://github.com/opengeospatial/geoparquet/blob/main/format-specs/distributing-geoparquet.md)
@@ -228,10 +228,11 @@ Beyond the rewrite itself:
 - **Partitioned output**: hive directories by chosen fields
   (`state=MA/part-0.parquet`) or adaptive H3 cells that split until each
   file is under a row target. Every part keeps the full treatment.
-- **Publish to S3 / R2**: tick "Publish to S3 / R2" in the Optimize
+- **Publish to S3 / R2**: tick "Publish to S3 / R2" in the Export
   dialog and the output uploads to your bucket (multipart for big
   files) instead of staying local; partitioned datasets upload under a
-  prefix that the workbench can reopen as one layer. Needs write
+  prefix that the workbench can reopen as one layer. Already-optimized
+  local files can upload as-is, skipping the rewrite. Needs write
   credentials in `~/.aws` (for R2: an API token plus the account
   endpoint).
 - **Before/after report**: size, row groups, and a spatial-clustering

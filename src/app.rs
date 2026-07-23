@@ -52,6 +52,8 @@ struct DeferredLoad {
 enum OptMsg {
     Progress(f32, String),
     Done(Box<crate::data::optimize::OptimizeReport>, PathBuf, Option<S3Dest>),
+    /// As-is publish (no rewrite): destination, bytes uploaded.
+    PublishedAsIs(S3Dest, u64),
     Failed(String),
     /// Distinct-value counts for partition-field candidates, tagged with
     /// the layer they were scanned for (the dialog may have moved on).
@@ -131,6 +133,11 @@ struct OptimizeState {
     merge_with: std::collections::HashSet<u64>,
     /// Tag merged rows with the layer they came from.
     merge_source_col: bool,
+    /// Publish the source file unchanged (no rewrite) — local sources
+    /// with an S3 destination and no rewrite-requiring options only.
+    upload_as_is: bool,
+    /// Finished as-is publish: destination and bytes uploaded.
+    report_as_is: Option<(S3Dest, u64)>,
 }
 
 /// Where an optimized output was published, for the report and the
@@ -221,6 +228,12 @@ pub struct ViewerApp {
     /// Last RefineDeferred row counts (layer id -> at_least_rows), for
     /// the "viewport too dense" badge. Cleared with refine_hold.
     refine_deferred: HashMap<u64, u64>,
+    /// Bumped on every camera move; refinement verdicts carry the epoch
+    /// they were spawned under, so a deferral computed for an obsolete
+    /// viewport can never arm the hold against the current one.
+    cam_epoch: u64,
+    /// Camera epoch each layer's in-flight refinement was spawned at.
+    refine_epoch: HashMap<u64, u64>,
     /// Frames still owed after new geometry arrived: uploads happen in
     /// paint and CPU-mesh stripping observes them in the NEXT update, so
     /// an idle app would otherwise never strip (meshes stay resident
@@ -640,6 +653,8 @@ impl ViewerApp {
             fit_after_rebuilds: false,
             refine_hold: HashSet::new(),
             refine_deferred: HashMap::new(),
+            cam_epoch: 0,
+            refine_epoch: HashMap::new(),
             strip_probe: 0,
             about_open: false,
             cookbook_open: false,
@@ -1479,8 +1494,12 @@ impl ViewerApp {
                     // Hold refinement until the camera moves — for cancels
                     // AND failures: the unchanged viewport would otherwise
                     // respawn the identical (failing) job every frame,
-                    // spamming errors and network requests.
-                    self.refine_hold.insert(layer_id);
+                    // spamming errors and network requests. Stale-viewport
+                    // endings don't hold: the current viewport still wants
+                    // its own check.
+                    if self.refine_epoch.get(&layer_id) == Some(&self.cam_epoch) {
+                        self.refine_hold.insert(layer_id);
+                    }
                     if error != loader::CANCELLED {
                         self.push_error(error);
                     }
@@ -1491,11 +1510,16 @@ impl ViewerApp {
                 } => {
                     self.appending.remove(&layer_id);
                     self.append_cancel.remove(&layer_id);
-                    // The exact covering scan proved this viewport is still
-                    // over budget. Retry only after the camera moves; say
-                    // so in the layer block instead of a silent debug log.
-                    self.refine_hold.insert(layer_id);
-                    self.refine_deferred.insert(layer_id, at_least_rows);
+                    // The exact covering scan proved that viewport is still
+                    // over budget. Hold (retry on camera move, with the
+                    // "zoom in" badge) — but only if the camera hasn't
+                    // moved since the check was spawned: a verdict about an
+                    // old viewport must not block refining the current one,
+                    // which the next frame will kick off.
+                    if self.refine_epoch.get(&layer_id) == Some(&self.cam_epoch) {
+                        self.refine_hold.insert(layer_id);
+                        self.refine_deferred.insert(layer_id, at_least_rows);
+                    }
                 }
                 LoadMsg::QualityGate {
                     job,
@@ -1692,6 +1716,7 @@ impl ViewerApp {
             // applies the budget; never gate refinement on bbox area.
             log::info!("{}: checking {} row groups for refinement", l.name, jobs.len());
             self.appending.insert(l.id);
+            self.refine_epoch.insert(l.id, self.cam_epoch);
             let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
             self.append_cancel.insert(l.id, Arc::clone(&cancel));
             loader::spawn_append(
@@ -2171,9 +2196,9 @@ impl ViewerApp {
                                     }
                                     let single = !l.store.is_partitioned();
                                     if ui
-                                        .add_enabled(single, egui::Button::new("Optimize…"))
+                                        .add_enabled(single, egui::Button::new("Export…"))
                                         .on_hover_text(if !single {
-                                            "Optimize works on single files; this layer is a \
+                                            "Export works on single files; this layer is a \
                                              multi-file dataset"
                                         } else if l.store.xy_geom.is_some() {
                                             "Materialize this x/y layer as real GeoParquet: \
@@ -2219,7 +2244,7 @@ impl ViewerApp {
                                                 rg.avg_overlap,
                                                 rg.overlap_frac() * 100.0,
                                                 if rg.poorly_clustered() {
-                                                    "(poorly clustered: consider Optimize…)"
+                                                    "(poorly clustered: consider Export…)"
                                                 } else {
                                                     "(well clustered)"
                                                 }
@@ -2520,6 +2545,8 @@ impl ViewerApp {
                         report_s3: None,
                         merge_with: Default::default(),
                         merge_source_col: true,
+                        upload_as_is: false,
+                        report_as_is: None,
                     });
                 }
             }
@@ -4310,6 +4337,10 @@ impl ViewerApp {
                     o.report_s3 = dest;
                     o.report = Some((*report, path));
                 }
+                OptMsg::PublishedAsIs(dest, size) => {
+                    o.running = false;
+                    o.report_as_is = Some((dest, size));
+                }
                 OptMsg::Failed(e) => {
                     o.running = false;
                     o.error = Some(e);
@@ -4337,6 +4368,54 @@ impl ViewerApp {
                 ctx,
             );
         }
+    }
+
+    /// Publish the source file to S3/R2 unchanged — the "upload as-is"
+    /// path that skips the optimize rewrite entirely.
+    fn start_publish_as_is(&mut self, src_path: PathBuf, ctx: &egui::Context) {
+        let Some(o) = &mut self.optimize else { return };
+        o.running = true;
+        o.error = None;
+        o.report = None;
+        o.report_as_is = None;
+        o.progress = (0.0, "starting upload".into());
+        let dest = S3Dest {
+            uri: o.s3_uri.trim().to_string(),
+            profile: o.s3_profile.clone(),
+            endpoint: {
+                let e = o.s3_endpoint.trim();
+                (!e.is_empty()).then(|| e.to_string())
+            },
+        };
+        let tx = self.opt_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            use crate::data::info::fmt_bytes;
+            let size = std::fs::metadata(&src_path).map(|m| m.len()).unwrap_or(0);
+            let name = src_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let msg = match crate::data::source::aws::upload_file(
+                &src_path,
+                &dest.uri,
+                dest.profile.as_deref(),
+                dest.endpoint.as_deref(),
+                &|sent, total| {
+                    let frac = if total > 0 { sent as f32 / total as f32 } else { 0.0 };
+                    let _ = tx.send(OptMsg::Progress(
+                        frac,
+                        format!("uploading {name}: {} / {}", fmt_bytes(sent), fmt_bytes(total)),
+                    ));
+                    ctx.request_repaint();
+                },
+            ) {
+                Ok(()) => OptMsg::PublishedAsIs(dest, size),
+                Err(e) => OptMsg::Failed(e),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
     }
 
     fn start_optimize(&mut self, dst: PathBuf, ctx: &egui::Context) {
@@ -4626,19 +4705,48 @@ impl ViewerApp {
             }
             None => Vec::new(),
         };
+        // Scorecard verdict of the primary layer, for the as-is nudge.
+        let primary_indexable: Option<bool> = self.optimize.as_ref().and_then(|o| {
+            self.layers
+                .iter()
+                .find(|l| l.id == o.layer_id)
+                .and_then(|l| l.info.quality.as_ref().map(|q| q.indexable))
+        });
         let Some(o) = &mut self.optimize else { return };
         let layer_id = o.layer_id;
         let mut open = true;
         let mut start: Option<PathBuf> = None;
+        let mut start_upload: Option<PathBuf> = None;
         let mut load_result: Option<PathBuf> = None;
         let mut load_remote: Option<S3Dest> = None;
         let mut close = false;
         let mut want_cards = false;
-        egui::Window::new(format!("Optimize — {}", o.layer_name))
+        egui::Window::new(format!("Export — {}", o.layer_name))
             .id(egui::Id::new("optimize_dialog"))
             .open(&mut open)
             .default_width(400.0)
             .constrain_to(floating_area).show(ctx, |ui| {
+                if let Some((d, size)) = &o.report_as_is {
+                    use crate::data::info::fmt_bytes;
+                    ui.label(RichText::new(format!("Published: {}", d.uri)).strong());
+                    ui.label(
+                        RichText::new(format!(
+                            "{} uploaded as-is (no rewrite)",
+                            fmt_bytes(*size)
+                        ))
+                        .weak(),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Load as layer").clicked() {
+                            load_remote = Some(d.clone());
+                        }
+                        if ui.button("Close").clicked() {
+                            close = true;
+                        }
+                    });
+                    return;
+                }
                 if let Some((rep, path)) = &o.report {
                     use crate::data::info::fmt_bytes;
                     ui.label(
@@ -5140,6 +5248,58 @@ impl ViewerApp {
                                     }
                                 });
                         });
+                        if let Source::Local(p) = &o.src {
+                            let mut reasons: Vec<&str> = Vec::new();
+                            if !o.merge_with.is_empty() {
+                                reasons.push("merge");
+                            }
+                            if o.viewport_only {
+                                reasons.push("viewport only");
+                            }
+                            if o.opts.h3_resolution.is_some() {
+                                reasons.push("H3 column");
+                            }
+                            if o.admin_layer.is_some() {
+                                reasons.push("admin column");
+                            }
+                            if o.part_mode != PartMode::None {
+                                reasons.push("partitioning");
+                            }
+                            let enabled = reasons.is_empty();
+                            if !enabled {
+                                o.upload_as_is = false;
+                            }
+                            let hover = if !enabled {
+                                format!("needs a rewrite: {}", reasons.join(", "))
+                            } else {
+                                match primary_indexable {
+                                    Some(true) => {
+                                        "This file already passes the gating checks —                                          uploading it unchanged is fine."
+                                            .into()
+                                    }
+                                    Some(false) => {
+                                        "The scorecard says this file would benefit                                          from a rewrite — consider exporting instead."
+                                            .into()
+                                    }
+                                    None => format!(
+                                        "Upload {} byte-for-byte, skipping the rewrite",
+                                        p.display()
+                                    ),
+                                }
+                            };
+                            ui.add_enabled(
+                                enabled,
+                                egui::Checkbox::new(
+                                    &mut o.upload_as_is,
+                                    "upload the file as-is (skip the rewrite)",
+                                ),
+                            )
+                            .on_hover_text(hover)
+                            .on_disabled_hover_text(format!(
+                                "needs a rewrite: {}",
+                                reasons.join(", ")
+                            ));
+                        }
                     }
                 });
                 ui.add_space(4.0);
@@ -5172,17 +5332,26 @@ impl ViewerApp {
                             let needs_name =
                                 trimmed.ends_with('/') || !rest.contains('/');
                             if o.part_mode == PartMode::None {
-                                o.s3_uri = if needs_name {
+                                o.s3_uri = if needs_name && o.upload_as_is {
+                                    // As-is keeps the source's own name.
+                                    format!("{uri}/{stem}.parquet")
+                                } else if needs_name {
                                     format!("{uri}/{stem}_optimized.parquet")
                                 } else if uri.ends_with(".parquet") {
                                     uri
                                 } else {
                                     format!("{uri}.parquet")
                                 };
-                                start = Some(std::env::temp_dir().join(format!(
-                                    "geopq_publish_{stem}_{}.parquet",
-                                    std::process::id()
-                                )));
+                                if o.upload_as_is
+                                    && let Source::Local(p) = &o.src
+                                {
+                                    start_upload = Some(p.clone());
+                                } else {
+                                    start = Some(std::env::temp_dir().join(format!(
+                                        "geopq_publish_{stem}_{}.parquet",
+                                        std::process::id()
+                                    )));
+                                }
                             } else {
                                 o.s3_uri = if needs_name {
                                     format!("{uri}/{stem}_partitioned/")
@@ -5245,6 +5414,9 @@ impl ViewerApp {
         }
         if let Some(dst) = start {
             self.start_optimize(dst, ctx);
+        }
+        if let Some(p) = start_upload {
+            self.start_publish_as_is(p, ctx);
         }
         if let Some(p) = load_result {
             self.enqueue_load(Source::Local(p), ctx);
@@ -5527,6 +5699,8 @@ impl ViewerApp {
                         report_s3: None,
                         merge_with: Default::default(),
                         merge_source_col: true,
+                        upload_as_is: false,
+                        report_as_is: None,
                     });
                 }
                 self.drop_gated(&gate, ctx);
@@ -5593,7 +5767,7 @@ impl ViewerApp {
                                     rg.avg_overlap,
                                     rg.overlap_frac() * 100.0,
                                     if rg.poorly_clustered() {
-                                        "(poorly clustered: consider Optimize…)"
+                                        "(poorly clustered: consider Export…)"
                                     } else {
                                         "(well clustered)"
                                     }
@@ -6001,8 +6175,16 @@ impl ViewerApp {
             if self.last_cam != Some(pose) {
                 self.last_cam = Some(pose);
                 self.cam_changed_at = now;
+                self.cam_epoch += 1;
                 self.refine_hold.clear();
                 self.refine_deferred.clear();
+                // A moved viewport obsoletes in-flight refinements:
+                // cancel them so the new view's check starts at settle
+                // instead of queueing behind downloads for a viewport
+                // nobody is looking at. Batches already landed stay.
+                for c in self.append_cancel.values() {
+                    c.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             } else if now - self.cam_changed_at > 0.35 {
                 self.refine_partial_layers(&ctx);
             }

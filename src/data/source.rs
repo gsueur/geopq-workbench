@@ -1172,10 +1172,21 @@ fn remote_len(url: &str) -> Result<u64, String> {
         .call()
         .map_err(|e| format!("cannot reach {url}: {e}"))?;
     if res.status() != 206 {
-        return Err(format!(
-            "{url}: server does not support range requests (status {})",
-            res.status()
-        ));
+        // Auth failures are not a range-request problem — say so.
+        return Err(match res.status().as_u16() {
+            401 | 403 => format!(
+                "{url}: access denied (HTTP {}). For a private bucket, pick \
+                 an AWS profile with read access in the Open URL dialog; for \
+                 a public one, the bucket needs Block Public Access disabled \
+                 and a bucket policy allowing s3:GetObject",
+                res.status()
+            ),
+            404 => format!("{url}: not found (HTTP 404)"),
+            _ => format!(
+                "{url}: server does not support range requests (status {})",
+                res.status()
+            ),
+        });
     }
     // Content-Range: bytes 0-0/12345
     header(&res, "content-range")
