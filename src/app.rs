@@ -293,6 +293,10 @@ struct RepoBrowser {
     selected: Option<(usize, Option<Result<crate::data::repo::Manifest, String>>)>,
     /// Themes ticked for loading in the selected dataset.
     checked: std::collections::HashSet<String>,
+    /// Country-wide theme list (the union over every dataset manifest
+    /// of the country), shown when a country is picked and no state is
+    /// selected: (country code, None = fetch in flight).
+    country_themes: Option<(String, Option<CountryThemesResult>)>,
     /// Unix seconds the dataset list was cached at (None = fetched live).
     cache_age: Option<u64>,
     /// Add-repository row (name, base URL).
@@ -300,6 +304,17 @@ struct RepoBrowser {
     /// Drops stale async results after repo/snapshot switches.
     generation: u64,
 }
+
+/// One theme aggregated across a country: total features and the
+/// dataset paths that actually carry it (exact part list, no 404s).
+#[derive(Clone)]
+struct CountryTheme {
+    theme: String,
+    features: u64,
+    paths: Vec<String>,
+}
+
+type CountryThemesResult = Result<Vec<CountryTheme>, String>;
 
 enum RepoMsg {
     Snapshots(u64, Result<Vec<crate::data::repo::Snapshot>, String>),
@@ -313,6 +328,10 @@ enum RepoMsg {
     /// index pins the result to the dataset it was fetched for — a slow
     /// fetch must not fill the panel of a dataset selected later.
     Manifest(u64, usize, Result<crate::data::repo::Manifest, String>),
+    /// Union of every dataset manifest of one country: (generation,
+    /// country code, themes). The code pins the result like Manifest's
+    /// index does.
+    CountryThemes(u64, String, CountryThemesResult),
 }
 
 /// Cap on attribute columns fetched for the feature info panel. Wide
@@ -1813,26 +1832,7 @@ impl ViewerApp {
                         )
                         .pick_file()
                 {
-                    use crate::data::import::ImportFormat;
-                    let format = ImportFormat::from_path(&path);
-                    let (tables, error) = match format {
-                        Some(ImportFormat::Gpkg) => match crate::data::gpkg::list_tables(&path) {
-                            Ok(t) => (t, None),
-                            Err(e) => (Vec::new(), Some(e)),
-                        },
-                        Some(_) => (Vec::new(), None),
-                        None => (Vec::new(), Some("unsupported file type".into())),
-                    };
-                    self.gpkg_import = Some(ImportState {
-                        format: format.unwrap_or(ImportFormat::Gpkg),
-                        src: path,
-                        tables,
-                        selected: 0,
-                        running: false,
-                        progress: 0.0,
-                        error,
-                        rx: None,
-                    });
+                    self.begin_import(path);
                 }
                 ui.separator();
                 if ui
@@ -2695,6 +2695,7 @@ impl ViewerApp {
             country: String::new(),
             selected: None,
             checked: Default::default(),
+            country_themes: None,
             cache_age: None,
             add: (String::new(), String::new()),
             generation: 0,
@@ -2775,6 +2776,63 @@ impl ViewerApp {
         });
     }
 
+    /// Fetch every dataset manifest of `country` in parallel and union
+    /// the themes, for the country-wide panel (parquetry repos only).
+    fn repo_fetch_country(&mut self, country: String, ctx: &egui::Context) {
+        let Some(b) = &mut self.repo_browser else { return };
+        b.country_themes = Some((country.clone(), None));
+        b.checked.clear();
+        let generation = b.generation;
+        let base = b.repos[b.sel_repo].url.trim_end_matches('/').to_string();
+        let snapshot = b.snapshots[b.sel_snapshot].path.clone();
+        let Some(Ok(ds)) = &b.datasets else { return };
+        let seg = format!("country={country}");
+        let paths: Vec<String> = ds
+            .iter()
+            .filter(|d| d.path.split('/').any(|s| s == seg))
+            .map(|d| d.path.clone())
+            .collect();
+        let tx = self.repo_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            use rayon::prelude::*;
+            let manifests: Vec<(String, crate::data::repo::Manifest)> = paths
+                .par_iter()
+                .filter_map(|p| {
+                    match crate::data::repo::fetch_manifest(&base, &snapshot, p) {
+                        Ok(m) => Some((p.clone(), m)),
+                        Err(e) => {
+                            log::warn!("{p}: manifest fetch failed: {e}");
+                            None
+                        }
+                    }
+                })
+                .collect();
+            let res = if manifests.is_empty() {
+                Err(format!("no manifests could be read for country={country}"))
+            } else {
+                let mut by_theme: std::collections::BTreeMap<String, CountryTheme> =
+                    Default::default();
+                for (path, m) in &manifests {
+                    for (theme, count) in &m.themes {
+                        let e = by_theme.entry(theme.clone()).or_insert_with(|| {
+                            CountryTheme {
+                                theme: theme.clone(),
+                                features: 0,
+                                paths: Vec::new(),
+                            }
+                        });
+                        e.features += *count;
+                        e.paths.push(path.clone());
+                    }
+                }
+                Ok(by_theme.into_values().collect())
+            };
+            let _ = tx.send(RepoMsg::CountryThemes(generation, country, res));
+            ctx.request_repaint();
+        });
+    }
+
     fn poll_repo(&mut self) {
         while let Ok(msg) = self.repo_rx.try_recv() {
             let Some(b) = &mut self.repo_browser else { continue };
@@ -2799,6 +2857,13 @@ impl ViewerApp {
                         }
                     }
                 }
+                RepoMsg::CountryThemes(g, country, res) if g == b.generation => {
+                    if let Some((c, slot)) = &mut b.country_themes
+                        && *c == country
+                    {
+                        *slot = Some(res);
+                    }
+                }
                 _ => {} // stale generation
             }
         }
@@ -2813,6 +2878,7 @@ impl ViewerApp {
         let mut refetch = false;
         let mut force_refetch = false;
         let mut fetch_manifest: Option<usize> = None;
+        let mut fetch_country: Option<String> = None;
         let mut load: Vec<(Source, String)> = Vec::new(); // (source, layer name)
 
         {
@@ -2932,6 +2998,7 @@ impl ViewerApp {
                                     countries.sort_unstable();
                                     countries.dedup();
                                     ui.horizontal(|ui| {
+                                        let country_before = b.country.clone();
                                         if countries.len() > 1 {
                                             egui::ComboBox::from_id_salt("repo_country")
                                                 .width(70.0)
@@ -2954,6 +3021,19 @@ impl ViewerApp {
                                                         );
                                                     }
                                                 });
+                                        }
+                                        if b.country != country_before {
+                                            // Country-wide themes replace any
+                                            // state selection until a state
+                                            // is clicked.
+                                            b.selected = None;
+                                            b.checked.clear();
+                                            if b.country.is_empty() {
+                                                b.country_themes = None;
+                                            } else {
+                                                fetch_country =
+                                                    Some(b.country.clone());
+                                            }
                                         }
                                         ui.add(
                                             egui::TextEdit::singleline(&mut b.filter)
@@ -3143,9 +3223,201 @@ impl ViewerApp {
                                 }
                             }
                             None => {
-                                ui.label(
-                                    RichText::new("select a dataset to list its layers").weak(),
-                                );
+                                let ct_view = b.country_themes.clone();
+                                match &ct_view {
+                                    Some((c, slot))
+                                        if kind == crate::data::repo::RepoKind::Parquetry
+                                            && !b.country.is_empty()
+                                            && *c == b.country =>
+                                    {
+                                        ui.label(
+                                            RichText::new(format!("All of country={c}"))
+                                                .strong(),
+                                        );
+                                        match slot {
+                                            None => {
+                                                ui.horizontal(|ui| {
+                                                    ui.spinner();
+                                                    ui.label(
+                                                        RichText::new(
+                                                            "reading state manifests…",
+                                                        )
+                                                        .weak(),
+                                                    );
+                                                });
+                                            }
+                                            Some(Err(e)) => {
+                                                ui.label(
+                                                    RichText::new(e).color(
+                                                        Color32::from_rgb(220, 60, 60),
+                                                    ),
+                                                );
+                                            }
+                                            Some(Ok(themes)) => {
+                                                let base = b.repos[b.sel_repo]
+                                                    .url
+                                                    .trim_end_matches('/')
+                                                    .to_string();
+                                                let snap = b.snapshots[b.sel_snapshot]
+                                                    .path
+                                                    .clone();
+                                                egui::ScrollArea::vertical()
+                                                    .id_salt("repo_country_themes")
+                                                    .max_height(300.0)
+                                                    .show(ui, |ui| {
+                                                        egui::Grid::new("repo_country_grid")
+                                                            .num_columns(2)
+                                                            .striped(true)
+                                                            .show(ui, |ui| {
+                                                                for t in themes {
+                                                                    // Country-wide totals
+                                                                    // beyond the display
+                                                                    // budget would load as
+                                                                    // a huge, disappointing
+                                                                    // preview: gate them to
+                                                                    // state-level loads.
+                                                                    let too_big = t.features
+                                                                        > crate::data::loader::MAX_BUILD_ROWS;
+                                                                    let mut on = b
+                                                                        .checked
+                                                                        .contains(&t.theme);
+                                                                    if ui
+                                                                        .add_enabled(
+                                                                            !too_big,
+                                                                            egui::Checkbox::new(
+                                                                                &mut on,
+                                                                                &t.theme,
+                                                                            ),
+                                                                        )
+                                                                        .on_disabled_hover_text(
+                                                                            format!(
+                                                                            "{} features — too \
+                                                                             large to display \
+                                                                             country-wide; pick \
+                                                                             a state on the left \
+                                                                             instead",
+                                                                            fmt_count(
+                                                                                t.features
+                                                                                    as usize
+                                                                            )
+                                                                        ),
+                                                                        )
+                                                                        .changed()
+                                                                    {
+                                                                        if on {
+                                                                            b.checked.insert(
+                                                                                t.theme
+                                                                                    .clone(),
+                                                                            );
+                                                                        } else {
+                                                                            b.checked
+                                                                                .remove(
+                                                                                    &t.theme,
+                                                                                );
+                                                                        }
+                                                                    }
+                                                                    ui.label(
+                                                                        RichText::new(
+                                                                            format!(
+                                                                            "{} features · {} states",
+                                                                            fmt_count(
+                                                                                t.features
+                                                                                    as usize
+                                                                            ),
+                                                                            t.paths.len()
+                                                                        ),
+                                                                        )
+                                                                        .weak(),
+                                                                    );
+                                                                    ui.end_row();
+                                                                }
+                                                            });
+                                                    });
+                                                ui.horizontal(|ui| {
+                                                    let n = b.checked.len();
+                                                    if ui
+                                                        .add_enabled(
+                                                            n > 0,
+                                                            egui::Button::new(format!(
+                                                                "Load {n} layer{}",
+                                                                if n == 1 { "" } else { "s" }
+                                                            )),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        for t in themes {
+                                                            if !b.checked.contains(&t.theme)
+                                                                || t.features
+                                                                    > crate::data::loader::MAX_BUILD_ROWS
+                                                            {
+                                                                continue;
+                                                            }
+                                                            let name = format!(
+                                                                "{c} {} (all)",
+                                                                t.theme
+                                                            );
+                                                            load.push((
+                                                                Source::Multi {
+                                                                    name: name.clone(),
+                                                                    urls: t
+                                                                        .paths
+                                                                        .iter()
+                                                                        .map(|p| {
+                                                                            crate::data::repo::theme_url(
+                                                                                &base, &snap,
+                                                                                p, &t.theme,
+                                                                            )
+                                                                        })
+                                                                        .collect(),
+                                                                },
+                                                                name,
+                                                            ));
+                                                        }
+                                                        b.checked.clear();
+                                                    }
+                                                    if ui.small_button("all").clicked() {
+                                                        b.checked = themes
+                                                            .iter()
+                                                            .filter(|t| {
+                                                                t.features
+                                                                    <= crate::data::loader::MAX_BUILD_ROWS
+                                                            })
+                                                            .map(|t| t.theme.clone())
+                                                            .collect();
+                                                    }
+                                                    if ui.small_button("none").clicked() {
+                                                        b.checked.clear();
+                                                    }
+                                                });
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "each theme loads as one layer \
+                                                         across all its states, with \
+                                                         state as a column; themes over \
+                                                         {} features are state-level \
+                                                         only",
+                                                        fmt_count(
+                                                            crate::data::loader::MAX_BUILD_ROWS
+                                                                as usize
+                                                        )
+                                                    ))
+                                                    .weak()
+                                                    .small(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        ui.label(
+                                            RichText::new(
+                                                "select a dataset to list its layers — \
+                                                 or pick a country to load themes \
+                                                 across all its states",
+                                            )
+                                            .weak(),
+                                        );
+                                    }
+                                }
                             }
                         });
                     });
@@ -3206,6 +3478,9 @@ impl ViewerApp {
 
         if refetch || force_refetch {
             self.repo_refetch(ctx, force_refetch);
+        }
+        if let Some(c) = fetch_country {
+            self.repo_fetch_country(c, ctx);
         }
         if let Some(i) = fetch_manifest {
             self.repo_fetch_manifest(i, ctx);
@@ -3693,10 +3968,17 @@ impl ViewerApp {
             .open(&mut open)
             .default_width(440.0)
             .constrain_to(floating_area).show(ctx, |ui| {
-                ui.label("GeoParquet over HTTP(S) (needs range requests) or s3://bucket/key:");
+                ui.label(
+                    "GeoParquet over HTTP(S) (needs range requests) or s3://bucket/key. \
+                     An s3:// prefix ending in /, or a * glob, opens every matching \
+                     parquet part as one layer (hive key=value segments become columns):",
+                );
                 let edit = ui.add(
                     egui::TextEdit::singleline(url)
-                        .hint_text("https://host/data.parquet · s3://bucket/key.parquet")
+                        .hint_text(
+                            "https://host/data.parquet · s3://bucket/dataset/state=MA/ · \
+                             s3://bucket/dataset/state=*/roads.parquet",
+                        )
                         .desired_width(f32::INFINITY),
                 );
                 let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -3821,6 +4103,34 @@ impl ViewerApp {
         } else {
             screen
         }
+    }
+
+    /// Open the vector-import dialog for a GPKG / SHP / GeoJSON path
+    /// (from the File menu or a drag & drop).
+    fn begin_import(&mut self, path: PathBuf) {
+        use crate::data::import::ImportFormat;
+        if self.gpkg_import.is_some() {
+            return; // one import at a time
+        }
+        let format = ImportFormat::from_path(&path);
+        let (tables, error) = match format {
+            Some(ImportFormat::Gpkg) => match crate::data::gpkg::list_tables(&path) {
+                Ok(t) => (t, None),
+                Err(e) => (Vec::new(), Some(e)),
+            },
+            Some(_) => (Vec::new(), None),
+            None => (Vec::new(), Some("unsupported file type".into())),
+        };
+        self.gpkg_import = Some(ImportState {
+            format: format.unwrap_or(ImportFormat::Gpkg),
+            src: path,
+            tables,
+            selected: 0,
+            running: false,
+            progress: 0.0,
+            error,
+            rx: None,
+        });
     }
 
     fn gpkg_import_window(&mut self, ctx: &egui::Context) {
@@ -5839,7 +6149,7 @@ fn current_year() -> i64 {
 /// Settings sidecar for the quality gate's decline memory: one small
 /// JSON file in the home directory (the app has no other persistence).
 /// Unknown keys are preserved for forward compatibility.
-fn settings_path() -> Option<PathBuf> {
+pub(crate) fn settings_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
     Some(PathBuf::from(home).join(".geopq-workbench.json"))
 }
@@ -5956,8 +6266,13 @@ impl eframe::App for ViewerApp {
                 .collect()
         });
         for p in dropped {
-            let src = if p.is_dir() { Source::Dir(p) } else { Source::Local(p) };
-            self.enqueue_load(src, &ctx);
+            let importable = crate::data::import::ImportFormat::from_path(&p).is_some();
+            if !p.is_dir() && importable {
+                self.begin_import(p);
+            } else {
+                let src = if p.is_dir() { Source::Dir(p) } else { Source::Local(p) };
+                self.enqueue_load(src, &ctx);
+            }
         }
 
         egui::Panel::top("menubar").show(ui, |ui| self.menu_bar(ui));

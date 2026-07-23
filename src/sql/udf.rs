@@ -22,7 +22,26 @@ use geo::{
 use geo_types::{Geometry, Point, Rect};
 use wkt::ToWkt;
 
+use crate::data::crs::Crs;
 use crate::data::loader::decode_wkb;
+
+/// Parse a user CRS argument: `EPSG:nnnn`, a bare numeric code, or a
+/// full proj4 string.
+fn parse_crs(s: &str) -> Result<Crs, String> {
+    let t = s.trim();
+    if t.starts_with('+') {
+        return Crs::from_proj4(t, None, t);
+    }
+    let num = t
+        .strip_prefix("EPSG:")
+        .or_else(|| t.strip_prefix("epsg:"))
+        .unwrap_or(t);
+    let code: u32 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid CRS {t:?} — use 'EPSG:nnnn' or a proj4 string"))?;
+    Crs::from_epsg(code)
+}
 
 /// Register every spatial UDF on the session.
 pub fn register_all(ctx: &SessionContext) {
@@ -56,6 +75,7 @@ pub const NAMES: &[&str] = &[
     "st_buffer",
     "st_simplify",
     "st_convexhull",
+    "st_transform",
 ];
 
 /// Names and signatures for the console's help panel.
@@ -80,6 +100,10 @@ pub fn catalog() -> &'static [(&'static str, &'static str)] {
         ("st_buffer(geom, dist)", "buffered polygon"),
         ("st_simplify(geom, tol)", "Douglas-Peucker simplification"),
         ("st_convexhull(geom)", "convex hull polygon"),
+        (
+            "st_transform(geom, 'EPSG:4326', 'EPSG:2154')",
+            "reproject between CRSs (EPSG codes or proj4 strings)",
+        ),
     ]
 }
 
@@ -223,6 +247,40 @@ fn all_udfs() -> Vec<ScalarUDF> {
                     }
                     _ => b.push(None)?,
                 }
+            }
+            Ok(b.finish())
+        }),
+        // Reprojection. WKB carries no SRID here, so both CRSs are
+        // explicit; strings parse per distinct value, not per row.
+        make_udf("st_transform", vec![Binary, Utf8, Utf8], Binary, |args| {
+            use geo::MapCoords;
+            let g = geom_array(&args[0])?;
+            let from = arrow::array::cast::as_string_array(&args[1]);
+            let to = arrow::array::cast::as_string_array(&args[2]);
+            let mut cache: Option<(String, String, Crs, Crs)> = None;
+            let mut b = WkbOut::new();
+            for i in 0..g.len() {
+                if g.is_null(i) || from.is_null(i) || to.is_null(i) {
+                    b.push(None)?;
+                    continue;
+                }
+                let (fs, ts) = (from.value(i), to.value(i));
+                if cache.as_ref().map(|(f, t, ..)| (f.as_str(), t.as_str()))
+                    != Some((fs, ts))
+                {
+                    let src = parse_crs(fs).map_err(DataFusionError::Execution)?;
+                    let dst = parse_crs(ts).map_err(DataFusionError::Execution)?;
+                    cache = Some((fs.to_string(), ts.to_string(), src, dst));
+                }
+                let (_, _, src, dst) = cache.as_ref().unwrap();
+                let out = geom_at(&g, i).and_then(|geom| {
+                    geom.try_map_coords(|c| {
+                        crate::data::crs::transform_point(src, dst, c.x, c.y)
+                            .map(|(x, y)| geo_types::Coord { x, y })
+                    })
+                    .ok()
+                });
+                b.push(out.as_ref())?;
             }
             Ok(b.finish())
         }),

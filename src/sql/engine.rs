@@ -610,6 +610,37 @@ mod tests {
         assert_eq!(bt, "MultiPolygon");
     }
 
+    #[test]
+    fn st_transform_roundtrip_and_lambert93() {
+        // 4326 -> 3857 -> 4326 must return the input (needs no fixture).
+        let out = run_query(
+            "select st_x(p) x, st_y(p) y from (select st_transform(\
+             st_transform(st_point(2.349014, 48.864716), 'EPSG:4326', 'EPSG:3857'),\
+             '3857', 'EPSG:4326') p)",
+            &[],
+        )
+        .unwrap();
+        assert!((get_f64(&out, 0) - 2.349014).abs() < 1e-6);
+        assert!((get_f64(&out, 1) - 48.864716).abs() < 1e-6);
+
+        // Paris in Lambert-93, against pyproj-computed coordinates.
+        let out = run_query(
+            "select st_x(p) x, st_y(p) y from (select \
+             st_transform(st_point(2.349014, 48.864716), 'EPSG:4326', 'EPSG:2154') p)",
+            &[],
+        )
+        .unwrap();
+        assert!((get_f64(&out, 0) - 652_242.70).abs() < 1.0, "{}", get_f64(&out, 0));
+        assert!((get_f64(&out, 1) - 6_862_939.61).abs() < 1.0, "{}", get_f64(&out, 1));
+
+        // Unknown code fails loudly rather than silently passing through.
+        assert!(run_query(
+            "select st_transform(st_point(0, 0), 'EPSG:999999', 'EPSG:4326')",
+            &[],
+        )
+        .is_err());
+    }
+
     /// Pushed-down spatial filters must return row-identical results to the
     /// same predicate evaluated without pruning (defeated via an OR the
     /// extractor doesn't handle), and fewer than all rows.

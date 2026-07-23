@@ -104,6 +104,38 @@ pub struct SqlConsole {
     export_n: u64,
     ac_query: AcState,
     ac_where: AcState,
+    /// Executed free-form queries, most recent first. Persisted in the
+    /// settings sidecar; navigated with Ctrl+Up / Ctrl+Down.
+    history: Vec<String>,
+    /// Current position while browsing history (None = editing draft).
+    hist_pos: Option<usize>,
+    /// The in-progress query stashed while browsing history.
+    hist_draft: String,
+}
+
+const HISTORY_CAP: usize = 50;
+
+fn load_history() -> Vec<String> {
+    let read = || -> Option<Vec<String>> {
+        let txt = std::fs::read_to_string(crate::app::settings_path()?).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
+        serde_json::from_value(v.get("sql_history")?.clone()).ok()
+    };
+    read().unwrap_or_default()
+}
+
+fn save_history(history: &[String]) {
+    let Some(p) = crate::app::settings_path() else { return };
+    let mut root = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    root["sql_history"] = serde_json::json!(history);
+    if let Ok(txt) = serde_json::to_string_pretty(&root)
+        && let Err(e) = std::fs::write(&p, txt)
+    {
+        log::warn!("could not save {}: {e}", p.display());
+    }
 }
 
 impl SqlConsole {
@@ -135,7 +167,23 @@ impl SqlConsole {
             export_n: 0,
             ac_query: AcState::default(),
             ac_where: AcState::default(),
+            history: load_history(),
+            hist_pos: None,
+            hist_draft: String::new(),
         }
+    }
+
+    /// Record an executed query: dedupe, most recent first, capped.
+    fn push_history(&mut self, sql: &str) {
+        let sql = sql.trim();
+        if sql.is_empty() {
+            return;
+        }
+        self.history.retain(|h| h != sql);
+        self.history.insert(0, sql.to_string());
+        self.history.truncate(HISTORY_CAP);
+        self.hist_pos = None;
+        save_history(&self.history);
     }
 
     pub fn is_running(&self) -> bool {
@@ -622,19 +670,89 @@ impl SqlConsole {
             },
         );
 
-        let run_clicked = ui
-            .add_enabled(
-                self.running.is_none() && !self.query.trim().is_empty(),
-                egui::Button::new("▶ Run"),
+        // History: Ctrl+Up / Ctrl+Down step through past queries; the
+        // in-progress draft is stashed and restored when stepping back.
+        let (older, newer) = ui.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowUp),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::ArrowDown),
             )
-            .on_hover_text("Ctrl+Enter")
-            .clicked();
-        let hotkey = ui
-            .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
-        if (run_clicked || hotkey) && self.running.is_none() && !self.query.trim().is_empty() {
-            let sql = self.query.clone();
-            self.run(ui.ctx().clone(), layers, sql);
+        });
+        if older && !self.history.is_empty() {
+            let next = match self.hist_pos {
+                None => {
+                    self.hist_draft = self.query.clone();
+                    0
+                }
+                Some(p) => (p + 1).min(self.history.len() - 1),
+            };
+            self.hist_pos = Some(next);
+            self.query = self.history[next].clone();
         }
+        if newer {
+            match self.hist_pos {
+                Some(0) => {
+                    self.hist_pos = None;
+                    self.query = std::mem::take(&mut self.hist_draft);
+                }
+                Some(p) => {
+                    self.hist_pos = Some(p - 1);
+                    self.query = self.history[p - 1].clone();
+                }
+                None => {}
+            }
+        }
+
+        ui.horizontal(|ui| {
+            let run_clicked = ui
+                .add_enabled(
+                    self.running.is_none() && !self.query.trim().is_empty(),
+                    egui::Button::new("▶ Run"),
+                )
+                .on_hover_text("Ctrl+Enter")
+                .clicked();
+            let hotkey = ui
+                .input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
+            if (run_clicked || hotkey) && self.running.is_none() && !self.query.trim().is_empty()
+            {
+                let sql = self.query.clone();
+                self.push_history(&sql);
+                self.run(ui.ctx().clone(), layers, sql);
+            }
+
+            if !self.history.is_empty() {
+                ui.menu_button(
+                    format!("{} History", egui_phosphor::regular::CLOCK_COUNTER_CLOCKWISE),
+                    |ui| {
+                        ui.set_max_width(420.0);
+                        let mut pick: Option<String> = None;
+                        for h in &self.history {
+                            let label = h.replace(['\n', '\t'], " ");
+                            let label = if label.chars().count() > 70 {
+                                let cut: String = label.chars().take(70).collect();
+                                format!("{cut}…")
+                            } else {
+                                label
+                            };
+                            if ui
+                                .button(RichText::new(label).monospace().small())
+                                .on_hover_text(h)
+                                .clicked()
+                            {
+                                pick = Some(h.clone());
+                                ui.close();
+                            }
+                        }
+                        if let Some(h) = pick {
+                            self.hist_pos = None;
+                            self.query = h;
+                        }
+                    },
+                )
+                .response
+                .on_hover_text("Recent queries (Ctrl+Up / Ctrl+Down)");
+            }
+        });
     }
 
     fn sql_layers(layers: &[VectorLayer]) -> Vec<SqlLayer> {

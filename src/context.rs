@@ -62,6 +62,11 @@ pub enum SourceCtx {
         url: String,
         name: String,
     },
+    /// A fixed set of remote parts loaded as one layer.
+    Multi {
+        name: String,
+        urls: Vec<String>,
+    },
 }
 
 impl SourceCtx {
@@ -88,6 +93,10 @@ impl SourceCtx {
                 url: url.clone(),
                 name: name.clone(),
             },
+            Source::Multi { name, urls } => SourceCtx::Multi {
+                name: name.clone(),
+                urls: urls.clone(),
+            },
         }
     }
 
@@ -109,6 +118,7 @@ impl SourceCtx {
                 len: 0,
             },
             SourceCtx::Stac { url, name } => Source::Stac { url, name },
+            SourceCtx::Multi { name, urls } => Source::Multi { name, urls },
         }
     }
 }

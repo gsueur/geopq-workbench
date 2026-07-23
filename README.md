@@ -35,14 +35,17 @@ so it doubles as a hands-on guide to GeoParquet best practices.
   WKB, 1.1 GeoArrow, or 2.0 native, with optional H3 / admin-boundary
   columns and partitioned output.
 - **Remote-native**: open `https://` and `s3://` files in place over
-  range requests. A 304 MB file opens in ~1.3 s; only the row groups
-  under your viewport are downloaded.
+  range requests — or a whole `s3://bucket/prefix/` of hive-partitioned
+  parts as one layer. A 304 MB file opens in ~1.3 s; only the row
+  groups under your viewport are downloaded.
 - **Catalog browser**: Overture Maps and Geomermaids Parquetry are
   preconfigured; check the layers you want and they load straight onto
   the map.
-- **SQL console**: DataFusion with 19 spatial functions over every
-  loaded layer, local or remote, with spatial predicate pushdown.
-  Results can be highlighted on the map or exported as new layers.
+- **SQL console**: DataFusion with 24 spatial functions (including
+  `st_transform` reprojection) over every loaded layer, local or
+  remote, with spatial predicate pushdown and persistent query
+  history. Results can be highlighted on the map or exported as new
+  layers.
 - **Cartography that defaults well**: automatic equal-area projection
   choice per dataset, ~30 official national grids, data-driven styling
   with Viridis/Turbo ramps, Jenks/quantile classification, basemaps.
@@ -141,8 +144,9 @@ geopq-workbench file.parquet dataset_dir/ https://host/data.parquet
 | Multi-file / hive-partitioned dataset | File → Open folder… — the directory loads as a single layer; `key=value` path segments become queryable columns |
 | HTTPS | File → Open URL… — needs range-request support on the server |
 | S3 (`s3://bucket/key`) | File → Open URL… — profiles from `~/.aws`, custom endpoints (MinIO etc.), anonymous access to public buckets |
-| Catalogs (Overture Maps, Parquetry, your own) | File → Repositories… — browse snapshots, check layers, they load with sensible names and stacking order |
-| GeoPackage / Shapefile / GeoJSON | File → Import vector file… — pure-Rust conversion to GeoParquet (no GDAL), then opens normally |
+| S3 hive dataset (`s3://bucket/prefix/` or a `*` glob) | File → Open URL… — every matching parquet part loads as one layer (`s3://bucket/d/state=*/roads.parquet` picks one theme across partitions); `key=value` path segments become queryable columns |
+| Catalogs (Overture Maps, Parquetry, your own) | File → Repositories… — browse snapshots, check layers, they load with sensible names and stacking order. Parquetry repos can load a theme across every state of a country as one layer, with `country`/`state` as columns |
+| GeoPackage / Shapefile / GeoJSON | drag & drop or File → Import vector file… — pure-Rust conversion to GeoParquet (no GDAL), then opens normally |
 | Sample data | File → Open sample dataset |
 
 Format-wise, anything in the GeoParquet family works: 1.0, 1.1 with WKB
@@ -265,11 +269,13 @@ the real rows for your viewport in the background.
 
 ## Querying with SQL
 
-The SQL console (toolbar → SQL) runs DataFusion with 19 `ST_*` spatial
+The SQL console (toolbar → SQL) runs DataFusion with 24 `ST_*` spatial
 functions (measures, predicates, constructors, buffer / simplify /
-convex hull / centroid, WKT in/out) over every loaded layer — local,
-HTTPS and S3 alike. Two modes, TablePlus-style: **Browse** (pick a
-table, type a WHERE clause) and **Query** (free-form SQL, Ctrl+Enter).
+convex hull / centroid, WKT in/out, `st_transform` reprojection) over
+every loaded layer — local, HTTPS and S3 alike. Two modes,
+TablePlus-style: **Browse** (pick a table, type a WHERE clause) and
+**Query** (free-form SQL, Ctrl+Enter, with a persistent query history
+on Ctrl+Up / Ctrl+Down).
 
 ```sql
 select name, st_area(geometry) as m2
@@ -323,11 +329,10 @@ quality gate and display policy).
 ## Roadmap
 
 - Overview/pyramid levels for zoomed-out views of huge remote files
-- Remote hive datasets (prefix listing over `s3://` / `https://`)
+- Remote hive datasets over `https://` (the `s3://` side shipped in 0.3.2)
 - Streaming optimize beyond the 8 GB in-memory cap; multi-file optimize
 - Lazy part-append while panning across STAC collections
-- More SQL: `st_transform`, polygon set operations, spatial aggregates,
-  query history
+- More SQL: polygon set operations, spatial aggregates
 - Zoom-dependent level of detail for very dense layers; label rendering
 - Basemap tiles warped to non-Mercator projections
 

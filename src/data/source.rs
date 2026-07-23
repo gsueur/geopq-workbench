@@ -64,6 +64,11 @@ pub enum Source {
     /// viewport; the store reads through per-part `Remote` sources, so
     /// `open()` is never valid on this (like `Dir`).
     Stac { url: String, name: String },
+    /// A fixed set of same-schema remote parquet parts opened as one
+    /// layer (repository "all states" loads). Hive `key=value` URL path
+    /// segments become partition columns; parts resolve at open, so
+    /// `open()` is never valid on this (like `Dir` and `Stac`).
+    Multi { name: String, urls: Vec<String> },
 }
 
 impl Source {
@@ -78,9 +83,27 @@ impl Source {
         .resolve()
     }
 
+    /// An `s3://` URI naming a dataset rather than one object: a
+    /// trailing slash (prefix), a bucket with no key, or a `*` glob
+    /// pattern (`s3://bucket/d/state=*/roads.parquet`). Opened by
+    /// listing.
+    pub fn is_s3_prefix(&self) -> bool {
+        match self {
+            Source::S3 { uri, .. } => {
+                let rest = uri.strip_prefix("s3://").unwrap_or(uri);
+                uri.ends_with('/') || !rest.contains('/') || rest.contains('*')
+            }
+            _ => false,
+        }
+    }
+
     /// Resolve credentials/length as needed (no-op when already resolved).
     /// Network + credential-file reads — run off the UI thread.
     pub fn resolve(self) -> Result<Source, String> {
+        if self.is_s3_prefix() {
+            // Prefix datasets resolve per part at open, not here.
+            return Ok(self);
+        }
         match self {
             Source::Remote { url, len: 0 } => {
                 let len = remote_len(&url)?;
@@ -120,6 +143,7 @@ impl Source {
             Source::Remote { url, .. } => url.clone(),
             Source::S3 { uri, .. } => uri.clone(),
             Source::Stac { url, .. } => url.clone(),
+            Source::Multi { name, urls } => format!("{name} ({} parts)", urls.len()),
         }
     }
 
@@ -135,24 +159,29 @@ impl Source {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "dataset".into()),
             Source::Remote { url, .. } | Source::S3 { uri: url, .. } => url
+                .trim_end_matches('/')
                 .split('/')
                 .next_back()
                 .filter(|s| !s.is_empty())
                 .map(|s| s.trim_end_matches(".parquet").to_string())
                 .unwrap_or_else(|| "remote".into()),
-            Source::Stac { name, .. } => name.clone(),
+            Source::Stac { name, .. } | Source::Multi { name, .. } => name.clone(),
         }
     }
 
     pub fn size(&self) -> u64 {
         match self {
             Source::Local(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
-            Source::Dir(_) | Source::Stac { .. } => 0, // aggregated per fragment
+            // Aggregated per fragment.
+            Source::Dir(_) | Source::Stac { .. } | Source::Multi { .. } => 0,
             Source::Remote { len, .. } | Source::S3 { len, .. } => *len,
         }
     }
 
     pub fn open(&self) -> Result<SourceReader, String> {
+        if self.is_s3_prefix() {
+            return Err(format!("{} is an S3 prefix, not a file", self.label()));
+        }
         match self {
             Source::Dir(p) => Err(format!(
                 "{} is a dataset directory, not a file",
@@ -160,6 +189,9 @@ impl Source {
             )),
             Source::Stac { url, .. } => {
                 Err(format!("{url} is a STAC collection, not a file"))
+            }
+            Source::Multi { name, .. } => {
+                Err(format!("{name} is a multi-part dataset, not a file"))
             }
             Source::Local(p) => {
                 let f = File::open(p).map_err(|e| format!("cannot open file: {e}"))?;
@@ -371,6 +403,38 @@ pub mod aws {
         out
     }
 
+    /// Custom endpoints (MinIO, Wasabi, ...): explicit field first, then
+    /// env, then the profile's `endpoint_url` (AWS CLI v2 convention).
+    fn resolve_endpoint(profile: Option<&str>, endpoint: Option<&str>) -> Option<String> {
+        let normalize = |e: &str| -> String {
+            let e = e.trim().trim_end_matches('/');
+            if e.starts_with("http://") || e.starts_with("https://") {
+                e.to_string()
+            } else {
+                format!("https://{e}")
+            }
+        };
+        endpoint
+            .filter(|e| !e.trim().is_empty())
+            .map(normalize)
+            .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok().map(|e| normalize(&e)))
+            .or_else(|| {
+                let name = profile
+                    .map(str::to_string)
+                    .or_else(|| std::env::var("AWS_PROFILE").ok())
+                    .unwrap_or_else(|| "default".into());
+                let config = ini(&config_file());
+                let creds_file = ini(&credentials_file());
+                config
+                    .get(&name)
+                    .and_then(|s| s.get("endpoint_url").cloned())
+                    .or_else(|| {
+                        creds_file.get(&name).and_then(|s| s.get("endpoint_url").cloned())
+                    })
+                    .map(|e| normalize(&e))
+            })
+    }
+
     /// Turn `s3://bucket/key` into a GET URL: presigned when credentials
     /// exist, plain URL for anonymous/public access. Endpoint priority:
     /// explicit `endpoint` (UI field) > `AWS_ENDPOINT_URL` > the profile's
@@ -395,35 +459,7 @@ pub mod aws {
                 profile.unwrap()
             ));
         }
-        // Custom endpoints (MinIO, Wasabi, ...): explicit field first,
-        // then env, then the profile's endpoint_url (AWS CLI v2 convention).
-        let normalize = |e: &str| -> String {
-            let e = e.trim().trim_end_matches('/');
-            if e.starts_with("http://") || e.starts_with("https://") {
-                e.to_string()
-            } else {
-                format!("https://{e}")
-            }
-        };
-        let endpoint_env = endpoint
-            .filter(|e| !e.trim().is_empty())
-            .map(normalize)
-            .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok().map(|e| normalize(&e)))
-            .or_else(|| {
-            let name = profile
-                .map(str::to_string)
-                .or_else(|| std::env::var("AWS_PROFILE").ok())
-                .unwrap_or_else(|| "default".into());
-            let config = ini(&config_file());
-            let creds_file = ini(&credentials_file());
-                config
-                    .get(&name)
-                    .and_then(|s| s.get("endpoint_url").cloned())
-                    .or_else(|| {
-                        creds_file.get(&name).and_then(|s| s.get("endpoint_url").cloned())
-                    })
-                    .map(|e| normalize(&e))
-            });
+        let endpoint_env = resolve_endpoint(profile, endpoint);
         let region = region(profile, bucket, endpoint_env.is_some());
         let (endpoint, style) = match &endpoint_env {
             Some(e) => (e.clone(), rusty_s3::UrlStyle::Path),
@@ -464,6 +500,112 @@ pub mod aws {
                 Ok(b.get_object(Some(&rc), key).sign(expiry).to_string())
             }
         }
+    }
+
+    /// Percent-decode a ListObjectsV2 key (`encoding-type=url` responses).
+    fn percent_decode(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%'
+                && i + 2 < bytes.len()
+                && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+            {
+                out.push(v);
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// List every object under an `s3://bucket/prefix` (paginated
+    /// ListObjectsV2; anonymous or signed like `presign`). Returns
+    /// `(key, size)` pairs in listing order.
+    pub fn list_prefix(
+        uri: &str,
+        profile: Option<&str>,
+        endpoint: Option<&str>,
+    ) -> Result<Vec<(String, u64)>, String> {
+        let rest = uri
+            .strip_prefix("s3://")
+            .ok_or_else(|| format!("not an s3:// URI: {uri}"))?;
+        let (bucket_name, prefix) = match rest.split_once('/') {
+            Some((b, p)) => (b, p),
+            None => (rest, ""),
+        };
+        if bucket_name.is_empty() {
+            return Err(format!("expected s3://bucket/prefix/, got {uri}"));
+        }
+
+        let creds = credentials(profile);
+        if let Some(p) = profile
+            && creds.is_none()
+        {
+            return Err(format!("profile '{p}' has no static credentials in ~/.aws"));
+        }
+        let endpoint_env = resolve_endpoint(profile, endpoint);
+        let region = region(profile, bucket_name, endpoint_env.is_some());
+        let (endpoint_url, style) = match &endpoint_env {
+            Some(e) => (e.clone(), rusty_s3::UrlStyle::Path),
+            None => (
+                format!("https://s3.{region}.amazonaws.com"),
+                rusty_s3::UrlStyle::VirtualHost,
+            ),
+        };
+        let b = rusty_s3::Bucket::new(
+            endpoint_url.parse().map_err(|e| format!("bad S3 endpoint: {e}"))?,
+            style,
+            bucket_name.to_string(),
+            region,
+        )
+        .map_err(|e| format!("bad S3 bucket: {e}"))?;
+        let rc = creds.map(|c| match &c.token {
+            Some(t) => rusty_s3::Credentials::new_with_token(&c.key, &c.secret, t),
+            None => rusty_s3::Credentials::new(&c.key, &c.secret),
+        });
+
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            use rusty_s3::S3Action;
+            let mut action = b.list_objects_v2(rc.as_ref());
+            if !prefix.is_empty() {
+                action.with_prefix(prefix);
+            }
+            if let Some(t) = &token {
+                action.with_continuation_token(t.as_str());
+            }
+            let url = action.sign(Duration::from_secs(300)).to_string();
+            let res = super::http_agent()
+                .get(&url)
+                .header("User-Agent", super::USER_AGENT)
+                .call()
+                .map_err(|e| format!("S3 listing failed: {}", super::redact_presign(&e.to_string())))?;
+            if res.status() != 200 {
+                return Err(format!("{uri}: S3 listing returned HTTP {}", res.status()));
+            }
+            let body = res
+                .into_body()
+                .read_to_string()
+                .map_err(|e| format!("S3 listing read: {e}"))?;
+            let parsed = rusty_s3::actions::ListObjectsV2::parse_response(&body)
+                .map_err(|e| format!("S3 listing parse: {e}"))?;
+            for c in parsed.contents {
+                out.push((percent_decode(&c.key), c.size));
+            }
+            match parsed.next_continuation_token {
+                Some(t) if !t.is_empty() => token = Some(t),
+                _ => break,
+            }
+            if out.len() > 100_000 {
+                return Err(format!("{uri}: prefix lists over 100k objects"));
+            }
+        }
+        Ok(out)
     }
 
     #[cfg(test)]
@@ -509,6 +651,47 @@ pub mod aws {
         fn s3_uri_validation() {
             assert!(super::presign("s3://bucket-only", None, None).is_err());
             assert!(super::presign("http://x/y", None, None).is_err());
+        }
+
+        #[test]
+        fn percent_decode_listing_keys() {
+            assert_eq!(super::percent_decode("a/b%20c%2Bd.parquet"), "a/b c+d.parquet");
+            assert_eq!(super::percent_decode("plain/key.parquet"), "plain/key.parquet");
+            // Malformed escapes pass through untouched.
+            assert_eq!(super::percent_decode("bad%2"), "bad%2");
+        }
+
+        #[test]
+        fn listing_xml_parses() {
+            let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>b</Name><Prefix>d/</Prefix><KeyCount>2</KeyCount><MaxKeys>1000</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+  <Contents><Key>d/state%3DMA/part-0.parquet</Key><LastModified>2026-01-01T00:00:00Z</LastModified><ETag>&quot;x&quot;</ETag><Size>123</Size></Contents>
+  <Contents><Key>d/state%3DNH/part-0.parquet</Key><LastModified>2026-01-01T00:00:00Z</LastModified><ETag>&quot;y&quot;</ETag><Size>456</Size></Contents>
+</ListBucketResult>"#;
+            let r = rusty_s3::actions::ListObjectsV2::parse_response(xml).unwrap();
+            assert_eq!(r.contents.len(), 2);
+            assert_eq!(super::percent_decode(&r.contents[0].key), "d/state=MA/part-0.parquet");
+            assert_eq!(r.contents[1].size, 456);
+            assert!(r.next_continuation_token.is_none());
+        }
+
+        /// Live anonymous listing against the public Overture bucket.
+        /// Network — run explicitly with `cargo test -- --ignored`. The
+        /// bucket only retains recent releases, so the date needs an
+        /// occasional bump when this starts returning nothing.
+        #[test]
+        #[ignore = "network"]
+        fn live_anonymous_prefix_listing() {
+            let keys = super::list_prefix(
+                "s3://overturemaps-us-west-2/release/2026-06-17.0/theme=divisions/type=division_area/",
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(!keys.is_empty());
+            assert!(keys.iter().all(|(k, _)| k.contains("type=division_area")));
         }
 
         #[test]

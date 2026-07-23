@@ -1233,6 +1233,12 @@ fn open_store_with_view(
     if let Source::Dir(dir) = source {
         return open_dir_store(source, dir);
     }
+    if source.is_s3_prefix() {
+        return open_s3_prefix_store(source);
+    }
+    if let Source::Multi { urls, .. } = source {
+        return open_multi_remote_store(source, urls);
+    }
     if let Source::Stac { url, .. } = source {
         return open_stac_store(source, url, stac_rect);
     }
@@ -1325,6 +1331,203 @@ fn open_dir_store(source: &Source, dir: &std::path::Path) -> Result<StoreOpen, S
 /// must zoom in rather than stream half a terabyte of metadata.
 pub const STAC_PART_CAP: usize = 16;
 
+/// Open a fixed set of remote parquet parts (repository "all states"
+/// loads) as one multi-fragment layer. Hive `key=value` URL path
+/// segments become partition columns. Parts whose probe fails are
+/// dropped with a warning — a theme absent from one region (404) must
+/// not sink the other 50 — but schema mismatches among the surviving
+/// parts still fail the open loudly.
+fn open_multi_remote_store(source: &Source, urls: &[String]) -> Result<StoreOpen, String> {
+    use super::store::hive_segments;
+
+    if urls.len() > PREFIX_PART_CAP {
+        return Err(format!(
+            "{} part files (cap {PREFIX_PART_CAP} per load)",
+            urls.len()
+        ));
+    }
+    // URL path portion, for hive segments and short labels.
+    let url_path = |u: &str| -> String {
+        let rest = u.split_once("://").map(|(_, r)| r).unwrap_or(u);
+        rest.split_once('/').map(|(_, p)| p.to_string()).unwrap_or_default()
+    };
+    let resolved: Vec<(String, Result<Source, String>)> = {
+        use rayon::prelude::*;
+        urls.par_iter()
+            .map(|u| (u.clone(), Source::Remote { url: u.clone(), len: 0 }.resolve()))
+            .collect()
+    };
+    let mut files = Vec::new();
+    let mut hive = Vec::new();
+    let mut dropped = 0usize;
+    for (u, r) in resolved {
+        let path = url_path(&u);
+        let short = path
+            .split('/')
+            .rev()
+            .take(2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("/");
+        match r {
+            Ok(src) => {
+                hive.push(hive_segments(std::path::Path::new(&path)));
+                files.push((src, short));
+            }
+            Err(e) => {
+                dropped += 1;
+                log::warn!("{u}: {e} (part skipped)");
+            }
+        }
+    }
+    if files.is_empty() {
+        return Err(format!(
+            "none of the {} parts could be opened (see log)",
+            urls.len()
+        ));
+    }
+    if dropped > 0 {
+        log::info!(
+            "{}: {dropped} of {} parts unavailable, loading {}",
+            source.label(),
+            urls.len(),
+            files.len()
+        );
+    }
+    open_multi_store(source, files, hive)
+}
+
+/// Cap on part files an S3 prefix dataset opens. Higher than the STAC
+/// cap: hive layouts legitimately fan out (50 US states and then some),
+/// footers open in parallel, and prefixes/globs are how users narrow
+/// further — but still bounded: every part costs a footer round-trip.
+pub const PREFIX_PART_CAP: usize = 64;
+
+/// Match one path segment against a `*` glob (no `/` crossing).
+fn seg_match(pat: &str, s: &str) -> bool {
+    let (pb, sb) = (pat.as_bytes(), s.as_bytes());
+    let (mut pi, mut si) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while si < sb.len() {
+        if pi < pb.len() && (pb[pi] == sb[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < pb.len() && pb[pi] == b'*' {
+            star = Some(pi);
+            mark = si;
+            pi += 1;
+        } else if let Some(st) = star {
+            pi = st + 1;
+            mark += 1;
+            si = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < pb.len() && pb[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pb.len()
+}
+
+/// Match a full key against a glob pattern, segment by segment: `*`
+/// matches within one path segment, never across `/`.
+fn glob_match(pat: &str, key: &str) -> bool {
+    let ps: Vec<&str> = pat.split('/').collect();
+    let ks: Vec<&str> = key.split('/').collect();
+    ps.len() == ks.len() && ps.iter().zip(&ks).all(|(p, k)| seg_match(p, k))
+}
+
+/// Open `s3://bucket/prefix/` (or a `*` glob like
+/// `s3://bucket/d/state=*/roads.parquet`) as one multi-fragment remote
+/// dataset: list the objects under the literal prefix, keep the
+/// matching parquet parts, and turn hive `key=value` path segments
+/// into virtual partition columns — the remote twin of
+/// `open_dir_store`.
+fn open_s3_prefix_store(source: &Source) -> Result<StoreOpen, String> {
+    use super::store::hive_segments;
+
+    let Source::S3 { uri, profile, endpoint, .. } = source else {
+        return Err("not an S3 prefix".into());
+    };
+    let rest = uri.strip_prefix("s3://").unwrap_or(uri);
+    let (bucket, keypat) = rest.split_once('/').unwrap_or((rest, ""));
+    // With a glob, list the literal prefix before the first `*` (cut
+    // at the last `/` so the listing prefix is a whole path).
+    let (prefix, glob) = match keypat.find('*') {
+        Some(star) => {
+            let lit = &keypat[..star];
+            let cut = lit.rfind('/').map(|i| i + 1).unwrap_or(0);
+            (&keypat[..cut], Some(keypat))
+        }
+        None => (keypat, None),
+    };
+    let list_uri = format!("s3://{bucket}/{prefix}");
+    let listed = crate::data::source::aws::list_prefix(
+        &list_uri,
+        profile.as_deref(),
+        endpoint.as_deref(),
+    )?;
+    let keys: Vec<&str> = listed
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .filter(|k| {
+            let rel = k.strip_prefix(prefix).unwrap_or(k);
+            matches!(
+                std::path::Path::new(k).extension().and_then(|e| e.to_str()),
+                Some("parquet" | "geoparquet" | "pq")
+            ) && !rel
+                .split('/')
+                .any(|seg| seg.starts_with('.') || seg.starts_with('_'))
+                && glob.is_none_or(|g| glob_match(g, k))
+        })
+        .collect();
+    if keys.is_empty() {
+        return Err(match glob {
+            Some(g) => format!("no .parquet objects matching s3://{bucket}/{g}"),
+            None => format!("no .parquet objects under {uri}"),
+        });
+    }
+    if keys.len() > PREFIX_PART_CAP {
+        return Err(format!(
+            "{} parquet files under {uri} (cap {PREFIX_PART_CAP} per load) — \
+             open a deeper prefix (e.g. one hive partition)",
+            keys.len()
+        ));
+    }
+
+    let hive: Vec<Vec<(String, Option<String>)>> = keys
+        .iter()
+        .map(|k| {
+            let rel = k.strip_prefix(prefix).unwrap_or(k);
+            hive_segments(std::path::Path::new(rel))
+        })
+        .collect();
+    // Resolve (presign + length probe) every part in parallel.
+    let files: Vec<(Source, String)> = {
+        use rayon::prelude::*;
+        keys.par_iter()
+            .map(|k| {
+                let short = k.strip_prefix(prefix).unwrap_or(k).to_string();
+                Source::S3 {
+                    uri: format!("s3://{bucket}/{k}"),
+                    profile: profile.clone(),
+                    endpoint: endpoint.clone(),
+                    url: String::new(),
+                    len: 0,
+                }
+                .resolve()
+                .map(|src| (src, short.clone()))
+                .map_err(|e| format!("{short}: {e}"))
+            })
+            .collect::<Result<_, _>>()?
+    };
+    log::info!("{uri}: opening {} part files", files.len());
+    open_multi_store(source, files, hive)
+}
+
 /// Open a STAC type collection as one multi-fragment remote store: fetch
 /// the item list, keep the parts whose bbox intersects the viewport, cap.
 fn open_stac_store(
@@ -1358,19 +1561,24 @@ fn open_stac_store(
             keep.len()
         );
     }
-    let mut files = Vec::with_capacity(keep.len());
-    for p in keep {
-        let short = p
-            .url
-            .rsplit('/')
-            .next()
-            .unwrap_or(p.url.as_str())
-            .to_string();
-        let src = Source::Remote { url: p.url, len: 0 }
-            .resolve()
-            .map_err(|e| format!("{short}: {e}"))?;
-        files.push((src, short));
-    }
+    // Resolve (length probe) every part in parallel.
+    let files: Vec<(Source, String)> = {
+        use rayon::prelude::*;
+        keep.into_par_iter()
+            .map(|p| {
+                let short = p
+                    .url
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(p.url.as_str())
+                    .to_string();
+                Source::Remote { url: p.url, len: 0 }
+                    .resolve()
+                    .map(|src| (src, short.clone()))
+                    .map_err(|e| format!("{short}: {e}"))
+            })
+            .collect::<Result<_, _>>()?
+    };
     let hive = vec![Vec::new(); files.len()];
     open_multi_store(source, files, hive)
 }
@@ -1396,11 +1604,20 @@ fn open_multi_store(
         }
     }
 
-    let first =
-        open_file(&files[0].0).map_err(|e| format!("{}: {e}", files[0].1))?;
+    // Open every part's footer in parallel: remote parts spend their
+    // time in network round-trips (a HEAD probe plus footer ranges
+    // each), so this is the wall-clock win for prefix/STAC datasets.
+    // The merge below stays sequential and order-stable.
+    let opened: Vec<FileOpen> = {
+        use rayon::prelude::*;
+        files
+            .par_iter()
+            .map(|(src, short)| open_file(src).map_err(|e| format!("{short}: {e}")))
+            .collect::<Result<_, _>>()?
+    };
     // A hive key shadowed by a real column stays path-only.
     part_cols.retain(|k| {
-        !first
+        !opened[0]
             .schema
             .fields()
             .iter()
@@ -1410,24 +1627,15 @@ fn open_multi_store(
     let mut frags: Vec<(Fragment, Vec<u64>)> = Vec::with_capacity(files.len());
     let mut boxes: Option<Vec<[f64; 4]>> = Some(Vec::new());
     let mut box_source: Option<String> = None;
-    let mut info = first.info.clone();
+    let mut info = opened[0].info.clone();
     info.files = files.len();
     let mut total_rows = 0u64;
     let mut page_index = true;
     let mut geom_bytes = 0u64;
 
-    for (i, (src, short)) in files.iter().enumerate() {
-        let f = if i == 0 {
-            // Reuse the already parsed first file (moved below).
-            None
-        } else {
-            Some(open_file(src).map_err(|e| format!("{short}: {e}"))?)
-        };
-        let f = match &f {
-            Some(f) => f,
-            None => &first,
-        };
+    for (i, ((src, short), f)) in files.iter().zip(&opened).enumerate() {
         if i > 0 {
+            let first = &opened[0];
             schema_compatible(&first.schema, &f.schema)
                 .map_err(|e| format!("{short}: {e}"))?;
             if !f.crs.same_as(&first.crs) {
@@ -1499,6 +1707,10 @@ fn open_multi_store(
             u32::MAX - 1
         ));
     }
+    let first = opened
+        .into_iter()
+        .next()
+        .expect("multi store has at least one file");
     for k in &part_cols {
         info.columns.push(ColumnInfo {
             name: k.clone(),
@@ -3939,6 +4151,218 @@ mod hive_tests {
         assert_eq!(check("C2"), Status::Fail);
         assert_eq!(check("C4"), Status::Warn, "WKB encoding is advisory only");
         assert!(q.geom_bytes > 0, "geometry decode-size proxy measured");
+    }
+
+    /// A repository "all states" load: fixed remote part set, hive
+    /// columns from the URL paths, missing parts (404) dropped.
+    #[test]
+    fn multi_remote_all_states_load() {
+        let root = std::env::temp_dir().join("geopq_multi_remote");
+        let _ = std::fs::remove_dir_all(&root);
+        write_part(&root.join("country=US/state=east/aeroways.parquet"), 300, 0, 10.0, 45.0);
+        write_part(&root.join("country=US/state=west/aeroways.parquet"), 200, 300, -10.0, 45.0);
+        let base = crate::data::source::testserver::spawn_dir(root.clone());
+
+        let src = Source::Multi {
+            name: "US aeroways (all)".into(),
+            urls: vec![
+                format!("{base}/country=US/state=east/aeroways.parquet"),
+                format!("{base}/country=US/state=west/aeroways.parquet"),
+                // A state without the theme: 404 must be skipped, not fatal.
+                format!("{base}/country=US/state=mid/aeroways.parquet"),
+            ],
+        };
+        let (store, crs, info, _rg_meta) = open_store(&src).unwrap();
+        assert!(crs.is_latlong);
+        assert_eq!(store.fragments.len(), 2, "missing part dropped");
+        assert_eq!(store.total_rows(), 500);
+        assert_eq!(store.part_cols, vec!["country".to_string(), "state".to_string()]);
+        assert_eq!(info.files, 2);
+    }
+
+    #[test]
+    fn glob_matches_segment_wise() {
+        assert!(glob_match("d/state=*/roads.parquet", "d/state=MA/roads.parquet"));
+        assert!(glob_match("d/*/*/aeroways.parquet", "d/country=CA/state=BC/aeroways.parquet"));
+        assert!(glob_match("d/part-*.parquet", "d/part-00001-abc.parquet"));
+        // `*` never crosses a `/`.
+        assert!(!glob_match("d/*/roads.parquet", "d/a/b/roads.parquet"));
+        assert!(!glob_match("d/state=*/roads.parquet", "d/state=MA/rails.parquet"));
+        // Multiple stars in one segment backtrack correctly.
+        assert!(glob_match("*-x-*.parquet", "part-x-1.parquet"));
+        assert!(!glob_match("*-x-*.parquet", "part-y-1.parquet"));
+    }
+
+    /// End-to-end S3 prefix open against a fake S3 endpoint: listing XML
+    /// (URL-encoded keys, sidecar noise), per-part HEAD probes, ranged
+    /// GETs, hive partition columns from the key paths.
+    #[test]
+    fn s3_prefix_opens_as_hive_dataset() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let root = std::env::temp_dir().join("geopq_s3_prefix_open");
+        let _ = std::fs::remove_dir_all(&root);
+        write_part(&root.join("state=east/part-0.parquet"), 300, 0, 10.0, 45.0);
+        write_part(&root.join("state=west/part-0.parquet"), 200, 300, -10.0, 45.0);
+
+        let listing = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>bucket</Name><Prefix>data/</Prefix><KeyCount>4</KeyCount><MaxKeys>1000</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+  <Contents><Key>data/_manifest.json</Key><LastModified>2026-01-01T00:00:00Z</LastModified><ETag>"a"</ETag><Size>10</Size></Contents>
+  <Contents><Key>data/_tmp/part-9.parquet</Key><LastModified>2026-01-01T00:00:00Z</LastModified><ETag>"b"</ETag><Size>10</Size></Contents>
+  <Contents><Key>data/state%3Deast/part-0.parquet</Key><LastModified>2026-01-01T00:00:00Z</LastModified><ETag>"c"</ETag><Size>1</Size></Contents>
+  <Contents><Key>data/state%3Dwest/part-0.parquet</Key><LastModified>2026-01-01T00:00:00Z</LastModified><ETag>"d"</ETag><Size>1</Size></Contents>
+</ListBucketResult>"#;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let (root_srv, listing_srv) = (root.clone(), listing.to_string());
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { continue };
+                let (root, listing) = (root_srv.clone(), listing_srv.clone());
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut b = [0u8; 1];
+                    while !buf.ends_with(b"\r\n\r\n") && buf.len() < 8192 {
+                        match conn.read(&mut b) {
+                            Ok(1) => buf.push(b[0]),
+                            _ => return,
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&buf);
+                    let line1 = text.lines().next().unwrap_or_default().to_string();
+                    let target = line1.split_whitespace().nth(1).unwrap_or_default();
+                    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+                    // Percent-decode the request path.
+                    let mut decoded = Vec::new();
+                    let pb = path.as_bytes();
+                    let mut i = 0;
+                    while i < pb.len() {
+                        if pb[i] == b'%' && i + 2 < pb.len() {
+                            decoded.push(
+                                u8::from_str_radix(&path[i + 1..i + 3], 16).unwrap_or(b'%'),
+                            );
+                            i += 3;
+                        } else {
+                            decoded.push(pb[i]);
+                            i += 1;
+                        }
+                    }
+                    let path = String::from_utf8_lossy(&decoded).into_owned();
+                    if query.contains("list-type=2") {
+                        let _ = write!(
+                            conn,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{listing}",
+                            listing.len()
+                        );
+                        return;
+                    }
+                    let Some(rel) = path.strip_prefix("/bucket/data/") else {
+                        let _ = write!(conn, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                        return;
+                    };
+                    let file = root.join(rel);
+                    let Ok(data) = std::fs::read(&file) else {
+                        let _ = write!(conn, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                        return;
+                    };
+                    let len = data.len() as u64;
+                    if line1.starts_with("HEAD") {
+                        let _ = write!(
+                            conn,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                        );
+                        return;
+                    }
+                    let range = text
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                        .and_then(|l| l.split_once('='))
+                        .and_then(|(_, v)| v.trim().split_once('-'))
+                        .map(|(a, b)| {
+                            (
+                                a.parse::<u64>().unwrap_or(0),
+                                b.parse::<u64>().unwrap_or(len - 1).min(len - 1),
+                            )
+                        });
+                    match range {
+                        Some((s, e)) => {
+                            let body = &data[s as usize..=e as usize];
+                            let _ = write!(
+                                conn,
+                                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {s}-{e}/{len}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = conn.write_all(body);
+                        }
+                        None => {
+                            let _ = write!(
+                                conn,
+                                "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+                            );
+                            let _ = conn.write_all(&data);
+                        }
+                    }
+                });
+            }
+        });
+
+        // A glob pattern selects a single part across partitions.
+        let glob_src = Source::S3 {
+            uri: "s3://bucket/data/state=*/part-0.parquet".into(),
+            profile: None,
+            endpoint: Some(endpoint.clone()),
+            url: String::new(),
+            len: 0,
+        };
+        assert!(glob_src.is_s3_prefix());
+        let (gstore, ..) = open_store(&glob_src).unwrap();
+        assert_eq!(gstore.fragments.len(), 2);
+        assert_eq!(gstore.total_rows(), 500);
+
+        // A glob matching nothing fails with the pattern in the message.
+        let miss = Source::S3 {
+            uri: "s3://bucket/data/state=*/nope-*.parquet".into(),
+            profile: None,
+            endpoint: Some(endpoint.clone()),
+            url: String::new(),
+            len: 0,
+        };
+        let err = match open_store(&miss) {
+            Err(e) => e,
+            Ok(_) => panic!("glob matching nothing must fail"),
+        };
+        assert!(err.contains("nope-"), "{err}");
+
+        let src = Source::S3 {
+            uri: "s3://bucket/data/".into(),
+            profile: None,
+            endpoint: Some(endpoint),
+            url: String::new(),
+            len: 0,
+        };
+        assert!(src.is_s3_prefix());
+        let (store, crs, info, _rg_meta) = open_store(&src).unwrap();
+        assert!(crs.is_latlong);
+        assert_eq!(store.fragments.len(), 2, "sidecar keys filtered out");
+        assert_eq!(store.total_rows(), 500);
+        assert_eq!(store.part_cols, vec!["state".to_string()]);
+        assert_eq!(info.files, 2);
+
+        // Partition values decoded from the URL-encoded listing keys.
+        let state_idx = store.schema.index_of("state").unwrap();
+        let batches = store.fetch(&[0u32, 499], Some(&[state_idx])).unwrap();
+        let states: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                let st = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                (0..b.num_rows()).map(|i| st.value(i).to_string()).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(states, vec!["east".to_string(), "west".to_string()]);
     }
 
     #[test]
