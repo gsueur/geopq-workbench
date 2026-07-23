@@ -608,6 +608,263 @@ pub mod aws {
         Ok(out)
     }
 
+    /// Multipart part size, and the single-PUT threshold. S3's minimum
+    /// part is 5 MB; 64 MB keeps a 5 GB file under 80 parts.
+    const UPLOAD_PART_SIZE: usize = 64 * 1024 * 1024;
+
+    /// Upload one local file to `s3://bucket/key`. Requires credentials
+    /// (there is no anonymous write); endpoint resolution matches the
+    /// read path, so R2/MinIO work the same way. `progress(sent, total)`
+    /// runs after every uploaded chunk.
+    pub fn upload_file(
+        local: &Path,
+        uri: &str,
+        profile: Option<&str>,
+        endpoint: Option<&str>,
+        progress: &dyn Fn(u64, u64),
+    ) -> Result<(), String> {
+        upload_file_with(local, uri, profile, endpoint, UPLOAD_PART_SIZE, progress)
+    }
+
+    fn upload_file_with(
+        local: &Path,
+        uri: &str,
+        profile: Option<&str>,
+        endpoint: Option<&str>,
+        part_size: usize,
+        progress: &dyn Fn(u64, u64),
+    ) -> Result<(), String> {
+        let rest = uri
+            .strip_prefix("s3://")
+            .ok_or_else(|| format!("not an s3:// URI: {uri}"))?;
+        let (bucket_name, key) = rest
+            .split_once('/')
+            .filter(|(b, k)| !b.is_empty() && !k.is_empty() && !k.ends_with('/'))
+            .ok_or_else(|| format!("expected s3://bucket/key, got {uri}"))?;
+
+        let c = credentials(profile).ok_or_else(|| {
+            "uploading requires credentials: add a profile in ~/.aws \
+             (for R2, an API token with write scope)"
+                .to_string()
+        })?;
+        let rc = match &c.token {
+            Some(t) => rusty_s3::Credentials::new_with_token(&c.key, &c.secret, t),
+            None => rusty_s3::Credentials::new(&c.key, &c.secret),
+        };
+        let endpoint_env = resolve_endpoint(profile, endpoint);
+        let region = region(profile, bucket_name, endpoint_env.is_some());
+        let (endpoint_url, style) = match &endpoint_env {
+            Some(e) => (e.clone(), rusty_s3::UrlStyle::Path),
+            None => (
+                format!("https://s3.{region}.amazonaws.com"),
+                rusty_s3::UrlStyle::VirtualHost,
+            ),
+        };
+        let b = rusty_s3::Bucket::new(
+            endpoint_url.parse().map_err(|e| format!("bad S3 endpoint: {e}"))?,
+            style,
+            bucket_name.to_string(),
+            region,
+        )
+        .map_err(|e| format!("bad S3 bucket: {e}"))?;
+        upload_to_bucket(&b, &rc, key, uri, local, part_size, progress)
+    }
+
+    /// The transport half of the upload, bucket and credentials already
+    /// resolved (separated so tests can target a local fake endpoint).
+    fn upload_to_bucket(
+        b: &rusty_s3::Bucket,
+        rc: &rusty_s3::Credentials,
+        key: &str,
+        uri: &str,
+        local: &Path,
+        part_size: usize,
+        progress: &dyn Fn(u64, u64),
+    ) -> Result<(), String> {
+        use std::io::Read as _;
+
+        use rusty_s3::S3Action;
+
+        let total = std::fs::metadata(local)
+            .map_err(|e| format!("{}: {e}", local.display()))?
+            .len();
+        let mut f = std::fs::File::open(local)
+            .map_err(|e| format!("{}: {e}", local.display()))?;
+        let expiry = Duration::from_secs(3600);
+        let put = |url: String, body: &[u8]| {
+            super::http_agent()
+                .put(&url)
+                .header("User-Agent", super::USER_AGENT)
+                .send(body)
+                .map_err(|e| {
+                    format!("upload failed: {}", super::redact_presign(&e.to_string()))
+                })
+        };
+
+        if total as usize <= part_size {
+            let mut buf = Vec::with_capacity(total as usize);
+            f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+            let url = b.put_object(Some(rc), key).sign(expiry).to_string();
+            let res = put(url, &buf)?;
+            if res.status() != 200 {
+                return Err(format!("{uri}: upload returned HTTP {}", res.status()));
+            }
+            progress(total, total);
+            return Ok(());
+        }
+
+        // Multipart: create, upload parts, complete; abort on any error
+        // so half-uploads don't linger (and bill) in the bucket.
+        let url = b
+            .create_multipart_upload(Some(rc), key)
+            .sign(expiry)
+            .to_string();
+        let res = super::http_agent()
+            .post(&url)
+            .header("User-Agent", super::USER_AGENT)
+            .send(&[][..])
+            .map_err(|e| {
+                format!("multipart create: {}", super::redact_presign(&e.to_string()))
+            })?;
+        if res.status() != 200 {
+            return Err(format!(
+                "{uri}: multipart create returned HTTP {}",
+                res.status()
+            ));
+        }
+        let body = res.into_body().read_to_string().map_err(|e| e.to_string())?;
+        let created = rusty_s3::actions::CreateMultipartUpload::parse_response(&body)
+            .map_err(|e| format!("multipart create parse: {e}"))?;
+        let upload_id = created.upload_id().to_string();
+
+        let abort = |reason: String| -> String {
+            let url = b
+                .abort_multipart_upload(Some(rc), key, &upload_id)
+                .sign(expiry)
+                .to_string();
+            let _ = super::http_agent()
+                .delete(&url)
+                .header("User-Agent", super::USER_AGENT)
+                .call();
+            reason
+        };
+
+        let mut etags: Vec<String> = Vec::new();
+        let mut sent: u64 = 0;
+        let mut buf = vec![0u8; part_size];
+        for part_no in 1u16..=10_000 {
+            let mut filled = 0usize;
+            while filled < buf.len() {
+                match f.read(&mut buf[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) => return Err(abort(e.to_string())),
+                }
+            }
+            if filled == 0 {
+                break;
+            }
+            let url = b
+                .upload_part(Some(rc), key, part_no, &upload_id)
+                .sign(expiry)
+                .to_string();
+            let res = match put(url, &buf[..filled]) {
+                Ok(r) => r,
+                Err(e) => return Err(abort(e)),
+            };
+            if res.status() != 200 {
+                return Err(abort(format!("part {part_no}: HTTP {}", res.status())));
+            }
+            let Some(etag) = super::header(&res, "etag").filter(|t| !t.is_empty()) else {
+                return Err(abort(format!("part {part_no}: no ETag in response")));
+            };
+            etags.push(etag);
+            sent += filled as u64;
+            progress(sent.min(total), total);
+            if filled < buf.len() {
+                break;
+            }
+        }
+        let action = b.complete_multipart_upload(
+            Some(rc),
+            key,
+            &upload_id,
+            etags.iter().map(|s| s.as_str()),
+        );
+        let url = action.sign(expiry).to_string();
+        let xml = action.body();
+        let res = super::http_agent()
+            .post(&url)
+            .header("User-Agent", super::USER_AGENT)
+            .send(xml.as_str())
+            .map_err(|e| {
+                abort(format!(
+                    "complete: {}",
+                    super::redact_presign(&e.to_string())
+                ))
+            })?;
+        // S3 can answer Complete with 200 + an <Error> body.
+        let status = res.status();
+        let text = res.into_body().read_to_string().unwrap_or_default();
+        if status != 200 || text.contains("<Error>") {
+            return Err(abort(format!("{uri}: complete failed (HTTP {status}): {text}")));
+        }
+        Ok(())
+    }
+
+    /// Upload every file under `root` to `s3://bucket/prefix/…`,
+    /// preserving relative paths (partitioned optimize output).
+    /// `progress(sent, total, current_file)` spans the whole tree.
+    /// Returns the number of files uploaded.
+    pub fn upload_tree(
+        root: &Path,
+        uri: &str,
+        profile: Option<&str>,
+        endpoint: Option<&str>,
+        progress: &dyn Fn(u64, u64, &str),
+    ) -> Result<usize, String> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+            let mut es: Vec<_> = std::fs::read_dir(dir)
+                .map_err(|e| format!("{}: {e}", dir.display()))?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .collect();
+            es.sort();
+            for p in es {
+                if p.is_dir() {
+                    walk(&p, out)?;
+                } else {
+                    out.push(p);
+                }
+            }
+            Ok(())
+        }
+        let prefix = uri.trim_end_matches('/');
+        let mut files = Vec::new();
+        walk(root, &mut files)?;
+        if files.is_empty() {
+            return Err(format!("nothing to upload under {}", root.display()));
+        }
+        let total: u64 = files
+            .iter()
+            .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            .sum();
+        let mut done: u64 = 0;
+        for p in &files {
+            let rel = p
+                .strip_prefix(root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let dst = format!("{prefix}/{rel}");
+            upload_file(p, &dst, profile, endpoint, &|sent, _| {
+                progress(done + sent, total, &rel)
+            })?;
+            done += std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        }
+        Ok(files.len())
+    }
+
     #[cfg(test)]
     mod tests {
         #[test]
@@ -675,6 +932,140 @@ pub mod aws {
             assert_eq!(super::percent_decode(&r.contents[0].key), "d/state=MA/part-0.parquet");
             assert_eq!(r.contents[1].size, 456);
             assert!(r.next_continuation_token.is_none());
+        }
+
+        /// Fake S3 endpoint accepting PUT / multipart flows; uploads land
+        /// in a temp dir keyed by object path.
+        fn spawn_upload_server(store: std::path::PathBuf) -> String {
+            use std::io::{Read as _, Write as _};
+            use std::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(mut conn) = conn else { continue };
+                    let store = store.clone();
+                    std::thread::spawn(move || {
+                        let mut head = Vec::new();
+                        let mut b = [0u8; 1];
+                        while !head.ends_with(b"\r\n\r\n") && head.len() < 16384 {
+                            match conn.read(&mut b) {
+                                Ok(1) => head.push(b[0]),
+                                _ => return,
+                            }
+                        }
+                        let text = String::from_utf8_lossy(&head).into_owned();
+                        let line1 = text.lines().next().unwrap_or_default().to_string();
+                        let method = line1.split_whitespace().next().unwrap_or_default();
+                        let target =
+                            line1.split_whitespace().nth(1).unwrap_or_default().to_string();
+                        let (path, query) = target.split_once('?').unwrap_or((&*target, ""));
+                        let clen: usize = text
+                            .lines()
+                            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                            .and_then(|l| l.split(':').nth(1))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        let mut body = vec![0u8; clen];
+                        if clen > 0 && conn.read_exact(&mut body).is_err() {
+                            return;
+                        }
+                        let rel = super::percent_decode(path.trim_start_matches('/'));
+                        let obj = store.join(&rel);
+                        let reply = |conn: &mut std::net::TcpStream,
+                                     status: &str,
+                                     extra: &str,
+                                     body: &str| {
+                            let _ = write!(
+                                conn,
+                                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                        };
+                        match method {
+                            "POST" if query.contains("uploads") => {
+                                // Create multipart.
+                                let xml = format!(
+                                    "<InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>b</Bucket><Key>{rel}</Key><UploadId>testupload</UploadId></InitiateMultipartUploadResult>"
+                                );
+                                reply(&mut conn, "200 OK", "", &xml);
+                            }
+                            "PUT" if query.contains("partNumber=") => {
+                                let n: u32 = query
+                                    .split('&')
+                                    .find_map(|kv| kv.strip_prefix("partNumber="))
+                                    .and_then(|v| v.parse().ok())
+                                    .unwrap_or(0);
+                                let part = obj.with_extension(format!("part{n}"));
+                                std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+                                std::fs::write(&part, &body).unwrap();
+                                reply(&mut conn, "200 OK", &format!("ETag: \"p{n}\"\r\n"), "");
+                            }
+                            "POST" if query.contains("uploadId=") => {
+                                // Complete: stitch parts in order.
+                                let mut out = Vec::new();
+                                for n in 1u32.. {
+                                    let part = obj.with_extension(format!("part{n}"));
+                                    match std::fs::read(&part) {
+                                        Ok(mut d) => out.append(&mut d),
+                                        Err(_) => break,
+                                    }
+                                }
+                                std::fs::create_dir_all(obj.parent().unwrap()).unwrap();
+                                std::fs::write(&obj, &out).unwrap();
+                                reply(&mut conn, "200 OK", "", "<CompleteMultipartUploadResult/>");
+                            }
+                            "PUT" => {
+                                std::fs::create_dir_all(obj.parent().unwrap()).unwrap();
+                                std::fs::write(&obj, &body).unwrap();
+                                reply(&mut conn, "200 OK", "ETag: \"whole\"\r\n", "");
+                            }
+                            "DELETE" => reply(&mut conn, "204 No Content", "", ""),
+                            _ => reply(&mut conn, "404 Not Found", "", ""),
+                        }
+                    });
+                }
+            });
+            format!("http://127.0.0.1:{port}")
+        }
+
+        #[test]
+        fn upload_single_put_and_multipart() {
+            let store = std::env::temp_dir().join("geopq_upload_srv");
+            let _ = std::fs::remove_dir_all(&store);
+            std::fs::create_dir_all(&store).unwrap();
+            let endpoint = spawn_upload_server(store.clone());
+            let bucket = rusty_s3::Bucket::new(
+                endpoint.parse().unwrap(),
+                rusty_s3::UrlStyle::Path,
+                "bucket".to_string(),
+                "us-east-1".to_string(),
+            )
+            .unwrap();
+            let rc = rusty_s3::Credentials::new("test-key", "test-secret");
+
+            // Single PUT (fits in one part).
+            let src = store.join("src_small.bin");
+            std::fs::write(&src, vec![7u8; 10_000]).unwrap();
+            let seen = std::sync::Mutex::new((0u64, 0u64));
+            super::upload_to_bucket(&bucket, &rc, "d/state=MA/f.parquet", "s3://bucket/d/state=MA/f.parquet", &src, 1 << 20, &|s, t| {
+                *seen.lock().unwrap() = (s, t);
+            })
+            .unwrap();
+            assert_eq!(*seen.lock().unwrap(), (10_000, 10_000));
+            assert_eq!(
+                std::fs::read(store.join("bucket/d/state=MA/f.parquet")).unwrap(),
+                vec![7u8; 10_000]
+            );
+
+            // Multipart: 25 kB with 10 kB parts = 3 parts, byte-identical.
+            let src = store.join("src_big.bin");
+            let payload: Vec<u8> = (0..25_000u32).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&src, &payload).unwrap();
+            super::upload_to_bucket(&bucket, &rc, "d/big.parquet", "s3://bucket/d/big.parquet", &src, 10_000, &|_, _| {})
+                .unwrap();
+            assert_eq!(std::fs::read(store.join("bucket/d/big.parquet")).unwrap(), payload);
         }
 
         /// Live anonymous listing against the public Overture bucket.

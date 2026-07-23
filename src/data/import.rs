@@ -62,12 +62,29 @@ pub(crate) fn writer_props() -> WriterProperties {
 /// key entirely (CRS84 per spec — right for GeoJSON), `Some(Value::Null)`
 /// records an explicitly unknown CRS, anything else is written verbatim.
 pub(crate) fn geo_meta(primary: &str, stats: &GeomStats, crs: Option<Value>) -> Value {
+    geo_meta_with_proj4(primary, stats, crs, None)
+}
+
+/// `geo_meta` with an optional vendor CRS: when the source CRS has no
+/// EPSG identity but does parse to a proj4 string (ESRI .prj files),
+/// the spec `crs` stays honest (`null` = unknown) and the proj4 string
+/// rides in a `geopq:crs` extension key that this app's reader uses
+/// for correct display. Other readers ignore it.
+pub(crate) fn geo_meta_with_proj4(
+    primary: &str,
+    stats: &GeomStats,
+    crs: Option<Value>,
+    proj4: Option<(String, String)>,
+) -> Value {
     let mut col = json!({
         "encoding": "WKB",
         "geometry_types": stats.types.iter().collect::<Vec<_>>(),
     });
     if let Some(c) = crs {
         col["crs"] = c;
+    }
+    if let Some((p4, name)) = proj4 {
+        col["geopq:crs"] = json!({ "proj4": p4, "name": name });
     }
     let b = stats.bbox;
     if b[0].is_finite() && b[2].is_finite() {

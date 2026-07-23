@@ -33,7 +33,8 @@ so it doubles as a hands-on guide to GeoParquet best practices.
 - **One-click Optimize**: rewrite any layer as a best-practice
   GeoParquet (spatially sorted, indexed, zstd), in your choice of 1.1
   WKB, 1.1 GeoArrow, or 2.0 native, with optional H3 / admin-boundary
-  columns and partitioned output.
+  columns and partitioned output — saved locally or published straight
+  to S3 / R2, ready to open in place from its `s3://` URI.
 - **Remote-native**: open `https://` and `s3://` files in place over
   range requests — or a whole `s3://bucket/prefix/` of hive-partitioned
   parts as one layer. A 304 MB file opens in ~1.3 s; only the row
@@ -217,14 +218,26 @@ Beyond the rewrite itself:
 
 - **Viewport only**: export just the features intersecting the current
   view.
+- **Merge with…**: fold other loaded layers into the export — schemas
+  union by column name, geometries reproject into the primary layer's
+  CRS, and an optional `source_layer` column records provenance. Merge
+  three regional files into one optimized national one, straight from
+  the dialog.
 - **Derived columns**: an H3 cell column at your chosen resolution, and
   admin attribution (state, county, …) from any loaded boundary layer.
 - **Partitioned output**: hive directories by chosen fields
   (`state=MA/part-0.parquet`) or adaptive H3 cells that split until each
   file is under a row target. Every part keeps the full treatment.
+- **Publish to S3 / R2**: tick "Publish to S3 / R2" in the Optimize
+  dialog and the output uploads to your bucket (multipart for big
+  files) instead of staying local; partitioned datasets upload under a
+  prefix that the workbench can reopen as one layer. Needs write
+  credentials in `~/.aws` (for R2: an API token plus the account
+  endpoint).
 - **Before/after report**: size, row groups, and a spatial-clustering
-  metric, with a button to load the result directly. A 1.89M-parcel
-  cadastral file rewrites in ~7 s.
+  metric, with a button to load the result directly — including
+  published outputs, which reload straight from the bucket. A
+  1.89M-parcel cadastral file rewrites in ~7 s.
 
 The optimizer holds the dataset in memory (capped at 8 GB uncompressed);
 larger files are on the roadmap.

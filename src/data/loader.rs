@@ -1815,7 +1815,24 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
                 spherical_edges =
                     cm.get("edges").and_then(Value::as_str) == Some("spherical");
             }
-            let crs = Crs::from_geoparquet_crs(col_meta.and_then(|c| c.get("crs")))?;
+            // A `geopq:crs` extension (our shapefile importer, for ESRI
+            // .prj files without an EPSG identity) beats a spec-level
+            // `crs: null`: the spec value stays honest for other
+            // readers, the proj4 string positions the data correctly.
+            let vendor = col_meta
+                .and_then(|c| c.get("geopq:crs"))
+                .filter(|_| {
+                    col_meta.and_then(|c| c.get("crs")) == Some(&Value::Null)
+                })
+                .and_then(|v| {
+                    let p4 = v.get("proj4")?.as_str()?;
+                    let name = v.get("name").and_then(Value::as_str).unwrap_or("from .prj");
+                    Crs::from_proj4(p4, None, name).ok()
+                });
+            let crs = match vendor {
+                Some(c) => c,
+                None => Crs::from_geoparquet_crs(col_meta.and_then(|c| c.get("crs")))?,
+            };
             (primary, crs)
         }
         None if native_geometry_column(&builder).is_some() => {

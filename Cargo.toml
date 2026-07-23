@@ -1,6 +1,6 @@
 [package]
 name = "geopq-workbench"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 description = "GeoPQ Workbench: a fast native technical workbench for GeoParquet data"
 license = "MIT OR Apache-2.0"
@@ -40,8 +40,9 @@ async-trait = "0.1.89"
 futures = "0.3.32"
 h3o = "0.10.0"
 rusqlite = { version = "0.37", features = ["bundled"] }
-shapefile = { version = "0.9.0", features = ["geo-types"] }
+shapefile = { version = "0.9.0", features = ["geo-types", "yore", "encoding_rs"] }
 egui-phosphor = "0.13.0"
+proj4wkt = "0.1.1"
 
 [dev-dependencies]
 pollster = "1.0.1"

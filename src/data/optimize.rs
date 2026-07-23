@@ -330,6 +330,23 @@ pub fn optimize(
                 json!({"id": {"authority": "EPSG", "code": e}})
             })
         });
+    // A carried-but-unidentified CRS (shapefile imports from ESRI .prj
+    // without an EPSG authority): the source declares `crs: null` with
+    // the proj4 string in our `geopq:crs` extension. Both must survive
+    // the rewrite — omitting `crs` would falsely claim the CRS84
+    // default and put the output thousands of km off the map.
+    let src_col_meta =
+        geo_meta.as_ref().and_then(|m| m.get("columns")?.get(&primary).cloned());
+    let vendor_crs: Option<Value> = crs_value
+        .is_none()
+        .then(|| src_col_meta.as_ref()?.get("geopq:crs").cloned())
+        .flatten();
+    let crs_explicit_null = crs_value.is_none()
+        && (vendor_crs.is_some()
+            || src_col_meta
+                .as_ref()
+                .and_then(|c| c.get("crs"))
+                .is_some_and(Value::is_null));
 
     // Source covering bbox column (dropped and rebuilt if we write our own).
     let src_covering_root: Option<String> = geo_meta
@@ -477,10 +494,17 @@ pub fn optimize(
     let need_lonlat = opts.h3_resolution.is_some()
         || matches!(opts.partition, PartitionBy::AdaptiveH3 { .. });
     let data_crs = if need_lonlat || admin.is_some() {
-        Some(
-            super::crs::Crs::from_geoparquet_crs(crs_value.as_ref())
+        // A vendor proj4 CRS resolves for centroid math like any other.
+        let vendor = vendor_crs.as_ref().and_then(|v| {
+            let p4 = v.get("proj4")?.as_str()?;
+            let name = v.get("name").and_then(Value::as_str).unwrap_or("from .prj");
+            super::crs::Crs::from_proj4(p4, None, name).ok()
+        });
+        Some(match vendor {
+            Some(c) => c,
+            None => super::crs::Crs::from_geoparquet_crs(crs_value.as_ref())
                 .map_err(|e| format!("H3/admin needs a resolvable CRS: {e}"))?,
-        )
+        })
     } else {
         None
     };
@@ -837,6 +861,8 @@ pub fn optimize(
                 opts,
                 &primary,
                 crs_value.as_ref(),
+                vendor_crs.as_ref(),
+                crs_explicit_null,
                 &geom_types,
                 out_encoding,
                 part_bbox,
@@ -969,10 +995,13 @@ fn transcode_geometry(
 }
 
 /// GeoParquet `geo` file metadata for the output.
+#[allow(clippy::too_many_arguments)]
 fn build_geo_meta(
     opts: &OptimizeOptions,
     primary: &str,
     crs: Option<&Value>,
+    vendor_crs: Option<&Value>,
+    crs_explicit_null: bool,
     geom_types: &HashSet<String>,
     out_encoding: GeomEncoding,
     file_bbox: Option<[f64; 4]>,
@@ -993,6 +1022,12 @@ fn build_geo_meta(
     });
     if let Some(c) = crs {
         col["crs"] = c.clone();
+    } else if crs_explicit_null {
+        // Unknown stays declared-unknown, never an implied CRS84.
+        col["crs"] = Value::Null;
+    }
+    if let Some(v) = vendor_crs {
+        col["geopq:crs"] = v.clone();
     }
     if let Some(b) = file_bbox {
         col["bbox"] = json!([b[0], b[1], b[2], b[3]]);
@@ -1214,6 +1249,73 @@ mod tests {
     use super::*;
     use arrow::array::{BinaryArray, Int64Array, StringArray};
     use parquet::file::properties::WriterProperties;
+
+    /// A source whose CRS exists only as the `geopq:crs` proj4 vendor
+    /// key (ESRI .prj import without an EPSG authority): the rewrite
+    /// must keep `crs: null` + the vendor key, and the reopened output
+    /// must resolve to the same projected CRS — not silently claim
+    /// CRS84 (the MassGIS statewide-parcels regression).
+    #[test]
+    fn vendor_proj4_crs_survives_optimize() {
+        let dir = std::env::temp_dir().join("geopq_optimize_vendor_crs");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let p4 = "+proj=lcc +lat_1=41.71666666666667 +lat_2=42.68333333333333 \
+                  +lat_0=41 +lon_0=-71.5 +x_0=200000 +y_0=750000 \
+                  +a=6378137.0 +rf=298.257222101 +towgs84=0,0,0,0,0,0,0 +units=m";
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {
+                "encoding": "WKB", "geometry_types": ["Point"],
+                "crs": null,
+                "geopq:crs": {"proj4": p4, "name": "Mass Mainland"},
+            }},
+        });
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let wkbs: Vec<Vec<u8>> = (0..100)
+            .map(|i| wkb_point(200_000.0 + i as f64 * 100.0, 890_000.0))
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(wkbs.iter())),
+                Arc::new(Int64Array::from((0..100i64).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap();
+        let src = dir.join("mass.parquet");
+        let mut w =
+            ArrowWriter::try_new(File::create(&src).unwrap(), schema, None).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let dst = dir.join("mass_optimized.parquet");
+        let opts = OptimizeOptions::default();
+        optimize(&Source::Local(src), &dst, &opts, None, None, &|_, _| {}).unwrap();
+
+        let (_store, crs, info, _rg) =
+            crate::data::loader::open_store_for_test(&dst).unwrap();
+        assert_eq!(crs.epsg, None);
+        assert!(!crs.is_latlong, "projected CRS, not an implied CRS84");
+        assert!(crs.proj4.contains("+proj=lcc"), "{}", crs.proj4);
+        assert!(crs.name.contains("Mass"), "{}", crs.name);
+        // The metadata says unknown-but-carried, never nothing.
+        let geo: serde_json::Value =
+            serde_json::from_str(info.geo.raw_geo_json.as_ref().expect("geo metadata"))
+                .unwrap();
+        let col = &geo["columns"]["geometry"];
+        assert!(col.get("crs").is_some_and(serde_json::Value::is_null));
+        assert!(col.get("geopq:crs").is_some());
+    }
 
     /// Partitioned exports: hive fields (incl. an admin join column),
     /// adaptive H3, and the H3 cell column — every partition file must be

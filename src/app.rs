@@ -51,7 +51,7 @@ struct DeferredLoad {
 
 enum OptMsg {
     Progress(f32, String),
-    Done(Box<crate::data::optimize::OptimizeReport>, PathBuf),
+    Done(Box<crate::data::optimize::OptimizeReport>, PathBuf, Option<S3Dest>),
     Failed(String),
     /// Distinct-value counts for partition-field candidates, tagged with
     /// the layer they were scanned for (the dialog may have moved on).
@@ -118,6 +118,28 @@ struct OptimizeState {
     /// Distinct counts per candidate partition field (computed on demand).
     cardinalities: Option<std::collections::HashMap<String, usize>>,
     card_pending: bool,
+    /// Publish destination: upload the optimized output to S3/R2
+    /// instead of keeping a local file.
+    dest_s3: bool,
+    s3_uri: String,
+    s3_endpoint: String,
+    s3_profile: Option<String>,
+    s3_profiles: Vec<String>,
+    /// Set when the finished report's output lives on S3/R2.
+    report_s3: Option<S3Dest>,
+    /// Layer ids merged into this export before optimizing.
+    merge_with: std::collections::HashSet<u64>,
+    /// Tag merged rows with the layer they came from.
+    merge_source_col: bool,
+}
+
+/// Where an optimized output was published, for the report and the
+/// "Load as layer" button.
+#[derive(Clone)]
+struct S3Dest {
+    uri: String,
+    profile: Option<String>,
+    endpoint: Option<String>,
 }
 
 pub struct ViewerApp {
@@ -2490,6 +2512,14 @@ impl ViewerApp {
                         card_pending: false,
                         open_result: false,
                         recommended,
+                        dest_s3: false,
+                        s3_uri: String::new(),
+                        s3_endpoint: String::new(),
+                        s3_profile: None,
+                        s3_profiles: crate::data::source::aws::profiles(),
+                        report_s3: None,
+                        merge_with: Default::default(),
+                        merge_source_col: true,
                     });
                 }
             }
@@ -4262,17 +4292,22 @@ impl ViewerApp {
 
     fn poll_optimizer(&mut self, ctx: &egui::Context) {
         let mut open_result: Option<PathBuf> = None;
+        let mut open_remote: Option<S3Dest> = None;
         while let Ok(msg) = self.opt_rx.try_recv() {
             let Some(o) = &mut self.optimize else { continue };
             match msg {
                 OptMsg::Progress(f, s) => o.progress = (f, s),
-                OptMsg::Done(report, path) => {
+                OptMsg::Done(report, path, dest) => {
                     o.running = false;
                     // Quality-gate flow: the optimized copy opens as the
                     // layer the original never became.
                     if o.open_result {
-                        open_result = Some(path.clone());
+                        match &dest {
+                            Some(d) => open_remote = Some(d.clone()),
+                            None => open_result = Some(path.clone()),
+                        }
                     }
+                    o.report_s3 = dest;
                     o.report = Some((*report, path));
                 }
                 OptMsg::Failed(e) => {
@@ -4289,6 +4324,18 @@ impl ViewerApp {
         }
         if let Some(path) = open_result {
             self.enqueue_load(Source::Local(path), ctx);
+        }
+        if let Some(d) = open_remote {
+            self.enqueue_load(
+                Source::S3 {
+                    uri: d.uri,
+                    profile: d.profile,
+                    endpoint: d.endpoint,
+                    url: String::new(),
+                    len: 0,
+                },
+                ctx,
+            );
         }
     }
 
@@ -4346,6 +4393,32 @@ impl ViewerApp {
                 value_column: admin_sel.1.clone(),
                 crs: bl.crs.clone(),
             });
+        // Publish destination, when the output goes to S3/R2 instead of
+        // staying local (dst is then a temp path).
+        let dest: Option<S3Dest> = o.dest_s3.then(|| S3Dest {
+            uri: o.s3_uri.trim().to_string(),
+            profile: o.s3_profile.clone(),
+            endpoint: {
+                let e = o.s3_endpoint.trim();
+                (!e.is_empty()).then(|| e.to_string())
+            },
+        });
+        // "Merge with…": the checked layers plus the primary, staged
+        // into one raw file that the optimizer then treats as the source.
+        let merge_inputs: Vec<crate::data::merge::MergeInput> = if o.merge_with.is_empty() {
+            Vec::new()
+        } else {
+            std::iter::once(o.layer_id)
+                .chain(o.merge_with.iter().copied())
+                .filter_map(|id| self.layers.iter().find(|l| l.id == id))
+                .map(|l| crate::data::merge::MergeInput {
+                    store: Arc::clone(&l.store),
+                    crs: l.crs.clone(),
+                    name: l.name.clone(),
+                })
+                .collect()
+        };
+        let merge_source_col = self.optimize.as_ref().is_some_and(|o| o.merge_source_col);
         let tx = self.opt_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
@@ -4353,10 +4426,104 @@ impl ViewerApp {
                 let _ = tx.send(OptMsg::Progress(f, s.to_string()));
                 ctx.request_repaint();
             };
+            // Merge phase (when requested): 0–35% of the bar, then the
+            // optimize pass on the staged file takes the rest.
+            let mut src = src;
+            let mut opts = opts;
+            let mut staging: Option<PathBuf> = None;
+            if merge_inputs.len() > 1 {
+                let stage = std::env::temp_dir()
+                    .join(format!("geopq_merge_{}.parquet", std::process::id()));
+                match crate::data::merge::merge(
+                    &merge_inputs,
+                    &stage,
+                    merge_source_col,
+                    &|f, s| progress(f * 0.35, s),
+                ) {
+                    Ok(_) => {
+                        src = Source::Local(stage.clone());
+                        // The staged file is plain WKB: coordinate-column
+                        // synthesis from the primary no longer applies.
+                        opts.xy_geom = None;
+                        staging = Some(stage);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(OptMsg::Failed(format!("merge failed: {e}")));
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
+            }
+            let scale = if staging.is_some() { 0.35 } else { 0.0 };
+            let progress =
+                |f: f32, s: &str| progress(scale + f * (1.0 - scale), s);
             let msg = match crate::data::optimize::optimize(&src, &dst, &opts, epsg, admin.as_ref(), &progress) {
-                Ok(r) => OptMsg::Done(Box::new(r), dst),
+                Ok(r) => match &dest {
+                    None => OptMsg::Done(Box::new(r), dst, None),
+                    Some(d) => {
+                        // Upload phase: file to key, dataset dir to prefix.
+                        use crate::data::info::fmt_bytes;
+                        use crate::data::source::aws;
+                        let up = |sent: u64, total: u64, name: &str| {
+                            let frac = if total > 0 {
+                                sent as f32 / total as f32
+                            } else {
+                                0.0
+                            };
+                            progress(
+                                frac,
+                                &format!(
+                                    "uploading {name}: {} / {}",
+                                    fmt_bytes(sent),
+                                    fmt_bytes(total)
+                                ),
+                            );
+                        };
+                        let uploaded = if dst.is_dir() {
+                            aws::upload_tree(
+                                &dst,
+                                &d.uri,
+                                d.profile.as_deref(),
+                                d.endpoint.as_deref(),
+                                &up,
+                            )
+                            .map(|_| ())
+                        } else {
+                            let name = dst
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            aws::upload_file(
+                                &dst,
+                                &d.uri,
+                                d.profile.as_deref(),
+                                d.endpoint.as_deref(),
+                                &|s, t| up(s, t, &name),
+                            )
+                        };
+                        match uploaded {
+                            Ok(()) => {
+                                // The local copy was only a staging file.
+                                let _ = if dst.is_dir() {
+                                    std::fs::remove_dir_all(&dst)
+                                } else {
+                                    std::fs::remove_file(&dst)
+                                };
+                                OptMsg::Done(Box::new(r), dst, Some(d.clone()))
+                            }
+                            Err(e) => OptMsg::Failed(format!(
+                                "optimized, but the upload failed: {e}\n\
+                                 (the local copy is at {})",
+                                dst.display()
+                            )),
+                        }
+                    }
+                },
                 Err(e) => OptMsg::Failed(e),
             };
+            if let Some(s) = &staging {
+                let _ = std::fs::remove_file(s);
+            }
             let _ = tx.send(msg);
             ctx.request_repaint();
         });
@@ -4434,11 +4601,37 @@ impl ViewerApp {
             }
             None => (Vec::new(), Vec::new()),
         };
+        // Layers offered for "Merge with…": every other vector layer,
+        // with its shared/conflicting column counts vs the primary.
+        let merge_candidates: Vec<(u64, String, u64, usize, usize)> = match &self.optimize {
+            Some(o) => {
+                let primary = self.layers.iter().find(|l| l.id == o.layer_id);
+                self.layers
+                    .iter()
+                    .filter(|l| l.id != o.layer_id)
+                    .map(|l| {
+                        let (mut shared, mut conflicts) = (0usize, 0usize);
+                        if let Some(p) = primary {
+                            for f in p.store.schema.fields() {
+                                match l.store.schema.field_with_name(f.name()) {
+                                    Ok(g) if g.data_type() == f.data_type() => shared += 1,
+                                    Ok(_) => conflicts += 1,
+                                    Err(_) => {}
+                                }
+                            }
+                        }
+                        (l.id, l.name.clone(), l.store.total_rows(), shared, conflicts)
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
         let Some(o) = &mut self.optimize else { return };
         let layer_id = o.layer_id;
         let mut open = true;
         let mut start: Option<PathBuf> = None;
         let mut load_result: Option<PathBuf> = None;
+        let mut load_remote: Option<S3Dest> = None;
         let mut close = false;
         let mut want_cards = false;
         egui::Window::new(format!("Optimize — {}", o.layer_name))
@@ -4449,7 +4642,11 @@ impl ViewerApp {
                 if let Some((rep, path)) = &o.report {
                     use crate::data::info::fmt_bytes;
                     ui.label(
-                        RichText::new(format!("Written: {}", path.display())).strong(),
+                        RichText::new(match &o.report_s3 {
+                            Some(d) => format!("Published: {}", d.uri),
+                            None => format!("Written: {}", path.display()),
+                        })
+                        .strong(),
                     );
                     ui.add_space(4.0);
                     egui::Grid::new("opt_report").num_columns(2).striped(true).show(ui, |ui| {
@@ -4497,8 +4694,15 @@ impl ViewerApp {
                     });
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if rep.files <= 1 && ui.button("Load as layer").clicked() {
-                            load_result = Some(path.clone());
+                        // Published outputs always reload in place (a
+                        // partitioned prefix opens via the listing);
+                        // local partitioned datasets load via Open folder.
+                        let loadable = o.report_s3.is_some() || rep.files <= 1;
+                        if loadable && ui.button("Load as layer").clicked() {
+                            match &o.report_s3 {
+                                Some(d) => load_remote = Some(d.clone()),
+                                None => load_result = Some(path.clone()),
+                            }
                         }
                         if ui.button("Close").clicked() {
                             close = true;
@@ -4645,6 +4849,46 @@ impl ViewerApp {
                         .on_hover_text(
                             "Export only features intersecting the current map viewport",
                         );
+
+                    // --- merge with other layers ---
+                    if !merge_candidates.is_empty() {
+                        ui.separator();
+                        ui.label(RichText::new("Merge with:").strong()).on_hover_text(
+                            "Concatenate other loaded layers into this export before \
+                             optimizing. Schemas union by column name (missing values \
+                             become NULL, conflicting types are dropped); geometries \
+                             reproject into this layer's CRS.",
+                        );
+                        for (id, name, rows, shared, conflicts) in &merge_candidates {
+                            let mut on = o.merge_with.contains(id);
+                            let label = format!("{name} — {}", fmt_count(*rows as usize));
+                            let hover = if *conflicts > 0 {
+                                format!(
+                                    "{shared} shared columns; {conflicts} dropped \
+                                     (type conflicts)"
+                                )
+                            } else {
+                                format!("{shared} shared columns")
+                            };
+                            if ui.checkbox(&mut on, label).on_hover_text(hover).changed() {
+                                if on {
+                                    o.merge_with.insert(*id);
+                                } else {
+                                    o.merge_with.remove(id);
+                                }
+                            }
+                        }
+                        if !o.merge_with.is_empty() {
+                            ui.checkbox(
+                                &mut o.merge_source_col,
+                                "add a source_layer column",
+                            )
+                            .on_hover_text(
+                                "Tag every row with the layer it came from — handy \
+                                 for styling by value and SQL filters",
+                            );
+                        }
+                    }
 
                     ui.separator();
                     // --- derived columns ---
@@ -4847,32 +5091,123 @@ impl ViewerApp {
                 });
 
                 ui.add_space(6.0);
+                ui.add_enabled_ui(!o.running, |ui| {
+                    ui.checkbox(&mut o.dest_s3, "Publish to S3 / R2")
+                        .on_hover_text(
+                            "Upload the optimized output to a bucket instead of \
+                             saving locally. Needs credentials with write access \
+                             (~/.aws; for R2, an API token and the account \
+                             endpoint). The result opens in place from its \
+                             s3:// URI.",
+                        );
+                    if o.dest_s3 {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut o.s3_uri)
+                                .hint_text(if o.part_mode == PartMode::None {
+                                    "s3://bucket/path/file.parquet"
+                                } else {
+                                    "s3://bucket/dataset/ (prefix for the parts)"
+                                })
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label("Endpoint:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut o.s3_endpoint)
+                                    .hint_text("(AWS) · <account>.r2.cloudflarestorage.com")
+                                    .desired_width(180.0),
+                            );
+                            ui.label("profile:");
+                            let current = o
+                                .s3_profile
+                                .clone()
+                                .unwrap_or_else(|| "(auto)".into());
+                            egui::ComboBox::from_id_salt("opt_s3_profile")
+                                .width(110.0)
+                                .selected_text(current)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut o.s3_profile,
+                                        None,
+                                        "(auto: env / default)",
+                                    );
+                                    for p in o.s3_profiles.clone() {
+                                        ui.selectable_value(
+                                            &mut o.s3_profile,
+                                            Some(p.clone()),
+                                            p,
+                                        );
+                                    }
+                                });
+                        });
+                    }
+                });
+                ui.add_space(4.0);
                 if o.running {
                     ui.add(
                         egui::ProgressBar::new(o.progress.0)
                             .text(o.progress.1.clone())
                             .animate(true),
                     );
-                } else if ui.button("Export…").clicked() {
+                } else if ui
+                    .button(if o.dest_s3 { "Optimize & upload…" } else { "Export…" })
+                    .clicked()
+                {
                     let stem = o.src.name();
-                    let stem = stem.trim_end_matches(".parquet");
-                    let mut dialog = rfd::FileDialog::new();
-                    if let Source::Local(p) = &o.src {
-                        if let Some(dir) = p.parent() {
-                            dialog = dialog.set_directory(dir);
+                    let stem = stem.trim_end_matches(".parquet").to_string();
+                    if o.dest_s3 {
+                        // Validate the URI, then stage locally in a temp
+                        // path; the worker uploads and removes it.
+                        let uri = o.s3_uri.trim().to_string();
+                        let object_like = uri.starts_with("s3://")
+                            && uri.trim_start_matches("s3://").contains('/')
+                            && !uri.ends_with('/');
+                        if o.part_mode == PartMode::None {
+                            if object_like {
+                                if !uri.ends_with(".parquet") {
+                                    o.s3_uri = format!("{uri}.parquet");
+                                }
+                                start = Some(std::env::temp_dir().join(format!(
+                                    "geopq_publish_{stem}_{}.parquet",
+                                    std::process::id()
+                                )));
+                            } else {
+                                o.error = Some(
+                                    "destination must be s3://bucket/path/file.parquet"
+                                        .into(),
+                                );
+                            }
+                        } else if uri.starts_with("s3://") && !uri.trim_start_matches("s3://").is_empty() {
+                            if !o.s3_uri.trim_end().ends_with('/') {
+                                o.s3_uri = format!("{uri}/");
+                            }
+                            start = Some(std::env::temp_dir().join(format!(
+                                "geopq_publish_{stem}_{}_parts",
+                                std::process::id()
+                            )));
+                        } else {
+                            o.error =
+                                Some("destination must be an s3://bucket/prefix/".into());
                         }
-                    }
-                    if o.part_mode == PartMode::None {
-                        if let Some(dst) = dialog
-                            .set_file_name(format!("{stem}_optimized.parquet"))
-                            .add_filter("GeoParquet", &["parquet"])
-                            .save_file()
-                        {
-                            start = Some(dst);
+                    } else {
+                        let mut dialog = rfd::FileDialog::new();
+                        if let Source::Local(p) = &o.src {
+                            if let Some(dir) = p.parent() {
+                                dialog = dialog.set_directory(dir);
+                            }
                         }
-                    } else if let Some(dir) = dialog.pick_folder() {
-                        // Dataset root inside the chosen folder.
-                        start = Some(dir.join(format!("{stem}_partitioned")));
+                        if o.part_mode == PartMode::None {
+                            if let Some(dst) = dialog
+                                .set_file_name(format!("{stem}_optimized.parquet"))
+                                .add_filter("GeoParquet", &["parquet"])
+                                .save_file()
+                            {
+                                start = Some(dst);
+                            }
+                        } else if let Some(dir) = dialog.pick_folder() {
+                            // Dataset root inside the chosen folder.
+                            start = Some(dir.join(format!("{stem}_partitioned")));
+                        }
                     }
                 }
                 if let Some(e) = &o.error {
@@ -4907,6 +5242,19 @@ impl ViewerApp {
         }
         if let Some(p) = load_result {
             self.enqueue_load(Source::Local(p), ctx);
+            close = true;
+        }
+        if let Some(d) = load_remote {
+            self.enqueue_load(
+                Source::S3 {
+                    uri: d.uri,
+                    profile: d.profile,
+                    endpoint: d.endpoint,
+                    url: String::new(),
+                    len: 0,
+                },
+                ctx,
+            );
             close = true;
         }
         // Keep the worker's state visible: ignore window close while running.
@@ -5165,6 +5513,14 @@ impl ViewerApp {
                         card_pending: false,
                         open_result: true,
                         recommended,
+                        dest_s3: false,
+                        s3_uri: String::new(),
+                        s3_endpoint: String::new(),
+                        s3_profile: None,
+                        s3_profiles: crate::data::source::aws::profiles(),
+                        report_s3: None,
+                        merge_with: Default::default(),
+                        merge_source_col: true,
                     });
                 }
                 self.drop_gated(&gate, ctx);
