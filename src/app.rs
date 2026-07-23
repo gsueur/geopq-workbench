@@ -5104,9 +5104,9 @@ impl ViewerApp {
                         ui.add(
                             egui::TextEdit::singleline(&mut o.s3_uri)
                                 .hint_text(if o.part_mode == PartMode::None {
-                                    "s3://bucket/path/file.parquet"
+                                    "s3://bucket/ (file name appended) · s3://bucket/path/file.parquet"
                                 } else {
-                                    "s3://bucket/dataset/ (prefix for the parts)"
+                                    "s3://bucket/ (dataset prefix appended) · s3://bucket/dataset/"
                                 })
                                 .desired_width(f32::INFINITY),
                         );
@@ -5156,38 +5156,44 @@ impl ViewerApp {
                     let stem = o.src.name();
                     let stem = stem.trim_end_matches(".parquet").to_string();
                     if o.dest_s3 {
-                        // Validate the URI, then stage locally in a temp
-                        // path; the worker uploads and removes it.
-                        let uri = o.s3_uri.trim().to_string();
-                        let object_like = uri.starts_with("s3://")
-                            && uri.trim_start_matches("s3://").contains('/')
-                            && !uri.ends_with('/');
-                        if o.part_mode == PartMode::None {
-                            if object_like {
-                                if !uri.ends_with(".parquet") {
-                                    o.s3_uri = format!("{uri}.parquet");
-                                }
+                        // Normalize the destination, then stage locally in
+                        // a temp path; the worker uploads and removes it.
+                        // A bare bucket or a prefix ending in `/` gets the
+                        // layer's file name appended, mirroring the local
+                        // save dialog's pre-filled name.
+                        let trimmed = o.s3_uri.trim().to_string();
+                        let uri = trimmed.trim_end_matches('/').to_string();
+                        let rest = uri.strip_prefix("s3://").unwrap_or("");
+                        if rest.is_empty() {
+                            o.error = Some(
+                                "destination must start with s3://bucket".into(),
+                            );
+                        } else {
+                            let needs_name =
+                                trimmed.ends_with('/') || !rest.contains('/');
+                            if o.part_mode == PartMode::None {
+                                o.s3_uri = if needs_name {
+                                    format!("{uri}/{stem}_optimized.parquet")
+                                } else if uri.ends_with(".parquet") {
+                                    uri
+                                } else {
+                                    format!("{uri}.parquet")
+                                };
                                 start = Some(std::env::temp_dir().join(format!(
                                     "geopq_publish_{stem}_{}.parquet",
                                     std::process::id()
                                 )));
                             } else {
-                                o.error = Some(
-                                    "destination must be s3://bucket/path/file.parquet"
-                                        .into(),
-                                );
+                                o.s3_uri = if needs_name {
+                                    format!("{uri}/{stem}_partitioned/")
+                                } else {
+                                    format!("{uri}/")
+                                };
+                                start = Some(std::env::temp_dir().join(format!(
+                                    "geopq_publish_{stem}_{}_parts",
+                                    std::process::id()
+                                )));
                             }
-                        } else if uri.starts_with("s3://") && !uri.trim_start_matches("s3://").is_empty() {
-                            if !o.s3_uri.trim_end().ends_with('/') {
-                                o.s3_uri = format!("{uri}/");
-                            }
-                            start = Some(std::env::temp_dir().join(format!(
-                                "geopq_publish_{stem}_{}_parts",
-                                std::process::id()
-                            )));
-                        } else {
-                            o.error =
-                                Some("destination must be an s3://bucket/prefix/".into());
                         }
                     } else {
                         let mut dialog = rfd::FileDialog::new();

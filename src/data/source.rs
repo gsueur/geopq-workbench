@@ -345,9 +345,13 @@ pub mod aws {
         from_files(&name)
     }
 
-    /// Region for a profile, falling back to env, then a bucket-location
-    /// probe (`x-amz-bucket-region` is present even on 403/301 answers),
-    /// then us-east-1.
+    /// Region for a bucket. For AWS the bucket's actual region wins
+    /// (probed once per bucket and cached: `x-amz-bucket-region` comes
+    /// back even on 403/301 answers) — SigV4 must match the bucket, and
+    /// a profile's `region` is just a service default that silently
+    /// breaks any bucket living elsewhere. Profile/env regions are the
+    /// fallback when the probe fails, and the answer for custom
+    /// endpoints (R2/MinIO), where the region is mostly decorative.
     fn region(profile: Option<&str>, bucket: &str, custom_endpoint: bool) -> String {
         let files_region = |name: &str| -> Option<String> {
             let config = ini(&config_file());
@@ -357,21 +361,31 @@ pub mod aws {
                 .and_then(|s| s.get("region").cloned())
                 .or_else(|| creds.get(name).and_then(|s| s.get("region").cloned()))
         };
-        if let Some(r) = profile.and_then(files_region) {
-            return r;
-        }
-        if let Ok(r) = std::env::var("AWS_REGION").or_else(|_| std::env::var("AWS_DEFAULT_REGION")) {
-            return r;
-        }
-        if profile.is_none() {
-            let name = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".into());
-            if let Some(r) = files_region(&name) {
-                return r;
-            }
-        }
-        // Probe (AWS only): any response carries the bucket's region header.
+        let configured = || -> Option<String> {
+            profile
+                .and_then(files_region)
+                .or_else(|| {
+                    std::env::var("AWS_REGION")
+                        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                        .ok()
+                })
+                .or_else(|| {
+                    profile.is_none().then(|| {
+                        let name =
+                            std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".into());
+                        files_region(&name)
+                    })?
+                })
+        };
         if custom_endpoint {
-            return "us-east-1".into();
+            return configured().unwrap_or_else(|| "us-east-1".into());
+        }
+        static BUCKET_REGIONS: std::sync::OnceLock<
+            std::sync::Mutex<HashMap<String, String>>,
+        > = std::sync::OnceLock::new();
+        let cache = BUCKET_REGIONS.get_or_init(Default::default);
+        if let Some(r) = cache.lock().unwrap().get(bucket) {
+            return r.clone();
         }
         if let Ok(res) = super::http_agent()
             .head(&format!("https://{bucket}.s3.amazonaws.com/"))
@@ -379,10 +393,11 @@ pub mod aws {
             .call()
         {
             if let Some(r) = super::header(&res, "x-amz-bucket-region") {
+                cache.lock().unwrap().insert(bucket.to_string(), r.clone());
                 return r;
             }
         }
-        "us-east-1".into()
+        configured().unwrap_or_else(|| "us-east-1".into())
     }
 
     /// RFC 3986 path encoding of an object key: percent-encode every byte
