@@ -225,6 +225,12 @@ fn cache_key(base: &str, snapshot: &str) -> String {
     format!("{base}|{snapshot}")
 }
 
+/// Serializes read-modify-write cycles on the two cache files. The file
+/// writes are atomic renames, but two concurrent RMWs still lose one
+/// side's insert (each rewrites the whole map from its own snapshot) —
+/// parallel tests hit this constantly, the app at worst re-fetches.
+static CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn read_cache() -> std::collections::HashMap<String, CacheEntry> {
     cache_file()
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -244,11 +250,13 @@ fn write_cache(cache: &std::collections::HashMap<String, CacheEntry>) {
 
 /// Cached dataset list with its age, if any.
 pub fn cached_datasets(base: &str, snapshot: &str) -> Option<(Vec<Dataset>, u64)> {
+    let _g = CACHE_LOCK.lock().unwrap();
     let e = read_cache().remove(&cache_key(base, snapshot))?;
     Some((e.datasets, e.fetched_at))
 }
 
 pub fn store_datasets(base: &str, snapshot: &str, datasets: &[Dataset]) {
+    let _g = CACHE_LOCK.lock().unwrap();
     let mut cache = read_cache();
     cache.insert(
         cache_key(base, snapshot),
@@ -264,6 +272,7 @@ pub fn store_datasets(base: &str, snapshot: &str, datasets: &[Dataset]) {
 }
 
 pub fn clear_cached_datasets(base: &str, snapshot: &str) {
+    let _g = CACHE_LOCK.lock().unwrap();
     let mut cache = read_cache();
     if cache.remove(&cache_key(base, snapshot)).is_some() {
         write_cache(&cache);
@@ -591,6 +600,7 @@ fn write_parts_cache(cache: &std::collections::HashMap<String, Vec<StacPart>>) {
 
 /// Drop cached part lists of one repository (all its collections).
 pub fn clear_cached_stac_parts(base: &str) {
+    let _g = CACHE_LOCK.lock().unwrap();
     let mut cache = read_parts_cache();
     let n = cache.len();
     cache.retain(|url, _| !url.starts_with(base));
@@ -604,10 +614,16 @@ pub fn clear_cached_stac_parts(base: &str) {
 /// (parallel fetch on dedicated threads; any failure aborts — a silently
 /// partial part list would silently drop data).
 pub fn fetch_stac_parts(collection_url: &str) -> Result<Vec<StacPart>, String> {
-    if let Some(parts) = read_parts_cache().remove(collection_url) {
-        return Ok(parts);
+    {
+        let _g = CACHE_LOCK.lock().unwrap();
+        if let Some(parts) = read_parts_cache().remove(collection_url) {
+            return Ok(parts);
+        }
     }
+    // Fetch outside the lock: item documents can take a while, and the
+    // lock only has to make the read-modify-write below atomic.
     let parts = fetch_stac_parts_live(collection_url)?;
+    let _g = CACHE_LOCK.lock().unwrap();
     let mut cache = read_parts_cache();
     cache.insert(collection_url.to_string(), parts.clone());
     write_parts_cache(&cache);
