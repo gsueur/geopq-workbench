@@ -241,6 +241,9 @@ pub struct ViewerApp {
     strip_probe: u8,
     /// Vector import dialog / conversion in flight.
     gpkg_import: Option<ImportState>,
+    /// Files dropped while an import dialog was already open; imported
+    /// one after another as each dialog closes.
+    import_queue: Vec<PathBuf>,
     about_open: bool,
     cookbook_open: bool,
     /// Decoded app icon for the About dialog (lazy).
@@ -636,6 +639,7 @@ impl ViewerApp {
             opt_rx,
             optimize: None,
             gpkg_import: None,
+            import_queue: Vec::new(),
             loading: HashMap::new(),
             pending_styles: HashMap::new(),
             next_job: 0,
@@ -2419,32 +2423,89 @@ impl ViewerApp {
                         ui.horizontal(|ui| {
                             let preview = l.preview_rgs();
                             let partial = l.partial_rgs();
-                            let text = if preview > 0 {
-                                format!(
-                                    "preview: {} of {} row groups decimated — zoom in \
-                                     to load real rows",
-                                    preview,
-                                    l.total_rgs()
+                            // Does the CURRENT viewport still show preview /
+                            // missing rows? Off-screen groups staying
+                            // decimated is normal and must not keep nagging
+                            // "zoom in" after the view has refined.
+                            let view_pending = {
+                                use crate::data::layer::GroupLoad;
+                                let rect = loader::viewport_to_data_bbox(
+                                    self.last_view_world,
+                                    &self.display,
+                                    &l.crs,
+                                );
+                                match (l.rg_bboxes.as_ref(), rect) {
+                                    (Some(rg), Some(rect)) => {
+                                        loader::intersecting_rgs(&rg.boxes, rect)
+                                            .into_iter()
+                                            .any(|g| {
+                                                let gb = rg.boxes[g as usize];
+                                                let need = [
+                                                    rect[0].max(gb[0]),
+                                                    rect[1].max(gb[1]),
+                                                    rect[2].min(gb[2]),
+                                                    rect[3].min(gb[3]),
+                                                ];
+                                                match &l.loaded[g as usize] {
+                                                    GroupLoad::Full => false,
+                                                    GroupLoad::None
+                                                    | GroupLoad::Preview { .. } => true,
+                                                    st @ GroupLoad::Rows { .. } => {
+                                                        !st.covers(need)
+                                                    }
+                                                }
+                                            })
+                                    }
+                                    _ => true,
+                                }
+                            };
+                            let (text, attention) = if preview > 0 && view_pending {
+                                (
+                                    format!(
+                                        "preview: {} of {} row groups decimated — zoom \
+                                         in to load real rows",
+                                        preview,
+                                        l.total_rgs()
+                                    ),
+                                    true,
+                                )
+                            } else if preview > 0 {
+                                (
+                                    format!(
+                                        "viewport loaded — {} of {} row groups still \
+                                         decimated off-screen",
+                                        preview,
+                                        l.total_rgs()
+                                    ),
+                                    false,
                                 )
                             } else if partial > 0 {
-                                format!(
-                                    "partial: {}/{} row groups full, {} viewport-filtered",
-                                    l.full_rgs(),
-                                    l.total_rgs(),
-                                    partial
+                                (
+                                    format!(
+                                        "partial: {}/{} row groups full, {} \
+                                         viewport-filtered",
+                                        l.full_rgs(),
+                                        l.total_rgs(),
+                                        partial
+                                    ),
+                                    true,
                                 )
                             } else {
-                                format!(
-                                    "partial: {}/{} row groups loaded",
-                                    l.full_rgs(),
-                                    l.total_rgs()
+                                (
+                                    format!(
+                                        "partial: {}/{} row groups loaded",
+                                        l.full_rgs(),
+                                        l.total_rgs()
+                                    ),
+                                    true,
                                 )
                             };
-                            ui.label(
-                                RichText::new(text)
-                                    .color(Color32::from_rgb(242, 140, 26))
-                                    .small(),
-                            );
+                            let label = if attention {
+                                RichText::new(text).color(Color32::from_rgb(242, 140, 26))
+                            } else {
+                                RichText::new(text).weak()
+                            };
+                            ui.label(label.small());
                             if ui.small_button("Load all").clicked() {
                                 load_all = Some(l.id);
                             }
@@ -4167,7 +4228,9 @@ impl ViewerApp {
     fn begin_import(&mut self, path: PathBuf) {
         use crate::data::import::ImportFormat;
         if self.gpkg_import.is_some() {
-            return; // one import at a time
+            // One dialog at a time: queue the rest, imported as each closes.
+            self.import_queue.push(path);
+            return;
         }
         let format = ImportFormat::from_path(&path);
         let (tables, error) = match format {
@@ -4218,14 +4281,23 @@ impl ViewerApp {
         if let Some(p) = done {
             self.gpkg_import = None;
             self.enqueue_load(Source::Local(p), ctx);
+            if !self.import_queue.is_empty() {
+                let next = self.import_queue.remove(0);
+                self.begin_import(next);
+            }
             return;
         }
 
         use crate::data::import::ImportFormat;
         let mut open = true;
         let mut start: Option<(PathBuf, Option<crate::data::gpkg::GpkgTable>, PathBuf)> = None;
+        let queued = self.import_queue.len();
         let st = self.gpkg_import.as_mut().unwrap();
-        let title = format!("Import {}", st.format.label());
+        let title = if queued > 0 {
+            format!("Import {} ({queued} more queued)", st.format.label())
+        } else {
+            format!("Import {}", st.format.label())
+        };
         egui::Window::new(title)
             .id(egui::Id::new("gpkg_import"))
             .open(&mut open)
@@ -4314,6 +4386,10 @@ impl ViewerApp {
         }
         if !open && !self.gpkg_import.as_ref().is_some_and(|s| s.running) {
             self.gpkg_import = None;
+            if !self.import_queue.is_empty() {
+                let next = self.import_queue.remove(0);
+                self.begin_import(next);
+            }
         }
     }
 
