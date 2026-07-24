@@ -4680,14 +4680,17 @@ impl ViewerApp {
             }
             None => (Vec::new(), Vec::new()),
         };
-        // Layers offered for "Merge with…": every other vector layer,
-        // with its shared/conflicting column counts vs the primary.
+        // Layers offered for "Merge with…": other vector layers of the
+        // SAME geometry family as the primary (merging points into a
+        // polygon export is never what anyone means, and the filter
+        // keeps the list short), with shared/conflicting column counts.
         let merge_candidates: Vec<(u64, String, u64, usize, usize)> = match &self.optimize {
             Some(o) => {
                 let primary = self.layers.iter().find(|l| l.id == o.layer_id);
+                let primary_kind = primary.map(|l| l.kind());
                 self.layers
                     .iter()
-                    .filter(|l| l.id != o.layer_id)
+                    .filter(|l| l.id != o.layer_id && Some(l.kind()) == primary_kind)
                     .map(|l| {
                         let (mut shared, mut conflicts) = (0usize, 0usize);
                         if let Some(p) = primary {
@@ -4967,25 +4970,36 @@ impl ViewerApp {
                              become NULL, conflicting types are dropped); geometries \
                              reproject into this layer's CRS.",
                         );
-                        for (id, name, rows, shared, conflicts) in &merge_candidates {
-                            let mut on = o.merge_with.contains(id);
-                            let label = format!("{name} — {}", fmt_count(*rows as usize));
-                            let hover = if *conflicts > 0 {
-                                format!(
-                                    "{shared} shared columns; {conflicts} dropped \
-                                     (type conflicts)"
-                                )
-                            } else {
-                                format!("{shared} shared columns")
-                            };
-                            if ui.checkbox(&mut on, label).on_hover_text(hover).changed() {
-                                if on {
-                                    o.merge_with.insert(*id);
-                                } else {
-                                    o.merge_with.remove(id);
+                        egui::ScrollArea::vertical()
+                            .id_salt("export_merge_list")
+                            .max_height(132.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for (id, name, rows, shared, conflicts) in &merge_candidates {
+                                    let mut on = o.merge_with.contains(id);
+                                    let label =
+                                        format!("{name} — {}", fmt_count(*rows as usize));
+                                    let hover = if *conflicts > 0 {
+                                        format!(
+                                            "{shared} shared columns; {conflicts} dropped \
+                                             (type conflicts)"
+                                        )
+                                    } else {
+                                        format!("{shared} shared columns")
+                                    };
+                                    if ui
+                                        .checkbox(&mut on, label)
+                                        .on_hover_text(hover)
+                                        .changed()
+                                    {
+                                        if on {
+                                            o.merge_with.insert(*id);
+                                        } else {
+                                            o.merge_with.remove(id);
+                                        }
+                                    }
                                 }
-                            }
-                        }
+                            });
                         if !o.merge_with.is_empty() {
                             ui.checkbox(
                                 &mut o.merge_source_col,

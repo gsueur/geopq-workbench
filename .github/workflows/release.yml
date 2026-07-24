@@ -175,8 +175,19 @@ jobs:
           mkdir -p "$STAGE"
           cp -R "$APP" "$STAGE/"
           ln -s /Applications "$STAGE/Applications"
-          hdiutil create -volname "GeoPQ Workbench" -srcfolder "$STAGE" \
-            -ov -format UDZO "$NAME.dmg"
+          # hdiutil intermittently hits "Resource busy" on runners
+          # (Spotlight racing the staging folder): retry a few times.
+          for a in 1 2 3 4 5; do
+            if hdiutil create -volname "GeoPQ Workbench" -srcfolder "$STAGE" \
+              -ov -format UDZO "$NAME.dmg"; then
+              break
+            fi
+            if [ "$a" = 5 ]; then
+              echo "hdiutil failed 5 times"; exit 1
+            fi
+            echo "hdiutil attempt $a failed; retrying in 15s"
+            sleep 15
+          done
           codesign --force --timestamp --sign "$SIGN_ID" "$NAME.dmg"
           notary "$NAME.dmg"
           xcrun stapler staple "$NAME.dmg"
