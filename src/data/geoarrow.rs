@@ -314,7 +314,7 @@ pub(crate) fn emit_bulk(
     items: &mut Vec<super::layer::PickItem>,
     bad: &mut usize,
     raw_bbox: &mut dyn FnMut(u64, [f64; 4]),
-    bins: Option<&[u8]>,
+    bins: Option<&super::loader::RowBins>,
 ) -> usize {
     use super::geometry::FeatureRef;
     use super::layer::PickItem;
@@ -368,8 +368,12 @@ pub(crate) fn emit_bulk(
             continue;
         }
 
-        if let Some(b) = bins {
-            mb.bin = b[i];
+        match bins {
+            Some(super::loader::RowBins::Pre(b)) => mb.bin = b[i],
+            Some(super::loader::RowBins::PerArea { vals, breaks }) => {
+                mb.bin = super::loader::norm_bin(vals[i], data_area(ga, i, xs, ys), breaks);
+            }
+            None => {}
         }
         mb.expand_feature(wb);
         let mut needs_rtree = true;
@@ -419,6 +423,47 @@ pub(crate) fn emit_bulk(
         }
     }
     rows
+}
+
+/// Feature area in data-CRS units from the raw coordinate buffers:
+/// exteriors minus holes per polygon part. Non-areal encodings report
+/// 1.0 so area normalization degenerates to the raw value.
+fn data_area(ga: &GaCol, i: usize, xs: &[f64], ys: &[f64]) -> f64 {
+    let ring = |span: std::ops::Range<usize>| -> f64 {
+        let (s, e) = (span.start, span.end);
+        if e - s < 3 {
+            return 0.0;
+        }
+        let mut a = 0.0;
+        for k in s..e {
+            let k2 = if k + 1 == e { s } else { k + 1 };
+            a += xs[k] * ys[k2] - xs[k2] * ys[k];
+        }
+        (a * 0.5).abs()
+    };
+    match ga.enc {
+        GeomEncoding::Polygon => {
+            let mut area = 0.0;
+            for (ri, r) in GaCol::range(ga.lists[0], i).enumerate() {
+                let s = GaCol::range(ga.lists[1], r);
+                let a = ring(s);
+                area += if ri == 0 { a } else { -a };
+            }
+            area.max(0.0)
+        }
+        GeomEncoding::MultiPolygon => {
+            let mut area = 0.0;
+            for poly in GaCol::range(ga.lists[0], i) {
+                for (ri, r) in GaCol::range(ga.lists[1], poly).enumerate() {
+                    let s = GaCol::range(ga.lists[2], r);
+                    let a = ring(s);
+                    area += if ri == 0 { a } else { -a };
+                }
+            }
+            area.max(0.0)
+        }
+        _ => 1.0,
+    }
 }
 
 // ---------------------------------------------------------------------

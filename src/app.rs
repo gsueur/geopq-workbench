@@ -571,6 +571,8 @@ struct StyleDialog {
     method: crate::data::layer::ClassMethod,
     /// Number of classes (2..=STYLE_BINS); breaks carry classes - 1 values.
     classes: usize,
+    /// Normalize by polygon area before classifying/rendering.
+    per_area: bool,
     /// Equal-interval bounds (from column statistics, editable).
     min: f64,
     max: f64,
@@ -3745,6 +3747,7 @@ impl ViewerApp {
         }
         // Start from the active styling, else the first numeric column.
         use crate::data::layer::ClassMethod;
+        let per_area = l.style.style_by.as_ref().is_some_and(|sb| sb.per_area);
         let (column, ramp, method, classes) = match &l.style.style_by {
             Some(sb) => match &sb.mode {
                 StyleMode::Graduated { method, breaks } => {
@@ -3771,6 +3774,7 @@ impl ViewerApp {
             ramp,
             method,
             classes,
+            per_area,
             min: 0.0,
             max: 1.0,
             breaks: None,
@@ -3806,7 +3810,7 @@ impl ViewerApp {
                     d.max = hi;
                 }
             }
-            if d.method.needs_values() {
+            if d.method.needs_values() || d.per_area {
                 // Classify from already-loaded rows in the background —
                 // never from the whole dataset (see the dialog note).
                 let idx = l
@@ -3818,13 +3822,16 @@ impl ViewerApp {
                 if let Some(idx) = idx {
                     let store = Arc::clone(&l.store);
                     let loaded = l.loaded.clone();
-                    let (id, col, method, classes) =
-                        (d.layer_id, d.column.clone(), d.method, d.classes);
+                    let (id, col, method, classes, per_area) =
+                        (d.layer_id, d.column.clone(), d.method, d.classes, d.per_area);
                     let tx = self.class_tx.clone();
                     let ctx = ctx.clone();
                     std::thread::spawn(move || {
+                        // Normalized values have no usable column stats:
+                        // equal interval classifies from the sample too.
+                        let cap = if per_area { 20_000 } else { 50_000 };
                         let res = crate::data::loader::sample_loaded_values(
-                            &store, &loaded, idx, 50_000,
+                            &store, &loaded, idx, cap, per_area,
                         )
                         .map(|mut vals| {
                             crate::data::layer::classify_breaks(method, &mut vals, classes)
@@ -3861,7 +3868,7 @@ impl ViewerApp {
                 if d.layer_id == layer_id
                     && d.column == column
                     && d.numeric
-                    && d.method.needs_values()
+                    && (d.method.needs_values() || d.per_area)
                 {
                     d.breaks = Some(res);
                 }
@@ -3893,6 +3900,10 @@ impl ViewerApp {
         let layer_name = self.layers[layer_idx].name.clone();
         let cols = Self::style_columns(&self.layers[layer_idx].store);
         let current = self.layers[layer_idx].style.style_by.clone();
+        let is_poly = matches!(
+            self.layers[layer_idx].kind(),
+            crate::data::geometry::GeomKind::Polygon
+        );
 
         let mut open = true;
         let mut reselect = false;
@@ -3955,7 +3966,17 @@ impl ViewerApp {
                                 reselect = true;
                             }
                         });
-                        if d.method.needs_values() {
+                        if is_poly {
+                            let before = d.per_area;
+                            ui.checkbox(&mut d.per_area, "normalize by area")
+                                .on_hover_text(
+                                    "Classify and color value / polygon area (data-CRS                                      units, e.g. $/m²) so large polygons don't dominate                                      the choropleth",
+                                );
+                            if d.per_area != before {
+                                reselect = true;
+                            }
+                        }
+                        if d.method.needs_values() || d.per_area {
                             ui.label(
                                 RichText::new(
                                     "classified from the currently loaded rows only \
@@ -4088,6 +4109,7 @@ impl ViewerApp {
                                 column: d.column.clone(),
                                 ramp: d.ramp,
                                 hidden_bins: 0,
+                                per_area: d.per_area && d.numeric,
                                 mode: if d.numeric {
                                     StyleMode::Graduated {
                                         method: d.method,
@@ -4143,7 +4165,7 @@ impl ViewerApp {
                 if matches!(
                     &sb.mode,
                     crate::data::layer::StyleMode::Graduated { method, .. }
-                        if method.needs_values()
+                        if method.needs_values() || sb.per_area
                 ) {
                     sb.classified_rows = Some(l.loaded_rows() as usize);
                 }
@@ -6832,9 +6854,12 @@ fn fmt_class_bound(v: f64) -> String {
 /// Clicking an entry toggles that class on the map (draw-time filter).
 fn style_legend(ui: &mut egui::Ui, layer_id: u64, sb: &mut crate::data::layer::StyleBy) {
     use crate::data::layer::{StyleMode, STYLE_BINS};
-    egui::CollapsingHeader::new(
-        RichText::new(format!("legend — {}", sb.column)).weak().small(),
-    )
+    let title = if sb.per_area {
+        format!("legend — {} / area", sb.column)
+    } else {
+        format!("legend — {}", sb.column)
+    };
+    egui::CollapsingHeader::new(RichText::new(title).weak().small())
     .id_salt(("style_legend", layer_id))
     .default_open(true)
     .show(ui, |ui| {

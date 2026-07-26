@@ -2403,6 +2403,9 @@ pub struct StyleSel {
     /// Store-schema index of the value column.
     pub col: usize,
     pub binning: Binning,
+    /// Normalize by polygon area (data-CRS units) before binning:
+    /// bin = f(value / area). Graduated styling only.
+    pub per_area: bool,
 }
 
 #[derive(Clone)]
@@ -2439,7 +2442,9 @@ pub fn resolve_style(
                 .collect(),
         },
     };
-    Some(StyleSel { col, binning })
+    let per_area =
+        sb.per_area && matches!(sb.mode, crate::data::layer::StyleMode::Graduated { .. });
+    Some(StyleSel { col, binning, per_area })
 }
 
 /// Sample up to `cap` values of a column from the already-loaded rows of
@@ -2450,6 +2455,7 @@ pub fn sample_loaded_values(
     loaded: &[GroupLoad],
     col: usize,
     cap: usize,
+    per_area: bool,
 ) -> Result<Vec<f64>, String> {
     let starts = store.rg_starts();
     // Rect-filtered previews: reproduce the load's exact selection (same
@@ -2536,7 +2542,22 @@ pub fn sample_loaded_values(
         return Err("no rows loaded yet".into());
     }
     let batches = store.fetch(&rows, Some(&[col]))?;
+    // Normalization needs each sampled feature's area too: fetch the
+    // geometries for the same rows (aligned with the value order).
+    let areas: Option<Vec<f64>> = if per_area {
+        use geo::Area;
+        let geoms = store.fetch_geoms(&rows)?;
+        Some(
+            geoms
+                .iter()
+                .map(|(_, g)| g.as_ref().map(|g| g.unsigned_area()).unwrap_or(0.0))
+                .collect(),
+        )
+    } else {
+        None
+    };
     let mut out = Vec::with_capacity(rows.len());
+    let mut k = 0usize; // running row index across batches
     for b in &batches {
         let vals = arrow::compute::cast(b.column(0), &DataType::Float64)
             .map_err(|e| format!("value cast: {e}"))?;
@@ -2545,12 +2566,58 @@ pub fn sample_loaded_values(
             .downcast_ref::<arrow::array::Float64Array>()
             .unwrap();
         for i in 0..vals.len() {
-            if !arrow::array::Array::is_null(vals, i) && vals.value(i).is_finite() {
-                out.push(vals.value(i));
+            let null = arrow::array::Array::is_null(vals, i);
+            let v = vals.value(i);
+            match &areas {
+                Some(a) => {
+                    let area = a.get(k).copied().unwrap_or(0.0);
+                    if !null && v.is_finite() && area > 0.0 {
+                        out.push(v / area);
+                    }
+                }
+                None => {
+                    if !null && v.is_finite() {
+                        out.push(v);
+                    }
+                }
             }
+            k += 1;
         }
     }
     Ok(out)
+}
+
+/// Per-batch style-bin source: precomputed bins, or raw values plus
+/// breaks when bins depend on each feature's area (normalize by area).
+pub(crate) enum RowBins {
+    Pre(Vec<u8>),
+    PerArea { vals: Vec<f64>, breaks: Vec<f64> },
+}
+
+/// Bin for an area-normalized value. Nulls, non-finite values and
+/// degenerate areas land in bin 0 like nulls do in the plain path.
+pub(crate) fn norm_bin(v: f64, area: f64, breaks: &[f64]) -> u8 {
+    use crate::data::layer::STYLE_BINS;
+    if !v.is_finite() || !(area > 0.0) {
+        return 0;
+    }
+    let x = v / area;
+    (breaks.partition_point(|b| x >= *b) as u8).min((STYLE_BINS - 1) as u8)
+}
+
+/// Raw numeric per row (NaN for nulls / uncastable columns).
+fn batch_values(arr: &arrow::array::ArrayRef) -> Vec<f64> {
+    let n = arr.len();
+    let vals = arrow::compute::cast(arr, &DataType::Float64).ok();
+    let vals = vals
+        .as_ref()
+        .and_then(|a| a.as_any().downcast_ref::<arrow::array::Float64Array>());
+    (0..n)
+        .map(|i| match vals {
+            Some(v) if !v.is_null(i) => v.value(i),
+            _ => f64::NAN,
+        })
+        .collect()
 }
 
 /// Per-row style bins for one batch's value column.
@@ -2801,7 +2868,7 @@ fn build_geometry(
             let rows = process_batch(
                 &batch, &map, encoding, &tr, display, &mut mb, &mut items, &mut bad,
                 rg_starts, &mut rg_boxes, geom_pos,
-                style.map(|st| (style_pos.unwrap(), &st.binning)),
+                style.map(|st| (style_pos.unwrap(), &st.binning, st.per_area)),
                 spherical,
             );
             if let Some((handle, job)) = progress {
@@ -2926,7 +2993,6 @@ fn grow_rg_box(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn process_batch(
     batch: &RecordBatch,
     map: &RowMap,
@@ -2939,7 +3005,7 @@ fn process_batch(
     rg_starts: &[u64],
     rg_boxes: &mut std::collections::HashMap<u32, [f64; 4]>,
     geom_pos: usize,
-    style: Option<(usize, &Binning)>,
+    style: Option<(usize, &Binning, bool)>,
     spherical: bool,
 ) -> usize {
     let col = batch.column(geom_pos);
@@ -2948,9 +3014,15 @@ fn process_batch(
         return batch.num_rows();
     };
     // Data-driven styling: per-row bin from the value column; the mesh
-    // builder keys chunks by (cell, bin).
-    let bins: Option<Vec<u8>> =
-        style.map(|(pos, binning)| batch_bins(batch.column(pos), binning));
+    // builder keys chunks by (cell, bin). Area-normalized bins can only
+    // be computed once the feature's geometry is decoded.
+    let bins: Option<RowBins> = style.map(|(pos, binning, per_area)| match binning {
+        Binning::Breaks(breaks) if per_area => RowBins::PerArea {
+            vals: batch_values(batch.column(pos)),
+            breaks: breaks.clone(),
+        },
+        _ => RowBins::Pre(batch_bins(batch.column(pos), binning)),
+    });
 
     // GeoArrow: bulk path — one linear reprojection pass over the whole
     // coordinate buffer, features emitted straight from the arrow offsets.
@@ -2967,7 +3039,7 @@ fn process_batch(
             items,
             bad,
             &mut |global, b| grow_rg_box(rg_boxes, rg_of(global, rg_starts), b),
-            bins.as_deref(),
+            bins.as_ref(),
         );
     }
 
@@ -2975,7 +3047,7 @@ fn process_batch(
         if get.is_null(row) {
             continue;
         }
-        if let Some(b) = &bins {
+        if let Some(RowBins::Pre(b)) = &bins {
             mb.bin = b[row];
         }
         let global = map.global(row);
@@ -2986,6 +3058,9 @@ fn process_batch(
         // Fast path: 2D point (WKB parse or GeoArrow coordinate read), no
         // per-feature geo allocation.
         if let Some((x, y)) = get.point2(row) {
+            if let Some(RowBins::PerArea { vals, breaks }) = &bins {
+                mb.bin = norm_bin(vals[row], 1.0, breaks);
+            }
             grow_rg_box(rg_boxes, rg_of(global, rg_starts), [x, y, x, y]);
             let (mut px, mut py) = (x, y);
             if !tr.apply(&mut px, &mut py) {
@@ -3000,6 +3075,10 @@ fn process_batch(
 
         match get.geometry(row) {
             Some(mut geom) => {
+                if let Some(RowBins::PerArea { vals, breaks }) = &bins {
+                    use geo::Area;
+                    mb.bin = norm_bin(vals[row], geom.unsigned_area(), breaks);
+                }
                 if spherical {
                     densify_spherical(&mut geom, SPHERICAL_MAX_SEG_DEG);
                 }
@@ -5005,6 +5084,7 @@ mod xy_tests {
         let style = StyleSel {
             col: id_col,
             binning: Binning::Breaks(crate::data::layer::equal_interval_breaks(lo, hi, crate::data::layer::STYLE_BINS)),
+            per_area: false,
         };
         let (g_styled, rows_styled, _, _, _) =
             build_geometry_styled_for_test(&store, &crs, &display, &style).unwrap();
@@ -5223,9 +5303,28 @@ mod preview_rect_tests {
         loaded[0] = resolved[0].1.clone();
         let id_col = store.schema.index_of("id").unwrap();
         let mut vals =
-            sample_loaded_values(&store, &loaded, id_col, 10_000).unwrap();
+            sample_loaded_values(&store, &loaded, id_col, 10_000, false).unwrap();
         vals.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         let got: Vec<u32> = vals.iter().map(|v| *v as u32).collect();
         assert_eq!(got, expected, "sampling must reproduce the preview selection");
+    }
+}
+
+#[cfg(test)]
+mod norm_bin_tests {
+    use super::norm_bin;
+
+    #[test]
+    fn area_normalization_orders_by_density() {
+        // Breaks on value/area (density): 10 and 100.
+        let breaks = vec![10.0, 100.0];
+        // Same value, different areas: the small parcel is denser.
+        assert_eq!(norm_bin(1000.0, 5.0, &breaks), 2, "200/unit: top class");
+        assert_eq!(norm_bin(1000.0, 20.0, &breaks), 1, "50/unit: middle");
+        assert_eq!(norm_bin(1000.0, 1000.0, &breaks), 0, "1/unit: bottom");
+        // Nulls and degenerate areas fall to bin 0 like the plain path.
+        assert_eq!(norm_bin(f64::NAN, 5.0, &breaks), 0);
+        assert_eq!(norm_bin(1000.0, 0.0, &breaks), 0);
+        assert_eq!(norm_bin(1000.0, -1.0, &breaks), 0);
     }
 }

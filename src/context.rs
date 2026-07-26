@@ -157,6 +157,8 @@ pub struct StyleByCtx {
     pub classified_rows: Option<usize>,
     #[serde(default, skip_serializing_if = "is_zero_u16")]
     pub hidden_bins: u16,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub per_area: bool,
     #[serde(flatten)]
     pub mode: StyleByMode,
 }
@@ -188,6 +190,7 @@ impl StyleCtx {
                 ramp: sb.ramp.label().to_string(),
                 classified_rows: sb.classified_rows,
                 hidden_bins: sb.hidden_bins,
+                per_area: sb.per_area,
                 mode: match &sb.mode {
                     StyleMode::Graduated { method, breaks } => StyleByMode::Graduated {
                         method: method.label().to_string(),
@@ -224,6 +227,7 @@ impl StyleCtx {
                     .unwrap_or(Ramp::Viridis),
                 classified_rows: sb.classified_rows,
                 hidden_bins: sb.hidden_bins,
+                per_area: sb.per_area,
                 mode: match sb.mode {
                     StyleByMode::Graduated { method, breaks } => StyleMode::Graduated {
                         method: crate::data::layer::ClassMethod::ALL

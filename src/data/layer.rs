@@ -105,6 +105,10 @@ pub struct StyleBy {
     /// by clicking legend entries. Draw-time filter only; meshes keep
     /// every feature.
     pub hidden_bins: u16,
+    /// Graduated styling: classify and render value / polygon area
+    /// (data-CRS units) instead of the absolute value, so large
+    /// polygons don't dominate a choropleth.
+    pub per_area: bool,
     /// Rows that were loaded when data-dependent classes were computed
     /// (quantiles/std-dev/Jenks classify only what is loaded — panning or
     /// zooming afterwards can make the classes stale).
@@ -813,6 +817,7 @@ mod class_tests {
             column: "v".into(),
             ramp: Ramp::Viridis,
             hidden_bins: 0,
+            per_area: false,
             mode: StyleMode::Graduated {
                 method: ClassMethod::EqualInterval,
                 breaks: equal_interval_breaks(0.0, 100.0, 5),
