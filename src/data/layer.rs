@@ -136,6 +136,16 @@ pub enum ClassMethod {
     StdDev,
     /// Jenks natural breaks (Fisher's algorithm on a loaded-rows sample).
     Jenks,
+    /// Class widths grow linearly (1w, 2w, 3w…): breaks concentrate
+    /// near the minimum. Metadata-only, like equal interval.
+    Arithmetic,
+    /// Class bounds follow min·q^i (equal intervals on a log scale);
+    /// the base is the smallest positive value, class 1 absorbs ≤ 0.
+    Geometric,
+    /// Head/tail breaks (Jiang 2013): split at the mean, recurse into
+    /// the head while it stays a minority. Made for heavy-tailed data;
+    /// may produce fewer classes than requested.
+    HeadTail,
 }
 
 impl ClassMethod {
@@ -144,6 +154,9 @@ impl ClassMethod {
         ClassMethod::Quantile,
         ClassMethod::StdDev,
         ClassMethod::Jenks,
+        ClassMethod::Arithmetic,
+        ClassMethod::Geometric,
+        ClassMethod::HeadTail,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -152,13 +165,40 @@ impl ClassMethod {
             ClassMethod::Quantile => "Quantiles",
             ClassMethod::StdDev => "Std deviation",
             ClassMethod::Jenks => "Jenks natural breaks",
+            ClassMethod::Arithmetic => "Arithmetic progression",
+            ClassMethod::Geometric => "Geometric progression",
+            ClassMethod::HeadTail => "Head/tail breaks",
         }
     }
 
     /// Does this method classify from data values (vs metadata only)?
     pub fn needs_values(&self) -> bool {
-        !matches!(self, ClassMethod::EqualInterval)
+        !matches!(self, ClassMethod::EqualInterval | ClassMethod::Arithmetic)
     }
+}
+
+/// Breaks computable from bounds alone, for the editable min/max path
+/// (methods where `needs_values()` is false).
+pub fn bounds_breaks(method: ClassMethod, min: f64, max: f64, classes: usize) -> Vec<f64> {
+    match method {
+        ClassMethod::Arithmetic => arithmetic_breaks(min, max, classes),
+        _ => equal_interval_breaks(min, max, classes),
+    }
+}
+
+/// Arithmetic-progression breaks: the i-th class is i units wide, the
+/// unit chosen so `classes` classes exactly cover [min, max].
+pub fn arithmetic_breaks(min: f64, max: f64, classes: usize) -> Vec<f64> {
+    let classes = classes.clamp(2, STYLE_BINS);
+    let span = if (max - min).abs() < f64::EPSILON { 1.0 } else { max - min };
+    let unit = span / (classes * (classes + 1) / 2) as f64;
+    let mut acc = min;
+    (1..classes)
+        .map(|i| {
+            acc += unit * i as f64;
+            acc
+        })
+        .collect()
 }
 
 /// Equal-interval breaks over [min, max], `classes - 1` of them.
@@ -197,6 +237,40 @@ pub fn classify_breaks(method: ClassMethod, values: &mut Vec<f64>, classes: usiz
                 .collect()
         }
         ClassMethod::Jenks => jenks_breaks(values, classes),
+        ClassMethod::Arithmetic => arithmetic_breaks(values[0], values[n - 1], classes),
+        ClassMethod::Geometric => {
+            // Base = smallest positive value: zeros/negatives all land in
+            // class 1 and the ratio spans the positive range.
+            let max = values[n - 1];
+            let base = values.iter().copied().find(|v| *v > 0.0).unwrap_or(0.0);
+            if base <= 0.0 || max / base <= 1.0 + 1e-12 {
+                return equal_interval_breaks(values[0], max, classes);
+            }
+            let q = (max / base).powf(1.0 / classes as f64);
+            (1..classes).map(|i| base * q.powi(i as i32)).collect()
+        }
+        ClassMethod::HeadTail => {
+            let mut out: Vec<f64> = Vec::new();
+            let mut slice: &[f64] = values;
+            while out.len() < classes - 1 && slice.len() > 1 {
+                let mean = slice.iter().sum::<f64>() / slice.len() as f64;
+                let head_start = slice.partition_point(|v| *v < mean);
+                let head = &slice[head_start..];
+                if head.is_empty() || head.len() == slice.len() {
+                    break;
+                }
+                out.push(mean);
+                // Recurse only while the head stays a minority (< 40%).
+                if head.len() as f64 / slice.len() as f64 >= 0.4 {
+                    break;
+                }
+                slice = head;
+            }
+            if out.is_empty() {
+                return equal_interval_breaks(values[0], values[n - 1], classes);
+            }
+            out
+        }
     }
 }
 
@@ -809,7 +883,13 @@ mod class_tests {
         for classes in [2usize, 5, 8, STYLE_BINS] {
             for m in ClassMethod::ALL {
                 let b = classify_breaks(*m, &mut vals.clone(), classes);
-                assert_eq!(b.len(), classes - 1, "{m:?} classes={classes}");
+                if *m == ClassMethod::HeadTail {
+                    // Head/tail decides its own depth; never more than asked.
+                    assert!(!b.is_empty() && b.len() <= classes - 1, "{m:?}");
+                } else {
+                    assert_eq!(b.len(), classes - 1, "{m:?} classes={classes}");
+                }
+                assert!(b.windows(2).all(|w| w[0] <= w[1]), "{m:?} sorted");
             }
         }
         // bin_colors spreads the ramp over exactly the class count.
@@ -828,6 +908,30 @@ mod class_tests {
         assert_eq!(colors[4], Ramp::Viridis.sample(1.0), "last class = ramp end");
         assert_eq!(colors[5], colors[4], "bins past the class count reuse the last color");
         assert_ne!(colors[0], colors[1]);
+    }
+
+    #[test]
+    fn progression_and_headtail_breaks() {
+        // Arithmetic over [0, 100], 4 classes: widths 10/20/30/40.
+        assert_eq!(arithmetic_breaks(0.0, 100.0, 4), vec![10.0, 30.0, 60.0]);
+        // Geometric spans decades; zeros fold into class 1 without
+        // breaking the ratio.
+        let mut v = vec![0.0, 0.0, 1.0, 10.0, 100.0, 1000.0];
+        let g = classify_breaks(ClassMethod::Geometric, &mut v, 3);
+        assert!((g[0] - 10.0).abs() < 1e-9 && (g[1] - 100.0).abs() < 1e-9, "{g:?}");
+        // Head/tail on a heavy tail: first break at the overall mean,
+        // deeper breaks climb into the head.
+        let mut v: Vec<f64> = vec![1.0; 900];
+        v.extend([10.0; 90]);
+        v.extend([100.0; 9]);
+        v.push(1000.0);
+        let mean = v.iter().sum::<f64>() / v.len() as f64;
+        let ht = classify_breaks(ClassMethod::HeadTail, &mut v, 8);
+        assert!((ht[0] - mean).abs() < 1e-9, "{ht:?} vs mean {mean}");
+        assert!(ht.len() >= 2 && ht.windows(2).all(|w| w[0] < w[1]), "{ht:?}");
+        // Uniform data cannot split at the mean: falls back, never empty.
+        let flat = classify_breaks(ClassMethod::HeadTail, &mut vec![5.0; 40], 6);
+        assert_eq!(flat.len(), 5);
     }
 
     #[test]

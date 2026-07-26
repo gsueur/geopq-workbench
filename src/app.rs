@@ -3871,8 +3871,8 @@ impl ViewerApp {
                     });
                 }
             } else {
-                d.breaks = Some(Ok(crate::data::layer::equal_interval_breaks(
-                    d.min, d.max, d.classes,
+                d.breaks = Some(Ok(crate::data::layer::bounds_breaks(
+                    d.method, d.min, d.max, d.classes,
                 )));
             }
         } else if let Some(sql) = self.sql_layer_of(d.layer_id) {
@@ -4053,8 +4053,8 @@ impl ViewerApp {
                             });
                             if (d.min, d.max) != before {
                                 d.breaks =
-                                    Some(Ok(crate::data::layer::equal_interval_breaks(
-                                        d.min, d.max, d.classes,
+                                    Some(Ok(crate::data::layer::bounds_breaks(
+                                        d.method, d.min, d.max, d.classes,
                                     )));
                             }
                         }
