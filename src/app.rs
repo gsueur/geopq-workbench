@@ -4033,10 +4033,10 @@ impl ViewerApp {
                                 Some(Ok(b)) => {
                                     ui.label(
                                         RichText::new(format!(
-                                            "{} classes · breaks {:.4} … {:.4}",
+                                            "{} classes · breaks {} … {}",
                                             b.len() + 1,
-                                            b.first().copied().unwrap_or(0.0),
-                                            b.last().copied().unwrap_or(0.0),
+                                            fmt_sig(b.first().copied().unwrap_or(0.0), 3),
+                                            fmt_sig(b.last().copied().unwrap_or(0.0), 3),
                                         ))
                                         .weak()
                                         .small(),
@@ -6950,13 +6950,48 @@ fn swatch_color_button(
     changed
 }
 
-/// Class bound for the legend: integers plain, fractions to 4 decimals.
-fn fmt_class_bound(v: f64) -> String {
-    if v == v.trunc() && v.abs() < 1e15 {
-        format!("{}", v as i64)
-    } else {
-        format!("{v:.4}")
+/// Compact class bound: `sig` significant digits with k/M/G suffixes
+/// (42200 → "42.2k", 718000 → "718k", 0.00123 → "0.00123").
+fn fmt_sig(v: f64, sig: usize) -> String {
+    if v == 0.0 || !v.is_finite() {
+        return format!("{v:.0}");
     }
+    let a = v.abs();
+    let (scaled, suffix) = if a >= 1e9 {
+        (v / 1e9, "G")
+    } else if a >= 1e6 {
+        (v / 1e6, "M")
+    } else if a >= 1e3 {
+        (v / 1e3, "k")
+    } else {
+        (v, "")
+    };
+    let e = scaled.abs().log10().floor() as i64;
+    let dec = (sig as i64 - 1 - e).max(0) as usize;
+    let s = format!("{scaled:.dec$}");
+    let s = if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s
+    };
+    format!("{s}{suffix}")
+}
+
+/// Legend labels for the break values: rounded to 3 significant digits,
+/// with precision raised until adjacent distinct breaks keep distinct
+/// labels (never show "40k – 40k" for a real interval).
+fn fmt_break_labels(breaks: &[f64]) -> Vec<String> {
+    for sig in 3..=8 {
+        let out: Vec<String> = breaks.iter().map(|b| fmt_sig(*b, sig)).collect();
+        let ok = breaks
+            .windows(2)
+            .zip(out.windows(2))
+            .all(|(bv, bl)| bv[0] == bv[1] || bl[0] != bl[1]);
+        if ok {
+            return out;
+        }
+    }
+    breaks.iter().map(|b| fmt_sig(*b, 8)).collect()
 }
 
 /// Compact legend for a data-styled layer in the layers panel: one
@@ -7041,6 +7076,7 @@ fn style_legend(
                     return;
                 }
                 let colors = sb.bin_colors();
+                let labels = fmt_break_labels(breaks);
                 let n = breaks.len() + 1;
                 for i in 0..n {
                     let c = colors[i.min(colors.len() - 1)];
@@ -7050,15 +7086,11 @@ fn style_legend(
                         (c[2] * 255.0) as u8,
                     );
                     let label = if i == 0 {
-                        format!("< {}", fmt_class_bound(breaks[0]))
+                        format!("< {}", labels[0])
                     } else if i == n - 1 {
-                        format!("≥ {}", fmt_class_bound(breaks[n - 2]))
+                        format!("≥ {}", labels[n - 2])
                     } else {
-                        format!(
-                            "{} – {}",
-                            fmt_class_bound(breaks[i - 1]),
-                            fmt_class_bound(breaks[i])
-                        )
+                        format!("{} – {}", labels[i - 1], labels[i])
                     };
                     swatch(ui, i as u8, c, label);
                 }
@@ -7581,5 +7613,28 @@ mod tests {
         }
         let lit = data.chunks_exact(4).filter(|px| px[0] > 100).count();
         assert!(lit > 3_000, "graticule pixels: {lit}");
+    }
+}
+
+#[cfg(test)]
+mod legend_fmt_tests {
+    use super::{fmt_break_labels, fmt_sig};
+
+    #[test]
+    fn sig_formatting_and_collision_guard() {
+        assert_eq!(fmt_sig(42200.0, 3), "42.2k");
+        assert_eq!(fmt_sig(718000.0, 3), "718k");
+        assert_eq!(fmt_sig(16188500.0, 3), "16.2M");
+        assert_eq!(fmt_sig(3200.0, 3), "3.2k");
+        assert_eq!(fmt_sig(0.0, 3), "0");
+        assert_eq!(fmt_sig(12.3456, 3), "12.3");
+        assert_eq!(fmt_sig(0.00123, 3), "0.00123");
+        assert_eq!(fmt_sig(-42200.0, 3), "-42.2k");
+        // Close but distinct breaks force extra precision…
+        let l = fmt_break_labels(&[42210.0, 42260.0, 99000.0]);
+        assert_ne!(l[0], l[1], "{l:?}");
+        // …while genuinely equal breaks (quantile dupes) may share one.
+        let l = fmt_break_labels(&[0.0, 0.0, 3200.0]);
+        assert_eq!(l[0], l[1]);
     }
 }
