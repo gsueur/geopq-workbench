@@ -1,3 +1,4 @@
+pub mod attribution;
 pub mod coastline;
 pub mod crs;
 pub mod geoarrow;

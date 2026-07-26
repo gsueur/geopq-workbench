@@ -2016,6 +2016,7 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
         columns,
         geo: summarize_geo_meta(geo_meta.as_ref(), &primary_name, &crs.name, has_native_geometry),
         files: 1,
+        attribution: super::attribution::find(source, &kv),
         quality: None,
     };
 

@@ -294,6 +294,12 @@ larger files are on the roadmap.
 - **Reload to viewport** (View menu): drop everything loaded and reload
   just the current view — reclaims memory after a continent-sized
   detour.
+- **Attribution**: a layer that carries a credit shows it in the map
+  corner beside the basemap's, and in full under File info. It is read
+  from the parquet metadata (`attribution`, `license`, …) or from an
+  `ATTRIBUTION.txt` sitting next to the data — the convention the
+  repositories follow, so a mirrored dataset credits its source without
+  anyone having to remember.
 - **Attributes on click**, fetched lazily from the file; a floating
   window that never resizes the map. Works identically on remote files
   (each click is a small ranged read, off the UI thread).

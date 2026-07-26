@@ -6735,6 +6735,25 @@ impl ViewerApp {
                             );
                         });
 
+                    if let Some(a) = &info.attribution {
+                        egui::CollapsingHeader::new("Attribution")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(&a.credit).strong());
+                                if ui.small_button("Copy").clicked() {
+                                    ui.ctx().copy_text(a.text.clone());
+                                }
+                                // The full notice: licences routinely ask
+                                // for a citation or a link, and the user
+                                // needs to be able to read and copy it.
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut a.text.as_str())
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY),
+                                );
+                            });
+                    }
+
                     if let Some(json) = &info.geo.raw_geo_json {
                         egui::CollapsingHeader::new("Raw geo metadata").show(ui, |ui| {
                             if ui.small_button("Copy JSON").clicked() {
@@ -7242,18 +7261,47 @@ impl ViewerApp {
                 Color32::from_rgb(242, 140, 26),
             );
         }
+        // Credits, bottom right: the basemap's, then one per visible
+        // layer that asks for one. Licences like CC BY want the credit
+        // where the data is seen, not buried in a dialog.
+        let mut credits: Vec<&str> = Vec::new();
         if let (Some(src), true) = (self.basemap, self.display.is_mercator()) {
-            ui.painter().text(
-                rect.right_bottom() - egui::vec2(6.0, 4.0),
-                egui::Align2::RIGHT_BOTTOM,
-                TILE_SOURCES[src].attribution,
-                egui::FontId::proportional(10.0),
-                if dark {
-                    Color32::from_white_alpha(120)
-                } else {
-                    Color32::from_black_alpha(140)
-                },
-            );
+            credits.push(TILE_SOURCES[src].attribution);
+        }
+        for l in &self.layers {
+            if !l.style.visible {
+                continue;
+            }
+            let Some(a) = l.info.attribution.as_ref() else {
+                continue;
+            };
+            if !credits.contains(&a.credit.as_str()) {
+                credits.push(&a.credit);
+            }
+        }
+        if !credits.is_empty() {
+            let color = if dark {
+                Color32::from_white_alpha(120)
+            } else {
+                Color32::from_black_alpha(140)
+            };
+            let font = egui::FontId::proportional(10.0);
+            // Stacked upwards so a long credit never runs off the side.
+            let mut y = rect.bottom() - 4.0;
+            for c in credits.iter().rev() {
+                let g = ui.painter().layout_no_wrap(
+                    (*c).to_string(),
+                    font.clone(),
+                    color,
+                );
+                let h = g.size().y;
+                ui.painter().galley(
+                    egui::pos2(rect.right() - 6.0 - g.size().x, y - h),
+                    g,
+                    color,
+                );
+                y -= h;
+            }
         }
     }
 }
