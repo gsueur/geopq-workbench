@@ -270,7 +270,10 @@ larger files are on the roadmap.
   frequent values. **Normalize by area** divides each value by its
   feature's area before classifying and drawing, so absolute totals stop
   tracking polygon size (the legend then reads `LAND_VAL / m²`, in the
-  CRS's own unit).
+  CRS's own unit). Geographic layers are measured on an equal-area
+  projection rather than in degrees², which are not an area: without
+  that, two identical fields would rank differently for no reason but
+  how far north they sit.
 - **Legend**: class bounds under the layer, rounded to three significant
   digits with k/M suffixes, swatches composited exactly as the map draws
   them at the current fill opacity. Click a class to hide it on the map;
