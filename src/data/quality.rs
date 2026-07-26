@@ -31,6 +31,10 @@ pub const RG_ROWS_MAX: u64 = 512_000;
 pub const RG_BYTES_MAX: u64 = 128 << 20;
 /// C3 advisory: below this, footer size and per-group overhead dominate.
 pub const RG_ROWS_MIN: u64 = 16_000;
+/// C2: average geometry bytes per feature above which features are big
+/// enough that their bounding boxes overlap however the file is sorted,
+/// and "sort it" is the wrong advice.
+pub const SPRAWL_BYTES: u64 = 8 << 10;
 /// C3 advisory: and only when the groups are small in bytes too. Few
 /// rows of heavy geometry make a substantial row group, and calling
 /// that "overhead dominated" would push the user to undo a split that
@@ -174,15 +178,32 @@ pub fn analyze(inp: &QualityInput) -> QualityReport {
                     ),
                 }
             } else {
+                // The metric sees overlapping boxes; it cannot see why.
+                // Sprawling features (country outlines with overseas
+                // territories, long rivers, dateline crossers) overlap
+                // whatever order they are written in, and telling that
+                // user to sort the file sends them after a fix that does
+                // not exist. Average geometry size separates the two
+                // cases well enough to name the likely one.
+                let per_feature = inp.geom_bytes / inp.rows.max(1);
+                let cause = if per_feature >= SPRAWL_BYTES {
+                    format!(
+                        "features average {} of geometry, so their bounding \
+                         boxes may overlap whatever the row order",
+                        super::info::fmt_bytes(per_feature)
+                    )
+                } else {
+                    "the rows are probably not spatially sorted".to_string()
+                };
                 Check {
                     code: "C2",
                     title: "spatial ordering",
                     status: Status::Fail,
                     gating: true,
                     detail: format!(
-                        "not spatially sorted: each row-group bbox overlaps \
-                         ×{avg:.1} others of {n} ({:.0}% of possible) — most \
-                         viewports touch most row groups",
+                        "each row-group bbox overlaps ×{avg:.1} others of {n} \
+                         ({:.0}% of possible): most viewports touch most row \
+                         groups — {cause}",
                         f * 100.0
                     ),
                 }
@@ -405,6 +426,31 @@ mod tests {
 
     fn status(r: &QualityReport, code: &str) -> Status {
         r.checks.iter().find(|c| c.code == code).unwrap().status
+    }
+
+    #[test]
+    fn c2_names_sprawl_rather_than_blaming_the_sort() {
+        // Administrative boundaries: Hilbert-sorted, yet every group's
+        // bbox overlaps every other, because a country's bbox spans its
+        // overseas territories. Telling the user to sort a sorted file
+        // sends them after a fix that does not exist.
+        let geo = geo_ok();
+        let boxes = vec![[-180.0, -60.0, 180.0, 75.0]; 6];
+        let mut inp = input(Some(("bbox", &boxes)), 218, 6, 61, &geo);
+        inp.geom_bytes = 218 * (400 << 10); // ~400 KB per country
+        let r = analyze(&inp);
+        assert_eq!(status(&r, "C2"), Status::Fail);
+        let d = &r.checks.iter().find(|c| c.code == "C2").unwrap().detail;
+        assert!(d.contains("whatever the row order"), "{d}");
+        assert!(!d.contains("not spatially sorted"), "{d}");
+
+        // Small features overlapping that much really is a sort problem.
+        inp.geom_bytes = 218 * 200;
+        let r = analyze(&inp);
+        let d = &r.checks.iter().find(|c| c.code == "C2").unwrap().detail;
+        assert!(d.contains("not spatially sorted"), "{d}");
+        // Either way the measurement itself is stated.
+        assert!(d.contains("of possible"), "{d}");
     }
 
     #[test]

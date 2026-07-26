@@ -6134,11 +6134,14 @@ impl ViewerApp {
                             } else {
                                 match primary_indexable {
                                     Some(true) => {
-                                        "This file already passes the gating checks —                                          uploading it unchanged is fine."
+                                        "This file already passes the gating checks — \
+                                         uploading it unchanged is fine."
                                             .into()
                                     }
                                     Some(false) => {
-                                        "The scorecard says this file would benefit                                          from a rewrite — consider exporting instead."
+                                        "The scorecard says this file would benefit \
+                                         from a rewrite — consider exporting \
+                                         instead."
                                             .into()
                                     }
                                     None => format!(
@@ -6437,7 +6440,7 @@ impl ViewerApp {
                     for c in q.failures() {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
-                                RichText::new("✘")
+                                RichText::new(ph::X_CIRCLE)
                                     .color(Color32::from_rgb(220, 60, 60))
                                     .strong(),
                             );
@@ -6771,9 +6774,9 @@ impl ViewerApp {
         egui::Grid::new("quality_grid").num_columns(3).striped(true).show(ui, |ui| {
             for c in &q.checks {
                 let (icon, color) = match c.status {
-                    Status::Pass => ("✔", green),
-                    Status::Warn => ("!", amber),
-                    Status::Fail => ("✘", red),
+                    Status::Pass => (ph::CHECK_CIRCLE, green),
+                    Status::Warn => (ph::WARNING_CIRCLE, amber),
+                    Status::Fail => (ph::X_CIRCLE, red),
                 };
                 ui.label(RichText::new(icon).color(color).strong());
                 ui.label(RichText::new(format!("{} {}", c.code, c.title)).strong());
