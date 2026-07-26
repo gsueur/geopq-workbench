@@ -4,6 +4,7 @@ pub mod geoarrow;
 pub mod geojson;
 pub mod geometry;
 pub mod gpkg;
+pub mod grid;
 pub mod import;
 pub mod info;
 pub mod layer;

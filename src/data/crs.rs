@@ -89,6 +89,24 @@ impl Crs {
         .expect("builtin 3857 proj string")
     }
 
+    /// Human label for the CRS's areal unit, for per-area legends:
+    /// "m²" for metric projected CRS (proj's default), "ft²"/"US ft²"
+    /// for foot-based ones, "deg²" for geographic.
+    pub fn area_unit(&self) -> &'static str {
+        if self.is_latlong {
+            return "deg²";
+        }
+        if self.proj4.contains("+units=us-ft") {
+            "US ft²"
+        } else if self.proj4.contains("+units=ft") {
+            "ft²"
+        } else if self.proj4.contains("+to_meter") && !self.proj4.contains("+units=m") {
+            "unit²"
+        } else {
+            "m²"
+        }
+    }
+
     pub fn same_as(&self, other: &Crs) -> bool {
         self.proj4 == other.proj4
     }

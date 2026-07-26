@@ -241,6 +241,9 @@ pub struct ViewerApp {
     strip_probe: u8,
     /// Vector import dialog / conversion in flight.
     gpkg_import: Option<ImportState>,
+    /// Grid summary dialog / aggregation in flight.
+    grid_dialog: Option<GridState>,
+    grid_n: u64,
     /// Files dropped while an import dialog was already open; imported
     /// one after another as each dialog closes.
     import_queue: Vec<PathBuf>,
@@ -564,6 +567,35 @@ fn fetch_pick_attrs(
     }
 }
 
+/// Grid summary dialog: aggregate a numeric column into cells.
+struct GridState {
+    layer_id: u64,
+    layer_name: String,
+    /// Numeric columns of the source layer.
+    columns: Vec<String>,
+    column: String,
+    /// 0 = square grid, 1 = H3, 2 = A5.
+    system: usize,
+    /// Square cell size, data-CRS units.
+    size: f64,
+    h3_res: u8,
+    a5_res: i32,
+    stat: crate::data::grid::GridStat,
+    kernel: crate::data::grid::Kernel,
+    passes: u32,
+    running: bool,
+    progress: f32,
+    error: Option<String>,
+    rx: Option<Receiver<GridMsg>>,
+}
+
+enum GridMsg {
+    Progress(f32),
+    /// (temp file, layer name, cells, rows aggregated)
+    Done(PathBuf, String, usize, u64),
+    Failed(String),
+}
+
 /// Data-driven styling editor for one layer.
 struct StyleDialog {
     layer_id: u64,
@@ -650,6 +682,8 @@ impl ViewerApp {
             opt_rx,
             optimize: None,
             gpkg_import: None,
+            grid_dialog: None,
+            grid_n: 0,
             import_queue: Vec::new(),
             rename_layer: None,
             loading: HashMap::new(),
@@ -2169,6 +2203,7 @@ impl ViewerApp {
         let mut optimize_open: Option<u64> = None;
         let mut filter_open: Option<u64> = None;
         let mut style_open: Option<u64> = None;
+        let mut grid_open: Option<u64> = None;
         let mut filter_clear: Option<u64> = None;
         let mut reclass_req: Option<u64> = None;
         let mut renaming = self.rename_layer.take();
@@ -2294,6 +2329,15 @@ impl ViewerApp {
                                     }
                                     if ui.button("Style by value…").clicked() {
                                         style_open = Some(l.id);
+                                    }
+                                    if ui
+                                        .button("Grid summary…")
+                                        .on_hover_text(
+                                            "Aggregate a numeric column into square / H3 /                                              A5 cells (mean, median, sum, count), with                                              optional smoothing — the grid becomes a new                                              layer",
+                                        )
+                                        .clicked()
+                                    {
+                                        grid_open = Some(l.id);
                                     }
                                     if l.style.style_by.is_some()
                                         && ui.button("Clear styling").clicked()
@@ -2488,6 +2532,7 @@ impl ViewerApp {
                         l.style.fill_opacity,
                         l.style.opacity,
                     );
+                    let area_unit = l.crs.area_unit();
                     if let Some(sb) = &mut l.style.style_by {
                         if let Some(n0) = sb.classified_rows {
                             let n1 = loaded_rows as f64;
@@ -2513,7 +2558,7 @@ impl ViewerApp {
                             }
                             _ => opacity,
                         };
-                        if style_legend(ui, layer_id, sb, fill_alpha) {
+                        if style_legend(ui, layer_id, sb, fill_alpha, area_unit) {
                             reclass_req = Some(layer_id);
                         }
                     }
@@ -2760,6 +2805,9 @@ impl ViewerApp {
         if let Some(id) = style_open {
             let ctx = ui.ctx().clone();
             self.open_style_dialog(id, &ctx);
+        }
+        if let Some(id) = grid_open {
+            self.open_grid_dialog(id);
         }
         if let Some(id) = load_all {
             use crate::data::layer::GroupLoad;
@@ -3765,6 +3813,258 @@ impl ViewerApp {
                 _ => None,
             })
             .collect()
+    }
+
+    fn open_grid_dialog(&mut self, layer_id: u64) {
+        let Some(l) = self.layers.iter().find(|l| l.id == layer_id) else { return };
+        let columns: Vec<String> = Self::style_columns(&l.store)
+            .into_iter()
+            .filter(|(_, numeric)| *numeric)
+            .map(|(n, _)| n)
+            .collect();
+        if columns.is_empty() {
+            self.push_error(format!("{}: no numeric columns to aggregate", l.name));
+            return;
+        }
+        let column = columns[0].clone();
+        self.grid_dialog = Some(GridState {
+            layer_id,
+            layer_name: l.name.clone(),
+            columns,
+            column,
+            system: 0,
+            size: 1000.0,
+            h3_res: 7,
+            a5_res: 14,
+            stat: crate::data::grid::GridStat::Mean,
+            kernel: crate::data::grid::Kernel::Box,
+            passes: 0,
+            running: false,
+            progress: 0.0,
+            error: None,
+            rx: None,
+        });
+    }
+
+    fn grid_window(&mut self, ctx: &egui::Context) {
+        use crate::data::grid::{CellSystem, GridStat, Kernel};
+        let floating_area = self.floating_area(ctx);
+        if self.grid_dialog.is_none() {
+            return;
+        }
+        // Drain progress / completion messages.
+        let mut done: Option<(PathBuf, String, usize, u64)> = None;
+        {
+            let st = self.grid_dialog.as_mut().unwrap();
+            let mut failed = None;
+            if let Some(rx) = &st.rx {
+                while let Ok(msg) = rx.try_recv() {
+                    match msg {
+                        GridMsg::Progress(f) => st.progress = f,
+                        GridMsg::Done(p, name, cells, rows) => {
+                            done = Some((p, name, cells, rows))
+                        }
+                        GridMsg::Failed(e) => failed = Some(e),
+                    }
+                }
+            }
+            if let Some(e) = failed {
+                st.error = Some(e);
+                st.running = false;
+                st.rx = None;
+            }
+        }
+        if let Some((path, name, cells, rows)) = done {
+            self.grid_dialog = None;
+            let job = self.enqueue_load(Source::Local(path), ctx);
+            self.pending_names.insert(job, name);
+            log::info!("grid: {cells} cells from {rows} features");
+            return;
+        }
+
+        let mut open = true;
+        let mut start = false;
+        let st = self.grid_dialog.as_mut().unwrap();
+        egui::Window::new(format!("Grid summary — {}", st.layer_name))
+            .id(egui::Id::new("grid_dialog"))
+            .open(&mut open)
+            .default_width(380.0)
+            .collapsible(false)
+            .constrain_to(floating_area)
+            .show(ctx, |ui| {
+                ui.add_enabled_ui(!st.running, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("column:");
+                        egui::ComboBox::from_id_salt("grid_col")
+                            .width(180.0)
+                            .selected_text(&st.column)
+                            .show_ui(ui, |ui| {
+                                for c in &st.columns {
+                                    ui.selectable_value(&mut st.column, c.clone(), c);
+                                }
+                            });
+                        ui.label("statistic:");
+                        egui::ComboBox::from_id_salt("grid_stat")
+                            .width(90.0)
+                            .selected_text(st.stat.label())
+                            .show_ui(ui, |ui| {
+                                for s in GridStat::ALL {
+                                    ui.selectable_value(&mut st.stat, *s, s.label());
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("cells:");
+                        ui.selectable_value(&mut st.system, 0, "square");
+                        ui.selectable_value(&mut st.system, 1, "H3");
+                        ui.selectable_value(&mut st.system, 2, "A5");
+                        match st.system {
+                            0 => {
+                                ui.label("size:");
+                                ui.add(
+                                    egui::DragValue::new(&mut st.size)
+                                        .range(1.0..=1e7)
+                                        .speed(50.0),
+                                )
+                                .on_hover_text(
+                                    "Cell size in the layer's CRS units (meters for                                      projected data — avoid degrees, st_transform first)",
+                                );
+                            }
+                            1 => {
+                                ui.label("res:");
+                                ui.add(egui::DragValue::new(&mut st.h3_res).range(0..=13))
+                                    .on_hover_text(
+                                        "H3 resolution (7 ≈ 5 km², 8 ≈ 0.7 km², 9 ≈ 0.1 km²)",
+                                    );
+                            }
+                            _ => {
+                                ui.label("res:");
+                                ui.add(egui::DragValue::new(&mut st.a5_res).range(0..=20))
+                                    .on_hover_text(
+                                        "A5 resolution (equal-area pentagons; ~14 is                                          comparable to H3 7)",
+                                    );
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("smoothing:");
+                        ui.add(egui::DragValue::new(&mut st.passes).range(0..=5))
+                            .on_hover_text(
+                                "Passes of neighbor averaging over present cells                                  (0 = raw aggregation)",
+                            );
+                        if st.system == 0 {
+                            egui::ComboBox::from_id_salt("grid_kernel")
+                                .width(90.0)
+                                .selected_text(match st.kernel {
+                                    Kernel::Box => "box 3×3",
+                                    Kernel::Gaussian => "gaussian",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut st.kernel, Kernel::Box, "box 3×3");
+                                    ui.selectable_value(
+                                        &mut st.kernel,
+                                        Kernel::Gaussian,
+                                        "gaussian",
+                                    );
+                                });
+                        } else {
+                            ui.label(RichText::new("(ring mean)").weak().small());
+                        }
+                    });
+                    ui.label(
+                        RichText::new(
+                            "Scans the whole file by feature centroid — columnar and fast                              when a covering bbox column exists, geometry decode otherwise.",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                });
+                if let Some(e) = &st.error {
+                    ui.colored_label(Color32::from_rgb(220, 60, 60), e);
+                }
+                ui.add_space(4.0);
+                if st.running {
+                    ui.add(egui::ProgressBar::new(st.progress).show_percentage());
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                } else if ui.button("Compute grid").clicked() {
+                    start = true;
+                }
+            });
+        if start {
+            let grid_n = self.next_grid_n();
+            let st = self.grid_dialog.as_mut().unwrap();
+            let Some(l) = self.layers.iter().find(|l| l.id == st.layer_id) else { return };
+            let Some(col) = l
+                .store
+                .schema
+                .fields()
+                .iter()
+                .position(|f| f.name() == &st.column)
+            else {
+                st.error = Some(format!("column {} not found", st.column));
+                return;
+            };
+            let system = match st.system {
+                0 => CellSystem::Square { size: st.size },
+                1 => CellSystem::H3 { res: st.h3_res },
+                _ => CellSystem::A5 { res: st.a5_res },
+            };
+            let spec = crate::data::grid::GridSpec {
+                value_col: col,
+                system,
+                stat: st.stat,
+                kernel: st.kernel,
+                smooth_passes: st.passes,
+            };
+            let cell_label = match st.system {
+                0 => format!("{}u", st.size),
+                1 => format!("h3r{}", st.h3_res),
+                _ => format!("a5r{}", st.a5_res),
+            };
+            let name = format!(
+                "{} · {}({}) {}",
+                st.layer_name,
+                st.stat.label(),
+                st.column,
+                cell_label
+            );
+            let dst = std::env::temp_dir().join(format!(
+                "geopq_grid_{}_{}_{grid_n}.parquet",
+                std::process::id(),
+                st.layer_id,
+            ));
+            let (tx, rx) = std::sync::mpsc::channel();
+            st.rx = Some(rx);
+            st.running = true;
+            st.progress = 0.0;
+            st.error = None;
+            let store = Arc::clone(&l.store);
+            let crs = l.crs.clone();
+            let ctx2 = ctx.clone();
+            std::thread::spawn(move || {
+                let tx_prog = tx.clone();
+                let ctx3 = ctx2.clone();
+                let prog = move |f: f32| {
+                    let _ = tx_prog.send(GridMsg::Progress(f));
+                    ctx3.request_repaint();
+                };
+                let res = crate::data::grid::compute(&store, &crs, &spec, &dst, &prog);
+                let _ = tx.send(match res {
+                    Ok((cells, rows)) => GridMsg::Done(dst, name, cells, rows),
+                    Err(e) => GridMsg::Failed(e),
+                });
+                ctx2.request_repaint();
+            });
+        }
+        if !open && !self.grid_dialog.as_ref().is_some_and(|s| s.running) {
+            self.grid_dialog = None;
+        }
+    }
+
+    /// Monotonic counter for grid temp files.
+    fn next_grid_n(&mut self) -> u64 {
+        self.grid_n += 1;
+        self.grid_n
     }
 
     fn open_style_dialog(&mut self, layer_id: u64, ctx: &egui::Context) {
@@ -7002,6 +7302,7 @@ fn style_legend(
     layer_id: u64,
     sb: &mut crate::data::layer::StyleBy,
     fill_alpha: f32,
+    area_unit: &str,
 ) -> bool {
     use crate::data::layer::{StyleMode, STYLE_BINS};
     let mut reclass = false;
@@ -7022,7 +7323,7 @@ fn style_legend(
         )
     };
     let title = if sb.per_area {
-        format!("legend — {} / area", sb.column)
+        format!("legend — {} / {area_unit}", sb.column)
     } else {
         format!("legend — {}", sb.column)
     };
@@ -7434,6 +7735,7 @@ impl eframe::App for ViewerApp {
         }
         self.optimize_window(&ctx);
         self.gpkg_import_window(&ctx);
+        self.grid_window(&ctx);
         self.url_window(&ctx);
         self.repo_window(&ctx);
         self.style_window(&ctx);
