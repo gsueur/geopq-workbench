@@ -24,8 +24,18 @@ pub const CHAIN_OVERLAP_MIN: f64 = 2.0;
 /// C3: the row group is the refine/decode unit; groups larger than this
 /// make pruning coarse and single-group decodes chunky.
 pub const RG_ROWS_MAX: u64 = 512_000;
+/// C3: the same limit in bytes. Rows measure a row group only when
+/// features are small; a few hundred administrative boundaries can fill
+/// hundreds of megabytes, and that group is one indivisible decode
+/// whatever its row count says.
+pub const RG_BYTES_MAX: u64 = 128 << 20;
 /// C3 advisory: below this, footer size and per-group overhead dominate.
 pub const RG_ROWS_MIN: u64 = 16_000;
+/// C3 advisory: and only when the groups are small in bytes too. Few
+/// rows of heavy geometry make a substantial row group, and calling
+/// that "overhead dominated" would push the user to undo a split that
+/// is doing exactly what it should.
+pub const RG_BYTES_MIN: u64 = 4 << 20;
 /// Hard ceiling for the quality-gate "Load all" path: above either, an
 /// unoptimized file can only be Optimized (an honest refusal beats an
 /// out-of-memory tessellation). Provisional values, to be calibrated.
@@ -80,6 +90,8 @@ pub struct QualityInput<'a> {
     pub rows: u64,
     pub row_groups: usize,
     pub rg_rows_max: u64,
+    /// Uncompressed bytes of the largest row group.
+    pub rg_bytes_max: u64,
     /// Merged per-row-group bboxes with their source label, as resolved
     /// by the loader (native geo stats, covering stats, coordinate
     /// stats, or the per-file bbox fallback of multi-file datasets).
@@ -199,15 +211,35 @@ pub fn analyze(inp: &QualityInput) -> QualityReport {
                 inp.rg_rows_max, RG_ROWS_MAX
             ),
         }
-    } else if mean_rows < RG_ROWS_MIN && inp.row_groups > 1 {
+    } else if inp.rg_bytes_max > RG_BYTES_MAX {
+        Check {
+            code: "C3",
+            title: "row-group size",
+            status: Status::Fail,
+            gating: true,
+            detail: format!(
+                "largest row group holds {} of geometry and attributes \
+                 (max {}) in {} rows: heavy features make a row group \
+                 that must be fetched and decoded whole, however few \
+                 rows it counts",
+                super::info::fmt_bytes(inp.rg_bytes_max),
+                super::info::fmt_bytes(RG_BYTES_MAX),
+                inp.rg_rows_max
+            ),
+        }
+    } else if mean_rows < RG_ROWS_MIN
+        && inp.row_groups > 1
+        && inp.rg_bytes_max < RG_BYTES_MIN
+    {
         Check {
             code: "C3",
             title: "row-group size",
             status: Status::Warn,
             gating: true,
             detail: format!(
-                "row groups average {mean_rows} rows (< {RG_ROWS_MIN}): \
-                 footer and per-group overhead dominate"
+                "row groups average {mean_rows} rows and none exceeds {}: \
+                 footer and per-group overhead dominate",
+                super::info::fmt_bytes(inp.rg_bytes_max)
             ),
         }
     } else {
@@ -217,8 +249,10 @@ pub fn analyze(inp: &QualityInput) -> QualityReport {
             status: Status::Pass,
             gating: true,
             detail: format!(
-                "{} groups, largest {} rows",
-                inp.row_groups, inp.rg_rows_max
+                "{} groups, largest {} rows / {}",
+                inp.row_groups,
+                inp.rg_rows_max,
+                super::info::fmt_bytes(inp.rg_bytes_max)
             ),
         }
     });
@@ -355,6 +389,10 @@ mod tests {
             rows,
             row_groups,
             rg_rows_max,
+            // Test files are sized by rows unless a case says
+            // otherwise; small enough that the byte branches stay out of
+            // the way.
+            rg_bytes_max: 1 << 20,
             boxes,
             encoding: GeomEncoding::MultiPolygon,
             xy_synthesized: false,
@@ -367,6 +405,45 @@ mod tests {
 
     fn status(r: &QualityReport, code: &str) -> Status {
         r.checks.iter().find(|c| c.code == code).unwrap().status
+    }
+
+    #[test]
+    fn few_rows_of_heavy_geometry_are_not_overhead() {
+        // Byte-capped splitting of administrative boundaries gives
+        // groups of a few dozen features weighing tens of megabytes.
+        // Warning about per-group overhead there would argue for undoing
+        // the split that made the file prunable in the first place.
+        let geo = geo_ok();
+        let boxes = sorted_boxes(6);
+        let mut inp = input(Some(("bbox", &boxes)), 218, 6, 61, &geo);
+        inp.rg_bytes_max = 33 << 20;
+        assert_eq!(status(&analyze(&inp), "C3"), Status::Pass);
+        // Genuinely tiny groups still warn.
+        inp.rg_bytes_max = 200 << 10;
+        assert_eq!(status(&analyze(&inp), "C3"), Status::Warn);
+    }
+
+    #[test]
+    fn heavy_row_groups_fail_however_few_rows_they_hold() {
+        // The case that motivated the check: 218 administrative
+        // boundaries, one row group, 162 MB. By rows it is trivially
+        // small; as a decode unit it is the whole file.
+        let geo = geo_ok();
+        let boxes = sorted_boxes(1);
+        let mut inp = input(Some(("bbox", &boxes)), 218, 1, 218, &geo);
+        inp.rg_bytes_max = 162 << 20;
+        let r = analyze(&inp);
+        assert_eq!(status(&r, "C3"), Status::Fail);
+        let d = &r.checks.iter().find(|c| c.code == "C3").unwrap().detail;
+        assert!(d.contains("162.0 MB"), "{d}");
+        assert!(!r.indexable, "a gating fail must block the fast path");
+
+        // Same shape under the limit passes, and says both measures.
+        inp.rg_bytes_max = 40 << 20;
+        let r = analyze(&inp);
+        assert_eq!(status(&r, "C3"), Status::Pass);
+        let d = &r.checks.iter().find(|c| c.code == "C3").unwrap().detail;
+        assert!(d.contains("218 rows") && d.contains("40.0 MB"), "{d}");
     }
 
     #[test]

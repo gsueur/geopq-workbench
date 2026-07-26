@@ -44,6 +44,10 @@ pub struct FileInfo {
     pub row_groups: usize,
     pub rg_rows_min: u64,
     pub rg_rows_max: u64,
+    /// Uncompressed bytes of the largest row group: the real decode unit.
+    /// Rows alone do not measure it — a few thousand admin boundaries
+    /// carry more bytes than a million points.
+    pub rg_bytes_max: u64,
     pub compressed_bytes: u64,
     pub uncompressed_bytes: u64,
     pub columns: Vec<ColumnInfo>,

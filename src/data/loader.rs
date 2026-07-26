@@ -1076,6 +1076,7 @@ fn quality_report(
         rows: info.rows,
         row_groups: info.row_groups,
         rg_rows_max: info.rg_rows_max,
+        rg_bytes_max: info.rg_bytes_max,
         boxes: boxes.map(|(s, b)| (s.as_str(), b.as_slice())),
         encoding,
         xy_synthesized,
@@ -1654,6 +1655,7 @@ fn open_multi_store(
             info.row_groups += f.info.row_groups;
             info.rg_rows_min = info.rg_rows_min.min(f.info.rg_rows_min);
             info.rg_rows_max = info.rg_rows_max.max(f.info.rg_rows_max);
+            info.rg_bytes_max = info.rg_bytes_max.max(f.info.rg_bytes_max);
             info.compressed_bytes += f.info.compressed_bytes;
             info.uncompressed_bytes += f.info.uncompressed_bytes;
         }
@@ -2003,6 +2005,12 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
         row_groups: rg_rows.len(),
         rg_rows_min: rg_rows.iter().copied().min().unwrap_or(0),
         rg_rows_max: rg_rows.iter().copied().max().unwrap_or(0),
+        rg_bytes_max: meta
+            .row_groups()
+            .iter()
+            .map(|rg| rg.total_byte_size().max(0) as u64)
+            .max()
+            .unwrap_or(0),
         compressed_bytes,
         uncompressed_bytes,
         columns,

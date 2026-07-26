@@ -137,7 +137,17 @@ impl BloomMode {
 #[derive(Clone)]
 pub struct OptimizeOptions {
     pub version: GpVersion,
+    /// Row cap per row group.
     pub row_group_size: usize,
+    /// Byte cap per row group, whichever limit is reached first. Rows
+    /// alone size a row group only when features are small: a few
+    /// hundred administrative boundaries carry more bytes than a million
+    /// points, and without this they land in one group that has to be
+    /// fetched and decoded whole.
+    ///
+    /// Measured on the *encoded* (compressed) estimate, which is what a
+    /// reader actually downloads for the group.
+    pub row_group_bytes: usize,
     pub codec: Codec,
     /// Sort features along a Hilbert curve over bbox centers.
     pub hilbert_sort: bool,
@@ -168,6 +178,10 @@ impl Default for OptimizeOptions {
         Self {
             version: GpVersion::V1_1,
             row_group_size: 65_536,
+            // In the same range as 65k rows of ordinary features, so
+            // light data keeps its current layout and only heavy
+            // features are split.
+            row_group_bytes: 16 << 20,
             codec: Codec::Zstd,
             hilbert_sort: true,
             covering: true,
@@ -767,6 +781,7 @@ pub fn optimize(
         let mut props = WriterProperties::builder()
             .set_compression(opts.codec.compression())
             .set_max_row_group_row_count(Some(opts.row_group_size))
+            .set_max_row_group_bytes(Some(opts.row_group_bytes))
             .set_statistics_enabled(EnabledStatistics::Page)
             .set_created_by(format!(
                 "{} {}",
@@ -827,7 +842,18 @@ pub fn optimize(
         (bi, row - batch_starts[bi])
     };
     let batch_refs: Vec<&RecordBatch> = batches.iter().collect();
-    let chunk_rows = opts.row_group_size.min(READ_BATCH);
+    // The writer can only close a row group between `write` calls, so a
+    // byte cap is worth exactly the granularity we hand it: one chunk of
+    // 65k heavy features would be one 200 MB group however low the cap.
+    // Size the chunk from the source's own bytes per row, aiming at half
+    // the budget so a group lands near it rather than at twice it.
+    let bytes_per_row = (uncompressed / total_rows.max(1) as u64).max(1);
+    let rows_per_budget = (opts.row_group_bytes as u64 / 2 / bytes_per_row).max(1);
+    let chunk_rows = opts
+        .row_group_size
+        .min(READ_BATCH)
+        .min(rows_per_budget.min(usize::MAX as u64) as usize)
+        .max(1);
     let out_geom_pos = kept_src_indices
         .iter()
         .position(|&i| i == geom_idx)
@@ -1701,6 +1727,109 @@ mod tests {
                 "{version:?}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heavy_features_split_row_groups_by_bytes() {
+        use arrow::array::BinaryArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        // 400 polygons of 2,000 vertices each: far under any row cap,
+        // ~13 MB of geometry. This is the shape administrative
+        // boundaries have, and the reason a row-only cap left them in
+        // one indivisible row group.
+        let dir = std::env::temp_dir().join(format!("geopq_rgbytes_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("heavy.parquet");
+        let mut wkbs: Vec<Vec<u8>> = Vec::new();
+        for i in 0..400usize {
+            let cx = (i % 20) as f64;
+            let cy = (i / 20) as f64;
+            // Jittered, so the coordinates do not compress away to
+            // nothing: the writer's byte budget counts encoded bytes,
+            // and a smooth circle costs almost none of them.
+            let mut seed = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut rnd = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 11) as f64 / (1u64 << 53) as f64
+            };
+            let ring: Vec<(f64, f64)> = (0..2_000)
+                .map(|k| {
+                    let a = k as f64 / 2_000.0 * std::f64::consts::TAU;
+                    let r = 0.3 + 0.2 * rnd();
+                    (cx + r * a.cos(), cy + r * a.sin())
+                })
+                .collect();
+            let mut b = vec![1u8];
+            b.extend_from_slice(&3u32.to_le_bytes()); // Polygon
+            b.extend_from_slice(&1u32.to_le_bytes()); // one ring
+            b.extend_from_slice(&((ring.len() + 1) as u32).to_le_bytes());
+            for (x, y) in ring.iter().chain(std::iter::once(&ring[0])) {
+                b.extend_from_slice(&x.to_le_bytes());
+                b.extend_from_slice(&y.to_le_bytes());
+            }
+            wkbs.push(b);
+        }
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "geometry",
+            DataType::Binary,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(BinaryArray::from_iter_values(wkbs.iter()))],
+        )
+        .unwrap();
+        let mut w = ArrowWriter::try_new(File::create(&src).unwrap(), schema, None).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            serde_json::json!({
+                "version": "1.0.0", "primary_column": "geometry",
+                "columns": {"geometry": {"encoding": "WKB", "geometry_types": ["Polygon"]}},
+            })
+            .to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        // Row cap alone: everything lands in one group, which is exactly
+        // the file the app used to produce.
+        let one = dir.join("one.parquet");
+        let opts = OptimizeOptions {
+            row_group_size: 65_536,
+            row_group_bytes: usize::MAX,
+            ..Default::default()
+        };
+        optimize(&Source::Local(src.clone()), &one, &opts, None, None, &|_, _| {}).unwrap();
+        let (_, _, info, _) = crate::data::loader::open_store_for_test(&one).unwrap();
+        assert_eq!(info.row_groups, 1, "row cap never fires on 400 rows");
+        let heavy = info.rg_bytes_max;
+        assert!(heavy > 4 << 20, "fixture should be chunky, got {heavy} B");
+
+        // Byte cap on: the same features split, and each group is under
+        // the limit.
+        let split = dir.join("split.parquet");
+        let opts = OptimizeOptions {
+            row_group_size: 65_536,
+            row_group_bytes: 2 << 20,
+            ..Default::default()
+        };
+        optimize(&Source::Local(src.clone()), &split, &opts, None, None, &|_, _| {}).unwrap();
+        let (store, _, info, _) = crate::data::loader::open_store_for_test(&split).unwrap();
+        assert!(
+            info.row_groups > 2,
+            "expected several groups, got {}",
+            info.row_groups
+        );
+        assert!(
+            info.rg_bytes_max < heavy,
+            "largest group {} should be under the single-group {heavy}",
+            info.rg_bytes_max
+        );
+        // No feature lost or duplicated in the split.
+        assert_eq!(store.total_rows(), 400);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
