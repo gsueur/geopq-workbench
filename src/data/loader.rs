@@ -2456,13 +2456,22 @@ pub fn sample_loaded_values(
     col: usize,
     cap: usize,
     per_area: bool,
+    groups: Option<&[u32]>,
 ) -> Result<Vec<f64>, String> {
     let starts = store.rg_starts();
+    // Optional spatial restriction: only sample these row groups (the
+    // ones intersecting the viewport for "reclassify from viewport").
+    let gset: Option<std::collections::HashSet<u32>> =
+        groups.map(|g| g.iter().copied().collect());
+    let allowed = |g: usize| gset.as_ref().is_none_or(|s| s.contains(&(g as u32)));
     // Rect-filtered previews: reproduce the load's exact selection (same
     // covering scan, same decimation) so sampling never fetches rows that
     // were never loaded.
     let mut preview_rows: std::collections::HashMap<usize, Vec<u32>> = Default::default();
     for (g, st) in loaded.iter().enumerate() {
+        if !allowed(g) {
+            continue;
+        }
         if let GroupLoad::Preview { stride, rect: Some(r) } = st {
             let group_rows = (starts[g + 1] - starts[g]) as u32;
             let ranges = covering_select(store, g as u32, *r)?
@@ -2478,6 +2487,7 @@ pub fn sample_loaded_values(
     let total: u64 = loaded
         .iter()
         .enumerate()
+        .filter(|(g, _)| allowed(*g))
         .map(|(g, st)| match st {
             GroupLoad::Full => starts[g + 1] - starts[g],
             GroupLoad::Rows { ranges, .. } => {
@@ -2497,6 +2507,9 @@ pub fn sample_loaded_values(
     let mut rows: Vec<u32> = Vec::with_capacity(cap + 1);
     let mut c = 0usize; // running loaded-row counter across groups
     for (g, st) in loaded.iter().enumerate() {
+        if !allowed(g) {
+            continue;
+        }
         let start = starts[g] as u32;
         let mut push_span = |s: u32, e: u32, c: &mut usize, step_by: usize| {
             let mut i = s as usize;
@@ -5303,7 +5316,7 @@ mod preview_rect_tests {
         loaded[0] = resolved[0].1.clone();
         let id_col = store.schema.index_of("id").unwrap();
         let mut vals =
-            sample_loaded_values(&store, &loaded, id_col, 10_000, false).unwrap();
+            sample_loaded_values(&store, &loaded, id_col, 10_000, false, None).unwrap();
         vals.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         let got: Vec<u32> = vals.iter().map(|v| *v as u32).collect();
         assert_eq!(got, expected, "sampling must reproduce the preview selection");

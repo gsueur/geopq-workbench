@@ -287,6 +287,10 @@ pub struct ViewerApp {
     /// Classification runs for the styling dialog (breaks from loaded rows).
     class_tx: Sender<(u64, String, Result<Vec<f64>, String>)>,
     class_rx: Receiver<(u64, String, Result<Vec<f64>, String>)>,
+    /// "Reclassify from viewport" runs (legend button): new breaks for
+    /// an already-styled layer.
+    vreclass_tx: Sender<(u64, Result<Vec<f64>, String>)>,
+    vreclass_rx: Receiver<(u64, Result<Vec<f64>, String>)>,
     filter_tx: Sender<crate::sql::engine::FilterMsg>,
     filter_rx: Receiver<crate::sql::engine::FilterMsg>,
     /// Layers with a filter computation in flight.
@@ -615,6 +619,7 @@ impl ViewerApp {
         let (repo_tx, repo_rx) = channel();
         let (cat_tx, cat_rx) = channel();
         let (class_tx, class_rx) = channel();
+        let (vreclass_tx, vreclass_rx) = channel();
         let display = DisplayCrs::hobo_dyer();
         let graticule_chunks = build_graticule(&display);
         let coastline_chunks = crate::data::coastline::build_coastline(&display);
@@ -689,6 +694,8 @@ impl ViewerApp {
             cat_tx,
             cat_rx,
             class_tx,
+            vreclass_tx,
+            vreclass_rx,
             class_rx,
             filter_tx,
             filter_rx,
@@ -2163,6 +2170,7 @@ impl ViewerApp {
         let mut filter_open: Option<u64> = None;
         let mut style_open: Option<u64> = None;
         let mut filter_clear: Option<u64> = None;
+        let mut reclass_req: Option<u64> = None;
         let mut renaming = self.rename_layer.take();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2474,6 +2482,12 @@ impl ViewerApp {
                     // Data-classified styling goes stale when the loaded
                     // rows drift (classification never reads beyond them).
                     let (layer_id, loaded_rows) = (l.id, l.loaded_rows());
+                    let (kind, fill_on, fill_opacity, opacity) = (
+                        l.kind(),
+                        l.style.fill_on,
+                        l.style.fill_opacity,
+                        l.style.opacity,
+                    );
                     if let Some(sb) = &mut l.style.style_by {
                         if let Some(n0) = sb.classified_rows {
                             let n1 = loaded_rows as f64;
@@ -2489,7 +2503,19 @@ impl ViewerApp {
                                 );
                             }
                         }
-                        style_legend(ui, layer_id, sb);
+                        let fill_alpha = match kind {
+                            crate::data::geometry::GeomKind::Polygon => {
+                                if fill_on {
+                                    fill_opacity * opacity
+                                } else {
+                                    1.0
+                                }
+                            }
+                            _ => opacity,
+                        };
+                        if style_legend(ui, layer_id, sb, fill_alpha) {
+                            reclass_req = Some(layer_id);
+                        }
                     }
                     if l.mode == crate::data::layer::LayerMode::Direct {
                         ui.label(
@@ -2624,6 +2650,10 @@ impl ViewerApp {
             }
         });
         self.rename_layer = renaming;
+        if let Some(id) = reclass_req {
+            let ctx = ui.ctx().clone();
+            self.start_viewport_reclassify(id, &ctx);
+        }
 
         if let Some((id, dir)) = reorder {
             // Vec order is draw order (bottom→top); ▲ raises the layer.
@@ -3831,7 +3861,7 @@ impl ViewerApp {
                         // equal interval classifies from the sample too.
                         let cap = if per_area { 20_000 } else { 50_000 };
                         let res = crate::data::loader::sample_loaded_values(
-                            &store, &loaded, idx, cap, per_area,
+                            &store, &loaded, idx, cap, per_area, None,
                         )
                         .map(|mut vals| {
                             crate::data::layer::classify_breaks(method, &mut vals, classes)
@@ -4182,6 +4212,86 @@ impl ViewerApp {
     }
 
     /// Rebuild a layer's meshes so features land in their style bins.
+    /// Legend ⟳: recompute the graduated breaks from the loaded rows of
+    /// the row groups under the current viewport, then rebuild.
+    fn start_viewport_reclassify(&mut self, layer_id: u64, ctx: &egui::Context) {
+        use crate::data::layer::StyleMode;
+        let Some(l) = self.layers.iter().find(|l| l.id == layer_id) else { return };
+        let Some(sb) = &l.style.style_by else { return };
+        let StyleMode::Graduated { method, breaks } = &sb.mode else { return };
+        let (method, classes, per_area) = (*method, breaks.len() + 1, sb.per_area);
+        let Some(idx) =
+            l.store.schema.fields().iter().position(|f| f.name() == &sb.column)
+        else {
+            return;
+        };
+        let Some(rect) =
+            loader::viewport_to_data_bbox(self.last_view_world, &self.display, &l.crs)
+        else {
+            self.push_error(format!(
+                "{}: viewport does not map into the layer's CRS",
+                l.name
+            ));
+            return;
+        };
+        let Some(rg) = &l.rg_bboxes else {
+            self.push_error(format!(
+                "{}: no row-group spatial extents — viewport reclassification                  needs a spatially indexed file",
+                l.name
+            ));
+            return;
+        };
+        let groups = loader::intersecting_rgs(&rg.boxes, rect);
+        if groups.is_empty() {
+            self.push_error(format!("{}: no data under the current viewport", l.name));
+            return;
+        }
+        let store = Arc::clone(&l.store);
+        let loaded = l.loaded.clone();
+        let tx = self.vreclass_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let cap = if per_area { 20_000 } else { 50_000 };
+            let res = crate::data::loader::sample_loaded_values(
+                &store,
+                &loaded,
+                idx,
+                cap,
+                per_area,
+                Some(&groups),
+            )
+            .map(|mut vals| crate::data::layer::classify_breaks(method, &mut vals, classes));
+            let _ = tx.send((layer_id, res));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_viewport_reclass(&mut self, ctx: &egui::Context) {
+        use crate::data::layer::StyleMode;
+        let mut restyle: Vec<u64> = Vec::new();
+        while let Ok((layer_id, res)) = self.vreclass_rx.try_recv() {
+            match res {
+                Ok(new_breaks) => {
+                    let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) else {
+                        continue;
+                    };
+                    let rows = l.loaded_rows() as usize;
+                    if let Some(sb) = &mut l.style.style_by {
+                        if let StyleMode::Graduated { breaks, .. } = &mut sb.mode {
+                            *breaks = new_breaks;
+                            sb.classified_rows = Some(rows);
+                            restyle.push(layer_id);
+                        }
+                    }
+                }
+                Err(e) => self.push_error(format!("viewport reclassify: {e}")),
+            }
+        }
+        for id in restyle {
+            self.restyle_layer(id, ctx);
+        }
+    }
+
     fn restyle_layer(&mut self, layer_id: u64, ctx: &egui::Context) {
         let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) else { return };
         l.generation += 1;
@@ -6852,8 +6962,30 @@ fn fmt_class_bound(v: f64) -> String {
 /// Compact legend for a data-styled layer in the layers panel: one
 /// swatch per class with its value boundaries (or category value).
 /// Clicking an entry toggles that class on the map (draw-time filter).
-fn style_legend(ui: &mut egui::Ui, layer_id: u64, sb: &mut crate::data::layer::StyleBy) {
+fn style_legend(
+    ui: &mut egui::Ui,
+    layer_id: u64,
+    sb: &mut crate::data::layer::StyleBy,
+    fill_alpha: f32,
+) -> bool {
     use crate::data::layer::{StyleMode, STYLE_BINS};
+    let mut reclass = false;
+    // Swatches composite exactly like map fills: class color at the
+    // layer's effective fill alpha over the map background, so the
+    // legend matches what the map actually shows.
+    let bg = if ui.visuals().dark_mode {
+        Color32::from_rgb(24, 24, 28)
+    } else {
+        Color32::from_rgb(244, 243, 240)
+    };
+    let a = fill_alpha.clamp(0.0, 1.0);
+    let blend = move |c: Color32| -> Color32 {
+        Color32::from_rgb(
+            (c.r() as f32 * a + bg.r() as f32 * (1.0 - a)).round() as u8,
+            (c.g() as f32 * a + bg.g() as f32 * (1.0 - a)).round() as u8,
+            (c.b() as f32 * a + bg.b() as f32 * (1.0 - a)).round() as u8,
+        )
+    };
     let title = if sb.per_area {
         format!("legend — {} / area", sb.column)
     } else {
@@ -6864,6 +6996,19 @@ fn style_legend(ui: &mut egui::Ui, layer_id: u64, sb: &mut crate::data::layer::S
     .default_open(true)
     .show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 2.0;
+        if matches!(sb.mode, StyleMode::Graduated { .. })
+            && ui
+                .small_button("⟳ viewport")
+                .on_hover_text(
+                    "Reclassify: recompute the class breaks from the data under \
+                     the current viewport (row groups intersecting it), then \
+                     re-render. Classes keep this stretch until you reclassify \
+                     again.",
+                )
+                .clicked()
+        {
+            reclass = true;
+        }
         let mut toggle: Option<u8> = None;
         let mut swatch = |ui: &mut egui::Ui, bin: u8, c: Color32, label: String| {
             let hidden = sb.hidden_bins & (1u16 << bin) != 0;
@@ -6871,6 +7016,7 @@ fn style_legend(ui: &mut egui::Ui, layer_id: u64, sb: &mut crate::data::layer::S
                 .horizontal(|ui| {
                     let (r, _) = ui
                         .allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    let c = blend(c);
                     ui.painter()
                         .rect_filled(r, 2.0, if hidden { c.gamma_multiply(0.2) } else { c });
                     let mut text = RichText::new(label).small();
@@ -6933,6 +7079,7 @@ fn style_legend(ui: &mut egui::Ui, layer_id: u64, sb: &mut crate::data::layer::S
             sb.hidden_bins ^= 1u16 << bin;
         }
     });
+    reclass
 }
 
 /// "832 m" / "12.42 km" (meters in; CRS units for projected layers).
@@ -7137,6 +7284,7 @@ impl eframe::App for ViewerApp {
         self.poll_repo();
         self.poll_categories();
         self.poll_classes();
+        self.poll_viewport_reclass(&ctx);
         self.strip_uploaded_cpu_meshes(frame);
         if self.strip_probe > 0 {
             self.strip_probe -= 1;
