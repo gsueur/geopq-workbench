@@ -153,7 +153,7 @@ geopq-workbench file.parquet dataset_dir/ https://host/data.parquet
 | S3 (`s3://bucket/key`) | File → Open URL… — profiles from `~/.aws`, custom endpoints (MinIO etc.), anonymous access to public buckets |
 | S3 hive dataset (`s3://bucket/prefix/` or a `*` glob) | File → Open URL… — every matching parquet part loads as one layer (`s3://bucket/d/state=*/roads.parquet` picks one theme across partitions); `key=value` path segments become queryable columns |
 | Catalogs (Overture Maps, Parquetry, your own) | File → Repositories… — browse snapshots, check layers, they load with sensible names and stacking order. Parquetry repos can load a theme across every state of a country as one layer, with `country`/`state` as columns |
-| GeoPackage / Shapefile / GeoJSON | drag & drop or File → Import vector file… — pure-Rust conversion to GeoParquet (no GDAL), then opens normally |
+| GeoPackage / Shapefile / GeoJSON | drag & drop or File → Import vector file… — pure-Rust conversion to GeoParquet (no GDAL), with a covering bbox column and byte-sized row groups so the result is readable by viewport from the first open, then opens normally |
 | Sample data | File → Open sample dataset |
 
 Format-wise, anything in the GeoParquet family works: 1.0, 1.1 with WKB
@@ -309,9 +309,11 @@ larger files are on the roadmap.
   remote URLs and S3 sources), styles, order, camera and projection as a
   JSON file; Load context… restores the whole session.
 
-Large files never lock you out: views that would decode more than
-~2.5M rows render as a live decimated preview, and zooming in streams
-the real rows for your viewport in the background.
+Large files never lock you out: views that would decode more than ~2.5M
+rows, or more than a gigabyte of geometry, render as a live decimated
+preview, and zooming in streams the real rows for your viewport in the
+background. Both limits matter — 2.4M land-cover polygons sit under the
+row budget while carrying 7 GB of coordinates.
 
 ## Querying with SQL
 

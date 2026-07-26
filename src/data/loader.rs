@@ -272,8 +272,28 @@ impl GroupSel {
 /// Row budget for one build: selections above it decode a decimated
 /// preview instead (every Nth row), refined with real rows on zoom-in.
 pub const MAX_BUILD_ROWS: u64 = 2_500_000;
+/// The same budget in geometry bytes, because rows do not measure the
+/// work. 2.5M parcels carry ~1 GB of WKB and build fine; 2.4M land-cover
+/// polygons carry 7 GB and take tens of gigabytes of RAM to tessellate,
+/// while sitting *under* the row budget and looking harmless.
+pub const MAX_BUILD_GEOM_BYTES: u64 = 1 << 30;
 /// Preview decimation targets roughly this many features.
 const PREVIEW_TARGET_ROWS: u64 = 1_200_000;
+/// …and roughly this many geometry bytes.
+const PREVIEW_TARGET_BYTES: u64 = 512 << 20;
+
+/// Decimation stride for a candidate selection, or None when it fits
+/// both budgets. Rows and geometry bytes are separate limits because
+/// neither predicts the other: a million points are 2.5M rows of nothing,
+/// a hundred thousand land-cover polygons are gigabytes.
+fn preview_stride(rows: u64, geom_bytes: u64) -> Option<u32> {
+    if rows <= MAX_BUILD_ROWS && geom_bytes <= MAX_BUILD_GEOM_BYTES {
+        return None;
+    }
+    let by_rows = rows.div_ceil(PREVIEW_TARGET_ROWS);
+    let by_bytes = geom_bytes.div_ceil(PREVIEW_TARGET_BYTES);
+    Some(by_rows.max(by_bytes).max(2).min(u32::MAX as u64) as u32)
+}
 
 /// Coalesce sorted row indices into [start, end) ranges.
 fn rows_to_ranges(rows: impl Iterator<Item = u32>) -> Vec<(u32, u32)> {
@@ -1142,9 +1162,13 @@ fn plan_viewport_selection(
         .iter()
         .map(|&g| store.rg_starts()[g as usize + 1] - store.rg_starts()[g as usize])
         .sum();
-    if est > MAX_BUILD_ROWS {
-        let stride = est.div_ceil(PREVIEW_TARGET_ROWS).max(2) as u32;
-        log::info!("{label}: {est} candidate rows exceed the budget — preview at 1/{stride}");
+    let bytes: u64 = groups.iter().map(|&g| store.rg_geom_bytes(g)).sum();
+    if let Some(stride) = preview_stride(est, bytes) {
+        log::info!(
+            "{label}: {est} candidate rows / {} of geometry exceed the budget — \
+             preview at 1/{stride}",
+            crate::data::info::fmt_bytes(bytes)
+        );
         sel = sel
             .into_iter()
             .map(|s| match s {
@@ -5398,6 +5422,30 @@ mod preview_rect_tests {
         vals.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         let got: Vec<u32> = vals.iter().map(|v| *v as u32).collect();
         assert_eq!(got, expected, "sampling must reproduce the preview selection");
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::{preview_stride, MAX_BUILD_GEOM_BYTES, MAX_BUILD_ROWS};
+
+    #[test]
+    fn the_budget_counts_bytes_as_well_as_rows() {
+        // Points: millions of rows, nothing to decode. Fits.
+        assert_eq!(preview_stride(2_000_000, 40 << 20), None);
+        // MassGIS parcels: 2.56M rows, 970 MB. Over on rows only, and
+        // the stride must stay what it has always been.
+        assert_eq!(preview_stride(2_557_399, 969 << 20), Some(3));
+        // CORINE land cover: 2.38M rows — *under* the row budget, which
+        // is why this file used to take the full-decode path and eat
+        // tens of gigabytes — but 7.18 GB of geometry.
+        let stride = preview_stride(2_375_406, 7_180 << 20).unwrap();
+        assert!(stride >= 14, "expected a deep stride, got 1/{stride}");
+        // Exactly at both limits is still fine; a byte over is not.
+        assert_eq!(preview_stride(MAX_BUILD_ROWS, MAX_BUILD_GEOM_BYTES), None);
+        assert!(preview_stride(MAX_BUILD_ROWS, MAX_BUILD_GEOM_BYTES + 1).is_some());
+        // A preview is never a no-op stride.
+        assert!(preview_stride(MAX_BUILD_ROWS + 1, 0).unwrap() >= 2);
     }
 }
 

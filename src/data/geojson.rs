@@ -16,7 +16,10 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use serde_json::{json, Value};
 
-use super::import::{geo_meta, to_wkb, AttrBuilder, Cell, GeomStats, IMPORT_BATCH_ROWS};
+use super::import::{
+    bbox_field, geo_meta, to_wkb, AttrBuilder, BboxBuilder, Cell, GeomStats,
+    IMPORT_WRITE_ROWS,
+};
 
 /// Convert a GeoJSON file to GeoParquet. Returns the rows written.
 pub fn convert(src: &Path, dst: &Path, progress: &dyn Fn(f32)) -> Result<u64, String> {
@@ -114,6 +117,7 @@ pub fn convert(src: &Path, dst: &Path, progress: &dyn Fn(f32)) -> Result<u64, St
     };
     let mut fields: Vec<Field> = vec![Field::new(&geom_name, DataType::Binary, true)];
     fields.extend(cols.iter().map(|(n, dt)| Field::new(n, dt.clone(), true)));
+    fields.push(bbox_field());
     let schema = Arc::new(Schema::new(fields));
 
     let out = std::fs::File::create(dst).map_err(|e| format!("cannot create output: {e}"))?;
@@ -122,16 +126,20 @@ pub fn convert(src: &Path, dst: &Path, progress: &dyn Fn(f32)) -> Result<u64, St
 
     let mut stats = GeomStats::new();
     let mut written = 0u64;
-    for chunk in feats.chunks(IMPORT_BATCH_ROWS) {
+    for chunk in feats.chunks(IMPORT_WRITE_ROWS) {
         let mut geom_b = BinaryBuilder::new();
+        let mut bbox_b = BboxBuilder::default();
         let mut attr_b: Vec<AttrBuilder> =
             cols.iter().map(|(_, dt)| AttrBuilder::new(dt)).collect();
         for f in chunk {
             match f.get("geometry") {
-                Some(Value::Null) | None => geom_b.append_null(),
+                Some(Value::Null) | None => {
+                    geom_b.append_null();
+                    bbox_b.push(None);
+                }
                 Some(g) => {
                     let g = parse_geometry(g, 0)?;
-                    stats.add(&g);
+                    bbox_b.push(stats.add(&g));
                     geom_b.append_value(to_wkb(&g)?);
                 }
             }
@@ -152,6 +160,7 @@ pub fn convert(src: &Path, dst: &Path, progress: &dyn Fn(f32)) -> Result<u64, St
         }
         let mut arrays: Vec<ArrayRef> = vec![Arc::new(geom_b.finish())];
         arrays.extend(attr_b.iter_mut().map(AttrBuilder::finish));
+        arrays.push(bbox_b.finish());
         let batch = RecordBatch::try_new(schema.clone(), arrays).map_err(|e| e.to_string())?;
         writer.write(&batch).map_err(|e| format!("write failed: {e}"))?;
         written += chunk.len() as u64;

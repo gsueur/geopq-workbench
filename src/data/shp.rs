@@ -20,7 +20,7 @@ use parquet::arrow::ArrowWriter;
 use serde_json::{json, Value};
 use shapefile::dbase;
 
-use super::import::{to_wkb, AttrBuilder, Cell, GeomStats, IMPORT_BATCH_ROWS};
+use super::import::{bbox_field, BboxBuilder, to_wkb, AttrBuilder, Cell, GeomStats, IMPORT_WRITE_ROWS};
 
 /// Find a shapefile sidecar (`dbf`, `shx`, `prj`, `cpg`) next to the
 /// .shp, matching stem and extension case-insensitively — real-world
@@ -88,6 +88,7 @@ pub fn convert(src: &Path, dst: &Path, progress: &dyn Fn(f32)) -> Result<u64, St
     };
     let mut fields: Vec<Field> = vec![Field::new(&geom_name, DataType::Binary, true)];
     fields.extend(cols.iter().map(|(n, dt)| Field::new(n, dt.clone(), true)));
+    fields.push(bbox_field());
     let schema = Arc::new(Schema::new(fields));
 
     let out = std::fs::File::create(dst).map_err(|e| format!("cannot create output: {e}"))?;
@@ -99,6 +100,7 @@ pub fn convert(src: &Path, dst: &Path, progress: &dyn Fn(f32)) -> Result<u64, St
         writer: &mut writer,
         schema: schema.clone(),
         geom_b: BinaryBuilder::new(),
+        bbox_b: BboxBuilder::default(),
         attr_b: cols.iter().map(|(_, dt)| AttrBuilder::new(dt)).collect(),
         in_batch: 0,
         written: 0,
@@ -125,7 +127,7 @@ pub fn convert(src: &Path, dst: &Path, progress: &dyn Fn(f32)) -> Result<u64, St
         let total = reader.shape_count().unwrap_or(0).max(1);
         for pair in reader.iter_shapes_and_records() {
             let (shape, record) = pair.map_err(|e| format!("read failed: {e}"))?;
-            push_shape(shape, &mut stats, &mut out.geom_b);
+            push_shape(shape, &mut stats, &mut out.geom_b, &mut out.bbox_b);
             for ((name, _), b) in cols.iter().zip(&mut out.attr_b) {
                 b.push(match record.get(name) {
                     Some(v) => cell(v),
@@ -143,6 +145,7 @@ pub fn convert(src: &Path, dst: &Path, progress: &dyn Fn(f32)) -> Result<u64, St
                 shape.map_err(|e| format!("read failed: {e}"))?,
                 &mut stats,
                 &mut out.geom_b,
+                &mut out.bbox_b,
             );
             out.bump()?;
         }
@@ -165,6 +168,7 @@ struct Out<'a> {
     writer: &'a mut ArrowWriter<std::fs::File>,
     schema: Arc<Schema>,
     geom_b: BinaryBuilder,
+    bbox_b: BboxBuilder,
     attr_b: Vec<AttrBuilder>,
     in_batch: usize,
     written: u64,
@@ -175,7 +179,7 @@ impl Out<'_> {
     /// a flush happened (progress checkpoint).
     fn bump(&mut self) -> Result<bool, String> {
         self.in_batch += 1;
-        if self.in_batch == IMPORT_BATCH_ROWS {
+        if self.in_batch == IMPORT_WRITE_ROWS {
             self.flush()?;
             return Ok(true);
         }
@@ -188,6 +192,7 @@ impl Out<'_> {
         }
         let mut arrays: Vec<ArrayRef> = vec![Arc::new(self.geom_b.finish())];
         arrays.extend(self.attr_b.iter_mut().map(AttrBuilder::finish));
+        arrays.push(self.bbox_b.finish());
         let batch =
             RecordBatch::try_new(self.schema.clone(), arrays).map_err(|e| e.to_string())?;
         self.writer.write(&batch).map_err(|e| format!("write failed: {e}"))?;
@@ -197,16 +202,31 @@ impl Out<'_> {
     }
 }
 
-fn push_shape(shape: shapefile::Shape, stats: &mut GeomStats, geom_b: &mut BinaryBuilder) {
+fn push_shape(
+    shape: shapefile::Shape,
+    stats: &mut GeomStats,
+    geom_b: &mut BinaryBuilder,
+    bbox_b: &mut BboxBuilder,
+) {
     match geo_types::Geometry::<f64>::try_from(shape) {
         Ok(g) => {
-            stats.add(&g);
+            let env = stats.add(&g);
             match to_wkb(&g) {
-                Ok(w) => geom_b.append_value(w),
-                Err(_) => geom_b.append_null(),
+                Ok(w) => {
+                    geom_b.append_value(w);
+                    bbox_b.push(env);
+                }
+                Err(_) => {
+                    geom_b.append_null();
+                    bbox_b.push(None);
+                }
             }
         }
-        Err(_) => geom_b.append_null(), // NullShape
+        Err(_) => {
+            // NullShape
+            geom_b.append_null();
+            bbox_b.push(None);
+        }
     }
 }
 

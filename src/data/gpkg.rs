@@ -14,7 +14,9 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::json;
 
-use super::import::{AttrBuilder, Cell, IMPORT_BATCH_ROWS as BATCH_ROWS};
+use super::import::{
+    bbox_field, AttrBuilder, BboxBuilder, Cell, IMPORT_WRITE_ROWS as BATCH_ROWS,
+};
 
 /// One feature table of a GeoPackage.
 #[derive(Clone)]
@@ -187,6 +189,9 @@ pub fn convert(
 
     let mut fields: Vec<Field> = vec![Field::new(&table.geom_col, DataType::Binary, true)];
     fields.extend(cols.iter().map(|(n, dt)| Field::new(n, dt.clone(), true)));
+    // Covering bbox last, so attribute column order still mirrors the
+    // source table.
+    fields.push(bbox_field());
     let schema = Arc::new(Schema::new(fields));
 
     let select: String = {
@@ -207,8 +212,10 @@ pub fn convert(
     let mut stmt = db.prepare(&select).map_err(|e| e.to_string())?;
     let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
     let mut geom_b = BinaryBuilder::new();
+    let mut bbox_b = BboxBuilder::default();
     let mut attr_b: Vec<AttrBuilder> = cols.iter().map(|(_, dt)| AttrBuilder::new(dt)).collect();
     let mut in_batch = 0usize;
+    let mut batch_bytes = 0usize;
     loop {
         let row = rows.next().map_err(|e| e.to_string())?;
         let done = row.is_none();
@@ -217,37 +224,60 @@ pub fn convert(
                 ValueRef::Blob(blob) => match gpkg_wkb(blob)? {
                     Some((wkb, env)) => {
                         geom_b.append_value(wkb);
+                        batch_bytes += wkb.len();
                         if let Some(n) = wkb_type_name(wkb) {
                             geom_types.insert(n);
                         }
-                        match env {
-                            Some(e) => {
-                                bbox[0] = bbox[0].min(e[0]);
-                                bbox[1] = bbox[1].min(e[1]);
-                                bbox[2] = bbox[2].max(e[2]);
-                                bbox[3] = bbox[3].max(e[3]);
-                            }
+                        // The GeoPackage header usually carries the
+                        // envelope already; parse the WKB only when it
+                        // does not.
+                        let e = match env {
+                            Some(e) => Some(e),
                             None => {
-                                let _ = crate::data::loader::grow_wkb_envelope(wkb, &mut bbox);
+                                let mut one = [
+                                    f64::INFINITY,
+                                    f64::INFINITY,
+                                    f64::NEG_INFINITY,
+                                    f64::NEG_INFINITY,
+                                ];
+                                crate::data::loader::grow_wkb_envelope(wkb, &mut one)
+                                    .map(|()| one)
                             }
+                        };
+                        if let Some(e) = e {
+                            bbox[0] = bbox[0].min(e[0]);
+                            bbox[1] = bbox[1].min(e[1]);
+                            bbox[2] = bbox[2].max(e[2]);
+                            bbox[3] = bbox[3].max(e[3]);
                         }
+                        bbox_b.push(e);
                     }
-                    None => geom_b.append_null(),
+                    None => {
+                        geom_b.append_null();
+                        bbox_b.push(None);
+                    }
                 },
-                _ => geom_b.append_null(),
+                _ => {
+                    geom_b.append_null();
+                    bbox_b.push(None);
+                }
             }
             for (i, b) in attr_b.iter_mut().enumerate() {
                 b.push(cell(row.get_ref(i + 1).map_err(|e| e.to_string())?));
             }
             in_batch += 1;
         }
-        if in_batch > 0 && (done || in_batch == BATCH_ROWS) {
+        if in_batch > 0
+            && (done || in_batch == BATCH_ROWS || batch_bytes >= super::import::IMPORT_BATCH_BYTES)
+        {
             let mut arrays: Vec<ArrayRef> = vec![Arc::new(geom_b.finish())];
             arrays.extend(attr_b.iter_mut().map(AttrBuilder::finish));
+            arrays.push(bbox_b.finish());
             let batch =
                 RecordBatch::try_new(schema.clone(), arrays).map_err(|e| e.to_string())?;
             writer.write(&batch).map_err(|e| format!("write failed: {e}"))?;
             written += in_batch as u64;
+            batch_bytes = 0;
             in_batch = 0;
             progress((written as f32 / table.rows.max(1) as f32).min(1.0));
         }
@@ -274,6 +304,10 @@ pub fn convert(
     if bbox[0].is_finite() && bbox[2].is_finite() {
         col["bbox"] = json!([bbox[0], bbox[1], bbox[2], bbox[3]]);
     }
+    col["covering"] = json!({"bbox": {
+        "xmin": ["bbox", "xmin"], "ymin": ["bbox", "ymin"],
+        "xmax": ["bbox", "xmax"], "ymax": ["bbox", "ymax"],
+    }});
     let geo = json!({
         "version": "1.1.0",
         "primary_column": table.geom_col,
@@ -368,10 +402,23 @@ mod tests {
         let written = convert(&src, t, &dst, &|_| {}).unwrap();
         assert_eq!(written, 501);
 
-        let (store, crs, info, _rg) =
+        let (store, crs, info, rg) =
             crate::data::loader::open_store_for_test(&dst).unwrap();
         assert_eq!(store.total_rows(), 501);
         assert_eq!(crs.epsg, Some(2154));
+        // The import must be spatially readable on its own: a covering
+        // column, declared, so the loader can select by viewport instead
+        // of decoding the file whole.
+        assert!(store.covering.is_some(), "covering column detected");
+        let (label, boxes) = rg.expect("row-group bboxes");
+        assert!(label.contains("covering"), "{label}");
+        assert_eq!(boxes.len(), info.row_groups);
+        let q = info.quality.clone().expect("scorecard");
+        assert_eq!(
+            q.checks.iter().find(|c| c.code == "C1").unwrap().status,
+            crate::data::quality::Status::Pass,
+            "C1 must pass on a fresh import"
+        );
         assert!(info.geo.geometry_types.contains(&"Point".to_string()));
         let b = info.geo.bbox.expect("bbox from envelopes");
         assert!(b[0] >= 700_000.0 && b[3] <= 6_610_000.0);

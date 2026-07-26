@@ -11,7 +11,7 @@ use std::sync::Arc;
 use arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
 };
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field};
 use geo::BoundingRect;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -46,16 +46,86 @@ impl ImportFormat {
     }
 }
 
+/// Byte cap per row group. An import of heavy polygons (land cover,
+/// cadastre) filled 65k-row groups with 700 MB each, and a row group is
+/// the unit a reader must fetch and decode whole.
+pub(crate) const IMPORT_ROW_GROUP_BYTES: usize = 16 << 20;
+/// Rows per `write` call. The byte cap can only close a row group
+/// between writes, so the batch has to be a fraction of the budget
+/// rather than equal to the row cap.
+pub(crate) const IMPORT_WRITE_ROWS: usize = 8_192;
+/// Geometry bytes per `write` call. Row counts do not bound a batch of
+/// land-cover or cadastral polygons: a few thousand of them are hundreds
+/// of megabytes, and the row group cannot close mid-batch.
+pub(crate) const IMPORT_BATCH_BYTES: usize = 8 << 20;
+
 /// Writer properties every importer uses: zstd (fast level — imports are
-/// intermediates, Optimize writes the distribution-grade file), 65k row
-/// groups, page statistics.
+/// intermediates, Optimize writes the distribution-grade file), row
+/// groups capped by rows *and* bytes, page statistics.
 pub(crate) fn writer_props() -> WriterProperties {
     WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
         .set_max_row_group_row_count(Some(IMPORT_BATCH_ROWS))
+        .set_max_row_group_bytes(Some(IMPORT_ROW_GROUP_BYTES))
         .set_statistics_enabled(EnabledStatistics::Page)
         .set_created_by(format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
         .build()
+}
+
+/// The covering bbox column every import writes beside the geometry.
+///
+/// Without it a reader has no way to select features spatially: WKB
+/// column statistics are meaningless, and 1.1 has no native geometry
+/// statistics to fall back on. Four f64 leaves cost 32 bytes a row and
+/// turn a file that must be decoded whole into one that can be read by
+/// viewport.
+pub(crate) fn bbox_field() -> Field {
+    Field::new(
+        "bbox",
+        DataType::Struct(
+            vec![
+                Field::new("xmin", DataType::Float64, true),
+                Field::new("ymin", DataType::Float64, true),
+                Field::new("xmax", DataType::Float64, true),
+                Field::new("ymax", DataType::Float64, true),
+            ]
+            .into(),
+        ),
+        true,
+    )
+}
+
+/// Per-feature bbox accumulator, finished into the struct column.
+#[derive(Default)]
+pub(crate) struct BboxBuilder {
+    xmin: Vec<Option<f64>>,
+    ymin: Vec<Option<f64>>,
+    xmax: Vec<Option<f64>>,
+    ymax: Vec<Option<f64>>,
+}
+
+impl BboxBuilder {
+    pub fn push(&mut self, env: Option<[f64; 4]>) {
+        let e = env.filter(|e| e.iter().all(|v| v.is_finite()));
+        self.xmin.push(e.map(|e| e[0]));
+        self.ymin.push(e.map(|e| e[1]));
+        self.xmax.push(e.map(|e| e[2]));
+        self.ymax.push(e.map(|e| e[3]));
+    }
+
+    pub fn finish(&mut self) -> ArrayRef {
+        let f = |v: &mut Vec<Option<f64>>| {
+            Arc::new(arrow::array::Float64Array::from(std::mem::take(v))) as ArrayRef
+        };
+        let DataType::Struct(fields) = bbox_field().data_type().clone() else {
+            unreachable!("bbox_field is a struct")
+        };
+        Arc::new(arrow::array::StructArray::new(
+            fields,
+            vec![f(&mut self.xmin), f(&mut self.ymin), f(&mut self.xmax), f(&mut self.ymax)],
+            None,
+        ))
+    }
 }
 
 /// GeoParquet 1.1 `geo` metadata for an import. `crs`: `None` omits the
@@ -90,6 +160,10 @@ pub(crate) fn geo_meta_with_proj4(
     if b[0].is_finite() && b[2].is_finite() {
         col["bbox"] = json!([b[0], b[1], b[2], b[3]]);
     }
+    col["covering"] = json!({"bbox": {
+        "xmin": ["bbox", "xmin"], "ymin": ["bbox", "ymin"],
+        "xmax": ["bbox", "xmax"], "ymax": ["bbox", "ymax"],
+    }});
     json!({
         "version": "1.1.0",
         "primary_column": primary,
@@ -113,7 +187,9 @@ impl GeomStats {
         }
     }
 
-    pub fn add(&mut self, g: &geo_types::Geometry<f64>) {
+    /// Record a feature and return its envelope, which the covering
+    /// column needs and `bounding_rect` has already computed.
+    pub fn add(&mut self, g: &geo_types::Geometry<f64>) -> Option<[f64; 4]> {
         use geo_types::Geometry::*;
         self.types.insert(
             match g {
@@ -127,12 +203,13 @@ impl GeomStats {
             }
             .to_string(),
         );
-        if let Some(r) = g.bounding_rect() {
-            self.bbox[0] = self.bbox[0].min(r.min().x);
-            self.bbox[1] = self.bbox[1].min(r.min().y);
-            self.bbox[2] = self.bbox[2].max(r.max().x);
-            self.bbox[3] = self.bbox[3].max(r.max().y);
-        }
+        let r = g.bounding_rect()?;
+        let e = [r.min().x, r.min().y, r.max().x, r.max().y];
+        self.bbox[0] = self.bbox[0].min(e[0]);
+        self.bbox[1] = self.bbox[1].min(e[1]);
+        self.bbox[2] = self.bbox[2].max(e[2]);
+        self.bbox[3] = self.bbox[3].max(e[3]);
+        Some(e)
     }
 }
 

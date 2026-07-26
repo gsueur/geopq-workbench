@@ -217,6 +217,43 @@ impl FeatureStore {
         &self.fragments[self.rg_frag[group]]
     }
 
+    /// Uncompressed bytes of the geometry column in one row group.
+    ///
+    /// The decode cost of a group, which its row count does not measure:
+    /// 27k land-cover polygons weigh what a million points do. Read from
+    /// the footer, so it costs nothing.
+    pub fn rg_geom_bytes(&self, group: u32) -> u64 {
+        let g = group as usize;
+        let Some(&fi) = self.rg_frag.get(g) else {
+            return 0;
+        };
+        let frag = &self.fragments[fi];
+        let local = g - frag.rg_offset;
+        let Some(rg) = frag.meta.metadata().row_groups().get(local) else {
+            return 0;
+        };
+        // Roots whose leaves hold coordinates: the geometry column, or
+        // the two coordinate columns of a synthesized point layer.
+        let roots: Vec<&str> = match self.xy_geom {
+            Some((xi, yi)) => vec![
+                self.schema.field(xi).name().as_str(),
+                self.schema.field(yi).name().as_str(),
+            ],
+            None => vec![self.schema.field(self.geom_col).name().as_str()],
+        };
+        rg.columns()
+            .iter()
+            .filter(|c| {
+                c.column_descr()
+                    .path()
+                    .parts()
+                    .first()
+                    .is_some_and(|p| roots.contains(&p.as_str()))
+            })
+            .map(|c| c.uncompressed_size().max(0) as u64)
+            .sum()
+    }
+
     /// Partition column `k`'s value for rows of a global row group.
     pub fn part_value(&self, group: usize, k: usize) -> Option<&str> {
         self.frag_of_group(group).part_values.get(k)?.as_deref()

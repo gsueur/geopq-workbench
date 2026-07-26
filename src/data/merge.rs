@@ -17,7 +17,10 @@ use parquet::arrow::ArrowWriter;
 use serde_json::{json, Value};
 
 use super::crs::{transform_point, Crs};
-use super::import::{geo_meta_with_proj4, to_wkb, writer_props, GeomStats, IMPORT_BATCH_ROWS};
+use super::import::{
+    bbox_field, geo_meta_with_proj4, to_wkb, writer_props, BboxBuilder, GeomStats,
+    IMPORT_WRITE_ROWS,
+};
 use super::store::FeatureStore;
 
 pub struct MergeInput {
@@ -116,6 +119,8 @@ pub fn merge(
     if source_col {
         fields.push(Field::new(&src_name, DataType::Utf8, true));
     }
+    // The metadata declares a covering column, so one gets written.
+    fields.push(bbox_field());
     let schema = Arc::new(Schema::new(fields));
 
     let out = std::fs::File::create(dst).map_err(|e| format!("cannot create output: {e}"))?;
@@ -143,11 +148,12 @@ pub fn merge(
         let n = input.store.total_rows() as u32;
         let mut start = 0u32;
         while start < n {
-            let end = (start + IMPORT_BATCH_ROWS as u32).min(n);
+            let end = (start + IMPORT_WRITE_ROWS as u32).min(n);
             let rows: Vec<u32> = (start..end).collect();
 
             // Geometry: decode, reproject into the target CRS, re-encode.
             let mut geom_b = BinaryBuilder::new();
+            let mut bbox_b = BboxBuilder::default();
             for (_, g) in input.store.fetch_geoms(&rows)? {
                 let g = match (g, reproject) {
                     (Some(g), true) => g
@@ -160,13 +166,22 @@ pub fn merge(
                 };
                 match g {
                     Some(g) => {
-                        stats.add(&g);
+                        let env = stats.add(&g);
                         match to_wkb(&g) {
-                            Ok(w) => geom_b.append_value(w),
-                            Err(_) => geom_b.append_null(),
+                            Ok(w) => {
+                                geom_b.append_value(w);
+                                bbox_b.push(env);
+                            }
+                            Err(_) => {
+                                geom_b.append_null();
+                                bbox_b.push(None);
+                            }
                         }
                     }
-                    None => geom_b.append_null(),
+                    None => {
+                        geom_b.append_null();
+                        bbox_b.push(None);
+                    }
                 }
             }
 
@@ -202,6 +217,7 @@ pub fn merge(
                     rows.len()
                 ])));
             }
+            arrays.push(bbox_b.finish());
             let batch =
                 RecordBatch::try_new(schema.clone(), arrays).map_err(|e| e.to_string())?;
             writer.write(&batch).map_err(|e| format!("write failed: {e}"))?;
