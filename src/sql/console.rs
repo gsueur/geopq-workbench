@@ -502,7 +502,7 @@ impl SqlConsole {
         ui: &mut egui::Ui,
         layers: &[VectorLayer],
         tables: &[String],
-        dict: &[String],
+        dict: &CompletionDict,
         view_world: [f64; 4],
         display: &DisplayCrs,
     ) {
@@ -630,7 +630,7 @@ impl SqlConsole {
         ui: &mut egui::Ui,
         layers: &[VectorLayer],
         tables: &[String],
-        dict: &[String],
+        dict: &CompletionDict,
     ) {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("tables:").weak().small());
@@ -926,9 +926,26 @@ fn ctrl_z_alias(ui: &mut egui::Ui, field: egui::Id) {
     }
 }
 
-/// Names offered by autocomplete: table names, every layer's column names
-/// (lowercased), ST_* functions, SQL keywords.
-fn completion_dict(layers: &[VectorLayer], tables: &[String]) -> Vec<String> {
+/// Names offered by autocomplete, split by context: inside a FROM/JOIN
+/// clause only table names make sense; everywhere else the full set
+/// (column names lowercased, table names, ST_* functions, SQL keywords).
+pub(crate) struct CompletionDict {
+    pub tables: Vec<String>,
+    pub all: Vec<String>,
+}
+
+impl CompletionDict {
+    /// The candidate list for a token whose preceding text is `before`.
+    fn for_context(&self, before: &str) -> &[String] {
+        if from_context(before) {
+            &self.tables
+        } else {
+            &self.all
+        }
+    }
+}
+
+fn completion_dict(layers: &[VectorLayer], tables: &[String]) -> CompletionDict {
     let mut dict: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut push = |s: String| {
@@ -950,7 +967,47 @@ fn completion_dict(layers: &[VectorLayer], tables: &[String]) -> Vec<String> {
     for k in SQL_KEYWORDS {
         push((*k).to_string());
     }
-    dict
+    CompletionDict {
+        tables: tables.to_vec(),
+        all: dict,
+    }
+}
+
+/// Is a token whose preceding text is `before` part of a FROM/JOIN table
+/// list? Walk backwards over identifiers, dots, commas and whitespace
+/// (aliases and multi-table lists); the first SQL keyword or function
+/// name reached decides. Any other character (parens, operators) means
+/// an expression, e.g. a subquery's interior.
+fn from_context(before: &str) -> bool {
+    let is_keyword = |w: &str| {
+        SQL_KEYWORDS
+            .iter()
+            .any(|k| k.split_whitespace().any(|kw| kw == w))
+            || udf::NAMES.contains(&w)
+    };
+    let chars: Vec<char> = before.chars().collect();
+    let mut i = chars.len();
+    while i > 0 {
+        let c = chars[i - 1];
+        if c.is_ascii_alphanumeric() || c == '_' {
+            let end = i;
+            while i > 0 && (chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_') {
+                i -= 1;
+            }
+            let word: String = chars[i..end].iter().collect::<String>().to_lowercase();
+            match word.as_str() {
+                "from" | "join" => return true,
+                w if is_keyword(w) => return false,
+                // A plain identifier (earlier table, alias): keep walking.
+                _ => {}
+            }
+        } else if c.is_whitespace() || c == ',' || c == '.' {
+            i -= 1;
+        } else {
+            return false;
+        }
+    }
+    false
 }
 
 /// A text edit with a completion popup: candidates from `dict` matching the
@@ -961,7 +1018,7 @@ pub(crate) fn autocomplete_edit(
     id: egui::Id,
     text: &mut String,
     ac: &mut AcState,
-    dict: &[String],
+    dict: &CompletionDict,
     make_edit: impl FnOnce(&mut String) -> egui::TextEdit<'_>,
 ) -> egui::Response {
     // Handle navigation/acceptance keys before the editor consumes them.
@@ -1018,7 +1075,9 @@ pub(crate) fn autocomplete_edit(
             if start < cur {
                 let prefix: String = chars[start..cur].iter().collect();
                 let prefix_l = prefix.to_lowercase();
+                let before: String = chars[..start].iter().collect();
                 let items: Vec<String> = dict
+                    .for_context(&before)
                     .iter()
                     .filter(|c| c.starts_with(&prefix_l) && **c != prefix_l)
                     .take(8)
@@ -1363,5 +1422,29 @@ fn geom_cell(col: &dyn Array, i: usize) -> String {
             format!("{t} ({} pts)", g.coords_count())
         }
         None => format!("WKB {} B", buf.len()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::from_context;
+
+    #[test]
+    fn from_context_detects_table_position() {
+        // Completing a table name.
+        assert!(from_context("select * from "));
+        assert!(from_context("select a, b from "));
+        assert!(from_context("select * from roads, "));
+        assert!(from_context("select * from roads r join "));
+        assert!(from_context("SELECT * FROM "));
+        // Completing anything else.
+        assert!(!from_context(""));
+        assert!(!from_context("select "));
+        assert!(!from_context("select * from t where "));
+        assert!(!from_context("select * from t where pop > 10 and "));
+        assert!(!from_context("select * from t order by "));
+        // Expressions and subquery interiors.
+        assert!(!from_context("select * from t where st_area("));
+        assert!(!from_context("select * from (select "));
     }
 }

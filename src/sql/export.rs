@@ -39,7 +39,9 @@ pub struct StreamWriter {
     writer: ArrowWriter<File>,
     geom_col: usize,
     geom_name: String,
-    crs_meta: CrsOut,
+    /// `crs` value (None = omit, spec default CRS84) and the optional
+    /// `geopq:crs` vendor proj4 for CRSs without EPSG id or PROJJSON.
+    crs_meta: (Option<Value>, Option<(String, String)>),
     types: Vec<String>,
     bbox: Option<[f64; 4]>,
     rows: usize,
@@ -62,7 +64,7 @@ impl StreamWriter {
             writer,
             geom_col,
             geom_name: schema.field(geom_col).name().clone(),
-            crs_meta: crs_value(crs),
+            crs_meta: crate::data::merge::crs_to_geo(crs),
             types: Vec::new(),
             bbox: None,
             rows: 0,
@@ -131,11 +133,12 @@ impl StreamWriter {
             "encoding": "WKB",
             "geometry_types": types,
         });
-        match &self.crs_meta {
-            CrsOut::Omit => {}
-            CrsOut::Value(v) => {
-                col_meta["crs"] = v.clone();
-            }
+        let (crs_v, vendor) = &self.crs_meta;
+        if let Some(v) = crs_v {
+            col_meta["crs"] = v.clone();
+        }
+        if let Some((proj4, name)) = vendor {
+            col_meta["geopq:crs"] = json!({ "proj4": proj4, "name": name });
         }
         if let Some(b) = self.bbox {
             col_meta["bbox"] = json!(b);
@@ -157,43 +160,6 @@ impl StreamWriter {
             .map_err(|e| format!("parquet close: {e}"))?;
         Ok(self.rows)
     }
-}
-
-enum CrsOut {
-    /// No `crs` key: spec default OGC:CRS84.
-    Omit,
-    Value(Value),
-}
-
-fn crs_value(crs: &Crs) -> CrsOut {
-    // The source file's PROJJSON round-trips verbatim — it is the only
-    // schema-valid representation we can emit.
-    if let Some(v) = &crs.projjson {
-        return CrsOut::Value(v.as_ref().clone());
-    }
-    if let Some(code) = crs.epsg {
-        if code == 4326 {
-            return CrsOut::Omit;
-        }
-        // Best-effort id-only reference for CRSs known by EPSG code alone:
-        // not schema-valid PROJJSON (no datum/base_crs), but it preserves
-        // the code for readers that resolve ids.
-        let kind = if crs.is_latlong {
-            "GeographicCRS"
-        } else {
-            "ProjectedCRS"
-        };
-        return CrsOut::Value(json!({
-            "type": kind,
-            "name": crs.name,
-            "id": { "authority": "EPSG", "code": code },
-        }));
-    }
-    if crs.name.contains("undefined") {
-        // Source layer had an explicit `crs: null`; stay honest.
-        return CrsOut::Value(Value::Null);
-    }
-    CrsOut::Omit
 }
 
 #[cfg(test)]
@@ -264,33 +230,74 @@ mod tests {
     /// id-only CRSs fall back to a reference typed by is_latlong.
     #[test]
     fn crs_projjson_passthrough_and_fallback() {
+        use crate::data::merge::crs_to_geo;
         let projjson = json!({
             "type": "ProjectedCRS", "name": "RGF93 / Lambert-93",
             "id": {"authority": "EPSG", "code": 2154},
             "base_crs": {"name": "RGF93", "type": "GeographicCRS"},
         });
         let crs = Crs::from_geoparquet_crs(Some(&projjson)).unwrap();
-        match crs_value(&crs) {
-            CrsOut::Value(v) => assert_eq!(v, projjson, "verbatim passthrough"),
-            CrsOut::Omit => panic!("PROJJSON must not be dropped"),
-        }
+        assert_eq!(
+            crs_to_geo(&crs),
+            (Some(projjson.clone()), None),
+            "verbatim passthrough"
+        );
         // Id-only geographic CRS: best-effort reference, honestly typed.
-        let nad83 = Crs::from_epsg(4269).unwrap();
-        match crs_value(&nad83) {
-            CrsOut::Value(v) => {
-                assert_eq!(v["type"], "GeographicCRS", "{v}");
-                assert_eq!(v["id"]["code"], 4269);
-            }
-            CrsOut::Omit => panic!("non-4326 CRS must be recorded"),
-        }
+        let (v, vendor) = crs_to_geo(&Crs::from_epsg(4269).unwrap());
+        let v = v.expect("non-4326 CRS must be recorded");
+        assert_eq!(v["type"], "GeographicCRS", "{v}");
+        assert_eq!(v["id"]["code"], 4269);
+        assert!(vendor.is_none());
         // Id-only projected CRS keeps the projected type.
-        let l93 = Crs::from_epsg(2154).unwrap();
-        match crs_value(&l93) {
-            CrsOut::Value(v) => assert_eq!(v["type"], "ProjectedCRS", "{v}"),
-            CrsOut::Omit => panic!("non-4326 CRS must be recorded"),
-        }
+        let (v, _) = crs_to_geo(&Crs::from_epsg(2154).unwrap());
+        assert_eq!(v.expect("recorded")["type"], "ProjectedCRS");
         // 4326 without source PROJJSON still omits (spec default CRS84).
-        assert!(matches!(crs_value(&Crs::wgs84()), CrsOut::Omit));
+        assert_eq!(crs_to_geo(&Crs::wgs84()), (None, None));
+        // Explicit `crs: null` source stays null; the CRS84 render
+        // fallback must not be laundered into a vendor proj4 claim.
+        let undef = Crs::from_geoparquet_crs(Some(&Value::Null)).unwrap();
+        assert_eq!(crs_to_geo(&undef), (Some(Value::Null), None));
+    }
+
+    /// A proj4-only CRS (loaded via the `geopq:crs` vendor key, e.g. an
+    /// ESRI shapefile import) must survive "Result as layer": the export
+    /// writes `crs: null` + the vendor key, and reloading resolves it
+    /// instead of falling back to CRS84 (which rejected every projected
+    /// coordinate as an out-of-range lon/lat).
+    #[test]
+    fn vendor_proj4_crs_round_trips() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let mass = "+proj=lcc +lat_1=41.71666666666667 +lat_2=42.68333333333333 \
+                    +lat_0=41 +lon_0=-71.5 +x_0=200000 +y_0=750000 +ellps=GRS80 \
+                    +units=m +no_defs";
+        let crs = Crs::from_proj4(mass, None, "NAD83 / Mass Mainland (ESRI)").unwrap();
+        // 2D WKB point in StatePlane meters.
+        let mut wkb = vec![1u8];
+        wkb.extend_from_slice(&1u32.to_le_bytes());
+        wkb.extend_from_slice(&231000.0f64.to_le_bytes());
+        wkb.extend_from_slice(&900000.0f64.to_le_bytes());
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "geometry",
+            DataType::Binary,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(BinaryArray::from_iter_values([&wkb]))],
+        )
+        .unwrap();
+        let dst = std::env::temp_dir().join("geopq_sql_export_vendor_crs_test.parquet");
+        write_result(&dst, &schema, &[batch], 0, &crs).unwrap();
+
+        let geo = read_geo_meta(&dst);
+        let col = &geo["columns"]["geometry"];
+        assert!(col["crs"].is_null(), "explicit crs: null, {col}");
+        assert_eq!(col["geopq:crs"]["proj4"], mass);
+
+        let (_, crs2, _, _) = open_store_for_test(&dst).unwrap();
+        assert!(!crs2.is_latlong, "vendor CRS resolved, not CRS84 fallback");
+        assert!(crs2.proj4.contains("+proj=lcc"), "{}", crs2.proj4);
+        let _ = std::fs::remove_file(&dst);
     }
 
     /// Z WKB passes through the export verbatim, so geometry_types needs

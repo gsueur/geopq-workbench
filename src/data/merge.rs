@@ -241,17 +241,29 @@ fn concat_batches(
 /// A layer CRS as GeoParquet metadata: PROJJSON passthrough when the
 /// source file carried it, an EPSG identity otherwise, the CRS84
 /// default for 4326, and unknown-plus-proj4 (the `geopq:crs` vendor
-/// key) for CRSs that only exist as proj strings.
-fn crs_to_geo(crs: &Crs) -> (Option<Value>, Option<(String, String)>) {
+/// key) for CRSs that only exist as proj strings. Shared with the SQL
+/// result exporter.
+pub(crate) fn crs_to_geo(crs: &Crs) -> (Option<Value>, Option<(String, String)>) {
     if let Some(pj) = &crs.projjson {
         return (Some((**pj).clone()), None);
     }
     match crs.epsg {
         Some(4326) => (None, None),
         Some(code) => (
-            Some(json!({"name": crs.name, "id": {"authority": "EPSG", "code": code}})),
+            // Best-effort id-only reference: not schema-valid PROJJSON
+            // (no datum/base_crs), but preserves the code for readers
+            // that resolve ids, honestly typed.
+            Some(json!({
+                "type": if crs.is_latlong { "GeographicCRS" } else { "ProjectedCRS" },
+                "name": crs.name,
+                "id": {"authority": "EPSG", "code": code},
+            })),
             None,
         ),
+        // The source declared its CRS undefined (`crs: null`): keep the
+        // honest null, don't launder the CRS84 render fallback into a
+        // vendor proj4 claim.
+        None if crs.name.contains("undefined") => (Some(Value::Null), None),
         None => (
             Some(Value::Null),
             Some((crs.proj4.clone(), crs.name.clone())),

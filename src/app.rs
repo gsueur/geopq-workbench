@@ -1115,6 +1115,11 @@ impl ViewerApp {
         for k in ["and", "or", "not", "like", "between", "in", "is null", "is not null"] {
             dict.push(k.into());
         }
+        // A filter predicate has no FROM clause; no table names to offer.
+        let dict = crate::sql::console::CompletionDict {
+            tables: Vec::new(),
+            all: dict,
+        };
         let sql_layer = self.sql_layer_of(layer_id);
         let test_tx = self.test_tx.clone();
 
