@@ -49,7 +49,12 @@ so it doubles as a hands-on guide to GeoParquet best practices.
   layers.
 - **Cartography that defaults well**: automatic equal-area projection
   choice per dataset, ~30 official national grids, data-driven styling
-  with Viridis/Turbo ramps, Jenks/quantile classification, basemaps.
+  with six ramps, seven classification methods and an interactive
+  legend, basemaps.
+- **Grid summaries**: aggregate any numeric column onto square, H3 or A5
+  cells with proper areal apportionment, smooth it, and get the cells or
+  contour lines back as a new GeoParquet layer. 2.56M parcels to a 1 km
+  grid in ~0.7 s.
 - **No barriers to entry**: built-in sample datasets and a pure-Rust
   importer for GeoPackage, Shapefile and GeoJSON (no GDAL) if your data
   is not in GeoParquet yet.
@@ -254,10 +259,25 @@ larger files are on the roadmap.
   pick any projection / EPSG code in the status bar; layers re-project
   in the background.
 - **Styling**: fill, border and point colors with sensible auto-derived
-  defaults, opacity, line width, point radius. **Style by value** colors
-  by any attribute: numeric columns get Viridis/Turbo/Blue–Red ramps
-  with equal-interval, quantile, half-std-dev or Jenks classification;
-  text columns get a categorical palette of the most frequent values.
+  defaults, opacity, line width, point radius; fill and border switch
+  off independently from the `f` / `w` labels in the layer row, so you
+  can draw outlines only or fills only. **Style by value** colors by any
+  attribute: numeric columns get six ramps and seven classification
+  methods (equal interval, quantile, half-std-dev, Jenks, arithmetic and
+  geometric progression, head/tail breaks) with your choice of class
+  count up to 16; text columns get a categorical palette of the most
+  frequent values. **Normalize by area** divides each value by its
+  feature's area before classifying and drawing, so absolute totals stop
+  tracking polygon size (the legend then reads `LAND_VAL / m²`, in the
+  CRS's own unit).
+- **Legend**: class bounds under the layer, rounded to three significant
+  digits with k/M suffixes, swatches composited exactly as the map draws
+  them at the current fill opacity. Click a class to hide it on the map;
+  ⟳ reclassifies from what is currently in the viewport, so a
+  state-wide ramp can be refitted to one county without touching the
+  file.
+- **Rename** (layer ⋮ → Rename): a display label for the layer panel and
+  legend; the file keeps its name.
 - **Basemaps**: Carto Light/Dark/Voyager and OSM raster tiles (Web
   Mercator), plus a Natural Earth coastline and graticule that follow
   any projection. The coastline is zoom-dependent: the embedded 1:50m
@@ -305,6 +325,40 @@ parts, then the exact predicate is re-applied. Results can highlight
 features on the map, zoom to a feature, copy as TSV, or export back as
 a regular layer (whole result or checked rows).
 
+## Summarizing onto a grid
+
+Layer ⋮ → **Grid summary…** aggregates a numeric column onto a regular
+cell system and writes the result as a new GeoParquet layer, ready to
+style, query or export like any other. Useful when the geometry gets in
+the way of the pattern: parcels, buildings and admin units come in wildly
+different sizes, and a choropleth of them mostly maps polygon size.
+
+- **Cell systems**: square cells in the layer's own CRS at the size you
+  choose, or H3 / A5 cells for equal-area coverage of the globe.
+- **Areal apportionment**: a feature spanning several cells gives each
+  cell the share of its value that the cell actually covers — exact
+  rectangle clipping on square grids, sampling on H3/A5. Assigning by
+  centroid instead would drop a 40 km² state forest's entire value onto
+  one 1 km cell, and that artifact is precisely what a grid is supposed
+  to remove.
+- **Statistics**, split into rates (mean, median) and totals (sum,
+  count, density). **Density** — apportioned total ÷ cell area — is the
+  one to reach for on mixed-size polygons: the apportionment weights
+  cancel out in mean and median, so under those a giant parcel still
+  paints its own value across every cell it touches.
+- **Smoothing**: any number of passes of a 3×3 box or Gaussian kernel
+  (ring mean on H3/A5). Each pass averages present neighbors only, so
+  nothing bleeds past the edge of the data.
+- **Contour lines**: square grids can output isolines instead of cell
+  polygons, with levels at value quantiles (the default — equal steps
+  put every line in the outlier tail on skewed data) or equal steps.
+
+Output columns keep the source field name, so a mean of `LAND_VAL`
+returns a `LAND_VAL` column and legends read correctly downstream.
+
+On 2.56M MassGIS parcels: 1 km square grid in ~0.7 s, H3 r7 in ~8 s,
+A5 r14 in ~16 s, contours in ~0.6 s.
+
 ## Performance notes
 
 Measured on real datasets, release build:
@@ -333,6 +387,7 @@ inside an egui shell. No GDAL, no web view, no server process.
 | `data/optimize.rs` | the Optimize rewrite (Hilbert sort, covering, 1.1/2.0 flavors, partitioning) |
 | `data/gpkg.rs`, `data/shp.rs`, `data/geojson.rs` | vector imports (bundled SQLite, pure-Rust shapefile, serde_json) over shared machinery in `data/import.rs` |
 | `data/crs.rs` | PROJJSON → EPSG → proj4rs, projection selection |
+| `data/grid.rs` | grid summaries: square/H3/A5 aggregation, areal apportionment, smoothing kernels, marching-squares contours |
 | `map/` | wgpu pipelines, tiles, chunked f64-origin geometry for jitter-free deep zoom |
 | `sql/` | DataFusion integration, ST_* UDFs, spatial pushdown, console UI |
 | `app.rs` | the egui application |
@@ -347,13 +402,15 @@ quality gate and display policy).
 - Streaming optimize beyond the 8 GB in-memory cap; multi-file optimize
 - Lazy part-append while panning across STAC collections
 - More SQL: polygon set operations, spatial aggregates
+- More grid statistics: focal standard deviation, morphological
+  open/close, hillshade
 - Zoom-dependent level of detail for very dense layers; label rendering
 - Basemap tiles warped to non-Mercator projections
 
 ## Development
 
 ```bash
-cargo test          # 130+ tests, no fixtures needed for most
+cargo test          # 150+ tests, no fixtures needed for most
 cargo run --release testdata/points_1m_wgs84.parquet
 ```
 

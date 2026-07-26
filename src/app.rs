@@ -2352,7 +2352,10 @@ impl ViewerApp {
                                     if ui
                                         .button("Grid summary…")
                                         .on_hover_text(
-                                            "Aggregate a numeric column into square / H3 /                                              A5 cells (mean, median, sum, count), with                                              optional smoothing — the grid becomes a new                                              layer",
+                                            "Aggregate a numeric column into square / H3 / A5 cells, \
+                                             apportioned by covered area, with optional \
+                                             smoothing and contour lines — the grid \
+                                             becomes a new layer",
                                         )
                                         .clicked()
                                     {
