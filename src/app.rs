@@ -586,6 +586,12 @@ struct GridState {
     kernel: crate::data::grid::Kernel,
     passes: u32,
     /// Square grids only: output isolines instead of cell polygons.
+    /// Focal operation index: 0 none, 1 focal std, 2 open, 3 close,
+    /// 4 hillshade.
+    post: usize,
+    /// Hillshade sun position, degrees.
+    azimuth: f64,
+    altitude: f64,
     contours: bool,
     levels: u32,
     /// Contour levels at value quantiles instead of equal steps.
@@ -3861,6 +3867,9 @@ impl ViewerApp {
             stat: crate::data::grid::GridStat::Mean,
             kernel: crate::data::grid::Kernel::Box,
             passes: 0,
+            post: 0,
+            azimuth: 315.0,
+            altitude: 45.0,
             contours: false,
             levels: 10,
             quantile_levels: true,
@@ -3964,6 +3973,12 @@ impl ViewerApp {
                         ui.selectable_value(&mut st.system, 0, "square");
                         ui.selectable_value(&mut st.system, 1, "H3");
                         ui.selectable_value(&mut st.system, 2, "A5");
+                        if st.system != 0 && st.post == 4 {
+                            // Hillshade and contours are square-only; drop
+                            // them rather than leave a dead selection on
+                            // screen that would fail at compute time.
+                            st.post = 0;
+                        }
                         match st.system {
                             0 => {
                                 ui.label("size:");
@@ -3973,7 +3988,9 @@ impl ViewerApp {
                                         .speed(50.0),
                                 )
                                 .on_hover_text(
-                                    "Cell size in the layer's CRS units (meters for                                      projected data — avoid degrees, st_transform first)",
+                                    "Cell size in the layer's CRS units (meters for \
+                                     projected data — avoid degrees, \
+                                     st_transform first)",
                                 );
                             }
                             1 => {
@@ -3987,7 +4004,8 @@ impl ViewerApp {
                                 ui.label("res:");
                                 ui.add(egui::DragValue::new(&mut st.a5_res).range(0..=20))
                                     .on_hover_text(
-                                        "A5 resolution (equal-area pentagons; ~14 is                                          comparable to H3 7)",
+                                        "A5 resolution (equal-area pentagons; \
+                                         ~14 is comparable to H3 7)",
                                     );
                             }
                         }
@@ -3996,7 +4014,8 @@ impl ViewerApp {
                         ui.label("smoothing:");
                         ui.add(egui::DragValue::new(&mut st.passes).range(0..=5))
                             .on_hover_text(
-                                "Passes of neighbor averaging over present cells                                  (0 = raw aggregation)",
+                                "Passes of neighbor averaging over present \
+                                 cells (0 = raw aggregation)",
                             );
                         if st.system == 0 {
                             egui::ComboBox::from_id_salt("grid_kernel")
@@ -4015,6 +4034,57 @@ impl ViewerApp {
                                 });
                         } else {
                             ui.label(RichText::new("(ring mean)").weak().small());
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("focal:");
+                        const POST: [&str; 5] =
+                            ["none", "focal std", "open", "close", "hillshade"];
+                        egui::ComboBox::from_id_salt("grid_post")
+                            .width(110.0)
+                            .selected_text(POST[st.post.min(4)])
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut st.post, 0, POST[0]);
+                                ui.selectable_value(&mut st.post, 1, POST[1]).on_hover_text(
+                                    "Standard deviation of each cell's neighborhood: \
+                                     where values are mixed rather than where they \
+                                     are high",
+                                );
+                                ui.selectable_value(&mut st.post, 2, POST[2]).on_hover_text(
+                                    "Erode then dilate: drops isolated hot cells, \
+                                     leaves the rest of the surface in place",
+                                );
+                                ui.selectable_value(&mut st.post, 3, POST[3]).on_hover_text(
+                                    "Dilate then erode: fills isolated holes without \
+                                     inflating the level around them",
+                                );
+                                ui.add_enabled_ui(st.system == 0, |ui| {
+                                    ui.selectable_value(&mut st.post, 4, POST[4]).on_hover_text(
+                                        if st.system == 0 {
+                                            "Shaded relief of the value surface, 0-255. \
+                                             Exaggeration is fitted to the data, so any \
+                                             unit reads; style it with a grey ramp"
+                                        } else {
+                                            "Square grids only — the gradient needs the \
+                                             regular lattice"
+                                        },
+                                    );
+                                });
+                            });
+                        if st.post == 4 && st.system == 0 {
+                            ui.label("sun:");
+                            ui.add(
+                                egui::DragValue::new(&mut st.azimuth)
+                                    .range(0.0..=360.0)
+                                    .suffix("°az"),
+                            )
+                            .on_hover_text("Azimuth the light comes from, clockwise from north");
+                            ui.add(
+                                egui::DragValue::new(&mut st.altitude)
+                                    .range(1.0..=89.0)
+                                    .suffix("°alt"),
+                            )
+                            .on_hover_text("Sun height above the horizon");
                         }
                     });
                     ui.horizontal(|ui| {
@@ -4120,6 +4190,16 @@ impl ViewerApp {
                 kernel: st.kernel,
                 output,
                 smooth_passes: st.passes,
+                post: match st.post {
+                    1 => crate::data::grid::PostOp::FocalStd,
+                    2 => crate::data::grid::PostOp::Open,
+                    3 => crate::data::grid::PostOp::Close,
+                    4 => crate::data::grid::PostOp::Hillshade {
+                        azimuth_deg: st.azimuth,
+                        altitude_deg: st.altitude,
+                    },
+                    _ => crate::data::grid::PostOp::None,
+                },
             };
             let cell_label = match st.system {
                 0 if st.contours => format!("{}u contours", st.size),
@@ -4127,12 +4207,20 @@ impl ViewerApp {
                 1 => format!("h3r{}", st.h3_res),
                 _ => format!("a5r{}", st.a5_res),
             };
+            let post_label = match st.post {
+                1 => " std",
+                2 => " open",
+                3 => " close",
+                4 if st.system == 0 => " hillshade",
+                _ => "",
+            };
             let name = format!(
-                "{} · {}({}) {}",
+                "{} · {}({}) {}{}",
                 st.layer_name,
                 st.stat.label(),
                 st.column,
-                cell_label
+                cell_label,
+                post_label
             );
             let dst = std::env::temp_dir().join(format!(
                 "geopq_grid_{}_{}_{grid_n}.parquet",

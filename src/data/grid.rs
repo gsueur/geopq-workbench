@@ -81,6 +81,44 @@ pub enum ContourSpacing {
     Quantile,
 }
 
+/// Focal operation applied to the cell surface after smoothing. The
+/// grid is an image by then, so these are the image operators that earn
+/// their place on tabular data.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PostOp {
+    /// Keep the aggregated values.
+    None,
+    /// Standard deviation of each cell's neighborhood: local
+    /// heterogeneity rather than local level. High where the
+    /// neighborhood mixes cheap and expensive, near zero on a uniform
+    /// stretch whatever its level.
+    FocalStd,
+    /// Erosion then dilation: drops isolated highs (single hot cells)
+    /// and keeps the rest of the surface where it was.
+    Open,
+    /// Dilation then erosion: fills isolated lows (single cold cells,
+    /// small holes) without inflating the surrounding level.
+    Close,
+    /// Horn hillshade of the value surface, 0..255. Square grids only —
+    /// it needs the regular lattice for the gradient. The vertical
+    /// exaggeration is fitted to the data (the median gradient lights
+    /// at 45°), because values are dollars or people, not metres, and
+    /// no fixed z-factor could suit them.
+    Hillshade { azimuth_deg: f64, altitude_deg: f64 },
+}
+
+impl PostOp {
+    /// Suffix for the output column: operations that change what the
+    /// number means say so, the ones that keep the quantity stay silent.
+    fn suffix(&self) -> &'static str {
+        match self {
+            PostOp::None | PostOp::Open | PostOp::Close => "",
+            PostOp::FocalStd => "_std",
+            PostOp::Hillshade { .. } => "_shade",
+        }
+    }
+}
+
 /// What the grid materializes as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GridOutput {
@@ -109,6 +147,8 @@ pub struct GridSpec {
     /// averages a cell with its present neighbors only: empty cells stay
     /// empty and contribute nothing (no bleed past the data's edge).
     pub smooth_passes: u32,
+    /// Focal operation applied after smoothing.
+    pub post: PostOp,
 }
 
 /// Weighted accumulator: features spanning several cells contribute
@@ -324,47 +364,59 @@ pub fn compute(
 
     // ---- smoothing passes --------------------------------------------
     for pass in 0..spec.smooth_passes {
-        progress(0.7 + 0.15 * (pass as f32 + 1.0) / spec.smooth_passes.max(1) as f32);
+        progress(0.7 + 0.12 * (pass as f32 + 1.0) / spec.smooth_passes.max(1) as f32);
         match spec.system {
             CellSystem::Square { .. } => {
-                sq_vals = smooth_pass(&sq_vals, |&(ix, iy)| {
-                    let mut out = Vec::with_capacity(8);
-                    for dx in -1..=1i64 {
-                        for dy in -1..=1i64 {
-                            if (dx, dy) != (0, 0) {
-                                out.push(((ix + dx, iy + dy), (dx, dy)));
-                            }
-                        }
-                    }
-                    out
-                }, spec.kernel);
+                sq_vals = smooth_pass(&sq_vals, square_neighbors, spec.kernel);
             }
             CellSystem::H3 { .. } => {
-                geo_vals = smooth_pass(&geo_vals, |&c| {
-                    h3o::CellIndex::try_from(c)
-                        .map(|cell| {
-                            cell.grid_disk::<Vec<_>>(1)
-                                .into_iter()
-                                .map(u64::from)
-                                .filter(|n| *n != c)
-                                .map(|n| (n, (1i64, 0i64)))
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                }, Kernel::Box);
+                geo_vals = smooth_pass(&geo_vals, h3_neighbors, Kernel::Box);
             }
             CellSystem::A5 { .. } => {
-                geo_vals = smooth_pass(&geo_vals, |&c| {
-                    a5::grid_disk(c, 1)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|n| *n != c)
-                        .map(|n| (n, (1i64, 0i64)))
-                        .collect()
-                }, Kernel::Box);
+                geo_vals = smooth_pass(&geo_vals, a5_neighbors, Kernel::Box);
             }
         }
     }
+
+    // ---- focal operation ----------------------------------------------
+    progress(0.85);
+    match spec.post {
+        PostOp::None => {}
+        PostOp::Hillshade {
+            azimuth_deg,
+            altitude_deg,
+        } => {
+            let CellSystem::Square { size } = spec.system else {
+                return Err("hillshade needs the square grid (it reads the \
+                            gradient off the regular lattice)"
+                    .into());
+            };
+            sq_vals = hillshade(&sq_vals, size, azimuth_deg, altitude_deg);
+        }
+        op => {
+            // Focal std is one pass; open and close are two passes of the
+            // opposite extremes.
+            let steps: &[Focal] = match op {
+                PostOp::FocalStd => &[Focal::Std],
+                PostOp::Open => &[Focal::Min, Focal::Max],
+                _ => &[Focal::Max, Focal::Min],
+            };
+            for &step in steps {
+                match spec.system {
+                    CellSystem::Square { .. } => {
+                        sq_vals = focal_pass(&sq_vals, square_neighbors, step);
+                    }
+                    CellSystem::H3 { .. } => {
+                        geo_vals = focal_pass(&geo_vals, h3_neighbors, step);
+                    }
+                    CellSystem::A5 { .. } => {
+                        geo_vals = focal_pass(&geo_vals, a5_neighbors, step);
+                    }
+                }
+            }
+        }
+    }
+    let value_name = format!("{}{}", spec.value_name, spec.post.suffix());
 
     // ---- materialize --------------------------------------------------
     progress(0.9);
@@ -374,14 +426,14 @@ pub fn compute(
             return Err("contour lines need the square grid (marching squares)".into());
         };
         let (batch, schema, lines) =
-            contour_lines(&sq_vals, &spec.value_name, size, levels, spacing)?;
+            contour_lines(&sq_vals, &value_name, size, levels, spacing)?;
         crate::sql::export::write_result(dst, &schema, std::slice::from_ref(&batch), 0, out_crs)?;
         progress(1.0);
         return Ok((lines, rows_used));
     }
     let (batch, schema, cells) = match spec.system {
         CellSystem::Square { size } => {
-            materialize(&sq_vals, &spec.value_name, |&(ix, iy)| {
+            materialize(&sq_vals, &value_name, |&(ix, iy)| {
                 let (x0, y0) = (ix as f64 * size, iy as f64 * size);
                 (
                     format!("{ix}:{iy}"),
@@ -395,7 +447,7 @@ pub fn compute(
                 )
             })?
         }
-        CellSystem::H3 { .. } => materialize(&geo_vals, &spec.value_name, |&c| {
+        CellSystem::H3 { .. } => materialize(&geo_vals, &value_name, |&c| {
             let cell = h3o::CellIndex::try_from(c).expect("aggregated cell is valid");
             let mut ring: Vec<(f64, f64)> = cell
                 .boundary()
@@ -407,7 +459,7 @@ pub fn compute(
             }
             (cell.to_string(), ring)
         })?,
-        CellSystem::A5 { .. } => materialize(&geo_vals, &spec.value_name, |&c| {
+        CellSystem::A5 { .. } => materialize(&geo_vals, &value_name, |&c| {
             let b = a5::cell_to_boundary(c, None).unwrap_or_default();
             let mut ring: Vec<(f64, f64)> =
                 b.iter().map(|ll| (ll.longitude(), ll.latitude())).collect();
@@ -649,6 +701,150 @@ fn stitch_segments(segments: Vec<([f64; 2], [f64; 2])>, eps: f64) -> Vec<Vec<[f6
         out.push(chain);
     }
     out
+}
+
+/// The eight square-grid neighbors, with their offsets (the kernel
+/// weights read them).
+fn square_neighbors(&(ix, iy): &(i64, i64)) -> Vec<((i64, i64), (i64, i64))> {
+    let mut out = Vec::with_capacity(8);
+    for dx in -1..=1i64 {
+        for dy in -1..=1i64 {
+            if (dx, dy) != (0, 0) {
+                out.push(((ix + dx, iy + dy), (dx, dy)));
+            }
+        }
+    }
+    out
+}
+
+/// H3 ring-1 neighbors. Offsets are meaningless on a hex lattice, so
+/// they all read as the box weight.
+fn h3_neighbors(c: &u64) -> Vec<(u64, (i64, i64))> {
+    let c = *c;
+    h3o::CellIndex::try_from(c)
+        .map(|cell| {
+            cell.grid_disk::<Vec<_>>(1)
+                .into_iter()
+                .map(u64::from)
+                .filter(|n| *n != c)
+                .map(|n| (n, (1i64, 0i64)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A5 ring-1 neighbors, same convention as H3.
+fn a5_neighbors(c: &u64) -> Vec<(u64, (i64, i64))> {
+    let c = *c;
+    a5::grid_disk(c, 1)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| *n != c)
+        .map(|n| (n, (1i64, 0i64)))
+        .collect()
+}
+
+/// Focal operator over a cell and its present neighbors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Focal {
+    /// Population standard deviation of the neighborhood.
+    Std,
+    /// Erosion.
+    Min,
+    /// Dilation.
+    Max,
+}
+
+/// One focal pass over present cells. Absent neighbors are absent, not
+/// zero: an edge cell is evaluated over the neighbors it has, so the
+/// operator never invents data past the edge of the grid.
+fn focal_pass<K: Hash + Eq + Copy>(
+    vals: &HashMap<K, (f64, f64)>,
+    neighbors: impl Fn(&K) -> Vec<(K, (i64, i64))>,
+    op: Focal,
+) -> HashMap<K, (f64, f64)> {
+    vals.iter()
+        .map(|(k, &(v, count))| {
+            let mut acc = v;
+            let (mut sum, mut sq, mut n) = (v, v * v, 1.0f64);
+            for (nk, _) in neighbors(k) {
+                let Some(&(nv, _)) = vals.get(&nk) else {
+                    continue;
+                };
+                match op {
+                    Focal::Std => {
+                        sum += nv;
+                        sq += nv * nv;
+                        n += 1.0;
+                    }
+                    Focal::Min => acc = acc.min(nv),
+                    Focal::Max => acc = acc.max(nv),
+                }
+            }
+            let out = match op {
+                Focal::Std => {
+                    let mean = sum / n;
+                    (sq / n - mean * mean).max(0.0).sqrt()
+                }
+                _ => acc,
+            };
+            (*k, (out, count))
+        })
+        .collect()
+}
+
+/// Horn hillshade of the square-cell surface, 0..255.
+///
+/// Values are dollars, people or parcels rather than metres, so no fixed
+/// z-factor makes sense: the exaggeration is fitted so the median
+/// gradient lights at 45°, which keeps the relief readable whatever the
+/// field's unit and range. Cells missing a neighbor borrow their own
+/// value for it (a flat continuation), which is the standard edge rule.
+fn hillshade(
+    vals: &HashMap<(i64, i64), (f64, f64)>,
+    size: f64,
+    azimuth_deg: f64,
+    altitude_deg: f64,
+) -> HashMap<(i64, i64), (f64, f64)> {
+    // Horn's 3×3 weighted differences, y increasing north.
+    let grad = |&(ix, iy): &(i64, i64), c: f64| -> (f64, f64) {
+        let at = |dx: i64, dy: i64| vals.get(&(ix + dx, iy + dy)).map_or(c, |&(v, _)| v);
+        let (nw, n, ne) = (at(-1, 1), at(0, 1), at(1, 1));
+        let (w, e) = (at(-1, 0), at(1, 0));
+        let (sw, s, se) = (at(-1, -1), at(0, -1), at(1, -1));
+        let dzdx = ((ne + 2.0 * e + se) - (nw + 2.0 * w + sw)) / (8.0 * size);
+        let dzdy = ((nw + 2.0 * n + ne) - (sw + 2.0 * s + se)) / (8.0 * size);
+        (dzdx, dzdy)
+    };
+    let grads: HashMap<(i64, i64), (f64, f64)> = vals
+        .iter()
+        .map(|(k, &(v, _))| (*k, grad(k, v)))
+        .collect();
+    let mut mags: Vec<f64> = grads
+        .values()
+        .map(|(dx, dy)| (dx * dx + dy * dy).sqrt())
+        .filter(|m| *m > 0.0)
+        .collect();
+    mags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let z = match mags.get(mags.len() / 2) {
+        Some(&median) if median > 0.0 => 1.0 / median,
+        _ => 1.0,
+    };
+
+    let zenith = (90.0 - altitude_deg).to_radians();
+    let sun = azimuth_deg.to_radians();
+    vals.iter()
+        .map(|(k, &(_, count))| {
+            let (dzdx, dzdy) = grads[k];
+            let slope = (z * (dzdx * dzdx + dzdy * dzdy).sqrt()).atan();
+            // Compass azimuth (clockwise from north) of the downhill
+            // direction: the face the sun sees when sun == aspect.
+            let aspect = (-dzdx).atan2(-dzdy);
+            let shade = zenith.cos() * slope.cos()
+                + zenith.sin() * slope.sin() * (sun - aspect).cos();
+            (*k, ((shade.clamp(0.0, 1.0) * 255.0), count))
+        })
+        .collect()
 }
 
 /// One renormalized smoothing pass over present cells.
@@ -1054,7 +1250,118 @@ mod tests {
             kernel: Kernel::Box,
             output: GridOutput::Cells,
             smooth_passes: passes,
+            post: PostOp::None,
         }
+    }
+
+    /// Square grid from a row-major picture, row 0 at the top (so iy
+    /// decreases as rows advance, matching a printed map).
+    fn surface(rows: &[&[f64]]) -> HashMap<(i64, i64), (f64, f64)> {
+        let h = rows.len() as i64;
+        let mut out = HashMap::new();
+        for (r, row) in rows.iter().enumerate() {
+            for (c, &v) in row.iter().enumerate() {
+                out.insert((c as i64, h - 1 - r as i64), (v, 1.0));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn focal_std_measures_spread_not_level() {
+        // A uniform block has no local spread whatever its level; a
+        // cell straddling a step does.
+        let flat = surface(&[&[7.0, 7.0, 7.0], &[7.0, 7.0, 7.0], &[7.0, 7.0, 7.0]]);
+        let out = focal_pass(&flat, square_neighbors, Focal::Std);
+        assert!(out.values().all(|&(v, _)| v < 1e-12), "{out:?}");
+
+        let step = surface(&[&[0.0, 0.0, 10.0], &[0.0, 0.0, 10.0], &[0.0, 0.0, 10.0]]);
+        let out = focal_pass(&step, square_neighbors, Focal::Std);
+        // Interior-left cell sees only zeros; the middle column straddles.
+        assert!(out[&(0, 1)].0 < 1e-12);
+        assert!(out[&(1, 1)].0 > 4.0, "{:?}", out[&(1, 1)]);
+        // Population std of {0,0,0,0,0,0,10,10,10}: mean 10/3.
+        let expect = (100.0 * 3.0 / 9.0f64 - (10.0 / 3.0f64).powi(2)).sqrt();
+        assert!((out[&(1, 1)].0 - expect).abs() < 1e-9, "{:?}", out[&(1, 1)]);
+        // Counts ride along untouched.
+        assert_eq!(out[&(1, 1)].1, 1.0);
+    }
+
+    #[test]
+    fn morphology_drops_spikes_and_fills_holes() {
+        // One hot cell in a cold field: open erases it, close leaves it.
+        let spike = surface(&[
+            &[0.0, 0.0, 0.0, 0.0],
+            &[0.0, 9.0, 0.0, 0.0],
+            &[0.0, 0.0, 0.0, 0.0],
+        ]);
+        let opened = focal_pass(
+            &focal_pass(&spike, square_neighbors, Focal::Min),
+            square_neighbors,
+            Focal::Max,
+        );
+        assert!(opened.values().all(|&(v, _)| v == 0.0), "{opened:?}");
+
+        // One cold cell in a hot field: close fills it, and the plateau
+        // around it does not move.
+        let hole = surface(&[
+            &[5.0, 5.0, 5.0, 5.0],
+            &[5.0, 0.0, 5.0, 5.0],
+            &[5.0, 5.0, 5.0, 5.0],
+        ]);
+        let closed = focal_pass(
+            &focal_pass(&hole, square_neighbors, Focal::Max),
+            square_neighbors,
+            Focal::Min,
+        );
+        assert!(closed.values().all(|&(v, _)| v == 5.0), "{closed:?}");
+
+        // Open must not shave a genuine plateau down. "Genuine" is
+        // relative to the 3×3 structuring element: a blob narrower than
+        // it is noise by definition and does get removed, so the plateau
+        // here is 3×3 and its centre has to survive.
+        let plateau = surface(&[
+            &[0.0, 0.0, 0.0, 0.0, 0.0],
+            &[0.0, 9.0, 9.0, 9.0, 0.0],
+            &[0.0, 9.0, 9.0, 9.0, 0.0],
+            &[0.0, 9.0, 9.0, 9.0, 0.0],
+            &[0.0, 0.0, 0.0, 0.0, 0.0],
+        ]);
+        let opened = focal_pass(
+            &focal_pass(&plateau, square_neighbors, Focal::Min),
+            square_neighbors,
+            Focal::Max,
+        );
+        assert_eq!(opened[&(2, 2)].0, 9.0, "plateau interior survives");
+    }
+
+    #[test]
+    fn hillshade_lights_the_slope_facing_the_sun() {
+        // A ridge running north-south: values rise to the crest in the
+        // middle column, so the west flank faces west and the east
+        // flank faces east.
+        let ridge = surface(&[
+            &[0.0, 5.0, 10.0, 5.0, 0.0],
+            &[0.0, 5.0, 10.0, 5.0, 0.0],
+            &[0.0, 5.0, 10.0, 5.0, 0.0],
+        ]);
+        let west_sun = hillshade(&ridge, 100.0, 270.0, 45.0);
+        let (west_flank, east_flank) = (west_sun[&(1, 1)].0, west_sun[&(3, 1)].0);
+        assert!(
+            west_flank > east_flank + 20.0,
+            "west sun must favour the west flank: {west_flank} vs {east_flank}"
+        );
+        // Move the sun east and the lighting swaps.
+        let east_sun = hillshade(&ridge, 100.0, 90.0, 45.0);
+        assert!(east_sun[&(3, 1)].0 > east_sun[&(1, 1)].0 + 20.0);
+
+        // Flat ground everywhere takes the sun's zenith cosine.
+        let flat = surface(&[&[4.0, 4.0, 4.0], &[4.0, 4.0, 4.0], &[4.0, 4.0, 4.0]]);
+        let shaded = hillshade(&flat, 100.0, 315.0, 45.0);
+        let expect = (45.0f64).to_radians().cos() * 255.0;
+        assert!(shaded.values().all(|&(v, _)| (v - expect).abs() < 1e-6));
+        // Values stay inside the 0..255 shading range.
+        assert!(west_sun.values().all(|&(v, _)| (0.0..=255.0).contains(&v)));
     }
 
     #[test]
@@ -1339,6 +1646,7 @@ mod real_file_tests {
                 kernel: Kernel::Gaussian,
                 output: GridOutput::Cells,
                 smooth_passes: 1,
+                post: PostOp::None,
             };
             let dst = std::env::temp_dir().join(format!(
                 "geopq_grid_e2e_{}.parquet",
@@ -1370,6 +1678,7 @@ mod real_file_tests {
                 spacing: ContourSpacing::Quantile,
             },
             smooth_passes: 2,
+            post: PostOp::None,
         };
         let dst = std::env::temp_dir().join("geopq_grid_e2e_contours.parquet");
         let t = std::time::Instant::now();
@@ -1384,6 +1693,28 @@ mod real_file_tests {
             g[0].1.as_ref().unwrap(),
             geo_types::Geometry::LineString(_)
         ));
+        let _ = std::fs::remove_file(&dst);
+
+        // Hillshade of the same surface: shading range, suffixed column.
+        let spec = GridSpec {
+            value_col: col,
+            value_name: "LAND_VAL".into(),
+            system: CellSystem::Square { size: 1000.0 },
+            stat: GridStat::Mean,
+            kernel: Kernel::Gaussian,
+            output: GridOutput::Cells,
+            smooth_passes: 2,
+            post: PostOp::Hillshade {
+                azimuth_deg: 315.0,
+                altitude_deg: 45.0,
+            },
+        };
+        let dst = std::env::temp_dir().join("geopq_grid_e2e_shade.parquet");
+        let t = std::time::Instant::now();
+        let (cells, _) = compute(&store, &crs, &spec, &dst, &|_| {}).unwrap();
+        eprintln!("hillshade: {cells} cells in {:?}", t.elapsed());
+        let (gs, _, _, _) = crate::data::loader::open_store_for_test(&dst).unwrap();
+        assert!(gs.schema.index_of("LAND_VAL_shade").is_ok());
         let _ = std::fs::remove_file(&dst);
     }
 }

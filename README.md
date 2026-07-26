@@ -52,9 +52,10 @@ so it doubles as a hands-on guide to GeoParquet best practices.
   with six ramps, seven classification methods and an interactive
   legend, basemaps.
 - **Grid summaries**: aggregate any numeric column onto square, H3 or A5
-  cells with proper areal apportionment, smooth it, and get the cells or
-  contour lines back as a new GeoParquet layer. 2.56M parcels to a 1 km
-  grid in ~0.7 s.
+  cells with proper areal apportionment, smooth it, run focal operators
+  (std, open/close, hillshade) over it, and get the cells or contour
+  lines back as a new GeoParquet layer. 2.56M parcels to a 1 km grid in
+  ~0.7 s.
 - **No barriers to entry**: built-in sample datasets and a pure-Rust
   importer for GeoPackage, Shapefile and GeoJSON (no GDAL) if your data
   is not in GeoParquet yet.
@@ -349,12 +350,21 @@ different sizes, and a choropleth of them mostly maps polygon size.
 - **Smoothing**: any number of passes of a 3×3 box or Gaussian kernel
   (ring mean on H3/A5). Each pass averages present neighbors only, so
   nothing bleeds past the edge of the data.
+- **Focal operations** on the smoothed surface, because a grid is an
+  image by then: **focal std** (local heterogeneity — where values are
+  mixed rather than where they are high), **open** and **close** (drop
+  isolated hot cells, fill isolated holes, without moving the level
+  around them), and **hillshade** on square grids, whose vertical
+  exaggeration is fitted to the data so dollars or people light as
+  readably as metres.
 - **Contour lines**: square grids can output isolines instead of cell
   polygons, with levels at value quantiles (the default — equal steps
   put every line in the outlier tail on skewed data) or equal steps.
 
 Output columns keep the source field name, so a mean of `LAND_VAL`
 returns a `LAND_VAL` column and legends read correctly downstream.
+Operations that change what the number means say so: focal std returns
+`LAND_VAL_std`, hillshade returns `LAND_VAL_shade`.
 
 On 2.56M MassGIS parcels: 1 km square grid in ~0.7 s, H3 r7 in ~8 s,
 A5 r14 in ~16 s, contours in ~0.6 s.
@@ -387,7 +397,7 @@ inside an egui shell. No GDAL, no web view, no server process.
 | `data/optimize.rs` | the Optimize rewrite (Hilbert sort, covering, 1.1/2.0 flavors, partitioning) |
 | `data/gpkg.rs`, `data/shp.rs`, `data/geojson.rs` | vector imports (bundled SQLite, pure-Rust shapefile, serde_json) over shared machinery in `data/import.rs` |
 | `data/crs.rs` | PROJJSON → EPSG → proj4rs, projection selection |
-| `data/grid.rs` | grid summaries: square/H3/A5 aggregation, areal apportionment, smoothing kernels, marching-squares contours |
+| `data/grid.rs` | grid summaries: square/H3/A5 aggregation, areal apportionment, smoothing and focal operators, marching-squares contours |
 | `map/` | wgpu pipelines, tiles, chunked f64-origin geometry for jitter-free deep zoom |
 | `sql/` | DataFusion integration, ST_* UDFs, spatial pushdown, console UI |
 | `app.rs` | the egui application |
@@ -402,8 +412,6 @@ quality gate and display policy).
 - Streaming optimize beyond the 8 GB in-memory cap; multi-file optimize
 - Lazy part-append while panning across STAC collections
 - More SQL: polygon set operations, spatial aggregates
-- More grid statistics: focal standard deviation, morphological
-  open/close, hillshade
 - Zoom-dependent level of detail for very dense layers; label rendering
 - Basemap tiles warped to non-Mercator projections
 
