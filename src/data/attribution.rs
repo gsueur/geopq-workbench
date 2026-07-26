@@ -6,9 +6,10 @@
 //! - the parquet key-value metadata (`attribution`, `license`, …), which
 //!   costs nothing to read and travels with the file;
 //! - an `ATTRIBUTION.txt` sitting next to the data, the convention the
-//!   parquetry repositories follow. The file's own directory is checked
-//!   first, then its parent, so a dataset release can carry one file for
-//!   all its parts.
+//!   parquetry repositories follow. Ancestors are walked from the file's
+//!   own directory upwards and the nearest notice wins, so one file at a
+//!   repository's root credits everything under it while a dataset that
+//!   needs its own can still override it.
 //!
 //! Nothing here is required: a layer without attribution simply has
 //! none, and no request is retried or reported.
@@ -27,6 +28,13 @@ const META_KEYS: [&str; 5] = [
 ];
 
 const FILE_NAME: &str = "ATTRIBUTION.txt";
+/// How far up to look. A URL's ancestors stay inside one publisher's
+/// namespace and stop at the host, so the walk can safely reach a
+/// repository root. A local path's ancestors turn into the user's home
+/// directory within a couple of steps, where an unrelated notice would
+/// be someone else's data — hence the shorter leash.
+const REMOTE_ANCESTORS: usize = 6;
+const LOCAL_ANCESTORS: usize = 3;
 /// Sanity cap: a credit file is prose, not a payload.
 const MAX_BYTES: usize = 64 * 1024;
 
@@ -91,14 +99,11 @@ pub fn find(source: &Source, kv: &[parquet::file::metadata::KeyValue]) -> Option
     sidecar(source)
 }
 
-/// `ATTRIBUTION.txt` beside the data, then one directory up.
+/// `ATTRIBUTION.txt` beside the data, then up the ancestors.
 fn sidecar(source: &Source) -> Option<Attribution> {
     match source {
-        Source::Local(p) => {
-            let dir = p.parent()?;
-            local(dir).or_else(|| local(dir.parent()?))
-        }
-        Source::Dir(p) => local(p).or_else(|| local(p.parent()?)),
+        Source::Local(p) => local_chain(p.parent()?),
+        Source::Dir(p) => local_chain(p),
         Source::Remote { url, .. } => remote_chain(url),
         Source::S3 { url, uri, .. } => {
             // The signed URL is what can actually be fetched; the s3://
@@ -148,14 +153,38 @@ fn local_uncached(dir: &Path) -> Option<Attribution> {
     parse(&std::fs::read_to_string(&p).ok()?)
 }
 
-/// Try the URL's own directory, then its parent.
+fn local_chain(dir: &Path) -> Option<Attribution> {
+    let mut cur = Some(dir);
+    for _ in 0..LOCAL_ANCESTORS {
+        let d = cur?;
+        if let Some(a) = local(d) {
+            return Some(a);
+        }
+        cur = d.parent();
+    }
+    None
+}
+
 fn remote_chain(url: &str) -> Option<Attribution> {
     let base = url.split(['?', '#']).next().unwrap_or(url);
-    let dir = base.rsplit_once('/')?.0;
-    if let Some(a) = remote(dir) {
-        return Some(a);
+    let mut dir = base.rsplit_once('/')?.0;
+    for _ in 0..REMOTE_ANCESTORS {
+        if let Some(a) = remote(dir) {
+            return Some(a);
+        }
+        match parent_url(dir) {
+            Some(p) => dir = p,
+            None => break,
+        }
     }
-    remote(dir.rsplit_once('/')?.0)
+    None
+}
+
+/// The parent of a URL directory, or None once it is `scheme://host`.
+fn parent_url(dir: &str) -> Option<&str> {
+    let root_len = dir.find("://")? + 3;
+    let (parent, _) = dir.rsplit_once('/')?;
+    (parent.len() >= root_len).then_some(parent)
 }
 
 fn remote(dir: &str) -> Option<Attribution> {
@@ -275,9 +304,35 @@ project at the William & Mary geoLab.
             len: 0,
         };
         let a = find(&src, &[]).expect("ATTRIBUTION.txt beside the data");
-        eprintln!("credit: {}", a.credit);
+        eprintln!("geoboundaries: {}", a.credit);
         assert!(a.credit.contains("geoBoundaries"), "{}", a.credit);
         assert!(a.text.contains("CC BY 4.0"));
+
+        // An OSM theme sits four directories below the repository's own
+        // notice, and must still find it.
+        let osm = Source::Remote {
+            url: "https://parquetry.geomermaids.com/latest/country=US/state=US-AR/\
+                  buildings.parquet"
+                .replace(' ', "")
+                .to_string(),
+            len: 0,
+        };
+        let a = find(&osm, &[]).expect("repository-root ATTRIBUTION.txt");
+        eprintln!("osm: {}", a.credit);
+        assert!(a.credit.contains("OpenStreetMap"), "{}", a.credit);
+        assert!(a.text.contains("ODbL"));
+    }
+
+    #[test]
+    fn url_ancestors_stop_at_the_host() {
+        assert_eq!(
+            parent_url("https://h.example/a/b/c"),
+            Some("https://h.example/a/b")
+        );
+        assert_eq!(parent_url("https://h.example/a"), Some("https://h.example"));
+        // The host itself has no parent to ask.
+        assert_eq!(parent_url("https://h.example"), None);
+        assert_eq!(parent_url("no-scheme/a/b"), None);
     }
 
     #[test]
@@ -294,8 +349,35 @@ project at the William & Mary geoLab.
         );
         // A dataset directory looks beside itself too.
         assert_eq!(
-            find(&Source::Dir(parts), &[]).unwrap().credit,
+            find(&Source::Dir(parts.clone()), &[]).unwrap().credit,
             "release-wide"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_nearest_notice_wins() {
+        // A repository-wide notice at the root, a dataset that overrides
+        // it further down. Fresh directories: lookups are memoized, so a
+        // tree must be built before it is probed.
+        let root = temp_dir("nearest");
+        let inner = root.join("dataset").join("v1");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(root.join(FILE_NAME), "Attribution: repository-wide").unwrap();
+        std::fs::write(inner.join(FILE_NAME), "Attribution: this dataset").unwrap();
+
+        let f = inner.join("x.parquet");
+        std::fs::write(&f, b"").unwrap();
+        assert_eq!(find(&Source::Local(f), &[]).unwrap().credit, "this dataset");
+
+        // A sibling dataset with no notice of its own inherits the root's.
+        let bare = root.join("other").join("v1");
+        std::fs::create_dir_all(&bare).unwrap();
+        let g = bare.join("y.parquet");
+        std::fs::write(&g, b"").unwrap();
+        assert_eq!(
+            find(&Source::Local(g), &[]).unwrap().credit,
+            "repository-wide"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

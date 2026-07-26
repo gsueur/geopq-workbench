@@ -297,9 +297,11 @@ larger files are on the roadmap.
 - **Attribution**: a layer that carries a credit shows it in the map
   corner beside the basemap's, and in full under File info. It is read
   from the parquet metadata (`attribution`, `license`, …) or from an
-  `ATTRIBUTION.txt` sitting next to the data — the convention the
-  repositories follow, so a mirrored dataset credits its source without
-  anyone having to remember.
+  `ATTRIBUTION.txt` beside the data, searched from the file's own folder
+  upwards with the nearest notice winning — so one file at a
+  repository's root credits everything under it (OpenStreetMap for the
+  Parquetry mirror) while a dataset that needs its own can override it
+  (geoBoundaries under CC BY).
 - **Attributes on click**, fetched lazily from the file; a floating
   window that never resizes the map. Works identically on remote files
   (each click is a small ranged read, off the UI thread).
