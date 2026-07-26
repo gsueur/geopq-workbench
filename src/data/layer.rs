@@ -254,19 +254,35 @@ fn jenks_breaks(sorted: &[f64]) -> Vec<f64> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ramp {
     Viridis,
+    Plasma,
+    /// Perceptually uniform blue → gray → yellow, color-blind safe.
+    Cividis,
     Turbo,
     /// Blue → white → red diverging.
     BuRd,
+    /// Brown → white → teal diverging (ColorBrewer BrBG): dry/wet,
+    /// loss/gain — diverging data where red/blue reads as politics.
+    BrBg,
 }
 
 impl Ramp {
-    pub const ALL: &[Ramp] = &[Ramp::Viridis, Ramp::Turbo, Ramp::BuRd];
+    pub const ALL: &[Ramp] = &[
+        Ramp::Viridis,
+        Ramp::Plasma,
+        Ramp::Cividis,
+        Ramp::Turbo,
+        Ramp::BuRd,
+        Ramp::BrBg,
+    ];
 
     pub fn label(&self) -> &'static str {
         match self {
             Ramp::Viridis => "Viridis",
+            Ramp::Plasma => "Plasma",
+            Ramp::Cividis => "Cividis",
             Ramp::Turbo => "Turbo",
             Ramp::BuRd => "Blue–Red",
+            Ramp::BrBg => "Brown–Teal",
         }
     }
 
@@ -301,11 +317,43 @@ impl Ramp {
                 ];
                 lerp_stops(&stops, t)
             }
+            Ramp::Plasma => {
+                let stops: [[f32; 3]; 6] = [
+                    [0.051, 0.031, 0.529],
+                    [0.416, 0.000, 0.659],
+                    [0.694, 0.165, 0.565],
+                    [0.882, 0.392, 0.384],
+                    [0.988, 0.651, 0.212],
+                    [0.941, 0.976, 0.129],
+                ];
+                lerp_stops(&stops, t)
+            }
+            Ramp::Cividis => {
+                let stops: [[f32; 3]; 6] = [
+                    [0.000, 0.133, 0.306],
+                    [0.208, 0.271, 0.424],
+                    [0.400, 0.408, 0.439],
+                    [0.580, 0.557, 0.467],
+                    [0.784, 0.722, 0.400],
+                    [0.992, 0.918, 0.271],
+                ];
+                lerp_stops(&stops, t)
+            }
             Ramp::BuRd => {
                 let stops: [[f32; 3]; 3] = [
                     [0.129, 0.400, 0.674],
                     [0.969, 0.966, 0.965],
                     [0.792, 0.086, 0.113],
+                ];
+                lerp_stops(&stops, t)
+            }
+            Ramp::BrBg => {
+                let stops: [[f32; 3]; 5] = [
+                    [0.549, 0.318, 0.039],
+                    [0.847, 0.702, 0.396],
+                    [0.961, 0.961, 0.961],
+                    [0.353, 0.706, 0.675],
+                    [0.004, 0.400, 0.369],
                 ];
                 lerp_stops(&stops, t)
             }
@@ -387,15 +435,30 @@ impl LayerStyle {
     }
 }
 
-const PALETTE: [Color32; 8] = [
+/// Tableau 20, darks first then their light variants: the first ten
+/// layers/classes stay maximally distinct, and only busier categorical
+/// legends dip into the pastels before cycling.
+const PALETTE: [Color32; 20] = [
     Color32::from_rgb(31, 119, 180),
     Color32::from_rgb(255, 127, 14),
     Color32::from_rgb(44, 160, 44),
     Color32::from_rgb(214, 39, 40),
     Color32::from_rgb(148, 103, 189),
-    Color32::from_rgb(23, 190, 207),
+    Color32::from_rgb(140, 86, 75),
     Color32::from_rgb(227, 119, 194),
+    Color32::from_rgb(127, 127, 127),
     Color32::from_rgb(188, 189, 34),
+    Color32::from_rgb(23, 190, 207),
+    Color32::from_rgb(174, 199, 232),
+    Color32::from_rgb(255, 187, 120),
+    Color32::from_rgb(152, 223, 138),
+    Color32::from_rgb(255, 152, 150),
+    Color32::from_rgb(197, 176, 213),
+    Color32::from_rgb(196, 156, 148),
+    Color32::from_rgb(247, 182, 210),
+    Color32::from_rgb(199, 199, 199),
+    Color32::from_rgb(219, 219, 141),
+    Color32::from_rgb(158, 218, 229),
 ];
 
 pub fn palette_color(i: usize) -> Color32 {
