@@ -67,15 +67,32 @@ pub enum Kernel {
     Gaussian,
 }
 
+/// How contour levels are placed across the value range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContourSpacing {
+    /// Equal steps between the value min and max. Reads naturally, but
+    /// on a heavy-tailed surface (parcel values, population) nearly
+    /// every cell falls under the first level and the rest of the lines
+    /// crowd around a handful of outliers.
+    Equal,
+    /// Equal counts of cells between levels: level k sits at the
+    /// k/(levels+1) quantile of the present cells. Each band holds the
+    /// same share of the map, whatever the distribution's shape.
+    Quantile,
+}
+
 /// What the grid materializes as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GridOutput {
     /// One polygon per cell.
     Cells,
-    /// Isolines from the (smoothed) cell values: `levels` equally
-    /// spaced levels between the value min and max. Square grids only
-    /// (marching squares needs the regular lattice).
-    Contours { levels: usize },
+    /// Isolines from the (smoothed) cell values: `levels` levels placed
+    /// per `spacing`. Square grids only (marching squares needs the
+    /// regular lattice).
+    Contours {
+        levels: usize,
+        spacing: ContourSpacing,
+    },
 }
 
 pub struct GridSpec {
@@ -352,12 +369,12 @@ pub fn compute(
     // ---- materialize --------------------------------------------------
     progress(0.9);
     let out_crs = if geographic { &wgs84 } else { crs };
-    if let GridOutput::Contours { levels } = spec.output {
+    if let GridOutput::Contours { levels, spacing } = spec.output {
         let CellSystem::Square { size } = spec.system else {
             return Err("contour lines need the square grid (marching squares)".into());
         };
         let (batch, schema, lines) =
-            contour_lines(&sq_vals, &spec.value_name, size, levels)?;
+            contour_lines(&sq_vals, &spec.value_name, size, levels, spacing)?;
         crate::sql::export::write_result(dst, &schema, std::slice::from_ref(&batch), 0, out_crs)?;
         progress(1.0);
         return Ok((lines, rows_used));
@@ -405,8 +422,56 @@ pub fn compute(
     Ok((cells, rows_used))
 }
 
+/// Level values for the isolines, strictly inside the value range and
+/// strictly increasing. Quantile levels collapse onto each other where
+/// many cells share a value (a big flat background), so duplicates are
+/// dropped rather than drawn on top of one another.
+fn contour_levels(
+    vals: &HashMap<(i64, i64), (f64, f64)>,
+    levels: usize,
+    spacing: ContourSpacing,
+) -> Result<Vec<f64>, String> {
+    let n = levels.clamp(1, 64);
+    let mut sorted: Vec<f64> = vals.values().map(|&(v, _)| v).collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let (vmin, vmax) = (sorted[0], sorted[sorted.len() - 1]);
+    let mut out: Vec<f64> = Vec::with_capacity(n);
+    for k in 1..=n {
+        let f = k as f64 / (n + 1) as f64;
+        let v = match spacing {
+            ContourSpacing::Equal => vmin + (vmax - vmin) * f,
+            ContourSpacing::Quantile => quantile_sorted(&sorted, f),
+        };
+        if v <= vmin || v >= vmax {
+            continue;
+        }
+        // Ties in the source distribution map several quantiles to the
+        // same value; keep one line, not five coincident ones.
+        if out.last().is_some_and(|&p| v <= p) {
+            continue;
+        }
+        out.push(v);
+    }
+    if out.is_empty() {
+        return Err(
+            "too many cells share one value for these levels — try equal spacing or fewer levels"
+                .into(),
+        );
+    }
+    Ok(out)
+}
+
+/// Linear-interpolation quantile of an ascending slice (non-empty).
+fn quantile_sorted(sorted: &[f64], f: f64) -> f64 {
+    let pos = f.clamp(0.0, 1.0) * (sorted.len() - 1) as f64;
+    let lo = pos.floor() as usize;
+    let hi = (lo + 1).min(sorted.len() - 1);
+    let t = pos - lo as f64;
+    sorted[lo] * (1.0 - t) + sorted[hi] * t
+}
+
 /// Marching squares over the cell-center lattice: isolines at `levels`
-/// equally spaced values, linearly interpolated, stitched into
+/// values placed per `spacing`, linearly interpolated, stitched into
 /// polylines. Cells missing from the grid stop the contours (no data
 /// invented past the edge).
 #[allow(clippy::type_complexity)]
@@ -415,6 +480,7 @@ fn contour_lines(
     value_name: &str,
     size: f64,
     levels: usize,
+    spacing: ContourSpacing,
 ) -> Result<(RecordBatch, SchemaRef, usize), String> {
     if vals.len() < 4 {
         return Err("not enough cells for contours".into());
@@ -443,9 +509,7 @@ fn contour_lines(
     if vmax <= vmin {
         return Err("flat value surface — no contours".into());
     }
-    let level_values: Vec<f64> = (1..=levels.clamp(1, 64))
-        .map(|k| vmin + (vmax - vmin) * k as f64 / (levels.clamp(1, 64) + 1) as f64)
-        .collect();
+    let level_values = contour_levels(vals, levels, spacing)?;
 
     // Cell-center position of grid node (i, j), data CRS.
     let pos = |i: usize, j: usize| -> [f64; 2] {
@@ -1042,7 +1106,8 @@ mod tests {
                 vals.insert((ix, iy), (10.0 - 4.0 * d, 1.0));
             }
         }
-        let (batch, _, n) = contour_lines(&vals, "v", 100.0, 3).unwrap();
+        let (batch, _, n) =
+            contour_lines(&vals, "v", 100.0, 3, ContourSpacing::Equal).unwrap();
         assert!(n >= 3, "one line per crossed level, got {n}");
         assert_eq!(batch.num_rows(), n);
         // Level column values sit strictly inside the value range.
@@ -1057,7 +1122,53 @@ mod tests {
         // Degenerate surfaces refuse politely.
         let flat: HashMap<(i64, i64), (f64, f64)> =
             (0..9).map(|i| ((i % 3, i / 3), (5.0, 1.0))).collect();
-        assert!(contour_lines(&flat, "v", 100.0, 3).is_err());
+        assert!(contour_lines(&flat, "v", 100.0, 3, ContourSpacing::Equal).is_err());
+    }
+
+    #[test]
+    fn quantile_levels_follow_the_distribution() {
+        // Heavy tail: 100 cells at 1, one cell at 1000. Equal spacing
+        // puts every level in the empty gap above the mass; quantile
+        // spacing has to keep them where the cells actually are.
+        let mut vals: HashMap<(i64, i64), (f64, f64)> = HashMap::new();
+        for i in 0..100i64 {
+            vals.insert((i % 10, i / 10), ((i % 10) as f64 + 1.0, 1.0));
+        }
+        vals.insert((5, 5), (1000.0, 1.0));
+
+        let eq = contour_levels(&vals, 4, ContourSpacing::Equal).unwrap();
+        let qt = contour_levels(&vals, 4, ContourSpacing::Quantile).unwrap();
+        assert!(
+            eq.iter().all(|&v| v > 100.0),
+            "equal steps land in the tail gap: {eq:?}"
+        );
+        assert!(
+            qt.iter().all(|&v| v <= 11.0),
+            "quantile levels stay in the bulk: {qt:?}"
+        );
+        // Strictly increasing, strictly inside the range, both ways.
+        for lv in [&eq, &qt] {
+            assert!(lv.windows(2).all(|w| w[1] > w[0]), "{lv:?}");
+            assert!(lv.iter().all(|&v| v > 1.0 && v < 1000.0), "{lv:?}");
+        }
+
+        // Ties collapse quantiles onto one value: keep one line each,
+        // never a stack of coincident ones.
+        let tied: HashMap<(i64, i64), (f64, f64)> = (0..100i64)
+            .map(|i| {
+                let v = if i < 50 {
+                    0.0
+                } else if i < 80 {
+                    5.0
+                } else {
+                    9.0
+                };
+                ((i % 10, i / 10), (v, 1.0))
+            })
+            .collect();
+        let lv = contour_levels(&tied, 10, ContourSpacing::Quantile).unwrap();
+        assert!(lv.windows(2).all(|w| w[1] > w[0]), "{lv:?}");
+        assert!(lv.len() < 10, "duplicates should be dropped: {lv:?}");
     }
 
     #[test]
@@ -1254,7 +1365,10 @@ mod real_file_tests {
             system: CellSystem::Square { size: 1000.0 },
             stat: GridStat::Mean,
             kernel: Kernel::Gaussian,
-            output: GridOutput::Contours { levels: 8 },
+            output: GridOutput::Contours {
+                levels: 8,
+                spacing: ContourSpacing::Quantile,
+            },
             smooth_passes: 2,
         };
         let dst = std::env::temp_dir().join("geopq_grid_e2e_contours.parquet");

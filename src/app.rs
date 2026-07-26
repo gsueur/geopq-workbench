@@ -588,6 +588,8 @@ struct GridState {
     /// Square grids only: output isolines instead of cell polygons.
     contours: bool,
     levels: u32,
+    /// Contour levels at value quantiles instead of equal steps.
+    quantile_levels: bool,
     running: bool,
     progress: f32,
     error: Option<String>,
@@ -3858,6 +3860,7 @@ impl ViewerApp {
             passes: 0,
             contours: false,
             levels: 10,
+            quantile_levels: true,
             running: false,
             progress: 0.0,
             error: None,
@@ -4026,6 +4029,34 @@ impl ViewerApp {
                         if st.contours && st.system == 0 {
                             ui.label("levels:");
                             ui.add(egui::DragValue::new(&mut st.levels).range(1..=64));
+                            egui::ComboBox::from_id_salt("grid_spacing")
+                                .width(96.0)
+                                .selected_text(if st.quantile_levels {
+                                    "quantile"
+                                } else {
+                                    "equal"
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut st.quantile_levels,
+                                        false,
+                                        "equal",
+                                    )
+                                    .on_hover_text(
+                                        "Equal steps between min and max",
+                                    );
+                                    ui.selectable_value(
+                                        &mut st.quantile_levels,
+                                        true,
+                                        "quantile",
+                                    )
+                                    .on_hover_text(
+                                        "Equal counts of cells per band — the \
+                                         readable choice on skewed surfaces, \
+                                         where equal steps push every line into \
+                                         the outlier tail",
+                                    );
+                                });
                         }
                     });
                     ui.label(
@@ -4069,6 +4100,11 @@ impl ViewerApp {
             let output = if st.contours && st.system == 0 {
                 GridOutput::Contours {
                     levels: st.levels as usize,
+                    spacing: if st.quantile_levels {
+                        crate::data::grid::ContourSpacing::Quantile
+                    } else {
+                        crate::data::grid::ContourSpacing::Equal
+                    },
                 }
             } else {
                 GridOutput::Cells
