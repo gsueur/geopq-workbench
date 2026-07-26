@@ -454,6 +454,7 @@ pub fn compute(
                 .iter()
                 .map(|ll| (ll.lng(), ll.lat()))
                 .collect();
+            unwrap_dateline(&mut ring);
             if let Some(&first) = ring.first() {
                 ring.push(first);
             }
@@ -463,6 +464,7 @@ pub fn compute(
             let b = a5::cell_to_boundary(c, None).unwrap_or_default();
             let mut ring: Vec<(f64, f64)> =
                 b.iter().map(|ll| (ll.longitude(), ll.latitude())).collect();
+            unwrap_dateline(&mut ring);
             if let Some(&first) = ring.first() {
                 ring.push(first);
             }
@@ -883,6 +885,24 @@ fn smooth_pass<K: Hash + Eq + Copy>(
         .collect()
 }
 
+/// Unwrap a geographic ring so consecutive vertices never jump more
+/// than 180° of longitude. H3 and A5 return dateline-crossing cells with
+/// vertices on both sides of ±180; taken literally that ring wraps the
+/// whole globe. Shifting the far side past ±180 keeps the cell the small
+/// polygon it is, and the display projection reads it correctly.
+fn unwrap_dateline(ring: &mut [(f64, f64)]) {
+    let mut shift = 0.0f64;
+    for i in 1..ring.len() {
+        let d = (ring[i].0 + shift) - ring[i - 1].0;
+        if d > 180.0 {
+            shift -= 360.0;
+        } else if d < -180.0 {
+            shift += 360.0;
+        }
+        ring[i].0 += shift;
+    }
+}
+
 /// Cells → one arrow batch: WKB polygon, value, count, cell id.
 #[allow(clippy::type_complexity)]
 fn materialize<K: Hash + Eq + Copy>(
@@ -940,6 +960,8 @@ fn apportion_square(
     add: &mut dyn FnMut((i64, i64), f64),
 ) {
     use geo::{Area, BoundingRect};
+    // Only used to detect degenerate (zero-area) input; the weights are
+    // normalized against the measured coverage below.
     let total = g.unsigned_area();
     let centroid_fallback = |add: &mut dyn FnMut((i64, i64), f64)| {
         if let Some(r) = g.bounding_rect() {
@@ -986,8 +1008,19 @@ fn apportion_square(
         centroid_fallback(add);
         return;
     }
+    // Normalize by the area actually accounted for, not by the ring's
+    // own area: they are equal for a valid ring (the cells tile its
+    // bbox), and for a self-intersecting one — routine in digitized
+    // cadastral data — `unsigned_area` returns the winding-cancelled
+    // area, which can be far smaller than what the clipper measures and
+    // would push the feature's total weight above 1.
+    let sum: f64 = covered.values().sum();
+    if sum <= 0.0 {
+        centroid_fallback(add);
+        return;
+    }
     for (k, a) in covered {
-        add(k, (a / total).min(1.0));
+        add(k, a / sum);
     }
 }
 
@@ -1082,32 +1115,50 @@ fn apportion_sampled(
             return;
         }
     };
-    const N: usize = 8;
+    // Coarse first; a geometry thinner than the sample spacing (a ring,
+    // a river strip, a diagonal sliver) needs a finer lattice before the
+    // bbox-center fallback, which for an annulus would land in the hole.
+    for n in [8usize, 32] {
+        if sample_rings(&rings, &r, n, to_cell, add) {
+            return;
+        }
+    }
+    centroid_fallback(add);
+}
+
+/// One sampling pass at `n`×`n` over `r`. Returns false when no sample
+/// landed inside the rings (or none of those could be classified), so
+/// the caller can refine or fall back.
+fn sample_rings(
+    rings: &[&[geo_types::Coord<f64>]],
+    r: &geo_types::Rect<f64>,
+    n: usize,
+    to_cell: &dyn Fn(f64, f64) -> Option<u64>,
+    add: &mut dyn FnMut(u64, f64),
+) -> bool {
     let (dx, dy) = (
-        (r.max().x - r.min().x) / N as f64,
-        (r.max().y - r.min().y) / N as f64,
+        (r.max().x - r.min().x) / n as f64,
+        (r.max().y - r.min().y) / n as f64,
     );
     if dx <= 0.0 || dy <= 0.0 {
-        centroid_fallback(add);
-        return;
+        return false;
     }
     let mut per_cell: HashMap<u64, u32> = HashMap::new();
-    let mut inside = 0u32;
     let mut xs: Vec<f64> = Vec::new();
-    for j in 0..N {
+    for j in 0..n {
         let y = r.min().y + (j as f64 + 0.5) * dy;
         xs.clear();
-        for ring in &rings {
-            let n = ring.len();
-            if n < 3 {
+        for ring in rings {
+            let len = ring.len();
+            if len < 3 {
                 continue;
             }
             // Rings from WKB carry the duplicate closing point; guard
             // with an explicit wrap segment in case one doesn't.
-            let closed = ring[0] == ring[n - 1];
-            let segs = if closed { n - 1 } else { n };
+            let closed = ring[0] == ring[len - 1];
+            let segs = if closed { len - 1 } else { len };
             for i in 0..segs {
-                let (a, b) = (ring[i], ring[(i + 1) % n]);
+                let (a, b) = (ring[i], ring[(i + 1) % len]);
                 if (a.y > y) != (b.y > y) {
                     let t = (y - a.y) / (b.y - a.y);
                     xs.push(a.x + t * (b.x - a.x));
@@ -1118,24 +1169,28 @@ fn apportion_sampled(
             continue;
         }
         xs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        for i in 0..N {
+        for i in 0..n {
             let x = r.min().x + (i as f64 + 0.5) * dx;
             // Odd number of crossings to the left ⇒ inside (even-odd).
-            if xs.partition_point(|&c| c < x) % 2 == 1 {
-                inside += 1;
-                if let Some(c) = to_cell(x, y) {
-                    *per_cell.entry(c).or_insert(0) += 1;
-                }
+            if xs.partition_point(|&c| c < x) % 2 == 1
+                && let Some(c) = to_cell(x, y)
+            {
+                *per_cell.entry(c).or_insert(0) += 1;
             }
         }
     }
-    if inside == 0 || per_cell.is_empty() {
-        centroid_fallback(add);
-        return;
+    // Normalize over the samples that produced a cell, not over every
+    // sample inside the rings: a sample whose inverse projection fails
+    // (near a pole, or an A5 face singularity) must not shrink the
+    // feature's total weight below 1.
+    let classified: u32 = per_cell.values().sum();
+    if classified == 0 {
+        return false;
     }
-    for (c, n) in per_cell {
-        add(c, n as f64 / inside as f64);
+    for (c, k) in per_cell {
+        add(c, k as f64 / classified as f64);
     }
+    true
 }
 
 /// Stream (row, data-CRS bbox, value, progress) for every row with a
@@ -1185,19 +1240,23 @@ fn scan_bbox_values(
                         .map_err(|e| format!("value cast: {e}"))?;
                     let vals = vals.as_any().downcast_ref::<Float64Array>().unwrap();
                     for i in 0..b.num_rows() {
-                        if vals.is_null(i) || xmin.is_null(i) {
+                        if vals.is_null(i)
+                            || xmin.is_null(i)
+                            || ymin.is_null(i)
+                            || xmax.is_null(i)
+                            || ymax.is_null(i)
+                        {
                             continue;
                         }
                         let v = vals.value(i);
-                        if !v.is_finite() {
+                        let bb = [xmin.value(i), ymin.value(i), xmax.value(i), ymax.value(i)];
+                        // A null Arrow slot reads as 0.0 and NaN floors to
+                        // cell 0 rather than erroring, so a corrupt covering
+                        // column would quietly pile features onto the origin.
+                        if !v.is_finite() || !bb.iter().all(|c| c.is_finite()) {
                             continue;
                         }
-                        f(
-                            rows[i + row_base],
-                            [xmin.value(i), ymin.value(i), xmax.value(i), ymax.value(i)],
-                            v,
-                            frac,
-                        );
+                        f(rows[i + row_base], bb, v, frac);
                     }
                     row_base += b.num_rows();
                 }
@@ -1265,6 +1324,105 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn apportionment_weights_always_sum_to_one() {
+        use geo_types::{Coord, LineString, Polygon};
+        // A self-intersecting bowtie: unsigned_area cancels the two
+        // lobes against each other, so normalizing by it would push the
+        // total weight far above 1 and inflate sum/count/density for
+        // one bad feature. Digitized parcel data is full of these.
+        let bowtie = geo_types::Geometry::Polygon(Polygon::new(
+            LineString(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 300.0, y: 300.0 },
+                Coord { x: 0.0, y: 300.0 },
+                Coord { x: 300.0, y: 0.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        ));
+        let mut w = 0.0;
+        apportion_square(&bowtie, 100.0, &mut |_, x| w += x);
+        assert!((w - 1.0).abs() < 1e-9, "bowtie weights sum to {w}");
+
+        // A thin annulus: no 8×8 sample lands in the 1-unit band and the
+        // bbox centre sits in the hole, so the coarse pass must refine
+        // rather than assign the whole value to a cell the ring never
+        // touches.
+        let ring = |r: f64| {
+            LineString(
+                (0..=64)
+                    .map(|i| {
+                        let a = i as f64 / 64.0 * std::f64::consts::TAU;
+                        Coord {
+                            x: 500.0 + r * a.cos(),
+                            y: 500.0 + r * a.sin(),
+                        }
+                    })
+                    .collect(),
+            )
+        };
+        let annulus =
+            geo_types::Geometry::Polygon(Polygon::new(ring(100.0), vec![ring(99.0)]));
+        let mut hits: Vec<((i64, i64), f64)> = Vec::new();
+        // Cell 100 units wide: the hole spans cells (4,4)..(5,5).
+        let to_cell = |x: f64, y: f64| -> Option<u64> {
+            Some((((x / 100.0) as u64) << 32) | ((y / 100.0) as u64))
+        };
+        let mut total = 0.0;
+        apportion_sampled(&annulus, &to_cell, &mut |c, wt| {
+            hits.push((((c >> 32) as i64, (c & 0xffff_ffff) as i64), wt));
+            total += wt;
+        });
+        assert!((total - 1.0).abs() < 1e-9, "annulus weights sum to {total}");
+        assert!(
+            hits.iter().any(|((ix, iy), _)| (*ix, *iy) != (5, 5)),
+            "the band must reach cells beyond the one holding the centre"
+        );
+
+        // Samples the cell lookup rejects must not shrink the total.
+        let square = geo_types::Geometry::Polygon(Polygon::new(
+            LineString(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 400.0, y: 0.0 },
+                Coord { x: 400.0, y: 400.0 },
+                Coord { x: 0.0, y: 400.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        ));
+        let picky = |x: f64, _y: f64| -> Option<u64> {
+            // Half the samples fail to project, as they would near a pole.
+            (x > 200.0).then_some(7)
+        };
+        let mut total = 0.0;
+        apportion_sampled(&square, &picky, &mut |_, wt| total += wt);
+        assert!((total - 1.0).abs() < 1e-9, "projection failures cost {total}");
+    }
+
+    #[test]
+    fn dateline_cells_stay_small() {
+        // An H3-style ring straddling ±180 comes back with vertices on
+        // both sides; left as-is it wraps the globe.
+        let mut ring = vec![
+            (179.6, 51.0),
+            (-179.7, 51.2),
+            (-179.5, 51.6),
+            (179.8, 51.7),
+            (179.5, 51.3),
+        ];
+        unwrap_dateline(&mut ring);
+        let (lo, hi) = ring.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &(x, _)| {
+            (lo.min(x), hi.max(x))
+        });
+        assert!(hi - lo < 2.0, "unwrapped span {} deg: {ring:?}", hi - lo);
+        // Rings away from the dateline are left exactly as they were.
+        let mut plain = vec![(2.0, 48.0), (2.4, 48.1), (2.2, 48.5)];
+        let before = plain.clone();
+        unwrap_dateline(&mut plain);
+        assert_eq!(plain, before);
     }
 
     #[test]

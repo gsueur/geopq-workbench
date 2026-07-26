@@ -321,6 +321,10 @@ pub struct ViewerApp {
     /// Names to give layers when their load finishes (keyed by job id) —
     /// repository themes would otherwise all be called "buildings".
     pending_names: HashMap<u64, String>,
+    /// Grid outputs written to the temp directory. They back live layers
+    /// for the session, so they can only go at exit; Export… is how a
+    /// grid becomes a file the user keeps.
+    temp_outputs: Vec<PathBuf>,
     /// Bumped on every display projection change; load jobs record it to
     /// detect a switch that happened while they were building.
     display_gen: u64,
@@ -759,6 +763,7 @@ impl ViewerApp {
             repo_tx,
             repo_rx,
             pending_names: HashMap::new(),
+            temp_outputs: Vec::new(),
             display_gen: 0,
         };
         for f in files {
@@ -2902,6 +2907,7 @@ impl ViewerApp {
                     source: SourceCtx::of(&l.store.source),
                     style: StyleCtx::of(&l.style),
                     filter: l.filter.as_ref().map(|f| f.sql.clone()),
+                    name: Some(l.name.clone()),
                 })
                 .collect(),
         };
@@ -2995,6 +3001,9 @@ impl ViewerApp {
             self.pending_styles.insert(job, layer.style.into_style());
             if let Some(f) = layer.filter {
                 self.pending_filters.insert(job, f);
+            }
+            if let Some(n) = layer.name {
+                self.pending_names.insert(job, n);
             }
         }
     }
@@ -3883,7 +3892,14 @@ impl ViewerApp {
     fn grid_window(&mut self, ctx: &egui::Context) {
         use crate::data::grid::{CellSystem, GridOutput, GridStat, Kernel};
         let floating_area = self.floating_area(ctx);
-        if self.grid_dialog.is_none() {
+        let Some(st) = self.grid_dialog.as_ref() else {
+            return;
+        };
+        // The dialog outliving its layer would leave "Compute grid"
+        // silently inert, as the style and filter dialogs already guard
+        // against. A computation in flight owns clones and finishes.
+        if !st.running && !self.layers.iter().any(|l| l.id == st.layer_id) {
+            self.grid_dialog = None;
             return;
         }
         // Drain progress / completion messages.
@@ -3892,13 +3908,23 @@ impl ViewerApp {
             let st = self.grid_dialog.as_mut().unwrap();
             let mut failed = None;
             if let Some(rx) = &st.rx {
-                while let Ok(msg) = rx.try_recv() {
-                    match msg {
-                        GridMsg::Progress(f) => st.progress = f,
-                        GridMsg::Done(p, name, cells, rows) => {
+                loop {
+                    match rx.try_recv() {
+                        Ok(GridMsg::Progress(f)) => st.progress = f,
+                        Ok(GridMsg::Done(p, name, cells, rows)) => {
                             done = Some((p, name, cells, rows))
                         }
-                        GridMsg::Failed(e) => failed = Some(e),
+                        Ok(GridMsg::Failed(e)) => failed = Some(e),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            // The worker died without reporting (a panic
+                            // in compute): say so rather than leaving the
+                            // form disabled behind a frozen progress bar.
+                            if done.is_none() && failed.is_none() && st.running {
+                                failed = Some("grid computation stopped unexpectedly".into());
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -3910,6 +3936,7 @@ impl ViewerApp {
         }
         if let Some((path, name, cells, rows)) = done {
             self.grid_dialog = None;
+            self.temp_outputs.push(path.clone());
             let job = self.enqueue_load(Source::Local(path), ctx);
             self.pending_names.insert(job, name);
             log::info!("grid: {cells} cells from {rows} features");
@@ -4348,6 +4375,7 @@ impl ViewerApp {
                     let loaded = l.loaded.clone();
                     let (id, col, method, classes, per_area) =
                         (d.layer_id, d.column.clone(), d.method, d.classes, d.per_area);
+                    let latlong = l.crs.is_latlong;
                     let tx = self.class_tx.clone();
                     let ctx = ctx.clone();
                     std::thread::spawn(move || {
@@ -4355,7 +4383,7 @@ impl ViewerApp {
                         // equal interval classifies from the sample too.
                         let cap = if per_area { 20_000 } else { 50_000 };
                         let res = crate::data::loader::sample_loaded_values(
-                            &store, &loaded, idx, cap, per_area, None,
+                            &store, &loaded, idx, cap, per_area, latlong, None,
                         )
                         .map(|mut vals| {
                             crate::data::layer::classify_breaks(method, &mut vals, classes)
@@ -4558,7 +4586,13 @@ impl ViewerApp {
                             egui::Sense::hover(),
                         );
                         let p = ui.painter();
-                        let n = d.classes.max(2);
+                        // Head/tail breaks can return fewer classes than
+                        // asked for; preview what will actually be drawn,
+                        // not what was requested.
+                        let n = match &d.breaks {
+                            Some(Ok(b)) => (b.len() + 1).max(2),
+                            _ => d.classes.max(2),
+                        };
                         for i in 0..n {
                             let c = d.ramp.sample(i as f32 / (n - 1) as f32);
                             let x0 = rect.left() + rect.width() * i as f32 / n as f32;
@@ -4742,6 +4776,7 @@ impl ViewerApp {
         }
         let store = Arc::clone(&l.store);
         let loaded = l.loaded.clone();
+        let latlong = l.crs.is_latlong;
         let tx = self.vreclass_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
@@ -4752,6 +4787,7 @@ impl ViewerApp {
                 idx,
                 cap,
                 per_area,
+                latlong,
                 Some(&groups),
             )
             .map(|mut vals| crate::data::layer::classify_breaks(method, &mut vals, classes));
@@ -7802,6 +7838,12 @@ impl ViewerApp {
 }
 
 impl eframe::App for ViewerApp {
+    fn on_exit(&mut self) {
+        for p in self.temp_outputs.drain(..) {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_loader(&ctx);

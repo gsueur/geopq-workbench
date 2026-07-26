@@ -37,6 +37,10 @@ pub struct LayerCtx {
     /// Persistent layer filter (SQL predicate), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
+    /// Display label. Absent in contexts written before labels existed,
+    /// and there the loader's filename-derived name is the right answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -314,6 +318,7 @@ mod tests {
                         lines_on: false,
                     },
                     filter: Some("status = 'active'".into()),
+                    name: Some("Parcels (2024)".into()),
                 },
                 LayerCtx {
                     source: SourceCtx::S3 {
@@ -323,12 +328,17 @@ mod tests {
                     },
                     style: StyleCtx::of(&LayerStyle::new(Color32::RED)),
                     filter: None,
+                    name: None,
                 },
             ],
         };
         let json = serde_json::to_string_pretty(&ctx).unwrap();
         let back: Context = serde_json::from_str(&json).unwrap();
         assert_eq!(back.layers.len(), 2);
+        // The display label is the one piece of layer state a user types
+        // by hand; a session that forgets it loses work silently.
+        assert_eq!(back.layers[0].name.as_deref(), Some("Parcels (2024)"));
+        assert_eq!(back.layers[1].name, None);
         assert_eq!(back.projection, "epsg:2154");
         assert_eq!(back.camera_zoom, 13.25);
         let style = back.layers[0].style.clone().into_style();

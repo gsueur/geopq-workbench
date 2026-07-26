@@ -250,13 +250,13 @@ fn write_cache(cache: &std::collections::HashMap<String, CacheEntry>) {
 
 /// Cached dataset list with its age, if any.
 pub fn cached_datasets(base: &str, snapshot: &str) -> Option<(Vec<Dataset>, u64)> {
-    let _g = CACHE_LOCK.lock().unwrap();
+    let _g = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let e = read_cache().remove(&cache_key(base, snapshot))?;
     Some((e.datasets, e.fetched_at))
 }
 
 pub fn store_datasets(base: &str, snapshot: &str, datasets: &[Dataset]) {
-    let _g = CACHE_LOCK.lock().unwrap();
+    let _g = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut cache = read_cache();
     cache.insert(
         cache_key(base, snapshot),
@@ -272,7 +272,7 @@ pub fn store_datasets(base: &str, snapshot: &str, datasets: &[Dataset]) {
 }
 
 pub fn clear_cached_datasets(base: &str, snapshot: &str) {
-    let _g = CACHE_LOCK.lock().unwrap();
+    let _g = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut cache = read_cache();
     if cache.remove(&cache_key(base, snapshot)).is_some() {
         write_cache(&cache);
@@ -600,7 +600,7 @@ fn write_parts_cache(cache: &std::collections::HashMap<String, Vec<StacPart>>) {
 
 /// Drop cached part lists of one repository (all its collections).
 pub fn clear_cached_stac_parts(base: &str) {
-    let _g = CACHE_LOCK.lock().unwrap();
+    let _g = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut cache = read_parts_cache();
     let n = cache.len();
     cache.retain(|url, _| !url.starts_with(base));
@@ -615,7 +615,7 @@ pub fn clear_cached_stac_parts(base: &str) {
 /// partial part list would silently drop data).
 pub fn fetch_stac_parts(collection_url: &str) -> Result<Vec<StacPart>, String> {
     {
-        let _g = CACHE_LOCK.lock().unwrap();
+        let _g = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(parts) = read_parts_cache().remove(collection_url) {
             return Ok(parts);
         }
@@ -623,7 +623,7 @@ pub fn fetch_stac_parts(collection_url: &str) -> Result<Vec<StacPart>, String> {
     // Fetch outside the lock: item documents can take a while, and the
     // lock only has to make the read-modify-write below atomic.
     let parts = fetch_stac_parts_live(collection_url)?;
-    let _g = CACHE_LOCK.lock().unwrap();
+    let _g = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut cache = read_parts_cache();
     cache.insert(collection_url.to_string(), parts.clone());
     write_parts_cache(&cache);

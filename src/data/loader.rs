@@ -2456,6 +2456,7 @@ pub fn sample_loaded_values(
     col: usize,
     cap: usize,
     per_area: bool,
+    latlong: bool,
     groups: Option<&[u32]>,
 ) -> Result<Vec<f64>, String> {
     let starts = store.rg_starts();
@@ -2558,12 +2559,22 @@ pub fn sample_loaded_values(
     // Normalization needs each sampled feature's area too: fetch the
     // geometries for the same rows (aligned with the value order).
     let areas: Option<Vec<f64>> = if per_area {
-        use geo::Area;
+        use geo::{Area, BoundingRect};
         let geoms = store.fetch_geoms(&rows)?;
         Some(
             geoms
                 .iter()
-                .map(|(_, g)| g.as_ref().map(|g| g.unsigned_area()).unwrap_or(0.0))
+                .map(|(_, g)| {
+                    g.as_ref().map_or(0.0, |g| {
+                        // Same correction the draw path applies, or the
+                        // breaks would be fitted to one scale and the map
+                        // coloured on another.
+                        let lat = g
+                            .bounding_rect()
+                            .map_or(0.0, |r| (r.min().y + r.max().y) * 0.5);
+                        area_in_ground_units(g.unsigned_area(), lat, latlong)
+                    })
+                })
                 .collect(),
         )
     } else {
@@ -2604,7 +2615,23 @@ pub fn sample_loaded_values(
 /// breaks when bins depend on each feature's area (normalize by area).
 pub(crate) enum RowBins {
     Pre(Vec<u8>),
-    PerArea { vals: Vec<f64>, breaks: Vec<f64> },
+    PerArea {
+        vals: Vec<f64>,
+        breaks: Vec<f64>,
+        /// Data CRS is geographic, so the shoelace area is in degrees²
+        /// and needs the latitude correction before it means anything.
+        latlong: bool,
+    },
+}
+
+/// Feature area in square metres (or the projected CRS's own unit²)
+/// from a planar shoelace area and the feature's latitude.
+pub(crate) fn area_in_ground_units(area: f64, lat_deg: f64, latlong: bool) -> f64 {
+    if latlong {
+        crate::data::crs::deg2_area_to_m2(area, lat_deg)
+    } else {
+        area
+    }
 }
 
 /// Bin for an area-normalized value. Nulls, non-finite values and
@@ -2645,7 +2672,12 @@ fn batch_bins(arr: &arrow::array::ArrayRef, binning: &Binning) -> Vec<u8> {
                 .and_then(|a| a.as_any().downcast_ref::<arrow::array::Float64Array>());
             (0..n)
                 .map(|i| match vals {
-                    Some(v) if !v.is_null(i) => {
+                    // A non-finite value would otherwise sort above every
+                    // break and land in the top class; the area-normalized
+                    // path already sends it to bin 0, and the two must
+                    // agree or toggling "normalize by area" would flip a
+                    // row from brightest to darkest.
+                    Some(v) if !v.is_null(i) && v.value(i).is_finite() => {
                         let x = v.value(i);
                         (breaks.partition_point(|b| x >= *b) as u8)
                             .min((STYLE_BINS - 1) as u8)
@@ -2882,6 +2914,7 @@ fn build_geometry(
                 &batch, &map, encoding, &tr, display, &mut mb, &mut items, &mut bad,
                 rg_starts, &mut rg_boxes, geom_pos,
                 style.map(|st| (style_pos.unwrap(), &st.binning, st.per_area)),
+                crs.is_latlong,
                 spherical,
             );
             if let Some((handle, job)) = progress {
@@ -3019,6 +3052,7 @@ fn process_batch(
     rg_boxes: &mut std::collections::HashMap<u32, [f64; 4]>,
     geom_pos: usize,
     style: Option<(usize, &Binning, bool)>,
+    crs_latlong: bool,
     spherical: bool,
 ) -> usize {
     let col = batch.column(geom_pos);
@@ -3033,6 +3067,7 @@ fn process_batch(
         Binning::Breaks(breaks) if per_area => RowBins::PerArea {
             vals: batch_values(batch.column(pos)),
             breaks: breaks.clone(),
+            latlong: crs_latlong,
         },
         _ => RowBins::Pre(batch_bins(batch.column(pos), binning)),
     });
@@ -3071,7 +3106,8 @@ fn process_batch(
         // Fast path: 2D point (WKB parse or GeoArrow coordinate read), no
         // per-feature geo allocation.
         if let Some((x, y)) = get.point2(row) {
-            if let Some(RowBins::PerArea { vals, breaks }) = &bins {
+            if let Some(RowBins::PerArea { vals, breaks, .. }) = &bins {
+                // Points have no area; norm_bin sends them to bin 0.
                 mb.bin = norm_bin(vals[row], 1.0, breaks);
             }
             grow_rg_box(rg_boxes, rg_of(global, rg_starts), [x, y, x, y]);
@@ -3088,9 +3124,18 @@ fn process_batch(
 
         match get.geometry(row) {
             Some(mut geom) => {
-                if let Some(RowBins::PerArea { vals, breaks }) = &bins {
-                    use geo::Area;
-                    mb.bin = norm_bin(vals[row], geom.unsigned_area(), breaks);
+                if let Some(RowBins::PerArea {
+                    vals,
+                    breaks,
+                    latlong,
+                }) = &bins
+                {
+                    use geo::{Area, BoundingRect};
+                    let lat = geom
+                        .bounding_rect()
+                        .map_or(0.0, |r| (r.min().y + r.max().y) * 0.5);
+                    let a = area_in_ground_units(geom.unsigned_area(), lat, *latlong);
+                    mb.bin = norm_bin(vals[row], a, breaks);
                 }
                 if spherical {
                     densify_spherical(&mut geom, SPHERICAL_MAX_SEG_DEG);
@@ -5316,7 +5361,8 @@ mod preview_rect_tests {
         loaded[0] = resolved[0].1.clone();
         let id_col = store.schema.index_of("id").unwrap();
         let mut vals =
-            sample_loaded_values(&store, &loaded, id_col, 10_000, false, None).unwrap();
+            sample_loaded_values(&store, &loaded, id_col, 10_000, false, false, None)
+                .unwrap();
         vals.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         let got: Vec<u32> = vals.iter().map(|v| *v as u32).collect();
         assert_eq!(got, expected, "sampling must reproduce the preview selection");
@@ -5325,7 +5371,27 @@ mod preview_rect_tests {
 
 #[cfg(test)]
 mod norm_bin_tests {
-    use super::norm_bin;
+    use super::{area_in_ground_units, norm_bin};
+
+    #[test]
+    fn geographic_areas_are_latitude_corrected() {
+        // One degree square at the equator and at 60°N: identical in
+        // degrees², roughly half the ground area up north. Without the
+        // correction the northern feature reads twice as dense and can
+        // fall in a different class for no reason but its latitude.
+        let equator = area_in_ground_units(1.0, 0.0, true);
+        let north = area_in_ground_units(1.0, 60.0, true);
+        assert!((north / equator - 0.5).abs() < 0.01, "{north} vs {equator}");
+        // Sanity: a degree square at the equator is ~12,300 km².
+        assert!(
+            (equator - 1.23e10).abs() / 1.23e10 < 0.02,
+            "{equator} m² for a degree square"
+        );
+        // Projected data is already in ground units and must not move.
+        assert_eq!(area_in_ground_units(500.0, 60.0, false), 500.0);
+        // Poles degenerate to zero rather than going negative.
+        assert!(area_in_ground_units(1.0, 90.0, true) >= 0.0);
+    }
 
     #[test]
     fn area_normalization_orders_by_density() {

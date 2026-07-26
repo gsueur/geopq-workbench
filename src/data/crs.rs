@@ -25,6 +25,20 @@ pub struct Crs {
     pub projjson: Option<Arc<Value>>,
 }
 
+/// Planar degree² area → square metres at latitude `lat_deg`.
+///
+/// A shoelace area over lon/lat coordinates is in degrees², and a
+/// degree of longitude shrinks with the cosine of the latitude: without
+/// this correction, two polygons of identical ground area normalize to
+/// different values purely because one sits further north, which lands
+/// them in different classes. The local-sphere approximation is good to
+/// well under a percent for anything small enough to be one feature.
+pub fn deg2_area_to_m2(area_deg2: f64, lat_deg: f64) -> f64 {
+    const M_PER_DEG_LAT: f64 = 110_574.0;
+    const M_PER_DEG_LON_EQUATOR: f64 = 111_320.0;
+    area_deg2 * M_PER_DEG_LAT * M_PER_DEG_LON_EQUATOR * lat_deg.to_radians().cos().max(0.0)
+}
+
 impl std::fmt::Debug for Crs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Crs({})", self.name)
@@ -94,7 +108,9 @@ impl Crs {
     /// for foot-based ones, "deg²" for geographic.
     pub fn area_unit(&self) -> &'static str {
         if self.is_latlong {
-            return "deg²";
+            // Geographic data is normalized through `deg2_area_to_m2`,
+            // so the quantity the user sees really is per square metre.
+            return "m²";
         }
         if self.proj4.contains("+units=us-ft") {
             "US ft²"

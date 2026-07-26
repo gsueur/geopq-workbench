@@ -261,8 +261,8 @@ larger files are on the roadmap.
   in the background.
 - **Styling**: fill, border and point colors with sensible auto-derived
   defaults, opacity, line width, point radius; fill and border switch
-  off independently from the `f` / `w` labels in the layer row, so you
-  can draw outlines only or fills only. **Style by value** colors by any
+  off independently from the `fill:` / `w:` labels in the layer row, so
+  you can draw outlines only or fills only. **Style by value** colors by any
   attribute: numeric columns get six ramps and seven classification
   methods (equal interval, quantile, half-std-dev, Jenks, arithmetic and
   geometric progression, head/tail breaks) with your choice of class

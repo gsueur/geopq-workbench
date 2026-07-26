@@ -370,8 +370,20 @@ pub(crate) fn emit_bulk(
 
         match bins {
             Some(super::loader::RowBins::Pre(b)) => mb.bin = b[i],
-            Some(super::loader::RowBins::PerArea { vals, breaks }) => {
-                mb.bin = super::loader::norm_bin(vals[i], data_area(ga, i, xs, ys), breaks);
+            Some(super::loader::RowBins::PerArea {
+                vals,
+                breaks,
+                latlong,
+            }) => {
+                // rb is this feature's raw data-CRS bbox, so its mid-y is
+                // the latitude the degree² correction needs.
+                let lat = (rb[1] + rb[3]) * 0.5;
+                let a = super::loader::area_in_ground_units(
+                    data_area(ga, i, xs, ys),
+                    lat,
+                    *latlong,
+                );
+                mb.bin = super::loader::norm_bin(vals[i], a, breaks);
             }
             None => {}
         }
