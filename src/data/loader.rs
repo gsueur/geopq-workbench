@@ -5004,7 +5004,7 @@ mod xy_tests {
         assert_eq!((lo, hi), (0.0, (n - 1) as f64));
         let style = StyleSel {
             col: id_col,
-            binning: Binning::Breaks(crate::data::layer::equal_interval_breaks(lo, hi)),
+            binning: Binning::Breaks(crate::data::layer::equal_interval_breaks(lo, hi, crate::data::layer::STYLE_BINS)),
         };
         let (g_styled, rows_styled, _, _, _) =
             build_geometry_styled_for_test(&store, &crs, &display, &style).unwrap();

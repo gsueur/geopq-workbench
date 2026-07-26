@@ -101,6 +101,10 @@ pub struct StyleBy {
     pub column: String,
     pub ramp: Ramp,
     pub mode: StyleMode,
+    /// Bitmask of classes hidden from the map (bit i = bin i), toggled
+    /// by clicking legend entries. Draw-time filter only; meshes keep
+    /// every feature.
+    pub hidden_bins: u16,
     /// Rows that were loaded when data-dependent classes were computed
     /// (quantiles/std-dev/Jenks classify only what is loaded — panning or
     /// zooming afterwards can make the classes stale).
@@ -153,44 +157,48 @@ impl ClassMethod {
     }
 }
 
-/// Equal-interval breaks over [min, max].
-pub fn equal_interval_breaks(min: f64, max: f64) -> Vec<f64> {
+/// Equal-interval breaks over [min, max], `classes - 1` of them.
+pub fn equal_interval_breaks(min: f64, max: f64, classes: usize) -> Vec<f64> {
+    let classes = classes.clamp(2, STYLE_BINS);
     let span = if (max - min).abs() < f64::EPSILON { 1.0 } else { max - min };
-    (1..STYLE_BINS)
-        .map(|i| min + span * i as f64 / STYLE_BINS as f64)
+    (1..classes)
+        .map(|i| min + span * i as f64 / classes as f64)
         .collect()
 }
 
-/// Data-driven breaks from sampled values. `values` gets sorted.
-pub fn classify_breaks(method: ClassMethod, values: &mut Vec<f64>) -> Vec<f64> {
+/// Data-driven breaks from sampled values (`classes - 1` of them, so the
+/// class count is always recoverable as `breaks.len() + 1`). `values`
+/// gets sorted.
+pub fn classify_breaks(method: ClassMethod, values: &mut Vec<f64>, classes: usize) -> Vec<f64> {
+    let classes = classes.clamp(2, STYLE_BINS);
     values.retain(|v| v.is_finite());
     if values.is_empty() {
-        return equal_interval_breaks(0.0, 1.0);
+        return equal_interval_breaks(0.0, 1.0, classes);
     }
     values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
     let n = values.len();
     match method {
-        ClassMethod::EqualInterval => equal_interval_breaks(values[0], values[n - 1]),
-        ClassMethod::Quantile => (1..STYLE_BINS)
-            .map(|i| values[(i * n / STYLE_BINS).min(n - 1)])
+        ClassMethod::EqualInterval => equal_interval_breaks(values[0], values[n - 1], classes),
+        ClassMethod::Quantile => (1..classes)
+            .map(|i| values[(i * n / classes).min(n - 1)])
             .collect(),
         ClassMethod::StdDev => {
             let mean = values.iter().sum::<f64>() / n as f64;
             let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
             let sd = var.sqrt().max(f64::EPSILON);
-            // Half-sd classes centered on the mean: 15 breaks spanning
-            // mean ± 3.75 σ.
-            (1..STYLE_BINS)
-                .map(|i| mean + sd * 0.5 * (i as f64 - STYLE_BINS as f64 / 2.0))
+            // Half-sd classes centered on the mean (16 classes span
+            // mean ± 3.75 σ).
+            (1..classes)
+                .map(|i| mean + sd * 0.5 * (i as f64 - classes as f64 / 2.0))
                 .collect()
         }
-        ClassMethod::Jenks => jenks_breaks(values),
+        ClassMethod::Jenks => jenks_breaks(values, classes),
     }
 }
 
 /// Fisher-Jenks natural breaks on a bounded sample (O(k·n²) exact DP —
 /// the caller keeps n small).
-fn jenks_breaks(sorted: &[f64]) -> Vec<f64> {
+fn jenks_breaks(sorted: &[f64], classes: usize) -> Vec<f64> {
     const MAX_N: usize = 1500;
     let sample: Vec<f64> = if sorted.len() > MAX_N {
         (0..MAX_N)
@@ -200,9 +208,9 @@ fn jenks_breaks(sorted: &[f64]) -> Vec<f64> {
         sorted.to_vec()
     };
     let n = sample.len();
-    let k = STYLE_BINS.min(n.max(1));
+    let k = classes.min(n.max(1));
     if n <= k {
-        return equal_interval_breaks(sample[0], sample[n - 1]);
+        return equal_interval_breaks(sample[0], sample[n - 1], classes);
     }
     // Prefix sums for O(1) within-class variance.
     let mut ps = vec![0.0f64; n + 1];
@@ -245,7 +253,7 @@ fn jenks_breaks(sorted: &[f64]) -> Vec<f64> {
     }
     bounds.reverse();
     // Pad if degenerate (shouldn't happen with n > k).
-    while bounds.len() < STYLE_BINS - 1 {
+    while bounds.len() < classes - 1 {
         bounds.push(*bounds.last().unwrap_or(&0.0));
     }
     bounds
@@ -378,9 +386,13 @@ impl StyleBy {
     pub fn bin_colors(&self) -> [[f32; 3]; STYLE_BINS] {
         let mut out = [[0.0; 3]; STYLE_BINS];
         match &self.mode {
-            StyleMode::Graduated { .. } => {
+            StyleMode::Graduated { breaks, .. } => {
+                // Class count derives from the breaks; bins past it never
+                // occur (bin = number of breaks ≤ value) but get the last
+                // color anyway.
+                let n = (breaks.len() + 1).clamp(2, STYLE_BINS);
                 for (i, c) in out.iter_mut().enumerate() {
-                    *c = self.ramp.sample(i as f32 / (STYLE_BINS - 1) as f32);
+                    *c = self.ramp.sample(i.min(n - 1) as f32 / (n - 1) as f32);
                 }
             }
             StyleMode::Categorical { values } => {
@@ -414,6 +426,10 @@ pub struct LayerStyle {
     pub point_radius_px: f32,
     pub fill_opacity: f32,
     pub opacity: f32,
+    /// Master switches for polygon rendition (the panel's clickable
+    /// "fill:" / "w:" labels): borders-only or fill-only display.
+    pub fill_on: bool,
+    pub lines_on: bool,
     /// Data-driven styling; None = single color. Changing column/breaks
     /// rebuilds the layer meshes (features are binned at build time).
     pub style_by: Option<StyleBy>,
@@ -429,6 +445,8 @@ impl LayerStyle {
             line_width_px: 1.2,
             point_radius_px: 3.0,
             fill_opacity: 0.35,
+            fill_on: true,
+            lines_on: true,
             opacity: 1.0,
             style_by: None,
         }
@@ -748,44 +766,70 @@ mod class_tests {
         let mut vals: Vec<f64> = (0..900).map(|i| i as f64 / 900.0).collect();
         vals.extend((0..100).map(|i| 100.0 + i as f64));
 
-        let eq = classify_breaks(ClassMethod::EqualInterval, &mut vals.clone());
+        let eq = classify_breaks(ClassMethod::EqualInterval, &mut vals.clone(), STYLE_BINS);
         assert_eq!(eq.len(), STYLE_BINS - 1);
         assert!(eq.windows(2).all(|w| w[0] <= w[1]), "ascending");
         // Equal interval spreads over the full range: most breaks above 1.
         assert!(eq.iter().filter(|b| **b > 1.0).count() > 10);
 
-        let q = classify_breaks(ClassMethod::Quantile, &mut vals.clone());
+        let q = classify_breaks(ClassMethod::Quantile, &mut vals.clone(), STYLE_BINS);
         assert_eq!(q.len(), STYLE_BINS - 1);
         assert!(q.windows(2).all(|w| w[0] <= w[1]));
         // Quantiles follow the mass: most breaks inside the dense [0,1).
         assert!(q.iter().filter(|b| **b < 1.0).count() >= 12, "{q:?}");
 
-        let j = classify_breaks(ClassMethod::Jenks, &mut vals.clone());
+        let j = classify_breaks(ClassMethod::Jenks, &mut vals.clone(), STYLE_BINS);
         assert_eq!(j.len(), STYLE_BINS - 1);
         assert!(j.windows(2).all(|w| w[0] <= w[1]));
         // Natural breaks must isolate the [100, 200) cluster from [0, 1).
         assert!(j.iter().any(|b| *b > 1.0 && *b <= 101.0), "{j:?}");
 
-        let sd = classify_breaks(ClassMethod::StdDev, &mut vals.clone());
+        let sd = classify_breaks(ClassMethod::StdDev, &mut vals.clone(), STYLE_BINS);
         assert_eq!(sd.len(), STYLE_BINS - 1);
         assert!(sd.windows(2).all(|w| w[0] <= w[1]));
 
         // Degenerate inputs don't panic.
         assert_eq!(
-            classify_breaks(ClassMethod::Jenks, &mut vec![5.0; 10]).len(),
+            classify_breaks(ClassMethod::Jenks, &mut vec![5.0; 10], STYLE_BINS).len(),
             STYLE_BINS - 1
         );
         assert_eq!(
-            classify_breaks(ClassMethod::Quantile, &mut Vec::new()).len(),
+            classify_breaks(ClassMethod::Quantile, &mut Vec::new(), STYLE_BINS).len(),
             STYLE_BINS - 1
         );
+    }
+
+    #[test]
+    fn class_count_flows_through_breaks() {
+        let mut vals: Vec<f64> = (0..100).map(|i| i as f64).collect();
+        for classes in [2usize, 5, 8, STYLE_BINS] {
+            for m in ClassMethod::ALL {
+                let b = classify_breaks(*m, &mut vals.clone(), classes);
+                assert_eq!(b.len(), classes - 1, "{m:?} classes={classes}");
+            }
+        }
+        // bin_colors spreads the ramp over exactly the class count.
+        let sb = StyleBy {
+            column: "v".into(),
+            ramp: Ramp::Viridis,
+            hidden_bins: 0,
+            mode: StyleMode::Graduated {
+                method: ClassMethod::EqualInterval,
+                breaks: equal_interval_breaks(0.0, 100.0, 5),
+            },
+            classified_rows: None,
+        };
+        let colors = sb.bin_colors();
+        assert_eq!(colors[4], Ramp::Viridis.sample(1.0), "last class = ramp end");
+        assert_eq!(colors[5], colors[4], "bins past the class count reuse the last color");
+        assert_ne!(colors[0], colors[1]);
     }
 
     #[test]
     fn breaks_binning_matches_partition() {
         // partition_point semantics: value below first break -> bin 0,
         // above last -> last bin.
-        let breaks = equal_interval_breaks(0.0, 16.0);
+        let breaks = equal_interval_breaks(0.0, 16.0, STYLE_BINS);
         let bin = |v: f64| breaks.partition_point(|b| v >= *b);
         assert_eq!(bin(-1.0), 0);
         assert_eq!(bin(0.5), 0);

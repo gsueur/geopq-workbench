@@ -44,6 +44,13 @@ pub struct ChunkMesh {
     /// Style bin of every feature in this chunk (data-driven styling
     /// splits chunks by bin so each draws with its own uniform color).
     pub bin: u8,
+    /// Oversized features (spanning several spatial cells) go into
+    /// underlay chunks, drawn before all normal fills: parcel datasets
+    /// contain km-scale aggregate polygons that legitimately overlap
+    /// thousands of small features, and with data-driven styling an
+    /// arbitrary draw order paints whole districts with the giant's
+    /// single bin color.
+    pub underlay: bool,
     pub fill_vertices: Vec<[f32; 2]>,
     pub fill_indices: Vec<u32>,
     /// Line segments per LOD; index 0 is full detail. Within each LOD the
@@ -137,6 +144,7 @@ impl Default for ChunkMesh {
         Self {
             origin: [0.0; 2],
             bin: 0,
+            underlay: false,
             fill_vertices: Vec::new(),
             fill_indices: Vec::new(),
             lines: Default::default(),
@@ -195,7 +203,7 @@ impl GeomKind {
 /// Accumulates tessellated features into spatial chunks. One builder per
 /// worker thread; merge with `merge_into`.
 pub struct MeshBuilder {
-    chunks: HashMap<(i64, i64, u8), ChunkMesh>,
+    chunks: HashMap<(i64, i64, u8, bool), ChunkMesh>,
     /// Style bin applied to subsequently added features.
     pub bin: u8,
     tess: FillTessellator,
@@ -239,6 +247,15 @@ fn expand(a: &mut [f64; 4], b: [f64; 4]) {
     a[3] = a[3].max(b[3]);
 }
 
+/// Features spanning more than this many world units in either axis are
+/// routed to underlay chunks (drawn first). Half a chunk cell: normal
+/// parcels/buildings sit far below it, km-scale aggregates far above.
+const UNDERLAY_SPAN: f64 = CHUNK_WORLD * 0.5;
+
+fn spans_underlay(bbox: [f64; 4]) -> bool {
+    (bbox[2] - bbox[0]).max(bbox[3] - bbox[1]) > UNDERLAY_SPAN
+}
+
 impl MeshBuilder {
     fn chunk_for(&mut self, bbox: [f64; 4]) -> &mut ChunkMesh {
         let cx = (bbox[0] + bbox[2]) * 0.5;
@@ -247,10 +264,12 @@ impl MeshBuilder {
             (cx / CHUNK_WORLD).floor() as i64,
             (cy / CHUNK_WORLD).floor() as i64,
             self.bin,
+            spans_underlay(bbox),
         );
         self.chunks.entry(key).or_insert_with(|| ChunkMesh {
             origin: [key.0 as f64 * CHUNK_WORLD, key.1 as f64 * CHUNK_WORLD],
             bin: key.2,
+            underlay: key.3,
             ..Default::default()
         })
     }
@@ -498,7 +517,10 @@ impl MeshBuilder {
             );
             match res {
                 Ok(()) => {
-                    let chunk = self.chunks.get_mut(&key_of(origin, self.bin)).expect("chunk exists");
+                    let chunk = self
+                        .chunks
+                        .get_mut(&key_of(origin, self.bin, spans_underlay(bbox)))
+                        .expect("chunk exists");
                     let base = chunk.fill_vertices.len() as u32;
                     chunk.fill_vertices.extend_from_slice(&self.scratch.vertices);
                     chunk
@@ -623,15 +645,19 @@ impl MeshBuilder {
                 chunks.push(c);
             }
         }
+        // Underlay chunks first so within a section big features draw
+        // below normal ones (the renderer repeats this across sections).
+        chunks.sort_by_key(|c| !c.underlay);
         chunks
     }
 }
 
-fn key_of(origin: [f64; 2], bin: u8) -> (i64, i64, u8) {
+fn key_of(origin: [f64; 2], bin: u8, underlay: bool) -> (i64, i64, u8, bool) {
     (
         (origin[0] / CHUNK_WORLD).round() as i64,
         (origin[1] / CHUNK_WORLD).round() as i64,
         bin,
+        underlay,
     )
 }
 
@@ -677,10 +703,12 @@ pub fn split_oversized(c: ChunkMesh, caps: &SplitCaps) -> Vec<ChunkMesh> {
     let origin = c.origin;
     let alias = c.line_alias;
     let bin = c.bin;
+    let underlay = c.underlay;
     let blank = move || ChunkMesh {
         origin,
         line_alias: alias,
         bin,
+        underlay,
         ..Default::default()
     };
     let mut out: Vec<ChunkMesh> = Vec::new();
@@ -1007,7 +1035,7 @@ mod split_tests {
             c.lines[1].extents.push(1.0);
         }
         let mut mb = MeshBuilder::default();
-        mb.chunks.insert(key_of([0.5, 0.5], 0), c);
+        mb.chunks.insert(key_of([0.5, 0.5], 0, false), c);
         let caps = SplitCaps {
             line_instances: 12,
             ..SplitCaps::default()
@@ -1039,5 +1067,48 @@ mod split_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod underlay_tests {
+    use super::*;
+
+    fn square(cx: f64, cy: f64, half: f64) -> geo_types::Polygon<f64> {
+        let ring = vec![
+            geo_types::Coord { x: cx - half, y: cy - half },
+            geo_types::Coord { x: cx + half, y: cy - half },
+            geo_types::Coord { x: cx + half, y: cy + half },
+            geo_types::Coord { x: cx - half, y: cy + half },
+            geo_types::Coord { x: cx - half, y: cy - half },
+        ];
+        geo_types::Polygon::new(geo_types::LineString(ring), vec![])
+    }
+
+    /// Oversized features route to underlay chunks that finish() orders
+    /// first, so km-scale aggregate polygons draw below normal parcels.
+    #[test]
+    fn oversized_features_underlay_normal_fills() {
+        let mut mb = MeshBuilder::default();
+        // Giant: spans 2 chunk cells (> UNDERLAY_SPAN); normal: 1/50 cell.
+        let giant = square(0.5, 0.5, CHUNK_WORLD);
+        let small = square(0.5, 0.5, CHUNK_WORLD / 100.0);
+        // Small added FIRST: order in finish() must still put the giant
+        // before it (routing, not insertion order, decides).
+        mb.add(&geo_types::Geometry::Polygon(small), FeatureRef::INVALID);
+        mb.add(&geo_types::Geometry::Polygon(giant), FeatureRef::INVALID);
+        let chunks = mb.finish();
+        let under: Vec<bool> = chunks
+            .iter()
+            .filter(|c| !c.fill_vertices.is_empty())
+            .map(|c| c.underlay)
+            .collect();
+        assert!(under.contains(&true), "giant feature must be underlay");
+        assert!(under.contains(&false), "small feature must stay normal");
+        let first_normal = under.iter().position(|u| !u).unwrap();
+        assert!(
+            under[..first_normal].iter().all(|u| *u),
+            "underlay chunks must come first: {under:?}"
+        );
     }
 }

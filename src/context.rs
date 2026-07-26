@@ -133,6 +133,10 @@ pub struct StyleCtx {
     pub point_radius_px: f32,
     pub fill_opacity: f32,
     pub opacity: f32,
+    #[serde(default = "default_true")]
+    pub fill_on: bool,
+    #[serde(default = "default_true")]
+    pub lines_on: bool,
     /// Data-driven styling: (column, ramp token, mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub style_by: Option<StyleByCtx>,
@@ -151,8 +155,18 @@ pub struct StyleByCtx {
     pub ramp: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classified_rows: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub hidden_bins: u16,
     #[serde(flatten)]
     pub mode: StyleByMode,
+}
+
+fn is_zero_u16(v: &u16) -> bool {
+    *v == 0
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl StyleCtx {
@@ -167,10 +181,13 @@ impl StyleCtx {
             point_radius_px: s.point_radius_px,
             fill_opacity: s.fill_opacity,
             opacity: s.opacity,
+            fill_on: s.fill_on,
+            lines_on: s.lines_on,
             style_by: s.style_by.as_ref().map(|sb| StyleByCtx {
                 column: sb.column.clone(),
                 ramp: sb.ramp.label().to_string(),
                 classified_rows: sb.classified_rows,
+                hidden_bins: sb.hidden_bins,
                 mode: match &sb.mode {
                     StyleMode::Graduated { method, breaks } => StyleByMode::Graduated {
                         method: method.label().to_string(),
@@ -196,6 +213,8 @@ impl StyleCtx {
             point_radius_px: self.point_radius_px,
             fill_opacity: self.fill_opacity,
             opacity: self.opacity,
+            fill_on: self.fill_on,
+            lines_on: self.lines_on,
             style_by: self.style_by.map(|sb| StyleBy {
                 column: sb.column,
                 ramp: Ramp::ALL
@@ -204,6 +223,7 @@ impl StyleCtx {
                     .find(|r| r.label() == sb.ramp)
                     .unwrap_or(Ramp::Viridis),
                 classified_rows: sb.classified_rows,
+                hidden_bins: sb.hidden_bins,
                 mode: match sb.mode {
                     StyleByMode::Graduated { method, breaks } => StyleMode::Graduated {
                         method: crate::data::layer::ClassMethod::ALL
@@ -286,6 +306,8 @@ mod tests {
                         point_radius_px: 3.0,
                         fill_opacity: 0.4,
                         opacity: 0.9,
+                        fill_on: true,
+                        lines_on: false,
                     },
                     filter: Some("status = 'active'".into()),
                 },

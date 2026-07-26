@@ -22,6 +22,16 @@ pub struct DrawStyle {
     /// Data-driven styling: per-bin RGB (chunks carry their bin); alpha
     /// channels come from the colors above. None = uniform colors.
     pub bin_colors: Option<Arc<[[f32; 3]; crate::data::layer::STYLE_BINS]>>,
+    /// Bitmask of style bins hidden from the map (legend toggles).
+    /// Only honored while `bin_colors` is set: without data styling
+    /// every chunk reports bin 0 and the mask would hide the layer.
+    pub hidden_bins: u16,
+}
+
+impl DrawStyle {
+    fn bin_hidden(&self, bin: u8) -> bool {
+        self.bin_colors.is_some() && self.hidden_bins & (1u16 << bin) != 0
+    }
 }
 
 impl DrawStyle {
@@ -65,6 +75,8 @@ struct ChunkGpu {
     origin: [f64; 2],
     /// Style bin (0 when the layer is not data-styled).
     bin: u8,
+    /// Oversized-feature chunk: its fills draw before all normal fills.
+    underlay: bool,
     /// World-space bounds of this chunk's vertices, for viewport culling.
     bounds_world: [f64; 4],
     fill_vbuf: Option<wgpu::Buffer>,
@@ -627,6 +639,7 @@ impl MapResources {
                 ChunkGpu {
                     origin: c.origin,
                     bin: c.bin,
+                    underlay: c.underlay,
                     bounds_world: [
                         c.origin[0] + c.bounds_local[0] as f64,
                         c.origin[1] + c.bounds_local[1] as f64,
@@ -812,17 +825,25 @@ impl egui_wgpu::CallbackTrait for MapCallback {
             // composite once at the layer's fill opacity: overlapping
             // features (stacked condo parcels etc.) don't darken.
             let mut fill_cmds: Vec<((u64, u64), usize, u32)> = Vec::new();
-            for layer in group_layers {
-                let Some(gpu) = res.layers.get(&layer.key) else {
-                    continue;
-                };
-                for (ci, chunk) in gpu.chunks.iter().enumerate() {
-                    if !no_fills && chunk.fill_index_count > 0 && visible(&chunk.bounds_world) {
-                        let rgb = layer.style.rgb_for(chunk.bin, s.fill_color);
-                        let opaque = [rgb[0], rgb[1], rgb[2], 1.0];
-                        let uoffset =
-                            push_uniform(&mut uniforms, chunk.origin, [1.0, 1.0], opaque, 0.0);
-                        fill_cmds.push((layer.key, ci, uoffset));
+            // Two passes: underlay chunks (oversized features) first, so
+            // giant polygons draw below normal fills across ALL sections
+            // of the group, not only their own.
+            for underlay_pass in [true, false] {
+                for layer in group_layers {
+                    let Some(gpu) = res.layers.get(&layer.key) else {
+                        continue;
+                    };
+                    for (ci, chunk) in gpu.chunks.iter().enumerate() {
+                        if chunk.underlay != underlay_pass || layer.style.bin_hidden(chunk.bin) {
+                            continue;
+                        }
+                        if !no_fills && chunk.fill_index_count > 0 && visible(&chunk.bounds_world) {
+                            let rgb = layer.style.rgb_for(chunk.bin, s.fill_color);
+                            let opaque = [rgb[0], rgb[1], rgb[2], 1.0];
+                            let uoffset =
+                                push_uniform(&mut uniforms, chunk.origin, [1.0, 1.0], opaque, 0.0);
+                            fill_cmds.push((layer.key, ci, uoffset));
+                        }
                     }
                 }
             }
@@ -851,8 +872,14 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                 continue;
             };
             let s = &layer.style;
+            if s.line_color[3] <= 0.0 {
+                continue;
+            }
             let lod = line_lod_for_zoom(cam.zoom);
             for (ci, chunk) in gpu.chunks.iter().enumerate() {
+                if s.bin_hidden(chunk.bin) {
+                    continue;
+                }
                 let count = chunk.line_bufs[lod]
                     .as_ref()
                     .map(|(_, index)| line_count_for_scale(index, scale))
@@ -887,7 +914,10 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                 }
             }
             for (ci, chunk) in gpu.chunks.iter().enumerate() {
-                if chunk.point_count > 0 && visible(&chunk.bounds_world) {
+                if chunk.point_count > 0
+                    && !s.bin_hidden(chunk.bin)
+                    && visible(&chunk.bounds_world)
+                {
                     let b = &chunk.bounds_world;
                     let chunk_px = [
                         ((b[2] - b[0]) * scale) as f32,
@@ -1125,6 +1155,7 @@ mod tests {
                         line_half_width_px: 0.6,
                         point_radius_px: 3.0,
                         bin_colors: None,
+                        hidden_bins: 0,
                     },
                 },
                 LayerDraw {
@@ -1138,6 +1169,7 @@ mod tests {
                         line_half_width_px: 1.0,
                         point_radius_px: 0.0,
                         bin_colors: None,
+                        hidden_bins: 0,
                     },
                 },
             ],
@@ -1248,6 +1280,7 @@ mod tests {
                             line_half_width_px: 0.6,
                             point_radius_px: 3.0,
                             bin_colors: None,
+                            hidden_bins: 0,
                         },
                     },
                     LayerDraw {
@@ -1261,6 +1294,7 @@ mod tests {
                             line_half_width_px: 1.2,
                             point_radius_px: 0.0,
                             bin_colors: None,
+                            hidden_bins: 0,
                         },
                     },
                 ],
@@ -1453,6 +1487,7 @@ mod tests {
                     line_half_width_px: 0.6,
                     point_radius_px: radius,
                     bin_colors: None,
+                    hidden_bins: 0,
                 },
             }],
             background: [0.0; 4],
@@ -1592,6 +1627,7 @@ mod tests {
                     line_half_width_px: 2.0,
                     point_radius_px: 5.0,
                     bin_colors: None,
+                    hidden_bins: 0,
                 },
             }],
             background: [0.0; 4],

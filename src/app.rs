@@ -244,6 +244,8 @@ pub struct ViewerApp {
     /// Files dropped while an import dialog was already open; imported
     /// one after another as each dialog closes.
     import_queue: Vec<PathBuf>,
+    /// Inline layer rename in the layers panel: (layer id, draft label).
+    rename_layer: Option<(u64, String)>,
     about_open: bool,
     cookbook_open: bool,
     /// Decoded app icon for the About dialog (lazy).
@@ -567,6 +569,8 @@ struct StyleDialog {
     numeric: bool,
     ramp: crate::data::layer::Ramp,
     method: crate::data::layer::ClassMethod,
+    /// Number of classes (2..=STYLE_BINS); breaks carry classes - 1 values.
+    classes: usize,
     /// Equal-interval bounds (from column statistics, editable).
     min: f64,
     max: f64,
@@ -640,6 +644,7 @@ impl ViewerApp {
             optimize: None,
             gpkg_import: None,
             import_queue: Vec::new(),
+            rename_layer: None,
             loading: HashMap::new(),
             pending_styles: HashMap::new(),
             next_job: 0,
@@ -2156,6 +2161,7 @@ impl ViewerApp {
         let mut filter_open: Option<u64> = None;
         let mut style_open: Option<u64> = None;
         let mut filter_clear: Option<u64> = None;
+        let mut renaming = self.rename_layer.take();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             crate::theme::compact(ui);
@@ -2200,14 +2206,59 @@ impl ViewerApp {
                                 l.style.line_color = None;
                             }
                         }
-                        ui.label(RichText::new(&l.name).strong())
-                            .on_hover_text(l.store.source.label());
+                        let te_id = egui::Id::new(("layer_rename", l.id));
+                        if renaming.as_ref().is_some_and(|(id, _)| *id == l.id) {
+                            let draft = &mut renaming.as_mut().unwrap().1;
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(draft)
+                                    .id(te_id)
+                                    .desired_width(150.0),
+                            );
+                            let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                            if resp.lost_focus() {
+                                if !esc {
+                                    let t = draft.trim();
+                                    if !t.is_empty() {
+                                        l.name = t.to_string();
+                                    }
+                                }
+                                renaming = None;
+                            }
+                        } else {
+                            let resp = ui
+                                .label(RichText::new(&l.name).strong())
+                                .on_hover_text(format!(
+                                    "{}\ndouble-click to rename the label",
+                                    l.store.source.label()
+                                ))
+                                .interact(egui::Sense::click());
+                            if resp.double_clicked() {
+                                renaming = Some((l.id, l.name.clone()));
+                                ui.ctx().memory_mut(|m| m.request_focus(te_id));
+                            }
+                        }
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 ui.menu_button(ph::LIST, |ui| {
                                     if ui.button("Info…").clicked() {
                                         info_open = Some(l.id);
+                                    }
+                                    if ui
+                                        .button("Rename…")
+                                        .on_hover_text(
+                                            "Display label only — the file is untouched. \
+                                             The SQL table name follows the label.",
+                                        )
+                                        .clicked()
+                                    {
+                                        renaming = Some((l.id, l.name.clone()));
+                                        ui.ctx().memory_mut(|m| {
+                                            m.request_focus(egui::Id::new((
+                                                "layer_rename",
+                                                l.id,
+                                            )))
+                                        });
                                     }
                                     let single = !l.store.is_partitioned();
                                     if ui
@@ -2336,13 +2387,41 @@ impl ViewerApp {
                                 );
                             }
                             crate::data::geometry::GeomKind::Polygon => {
-                                ui.label("fill:");
-                                ui.add(
+                                let toggle = |ui: &mut egui::Ui, on: &mut bool, txt: &str, hover: &str| {
+                                    let label = if *on {
+                                        RichText::new(txt)
+                                    } else {
+                                        RichText::new(txt).weak().strikethrough()
+                                    };
+                                    if ui
+                                        .label(label)
+                                        .interact(egui::Sense::click())
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .on_hover_text(hover)
+                                        .clicked()
+                                    {
+                                        *on = !*on;
+                                    }
+                                };
+                                toggle(
+                                    ui,
+                                    &mut l.style.fill_on,
+                                    "fill:",
+                                    "click to toggle fills (borders-only display)",
+                                );
+                                ui.add_enabled(
+                                    l.style.fill_on,
                                     egui::Slider::new(&mut l.style.fill_opacity, 0.0..=1.0)
                                         .show_value(false),
                                 );
-                                ui.label("w:");
-                                ui.add(
+                                toggle(
+                                    ui,
+                                    &mut l.style.lines_on,
+                                    "w:",
+                                    "click to toggle borders (fill-only display)",
+                                );
+                                ui.add_enabled(
+                                    l.style.lines_on,
                                     egui::Slider::new(&mut l.style.line_width_px, 0.0..=6.0)
                                         .show_value(false),
                                 );
@@ -2392,9 +2471,10 @@ impl ViewerApp {
                     }
                     // Data-classified styling goes stale when the loaded
                     // rows drift (classification never reads beyond them).
-                    if let Some(sb) = &l.style.style_by {
+                    let (layer_id, loaded_rows) = (l.id, l.loaded_rows());
+                    if let Some(sb) = &mut l.style.style_by {
                         if let Some(n0) = sb.classified_rows {
-                            let n1 = l.loaded_rows() as f64;
+                            let n1 = loaded_rows as f64;
                             let drift = (n1 - n0 as f64).abs() / (n0.max(1) as f64);
                             if drift > 0.25 {
                                 ui.label(
@@ -2407,6 +2487,7 @@ impl ViewerApp {
                                 );
                             }
                         }
+                        style_legend(ui, layer_id, sb);
                     }
                     if l.mode == crate::data::layer::LayerMode::Direct {
                         ui.label(
@@ -2540,6 +2621,7 @@ impl ViewerApp {
                 ui.add_space(4.0);
             }
         });
+        self.rename_layer = renaming;
 
         if let Some((id, dir)) = reorder {
             // Vec order is draw order (bottom→top); ▲ raises the layer.
@@ -3663,11 +3745,13 @@ impl ViewerApp {
         }
         // Start from the active styling, else the first numeric column.
         use crate::data::layer::ClassMethod;
-        let (column, ramp, method) = match &l.style.style_by {
+        let (column, ramp, method, classes) = match &l.style.style_by {
             Some(sb) => match &sb.mode {
-                StyleMode::Graduated { method, .. } => (sb.column.clone(), sb.ramp, *method),
+                StyleMode::Graduated { method, breaks } => {
+                    (sb.column.clone(), sb.ramp, *method, breaks.len() + 1)
+                }
                 StyleMode::Categorical { .. } => {
-                    (sb.column.clone(), sb.ramp, ClassMethod::EqualInterval)
+                    (sb.column.clone(), sb.ramp, ClassMethod::EqualInterval, 8)
                 }
             },
             None => {
@@ -3677,7 +3761,7 @@ impl ViewerApp {
                     .unwrap_or(&cols[0])
                     .0
                     .clone();
-                (c, Ramp::Viridis, ClassMethod::EqualInterval)
+                (c, Ramp::Viridis, ClassMethod::EqualInterval, 8)
             }
         };
         let mut d = StyleDialog {
@@ -3686,6 +3770,7 @@ impl ViewerApp {
             numeric: true,
             ramp,
             method,
+            classes,
             min: 0.0,
             max: 1.0,
             breaks: None,
@@ -3733,7 +3818,8 @@ impl ViewerApp {
                 if let Some(idx) = idx {
                     let store = Arc::clone(&l.store);
                     let loaded = l.loaded.clone();
-                    let (id, col, method) = (d.layer_id, d.column.clone(), d.method);
+                    let (id, col, method, classes) =
+                        (d.layer_id, d.column.clone(), d.method, d.classes);
                     let tx = self.class_tx.clone();
                     let ctx = ctx.clone();
                     std::thread::spawn(move || {
@@ -3741,7 +3827,7 @@ impl ViewerApp {
                             &store, &loaded, idx, 50_000,
                         )
                         .map(|mut vals| {
-                            crate::data::layer::classify_breaks(method, &mut vals)
+                            crate::data::layer::classify_breaks(method, &mut vals, classes)
                         });
                         let _ = tx.send((id, col, res));
                         ctx.request_repaint();
@@ -3749,7 +3835,7 @@ impl ViewerApp {
                 }
             } else {
                 d.breaks = Some(Ok(crate::data::layer::equal_interval_breaks(
-                    d.min, d.max,
+                    d.min, d.max, d.classes,
                 )));
             }
         } else if let Some(sql) = self.sql_layer_of(d.layer_id) {
@@ -3850,8 +3936,8 @@ impl ViewerApp {
                                         ui.selectable_value(&mut d.ramp, *r, r.label());
                                     }
                                 });
-                            ui.label("classes:");
-                            let before = d.method;
+                            ui.label("method:");
+                            let before = (d.method, d.classes);
                             egui::ComboBox::from_id_salt("style_method")
                                 .selected_text(d.method.label())
                                 .show_ui(ui, |ui| {
@@ -3859,7 +3945,13 @@ impl ViewerApp {
                                         ui.selectable_value(&mut d.method, *m, m.label());
                                     }
                                 });
-                            if d.method != before {
+                            ui.label("classes:");
+                            ui.add(
+                                egui::DragValue::new(&mut d.classes)
+                                    .range(2..=crate::data::layer::STYLE_BINS)
+                                    .speed(0.1),
+                            );
+                            if (d.method, d.classes) != before {
                                 reselect = true;
                             }
                         });
@@ -3911,7 +4003,7 @@ impl ViewerApp {
                             if (d.min, d.max) != before {
                                 d.breaks =
                                     Some(Ok(crate::data::layer::equal_interval_breaks(
-                                        d.min, d.max,
+                                        d.min, d.max, d.classes,
                                     )));
                             }
                         }
@@ -3921,7 +4013,7 @@ impl ViewerApp {
                             egui::Sense::hover(),
                         );
                         let p = ui.painter();
-                        let n = crate::data::layer::STYLE_BINS;
+                        let n = d.classes.max(2);
                         for i in 0..n {
                             let c = d.ramp.sample(i as f32 / (n - 1) as f32);
                             let x0 = rect.left() + rect.width() * i as f32 / n as f32;
@@ -3995,6 +4087,7 @@ impl ViewerApp {
                             apply = Some(StyleBy {
                                 column: d.column.clone(),
                                 ramp: d.ramp,
+                                hidden_bins: 0,
                                 mode: if d.numeric {
                                     StyleMode::Graduated {
                                         method: d.method,
@@ -6333,6 +6426,7 @@ impl ViewerApp {
                     line_half_width_px: 0.4,
                     point_radius_px: 0.0,
                     bin_colors: None,
+                    hidden_bins: 0,
                 },
             });
         }
@@ -6353,6 +6447,7 @@ impl ViewerApp {
                     line_half_width_px: 0.5,
                     point_radius_px: 0.0,
                     bin_colors: None,
+                    hidden_bins: 0,
                 },
             });
         }
@@ -6400,6 +6495,7 @@ impl ViewerApp {
                     line_half_width_px: 0.8,
                     point_radius_px: 0.0,
                     bin_colors: None,
+                    hidden_bins: 0,
                 },
             });
             if anchors.len() <= 64 {
@@ -6432,6 +6528,7 @@ impl ViewerApp {
                     line_half_width_px: 1.8,
                     point_radius_px: 6.0,
                     bin_colors: None,
+                    hidden_bins: 0,
                 },
             });
         }
@@ -6447,6 +6544,7 @@ impl ViewerApp {
                     line_half_width_px: 1.8,
                     point_radius_px: 6.0,
                     bin_colors: None,
+                    hidden_bins: 0,
                 },
             });
         }
@@ -6720,6 +6818,98 @@ fn swatch_color_button(
     changed
 }
 
+/// Class bound for the legend: integers plain, fractions to 4 decimals.
+fn fmt_class_bound(v: f64) -> String {
+    if v == v.trunc() && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v:.4}")
+    }
+}
+
+/// Compact legend for a data-styled layer in the layers panel: one
+/// swatch per class with its value boundaries (or category value).
+/// Clicking an entry toggles that class on the map (draw-time filter).
+fn style_legend(ui: &mut egui::Ui, layer_id: u64, sb: &mut crate::data::layer::StyleBy) {
+    use crate::data::layer::{StyleMode, STYLE_BINS};
+    egui::CollapsingHeader::new(
+        RichText::new(format!("legend — {}", sb.column)).weak().small(),
+    )
+    .id_salt(("style_legend", layer_id))
+    .default_open(true)
+    .show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        let mut toggle: Option<u8> = None;
+        let mut swatch = |ui: &mut egui::Ui, bin: u8, c: Color32, label: String| {
+            let hidden = sb.hidden_bins & (1u16 << bin) != 0;
+            let row = ui
+                .horizontal(|ui| {
+                    let (r, _) = ui
+                        .allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    ui.painter()
+                        .rect_filled(r, 2.0, if hidden { c.gamma_multiply(0.2) } else { c });
+                    let mut text = RichText::new(label).small();
+                    if hidden {
+                        text = text.weak().strikethrough();
+                    }
+                    ui.label(text);
+                })
+                .response
+                .interact(egui::Sense::click());
+            if row
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("click to hide/show this class")
+                .clicked()
+            {
+                toggle = Some(bin);
+            }
+        };
+        match &sb.mode {
+            StyleMode::Graduated { breaks, .. } => {
+                if breaks.is_empty() {
+                    return;
+                }
+                let colors = sb.bin_colors();
+                let n = breaks.len() + 1;
+                for i in 0..n {
+                    let c = colors[i.min(colors.len() - 1)];
+                    let c = Color32::from_rgb(
+                        (c[0] * 255.0) as u8,
+                        (c[1] * 255.0) as u8,
+                        (c[2] * 255.0) as u8,
+                    );
+                    let label = if i == 0 {
+                        format!("< {}", fmt_class_bound(breaks[0]))
+                    } else if i == n - 1 {
+                        format!("≥ {}", fmt_class_bound(breaks[n - 2]))
+                    } else {
+                        format!(
+                            "{} – {}",
+                            fmt_class_bound(breaks[i - 1]),
+                            fmt_class_bound(breaks[i])
+                        )
+                    };
+                    swatch(ui, i as u8, c, label);
+                }
+            }
+            StyleMode::Categorical { values } => {
+                for (i, v) in values.iter().enumerate() {
+                    swatch(ui, i as u8, crate::data::layer::palette_color(i), v.clone());
+                }
+                swatch(
+                    ui,
+                    (STYLE_BINS - 1) as u8,
+                    Color32::from_gray(140),
+                    "(other)".into(),
+                );
+            }
+        }
+        if let Some(bin) = toggle {
+            sb.hidden_bins ^= 1u16 << bin;
+        }
+    });
+}
+
 /// "832 m" / "12.42 km" (meters in; CRS units for projected layers).
 fn fmt_length(m: f64) -> String {
     if m < 1000.0 {
@@ -6750,12 +6940,18 @@ fn resolve_style(s: &crate::data::layer::LayerStyle) -> DrawStyle {
     let (r, g, b) = (rgba.r(), rgba.g(), rgba.b());
     let lc = egui::Rgba::from(s.line_color.unwrap_or_else(|| derived_line_color(s.color)));
     DrawStyle {
-        fill_color: [r, g, b, s.fill_opacity * s.opacity],
-        line_color: [lc.r(), lc.g(), lc.b(), lc.a() * s.opacity],
+        fill_color: [r, g, b, if s.fill_on { s.fill_opacity * s.opacity } else { 0.0 }],
+        line_color: [
+            lc.r(),
+            lc.g(),
+            lc.b(),
+            if s.lines_on { lc.a() * s.opacity } else { 0.0 },
+        ],
         point_color: [r, g, b, s.opacity],
         line_half_width_px: (s.line_width_px * 0.5).max(0.01),
         point_radius_px: s.point_radius_px.max(0.1),
         bin_colors: s.style_by.as_ref().map(|sb| Arc::new(sb.bin_colors())),
+        hidden_bins: s.style_by.as_ref().map(|sb| sb.hidden_bins).unwrap_or(0),
     }
 }
 
@@ -7107,6 +7303,7 @@ mod tests {
                         line_half_width_px: 0.5,
                         point_radius_px: 0.0,
                         bin_colors: None,
+                        hidden_bins: 0,
                     },
                 },
                 crate::map::renderer::LayerDraw {
@@ -7120,6 +7317,7 @@ mod tests {
                         line_half_width_px: 0.6,
                         point_radius_px: 0.0,
                         bin_colors: None,
+                        hidden_bins: 0,
                     },
                 },
             ],
