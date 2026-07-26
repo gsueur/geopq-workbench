@@ -243,6 +243,8 @@ pub struct ViewerApp {
     gpkg_import: Option<ImportState>,
     /// Grid summary dialog / aggregation in flight.
     grid_dialog: Option<GridState>,
+    /// Layers side panel visibility (toolbar toggle).
+    layers_open: bool,
     grid_n: u64,
     /// Files dropped while an import dialog was already open; imported
     /// one after another as each dialog closes.
@@ -583,6 +585,9 @@ struct GridState {
     stat: crate::data::grid::GridStat,
     kernel: crate::data::grid::Kernel,
     passes: u32,
+    /// Square grids only: output isolines instead of cell polygons.
+    contours: bool,
+    levels: u32,
     running: bool,
     progress: f32,
     error: Option<String>,
@@ -683,6 +688,7 @@ impl ViewerApp {
             optimize: None,
             gpkg_import: None,
             grid_dialog: None,
+            layers_open: true,
             grid_n: 0,
             import_queue: Vec::new(),
             rename_layer: None,
@@ -2184,7 +2190,18 @@ impl ViewerApp {
 
     fn layers_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        ui.heading("Layers");
+        ui.horizontal(|ui| {
+            ui.heading("Layers");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button(ph::CARET_DOUBLE_LEFT)
+                    .on_hover_text("Collapse the layers panel")
+                    .clicked()
+                {
+                    self.layers_open = false;
+                }
+            });
+        });
         ui.separator();
         if self.layers.is_empty() && self.loading.is_empty() {
             ui.vertical_centered(|ui| {
@@ -3839,6 +3856,8 @@ impl ViewerApp {
             stat: crate::data::grid::GridStat::Mean,
             kernel: crate::data::grid::Kernel::Box,
             passes: 0,
+            contours: false,
+            levels: 10,
             running: false,
             progress: 0.0,
             error: None,
@@ -3847,7 +3866,7 @@ impl ViewerApp {
     }
 
     fn grid_window(&mut self, ctx: &egui::Context) {
-        use crate::data::grid::{CellSystem, GridStat, Kernel};
+        use crate::data::grid::{CellSystem, GridOutput, GridStat, Kernel};
         let floating_area = self.floating_area(ctx);
         if self.grid_dialog.is_none() {
             return;
@@ -3908,10 +3927,31 @@ impl ViewerApp {
                             .width(90.0)
                             .selected_text(st.stat.label())
                             .show_ui(ui, |ui| {
-                                for s in GridStat::ALL {
-                                    ui.selectable_value(&mut st.stat, *s, s.label());
+                                ui.label(
+                                    RichText::new("rates (per-m² prices, years, ratios)")
+                                        .weak()
+                                        .small(),
+                                );
+                                for s in [GridStat::Mean, GridStat::Median] {
+                                    ui.selectable_value(&mut st.stat, s, s.label());
                                 }
-                            });
+                                ui.separator();
+                                ui.label(
+                                    RichText::new("totals (values, populations, counts)")
+                                        .weak()
+                                        .small(),
+                                );
+                                for s in [GridStat::Sum, GridStat::Count, GridStat::Density] {
+                                    ui.selectable_value(&mut st.stat, s, s.label());
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Pick by column type: totals grow with polygon size \
+                                 (use sum / count / density — a giant polygon's mean \
+                                 equals its full value in every covered cell); rates \
+                                 don't (use mean / median)",
+                            );
                     });
                     ui.horizontal(|ui| {
                         ui.label("cells:");
@@ -3971,9 +4011,26 @@ impl ViewerApp {
                             ui.label(RichText::new("(ring mean)").weak().small());
                         }
                     });
+                    ui.horizontal(|ui| {
+                        ui.add_enabled_ui(st.system == 0, |ui| {
+                            ui.checkbox(&mut st.contours, "contour lines")
+                                .on_hover_text(if st.system == 0 {
+                                    "Marching squares over the (smoothed) cell values: \
+                                     the output layer is isolines with the field's value \
+                                     per line instead of cell polygons"
+                                } else {
+                                    "Square grids only — marching squares needs the \
+                                     regular lattice"
+                                });
+                        });
+                        if st.contours && st.system == 0 {
+                            ui.label("levels:");
+                            ui.add(egui::DragValue::new(&mut st.levels).range(1..=64));
+                        }
+                    });
                     ui.label(
                         RichText::new(
-                            "Scans the whole file by feature centroid — columnar and fast                              when a covering bbox column exists, geometry decode otherwise.",
+                            "Whole-file scan; features spanning several cells are apportioned by covered area. Columnar fast path when a covering bbox column exists",
                         )
                         .weak()
                         .small(),
@@ -4009,14 +4066,24 @@ impl ViewerApp {
                 1 => CellSystem::H3 { res: st.h3_res },
                 _ => CellSystem::A5 { res: st.a5_res },
             };
+            let output = if st.contours && st.system == 0 {
+                GridOutput::Contours {
+                    levels: st.levels as usize,
+                }
+            } else {
+                GridOutput::Cells
+            };
             let spec = crate::data::grid::GridSpec {
                 value_col: col,
+                value_name: st.column.clone(),
                 system,
                 stat: st.stat,
                 kernel: st.kernel,
+                output,
                 smooth_passes: st.passes,
             };
             let cell_label = match st.system {
+                0 if st.contours => format!("{}u contours", st.size),
                 0 => format!("{}u", st.size),
                 1 => format!("h3r{}", st.h3_res),
                 _ => format!("a5r{}", st.a5_res),
@@ -7683,10 +7750,26 @@ impl eframe::App for ViewerApp {
             }
             None => {}
         }
-        egui::Panel::left("layers")
-            .resizable(true)
-            .default_size(260.0)
-            .show(ui, |ui| self.layers_panel(ui));
+        if self.layers_open {
+            egui::Panel::left("layers")
+                .resizable(true)
+                .default_size(260.0)
+                .show(ui, |ui| self.layers_panel(ui));
+        } else {
+            egui::Panel::left("layers_collapsed")
+                .resizable(false)
+                .exact_size(18.0)
+                .show(ui, |ui| {
+                    ui.add_space(4.0);
+                    if ui
+                        .small_button(ph::CARET_DOUBLE_RIGHT)
+                        .on_hover_text("Show the layers panel")
+                        .clicked()
+                    {
+                        self.layers_open = true;
+                    }
+                });
+        }
         if self.selection.is_some() {
             // Floating over the map (upper right) instead of a side panel:
             // opening it must not resize the viewport.
