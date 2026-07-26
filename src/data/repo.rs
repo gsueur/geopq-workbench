@@ -52,6 +52,11 @@ pub fn default_repos() -> Vec<Repository> {
             kind: RepoKind::Parquetry,
         },
         Repository {
+            name: "Geomermaids geoBoundaries (global admin)".into(),
+            url: "https://parquetry.geomermaids.com/geoboundaries".into(),
+            kind: RepoKind::Parquetry,
+        },
+        Repository {
             name: "Overture Maps (STAC)".into(),
             url: "https://stac.overturemaps.org".into(),
             kind: RepoKind::Stac,
@@ -179,8 +184,19 @@ impl Snapshot {
 /// Snapshots of a repository, newest first, "latest" always included.
 /// A repository without snapshots.json just has "latest".
 pub fn fetch_snapshots(base: &str) -> Result<Vec<Snapshot>, String> {
-    let mut out = vec![Snapshot::latest()];
+    let mut out = Vec::new();
     if let Some(v) = get_json(&format!("{base}/snapshots.json"))? {
+        // A repository that versions its data (a dataset release rather
+        // than a rolling mirror) has no `latest/` prefix to offer, and
+        // an entry pointing at a 404 is worse than none. `"latest"` in
+        // snapshots.json aliases it onto a real prefix.
+        match v.get("latest").and_then(Value::as_str) {
+            Some(p) => out.push(Snapshot {
+                label: "latest".into(),
+                path: p.to_string(),
+            }),
+            None => out.push(Snapshot::latest()),
+        }
         for s in v.get("snapshots").and_then(Value::as_array).into_iter().flatten() {
             let (Some(date), Some(path)) = (
                 s.get("date").and_then(Value::as_str),
@@ -193,6 +209,9 @@ pub fn fetch_snapshots(base: &str) -> Result<Vec<Snapshot>, String> {
                 path: path.to_string(),
             });
         }
+    }
+    if out.is_empty() {
+        out.push(Snapshot::latest());
     }
     Ok(out)
 }
@@ -308,7 +327,11 @@ pub fn discover_datasets(base: &str, snapshot: &str) -> Result<Vec<Dataset>, Str
             let Some(path) = d.get("path").and_then(Value::as_str) else {
                 continue;
             };
-            let code = path.rsplit('=').next().unwrap_or(path).to_string();
+            let code = d
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| path.rsplit('=').next().unwrap_or(path))
+                .to_string();
             out.push(Dataset {
                 name: d
                     .get("name")
@@ -380,8 +403,20 @@ pub struct Manifest {
     pub themes: Vec<(String, u64)>,
 }
 
+/// Prefix of a dataset's files, snapshot included. A repository holding
+/// one global dataset publishes it directly under the snapshot with an
+/// empty path, and an empty path segment must not become `//`, which
+/// object storage reads as a different key.
+fn dataset_prefix(snapshot: &str, path: &str) -> String {
+    if path.is_empty() {
+        snapshot.to_string()
+    } else {
+        format!("{snapshot}{path}/")
+    }
+}
+
 pub fn fetch_manifest(base: &str, snapshot: &str, path: &str) -> Result<Manifest, String> {
-    let url = format!("{base}/{snapshot}{path}/_manifest.json");
+    let url = format!("{base}/{}_manifest.json", dataset_prefix(snapshot, path));
     let v = get_json(&url)?.ok_or_else(|| format!("{url}: not found"))?;
     let themes = v
         .get("themes")
@@ -403,7 +438,7 @@ pub fn fetch_manifest(base: &str, snapshot: &str, path: &str) -> Result<Manifest
 }
 
 pub fn theme_url(base: &str, snapshot: &str, path: &str, theme: &str) -> String {
-    format!("{base}/{snapshot}{path}/{theme}.parquet")
+    format!("{base}/{}{theme}.parquet", dataset_prefix(snapshot, path))
 }
 
 // ---------------------------------------------------------------------
@@ -1092,6 +1127,76 @@ mod tests {
             ),
             "https://parquetry.geomermaids.com/latest/country=US/state=US-AR/buildings.parquet"
         );
+        // A repository holding one global dataset publishes it directly
+        // under the snapshot: the empty dataset path must not leave a
+        // double slash, which object storage reads as another key.
+        assert_eq!(
+            theme_url(
+                "https://parquetry.geomermaids.com/geoboundaries",
+                "6.0.0/",
+                "",
+                "cgaz_adm0"
+            ),
+            "https://parquetry.geomermaids.com/geoboundaries/6.0.0/cgaz_adm0.parquet"
+        );
+        assert_eq!(
+            dataset_prefix("6.0.0/", ""),
+            "6.0.0/",
+            "manifest and theme URLs share the prefix"
+        );
+    }
+
+    /// A directory of literal JSON files, served over loopback.
+    fn spawn_files(files: &[(&str, &str)]) -> String {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "geopq_repo_fix_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for (rel, body) in files {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        crate::data::source::testserver::spawn_dir(root)
+    }
+
+    #[test]
+    fn snapshots_can_alias_latest_onto_a_release() {
+        let base = spawn_files(&[(
+            "snapshots.json",
+            r#"{"latest":"6.0.0/","snapshots":[{"date":"6.0.0","path":"6.0.0/"}]}"#,
+        )]);
+        let snaps = fetch_snapshots(&base).unwrap();
+        // "latest" resolves to the real release rather than a 404 prefix,
+        // and it is not duplicated by the release entry.
+        assert_eq!(snaps[0].label, "latest");
+        assert_eq!(snaps[0].path, "6.0.0/");
+        assert_eq!(snaps[1].label, "6.0.0");
+        assert_eq!(snaps.len(), 2);
+
+        // Without the alias, the rolling default still applies.
+        let base2 = spawn_files(&[(
+            "snapshots.json",
+            r#"{"snapshots":[{"date":"2026-07-15","path":"2026-07-15/"}]}"#,
+        )]);
+        let snaps = fetch_snapshots(&base2).unwrap();
+        assert_eq!(snaps[0].path, "latest/");
+    }
+
+    #[test]
+    fn index_json_may_name_a_single_global_dataset() {
+        let base = spawn_files(&[(
+            "index.json",
+            r#"{"datasets":[{"path":"","code":"","name":"geoBoundaries CGAZ (global)"}]}"#,
+        )]);
+        let ds = discover_datasets(&base, "6.0.0/").unwrap();
+        assert_eq!(ds.len(), 1);
+        assert_eq!(ds[0].path, "");
+        assert_eq!(ds[0].code, "");
+        assert_eq!(ds[0].name, "geoBoundaries CGAZ (global)");
     }
 
     /// Live repository probe, opt-in:
@@ -1110,5 +1215,35 @@ mod tests {
         let m = fetch_manifest(base, "latest/", "country=US/state=US-AR").unwrap();
         eprintln!("US-AR: {:?}, {} themes", m.state_name, m.themes.len());
         assert!(m.themes.iter().any(|(t, _)| t == "buildings"));
+    }
+
+    /// Live probe of the single-dataset repository shape, opt-in:
+    /// cargo test --release repo_live_geoboundaries -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn repo_live_geoboundaries() {
+        let base = "https://parquetry.geomermaids.com/geoboundaries";
+        let snaps = fetch_snapshots(base).unwrap();
+        eprintln!("snapshots: {:?}", snaps.iter().map(|s| (&s.label, &s.path)).collect::<Vec<_>>());
+        // "latest" is aliased onto the release, not a 404 prefix.
+        assert_eq!(snaps[0].label, "latest");
+        assert_eq!(snaps[0].path, "6.0.0/");
+
+        let ds = discover_datasets(base, "6.0.0/").unwrap();
+        eprintln!("datasets: {:?}", ds.iter().map(|d| (&d.name, &d.path)).collect::<Vec<_>>());
+        assert_eq!(ds.len(), 1);
+        assert!(ds[0].path.is_empty());
+
+        let m = fetch_manifest(base, "6.0.0/", &ds[0].path).unwrap();
+        eprintln!("manifest: {:?} {:?}", m.state_name, m.themes);
+        assert_eq!(m.themes.len(), 3);
+
+        // Every theme URL must actually resolve.
+        for (theme, rows) in &m.themes {
+            let url = theme_url(base, "6.0.0/", &ds[0].path, theme);
+            let ok = exists(&url).unwrap();
+            eprintln!("{theme}: {rows} rows -> {url} [{}]", if ok { "OK" } else { "MISSING" });
+            assert!(ok, "{url}");
+        }
     }
 }

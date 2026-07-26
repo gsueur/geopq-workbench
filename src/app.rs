@@ -3510,7 +3510,11 @@ impl ViewerApp {
                                                                 ),
                                                                 len: 0,
                                                             },
-                                                            format!("{code} {theme}"),
+                                                            if code.is_empty() {
+                                                                theme.clone()
+                                                            } else {
+                                                                format!("{code} {theme}")
+                                                            },
                                                         ),
                                                         RepoKind::Stac => (
                                                             Source::Stac {
