@@ -2559,21 +2559,15 @@ pub fn sample_loaded_values(
     // Normalization needs each sampled feature's area too: fetch the
     // geometries for the same rows (aligned with the value order).
     let areas: Option<Vec<f64>> = if per_area {
-        use geo::{Area, BoundingRect};
         let geoms = store.fetch_geoms(&rows)?;
         Some(
             geoms
                 .iter()
                 .map(|(_, g)| {
-                    g.as_ref().map_or(0.0, |g| {
-                        // Same correction the draw path applies, or the
-                        // breaks would be fitted to one scale and the map
-                        // coloured on another.
-                        let lat = g
-                            .bounding_rect()
-                            .map_or(0.0, |r| (r.min().y + r.max().y) * 0.5);
-                        area_in_ground_units(g.unsigned_area(), lat, latlong)
-                    })
+                    // Measured exactly as the draw path measures, or the
+                    // breaks would be fitted to one scale and the map
+                    // coloured on another.
+                    g.as_ref().map_or(0.0, |g| ground_area(g, latlong))
                 })
                 .collect(),
         )
@@ -2624,14 +2618,48 @@ pub(crate) enum RowBins {
     },
 }
 
-/// Feature area in square metres (or the projected CRS's own unit²)
-/// from a planar shoelace area and the feature's latitude.
-pub(crate) fn area_in_ground_units(area: f64, lat_deg: f64, latlong: bool) -> f64 {
-    if latlong {
-        crate::data::crs::deg2_area_to_m2(area, lat_deg)
-    } else {
-        area
+/// Ground area of a feature for per-area normalization.
+///
+/// Projected data is already in ground units and is measured as it is —
+/// the mapping agency picked that CRS. Geographic data is projected onto
+/// an equal-area CRS first, because a shoelace over degrees measures
+/// nothing comparable between latitudes.
+pub(crate) fn ground_area(g: &geo_types::Geometry<f64>, latlong: bool) -> f64 {
+    use geo::Area;
+    if !latlong {
+        return g.unsigned_area();
     }
+    let mut g = g.clone();
+    let dst = crate::data::crs::equal_area_measure();
+    let src = crate::data::crs::wgs84_cached();
+    let failed = std::cell::Cell::new(false);
+    use geo::MapCoordsInPlace;
+    g.map_coords_in_place(
+        |c| match crate::data::crs::transform_point(src, dst, c.x, c.y) {
+            Ok((x, y)) => geo_types::Coord { x, y },
+            Err(_) => {
+                // Outside the projection's domain: no usable area, and
+                // norm_bin sends a zero area to bin 0 like a null.
+                failed.set(true);
+                c
+            }
+        },
+    );
+    if failed.get() { 0.0 } else { g.unsigned_area() }
+}
+
+/// Same, for coordinates already split into x/y slices (the GeoArrow
+/// bulk path): returns the scale factor to apply to a shoelace area
+/// computed at `(lon, lat)`, or None when the data is already projected.
+pub(crate) fn equal_area_projector(
+    latlong: bool,
+) -> Option<impl Fn(f64, f64) -> Option<(f64, f64)>> {
+    if !latlong {
+        return None;
+    }
+    let dst = crate::data::crs::equal_area_measure();
+    let src = crate::data::crs::wgs84_cached();
+    Some(move |x: f64, y: f64| crate::data::crs::transform_point(src, dst, x, y).ok())
 }
 
 /// Bin for an area-normalized value. Nulls, non-finite values and
@@ -3130,12 +3158,7 @@ fn process_batch(
                     latlong,
                 }) = &bins
                 {
-                    use geo::{Area, BoundingRect};
-                    let lat = geom
-                        .bounding_rect()
-                        .map_or(0.0, |r| (r.min().y + r.max().y) * 0.5);
-                    let a = area_in_ground_units(geom.unsigned_area(), lat, *latlong);
-                    mb.bin = norm_bin(vals[row], a, breaks);
+                    mb.bin = norm_bin(vals[row], ground_area(&geom, *latlong), breaks);
                 }
                 if spherical {
                     densify_spherical(&mut geom, SPHERICAL_MAX_SEG_DEG);
@@ -5371,26 +5394,79 @@ mod preview_rect_tests {
 
 #[cfg(test)]
 mod norm_bin_tests {
-    use super::{area_in_ground_units, norm_bin};
+    use super::{ground_area, norm_bin};
+
+    fn square(cx: f64, cy: f64, half: f64) -> geo_types::Geometry<f64> {
+        use geo_types::{Coord, LineString, Polygon};
+        geo_types::Geometry::Polygon(Polygon::new(
+            LineString(vec![
+                Coord { x: cx - half, y: cy - half },
+                Coord { x: cx + half, y: cy - half },
+                Coord { x: cx + half, y: cy + half },
+                Coord { x: cx - half, y: cy + half },
+                Coord { x: cx - half, y: cy - half },
+            ]),
+            vec![],
+        ))
+    }
 
     #[test]
-    fn geographic_areas_are_latitude_corrected() {
-        // One degree square at the equator and at 60°N: identical in
-        // degrees², roughly half the ground area up north. Without the
-        // correction the northern feature reads twice as dense and can
-        // fall in a different class for no reason but its latitude.
-        let equator = area_in_ground_units(1.0, 0.0, true);
-        let north = area_in_ground_units(1.0, 60.0, true);
-        assert!((north / equator - 0.5).abs() < 0.01, "{north} vs {equator}");
-        // Sanity: a degree square at the equator is ~12,300 km².
+    fn geographic_areas_are_measured_on_an_equal_area_projection() {
+        // Two one-degree squares, at the equator and at 60°N. In degrees²
+        // they are identical; on the ground the northern one covers about
+        // half as much, so normalizing by the raw shoelace would rank it
+        // twice as dense for no reason but its latitude.
+        let equator = ground_area(&square(0.0, 0.5, 0.5), true);
+        let north = ground_area(&square(0.0, 60.5, 0.5), true);
+        assert!(
+            (north / equator - 0.5).abs() < 0.02,
+            "{north} vs {equator} m²"
+        );
+        // A degree square at the equator is ~12,300 km².
         assert!(
             (equator - 1.23e10).abs() / 1.23e10 < 0.02,
             "{equator} m² for a degree square"
         );
+        // Longitude must not matter: the same square moved east measures
+        // the same, which a cylindrical equal-area projection guarantees
+        // and a fitted per-layer projection would only approximate.
+        let east = ground_area(&square(150.0, 60.5, 0.5), true);
+        assert!((east / north - 1.0).abs() < 1e-9, "{east} vs {north}");
+
         // Projected data is already in ground units and must not move.
-        assert_eq!(area_in_ground_units(500.0, 60.0, false), 500.0);
-        // Poles degenerate to zero rather than going negative.
-        assert!(area_in_ground_units(1.0, 90.0, true) >= 0.0);
+        let projected = square(500_000.0, 6_000_000.0, 100.0);
+        assert!((ground_area(&projected, false) - 40_000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn both_decode_paths_measure_the_same_area() {
+        // The WKB path measures through `ground_area`, the GeoArrow bulk
+        // path through `equal_area_projector` and its own shoelace. They
+        // must agree, or the same data would classify differently
+        // depending on how the file happens to encode its geometry.
+        let poly = square(7.0, 62.0, 0.25);
+        let wkb = ground_area(&poly, true);
+
+        let proj = super::equal_area_projector(true).expect("geographic");
+        let geo_types::Geometry::Polygon(p) = &poly else {
+            unreachable!()
+        };
+        let pts: Vec<(f64, f64)> = p
+            .exterior()
+            .0
+            .iter()
+            .map(|c| proj(c.x, c.y).expect("inside the projection domain"))
+            .collect();
+        let mut shoelace = 0.0;
+        for k in 0..pts.len() - 1 {
+            shoelace += pts[k].0 * pts[k + 1].1 - pts[k + 1].0 * pts[k].1;
+        }
+        let ga = (shoelace * 0.5).abs();
+        assert!(
+            (ga - wkb).abs() / wkb < 1e-9,
+            "geoarrow {ga} vs wkb {wkb}"
+        );
+        assert!(super::equal_area_projector(false).is_none());
     }
 
     #[test]

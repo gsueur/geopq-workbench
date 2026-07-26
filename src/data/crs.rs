@@ -25,18 +25,30 @@ pub struct Crs {
     pub projjson: Option<Arc<Value>>,
 }
 
-/// Planar degree² area → square metres at latitude `lat_deg`.
+/// The projection geographic data is measured on.
 ///
-/// A shoelace area over lon/lat coordinates is in degrees², and a
-/// degree of longitude shrinks with the cosine of the latitude: without
-/// this correction, two polygons of identical ground area normalize to
-/// different values purely because one sits further north, which lands
-/// them in different classes. The local-sphere approximation is good to
-/// well under a percent for anything small enough to be one feature.
-pub fn deg2_area_to_m2(area_deg2: f64, lat_deg: f64) -> f64 {
-    const M_PER_DEG_LAT: f64 = 110_574.0;
-    const M_PER_DEG_LON_EQUATOR: f64 = 111_320.0;
-    area_deg2 * M_PER_DEG_LAT * M_PER_DEG_LON_EQUATOR * lat_deg.to_radians().cos().max(0.0)
+/// A screen is flat and so is a shoelace: an area over raw lon/lat is in
+/// degrees², which is not an area at all — a degree of longitude shrinks
+/// with the cosine of the latitude, so two identical fields normalize
+/// differently for no reason but how far north they sit. Projecting
+/// first is the answer the app already gives everywhere else.
+///
+/// Any equal-area projection would do, since normalization needs only
+/// the ratios between features, so this is deliberately fixed rather
+/// than fitted per layer: the measurement must not move when the user
+/// switches the display to Mercator to *show* what Mercator does to
+/// areas. Lambert cylindrical equal-area at 37.5°, the same family as
+/// the Hobo–Dyer world default.
+pub fn equal_area_measure() -> &'static Crs {
+    static MEASURE: std::sync::OnceLock<Crs> = std::sync::OnceLock::new();
+    MEASURE.get_or_init(|| {
+        Crs::from_proj4(
+            "+proj=cea +lat_ts=37.5 +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs",
+            None,
+            "equal-area measure",
+        )
+        .expect("builtin equal-area measurement proj string")
+    })
 }
 
 impl std::fmt::Debug for Crs {
@@ -108,8 +120,8 @@ impl Crs {
     /// for foot-based ones, "deg²" for geographic.
     pub fn area_unit(&self) -> &'static str {
         if self.is_latlong {
-            // Geographic data is normalized through `deg2_area_to_m2`,
-            // so the quantity the user sees really is per square metre.
+            // Geographic data is measured on `equal_area_measure`, so
+            // the quantity the user sees really is per square metre.
             return "m²";
         }
         if self.proj4.contains("+units=us-ft") {

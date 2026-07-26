@@ -335,6 +335,15 @@ pub(crate) fn emit_bulk(
         }
     }
 
+    // Built once per batch: per-area normalization on geographic data
+    // measures on the equal-area CRS, not on degrees.
+    let area_proj = match bins {
+        Some(super::loader::RowBins::PerArea { latlong, .. }) => {
+            super::loader::equal_area_projector(*latlong)
+        }
+        _ => None,
+    };
+
     let mut ring_refs: Vec<&[Coord<f64>]> = Vec::new();
     for i in 0..rows {
         if ga.top.is_null(i) {
@@ -375,14 +384,8 @@ pub(crate) fn emit_bulk(
                 breaks,
                 latlong,
             }) => {
-                // rb is this feature's raw data-CRS bbox, so its mid-y is
-                // the latitude the degree² correction needs.
-                let lat = (rb[1] + rb[3]) * 0.5;
-                let a = super::loader::area_in_ground_units(
-                    data_area(ga, i, xs, ys),
-                    lat,
-                    *latlong,
-                );
+                let _ = latlong;
+                let a = data_area(ga, i, xs, ys, area_proj.as_ref().map(|p| p as _));
                 mb.bin = super::loader::norm_bin(vals[i], a, breaks);
             }
             None => {}
@@ -440,16 +443,36 @@ pub(crate) fn emit_bulk(
 /// Feature area in data-CRS units from the raw coordinate buffers:
 /// exteriors minus holes per polygon part. Non-areal encodings report
 /// 1.0 so area normalization degenerates to the raw value.
-fn data_area(ga: &GaCol, i: usize, xs: &[f64], ys: &[f64]) -> f64 {
+/// Projects a data-CRS coordinate onto the equal-area measurement CRS.
+type AreaProj<'a> = dyn Fn(f64, f64) -> Option<(f64, f64)> + 'a;
+
+fn data_area(
+    ga: &GaCol,
+    i: usize,
+    xs: &[f64],
+    ys: &[f64],
+    proj: Option<&AreaProj<'_>>,
+) -> f64 {
     let ring = |span: std::ops::Range<usize>| -> f64 {
         let (s, e) = (span.start, span.end);
         if e - s < 3 {
             return 0.0;
         }
+        // Geographic data is projected onto the equal-area measurement
+        // CRS first: a shoelace over degrees is not an area.
+        let at = |k: usize| -> Option<(f64, f64)> {
+            match proj {
+                Some(p) => p(xs[k], ys[k]),
+                None => Some((xs[k], ys[k])),
+            }
+        };
         let mut a = 0.0;
         for k in s..e {
             let k2 = if k + 1 == e { s } else { k + 1 };
-            a += xs[k] * ys[k2] - xs[k2] * ys[k];
+            let (Some((x1, y1)), Some((x2, y2))) = (at(k), at(k2)) else {
+                return 0.0;
+            };
+            a += x1 * y2 - x2 * y1;
         }
         (a * 0.5).abs()
     };
