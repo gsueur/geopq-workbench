@@ -360,6 +360,7 @@ fn fetch_tile(key: TileKey) -> Option<image::RgbaImage> {
         .call()
         .ok()?;
     let bytes = res.body_mut().read_to_vec().ok()?;
+    crate::data::net::record(crate::data::net::Channel::Tiles, &url, bytes.len() as u64);
     let img = image::load_from_memory(&bytes).ok()?;
     Some(img.to_rgba8())
 }

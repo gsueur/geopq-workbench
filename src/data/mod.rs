@@ -13,6 +13,7 @@ pub mod layer;
 pub mod loader;
 pub mod merge;
 pub mod national;
+pub mod net;
 pub mod optimize;
 pub mod partition;
 pub mod quality;

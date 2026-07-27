@@ -5116,6 +5116,30 @@ mod pruning_tests {
         // The point of range requests: a small fraction of the file moved.
         let served = server.bytes_served.load(std::sync::atomic::Ordering::SeqCst);
         let requests = server.requests.load(std::sync::atomic::Ordering::SeqCst);
+        // The network readout counts what the server actually sent. The
+        // two sides are measured independently — the server tallies what
+        // it wrote, the app tallies what each request returned — so
+        // agreement means the status bar is reporting real traffic and
+        // not an estimate.
+        {
+            use crate::data::net::{self, Channel};
+            // Per source, not per process: the counters are global and
+            // other tests fetch over http at the same time, but a URL
+            // belongs to exactly one of them.
+            let (by_src, reqs_src) =
+                net::for_source(&server.url).expect("attributed to its file");
+            assert_eq!(
+                by_src, served,
+                "the readout must account for every byte the server sent"
+            );
+            // The server also sees a HEAD (no body) and a 404 sidecar
+            // probe, neither of which moves data.
+            assert!(
+                reqs_src <= requests,
+                "{reqs_src} counted against {requests} served"
+            );
+            assert!(net::rate(Channel::Data) > 0.0, "a live transfer reads a rate");
+        }
         eprintln!(
             "remote load: {} of {} bytes ({:.1}%), {} requests, {} rows",
             served,

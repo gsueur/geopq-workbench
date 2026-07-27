@@ -147,6 +147,20 @@ impl Source {
         }
     }
 
+    /// The URL this source is actually fetched from, when it is remote.
+    /// S3 reads go through a resolved (possibly presigned) HTTPS URL, so
+    /// that is the one the network counters see.
+    pub fn url(&self) -> Option<String> {
+        match self {
+            Source::Local(_) | Source::Dir(_) => None,
+            Source::Remote { url, .. } => Some(url.clone()),
+            Source::S3 { url, .. } if !url.is_empty() => Some(url.clone()),
+            Source::S3 { .. } => None,
+            Source::Stac { url, .. } => Some(url.clone()),
+            Source::Multi { .. } => None,
+        }
+    }
+
     /// Short display name (file stem / directory name / last URL segment).
     pub fn name(&self) -> String {
         match self {
@@ -1249,6 +1263,7 @@ fn fetch_range(url: &str, start: u64, end_inclusive: u64) -> PqResult<Vec<u8>> {
         )));
     }
     buf.truncate(expect);
+    super::net::record(super::net::Channel::Data, url, buf.len() as u64);
     Ok(buf)
 }
 
@@ -1358,6 +1373,14 @@ pub(crate) mod testserver {
                     }
                     reqs.fetch_add(1, Ordering::SeqCst);
                     let text = String::from_utf8_lossy(&buf);
+                    if std::env::var("GEOPQ_TRACE_HTTP").is_ok() {
+                        let first = text.lines().next().unwrap_or("");
+                        let r = text
+                            .lines()
+                            .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                            .unwrap_or("(no range)");
+                        eprintln!("SERVER <- {first} | {r}");
+                    }
                     let is_head = text.starts_with("HEAD");
                     let range = text
                         .lines()
@@ -1374,6 +1397,19 @@ pub(crate) mod testserver {
                         let _ = write!(
                             conn,
                             "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                        );
+                        return;
+                    }
+                    // Only the file this server was spawned for. Serving
+                    // it under any path made a sidecar probe look like a
+                    // multi-megabyte download of the parquet itself, and
+                    // hid the fact that such a probe was happening at all.
+                    let path = text.split_whitespace().nth(1).unwrap_or("/");
+                    if path != "/data.parquet" {
+                        let _ = write!(
+                            conn,
+                            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\
+                             Connection: close\r\n\r\n"
                         );
                         return;
                     }

@@ -242,6 +242,14 @@ fn remote_uncached(dir: &str) -> Option<Attribution> {
         return None;
     }
     let body = res.into_body().read_to_string().ok()?;
+    // Counted with the layer's own traffic: a sidecar lookup is part of
+    // what opening a remote dataset costs, and it is one more round trip
+    // against object storage.
+    super::net::record(
+        super::net::Channel::Data,
+        &format!("{dir}/{FILE_NAME}"),
+        body.len() as u64,
+    );
     if body.len() > MAX_BYTES {
         return None;
     }

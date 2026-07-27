@@ -6934,6 +6934,27 @@ impl ViewerApp {
                             ui.label(v);
                             ui.end_row();
                         };
+                        // Remote layers: what this file has actually cost
+                        // over the wire. Range count matters as much as
+                        // the volume — against object storage the latency
+                        // of each request usually dominates the transfer.
+                        let fetched: Option<(u64, u64)> = layer
+                            .store
+                            .fragments
+                            .iter()
+                            .filter_map(|f| crate::data::net::for_source(&f.source.url()?))
+                            .reduce(|a, b| (a.0 + b.0, a.1 + b.1));
+                        if let Some((bytes, reqs)) = fetched {
+                            row(
+                                ui,
+                                "downloaded",
+                                format!(
+                                    "{} in {} range requests",
+                                    fmt_bytes(bytes),
+                                    fmt_count(reqs as usize)
+                                ),
+                            );
+                        }
                         row(ui, "geometry column", info.geo.primary_column.clone());
                         row(ui, "encoding", info.geo.encoding.clone());
                         if !info.geo.geometry_types.is_empty() {
@@ -7258,6 +7279,49 @@ impl ViewerApp {
         self.show_errors = open && !self.errors.is_empty();
     }
 
+    /// Live network use, data and basemap counted apart.
+    ///
+    /// Which stream is moving is the first thing worth knowing when a
+    /// remote layer feels slow: a busy tile stream and an idle data one
+    /// says the basemap is the holdup, not the dataset.
+    fn network_readout(&mut self, ui: &mut egui::Ui) {
+        use crate::data::info::fmt_bytes;
+        use crate::data::net::{self, Channel};
+        if !net::any_traffic() {
+            return;
+        }
+        let (data_bytes, data_reqs) = net::totals(Channel::Data);
+        let (tile_bytes, tile_reqs) = net::totals(Channel::Tiles);
+        let (data_rate, tile_rate) = (net::rate(Channel::Data), net::rate(Channel::Tiles));
+        let live = data_rate + tile_rate > 0.0;
+        let text = if live {
+            let mut parts: Vec<String> = Vec::new();
+            if data_rate > 0.0 {
+                parts.push(format!("data {}/s", fmt_bytes(data_rate as u64)));
+            }
+            if tile_rate > 0.0 {
+                parts.push(format!("tiles {}/s", fmt_bytes(tile_rate as u64)));
+            }
+            format!("· ↓ {}", parts.join(" "))
+        } else {
+            format!("· ↓ {} total", fmt_bytes(data_bytes + tile_bytes))
+        };
+        let label = if live {
+            RichText::new(text).color(Color32::from_rgb(90, 160, 210))
+        } else {
+            RichText::new(text).weak()
+        };
+        ui.monospace(label).on_hover_text(format!(
+            "downloaded this session\n\
+             data: {} in {} range requests\n\
+             basemap: {} in {} tiles",
+            fmt_bytes(data_bytes),
+            fmt_count(data_reqs as usize),
+            fmt_bytes(tile_bytes),
+            fmt_count(tile_reqs as usize),
+        ));
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if let Some(w) = self.cursor_world {
@@ -7284,6 +7348,7 @@ impl ViewerApp {
                 if total > 0 {
                     ui.monospace(format!("· {} features", fmt_count(total)));
                 }
+                self.network_readout(ui);
                 if !self.errors.is_empty() {
                     let btn = egui::Button::new(
                         RichText::new(format!("⚠ {}", self.errors.len()))
