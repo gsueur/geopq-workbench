@@ -57,6 +57,11 @@ pub fn default_repos() -> Vec<Repository> {
             kind: RepoKind::Parquetry,
         },
         Repository {
+            name: "Geomermaids CORINE Land Cover (Europe)".into(),
+            url: "https://parquetry.geomermaids.com/clc".into(),
+            kind: RepoKind::Parquetry,
+        },
+        Repository {
             name: "Overture Maps (STAC)".into(),
             url: "https://stac.overturemaps.org".into(),
             kind: RepoKind::Stac,
@@ -1217,8 +1222,26 @@ mod tests {
         assert!(m.themes.iter().any(|(t, _)| t == "buildings"));
     }
 
-    /// Live probe of the single-dataset repository shape, opt-in:
+    /// Live probe of every single-dataset repository, opt-in:
     /// cargo test --release repo_live_geoboundaries -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn repo_live_clc() {
+        let base = "https://parquetry.geomermaids.com/clc";
+        let snaps = fetch_snapshots(base).unwrap();
+        assert_eq!(snaps[0].path, "2018/", "latest aliases the release");
+        let ds = discover_datasets(base, "2018/").unwrap();
+        assert_eq!(ds.len(), 1);
+        let m = fetch_manifest(base, "2018/", &ds[0].path).unwrap();
+        eprintln!("clc: {:?} {:?}", m.state_name, m.themes);
+        assert_eq!(m.themes.len(), 1);
+        for (theme, rows) in &m.themes {
+            let url = theme_url(base, "2018/", &ds[0].path, theme);
+            eprintln!("{theme}: {rows} rows -> {url}");
+            assert!(exists(&url).unwrap(), "{url}");
+        }
+    }
+
     #[test]
     #[ignore]
     fn repo_live_geoboundaries() {

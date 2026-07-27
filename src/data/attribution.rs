@@ -57,12 +57,39 @@ pub fn parse(text: &str) -> Option<Attribution> {
     if text.is_empty() {
         return None;
     }
+    // A `Key: value` line, plus any indented continuation lines that
+    // follow it: these notices wrap, and a credit cut at the wrap reads
+    // as "(c) European Union, Copernicus Land Monitoring Service," which
+    // is worse than no credit at all.
     let labelled = |label: &str| -> Option<String> {
-        text.lines().find_map(|l| {
+        let lines: Vec<&str> = text.lines().collect();
+        let i = lines.iter().position(|l| {
             let l = l.trim().trim_start_matches(['-', '*', '#']).trim();
-            let (k, v) = l.split_once(':')?;
-            k.trim().eq_ignore_ascii_case(label).then(|| v.trim().to_string())
-        })
+            l.split_once(':')
+                .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(label))
+        })?;
+        let first = lines[i]
+            .trim()
+            .trim_start_matches(['-', '*', '#'])
+            .trim()
+            .split_once(':')?
+            .1
+            .trim()
+            .to_string();
+        let mut out = first;
+        for l in &lines[i + 1..] {
+            // Indented, and not itself a labelled entry.
+            if l.is_empty() || !l.starts_with(char::is_whitespace) {
+                break;
+            }
+            let t = l.trim();
+            if t.is_empty() || is_labelled_line(t) {
+                break;
+            }
+            out.push(' ');
+            out.push_str(t);
+        }
+        Some(out)
     };
     let credit = labelled("attribution")
         .or_else(|| labelled("source"))
@@ -81,6 +108,17 @@ pub fn parse(text: &str) -> Option<Attribution> {
     Some(Attribution {
         credit,
         text: text.to_string(),
+    })
+}
+
+/// A short `Key: value` opener, the shape these notices use for their
+/// fields. A bare URL is not one: `https://…` has no space after its
+/// colon, so a wrapped line carrying a link stays part of its value.
+fn is_labelled_line(line: &str) -> bool {
+    line.split_once(": ").is_some_and(|(k, _)| {
+        !k.is_empty()
+            && k.len() <= 24
+            && k.chars().all(|c| c.is_alphanumeric() || c == ' ' || c == '_' || c == '-')
     })
 }
 
@@ -235,6 +273,28 @@ project at the William & Mary geoLab.
     }
 
     #[test]
+    fn wrapped_values_are_joined() {
+        // The CORINE notice wraps its credit across two lines; cutting
+        // it at the wrap loses the attributed body.
+        let a = parse(
+            "  Source:       https://land.copernicus.eu/\n\
+             \x20 Attribution:  (c) European Union, Copernicus Land Monitoring Service,\n\
+             \x20               European Environment Agency (EEA)\n\
+             \n\
+             Downstream users MUST credit the service.\n",
+        )
+        .unwrap();
+        assert!(a.credit.ends_with("European Environment Agency (EEA)"), "{}", a.credit);
+        assert!(a.credit.starts_with("(c) European Union"), "{}", a.credit);
+        // The next labelled entry ends the value.
+        let a = parse("Attribution: One\n  License: CC BY 4.0\n").unwrap();
+        assert_eq!(a.credit, "One");
+        // An unindented line ends it too.
+        let a = parse("Attribution: One\nNot a continuation\n").unwrap();
+        assert_eq!(a.credit, "One");
+    }
+
+    #[test]
     fn falls_back_through_source_then_prose() {
         let a = parse("Source: Natural Earth\nLicense: public domain").unwrap();
         assert_eq!(a.credit, "Natural Earth");
@@ -321,6 +381,17 @@ project at the William & Mary geoLab.
         eprintln!("osm: {}", a.credit);
         assert!(a.credit.contains("OpenStreetMap"), "{}", a.credit);
         assert!(a.text.contains("ODbL"));
+
+        // CORINE: the notice sits beside the data, like geoBoundaries.
+        let clc = Source::Remote {
+            url: "https://parquetry.geomermaids.com/clc/2018/clc_2018.parquet".to_string(),
+            len: 0,
+        };
+        let a = find(&clc, &[]).expect("CLC ATTRIBUTION.txt");
+        eprintln!("clc: {}", a.credit);
+        assert!(a.credit.contains("Copernicus"), "{}", a.credit);
+        // The wrapped credit must arrive whole, agency and all.
+        assert!(a.credit.contains("European Environment Agency"), "{}", a.credit);
     }
 
     #[test]
