@@ -1091,6 +1091,224 @@ mod tests {
     use crate::data::geometry::MeshBuilder;
     use egui_wgpu::CallbackTrait;
 
+    /// Render the box path of a real file to a PNG so it can be looked at.
+    ///
+    /// A build that reports the right feature count can still draw
+    /// nothing, and the counts cannot tell you which. Run:
+    /// `GEOPQ_FILE=... GEOPQ_GROUPS=40 cargo test --release
+    /// boxes_render_to_png -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a local file; writes a PNG to inspect"]
+    fn boxes_render_to_png() {
+        let Ok(path) = std::env::var("GEOPQ_FILE") else {
+            eprintln!("set GEOPQ_FILE");
+            return;
+        };
+        let groups: usize = std::env::var("GEOPQ_GROUPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        let (store, crs, _info, _rg) =
+            crate::data::loader::open_store_for_test(&path.clone().into()).unwrap();
+        let total = store.rg_starts().len() - 1;
+        // GEOPQ_DISPLAY=auto uses the projection the app adopts on open
+        // (the data CRS for a projected file), not the world default.
+        let display = if std::env::var("GEOPQ_DISPLAY").is_ok_and(|v| v == "auto") {
+            crate::data::crs::DisplayCrs::auto_for(&crs, None)
+                .unwrap_or_else(crate::data::crs::DisplayCrs::hobo_dyer)
+        } else {
+            crate::data::crs::DisplayCrs::hobo_dyer()
+        };
+        eprintln!("display: {}", display.name);
+        // GEOPQ_BOXES=0 builds the same groups from geometry: the control
+        // for "is it the box path or the harness".
+        let boxes = std::env::var("GEOPQ_BOXES").map_or(true, |v| v == "1");
+        let outlines = std::env::var("GEOPQ_OUTLINES").is_ok_and(|v| v == "1");
+        // GEOPQ_STYLE=1 applies whatever colour map the schema announces,
+        // exactly as a plain open does — the app never draws these
+        // unstyled, so neither should the picture we judge it by.
+        let style_by = std::env::var("GEOPQ_STYLE")
+            .is_ok_and(|v| v == "1")
+            .then(|| crate::data::colormap::schema_style(&store.style_columns()))
+            .flatten();
+        let style_sel = style_by
+            .as_ref()
+            .and_then(|sb| crate::data::loader::resolve_style(&store, sb));
+        eprintln!(
+            "style: {}",
+            style_by
+                .as_ref()
+                .map_or("none".into(), |sb| format!("{} ({:?})", sb.column, style_sel.is_some()))
+        );
+        let (geometry, rows, _bad) = crate::data::loader::build_selection_for_test(
+            &store,
+            &crs,
+            &display,
+            groups.min(total),
+            boxes,
+            style_sel.as_ref(),
+        )
+        .unwrap();
+        eprintln!("source: {}", if boxes { "boxes" } else { "geometry" });
+        let mut bin_hist = std::collections::BTreeMap::new();
+        for c in geometry.chunks.iter() {
+            *bin_hist.entry(c.bin).or_insert(0usize) += c.fill_indices.len() / 3;
+        }
+        eprintln!("triangles per style bin: {bin_hist:?}");
+        let fills: usize = geometry.chunks.iter().map(|c| c.fill_indices.len() / 3).sum();
+        eprintln!(
+            "{rows} features, {} chunks, {fills} triangles, bounds {:?}",
+            geometry.chunks.len(),
+            geometry.bounds_world
+        );
+
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        // Width must keep the readback row stride a multiple of 256, or
+        // copy_texture_to_buffer fails and every pixel reads back zero.
+        let (w, h) = (1280u32, 800u32);
+        assert_eq!((w * 4) % 256, 0);
+        let mut resources = egui_wgpu::CallbackResources::default();
+        resources.insert(MapResources::new(&device, format));
+
+        let mut camera = crate::map::camera::Camera::default();
+        camera.fit(geometry.bounds_world, [w as f32, h as f32], 20.0);
+        let cb = MapCallback {
+            camera,
+            viewport_px: [w as f32, h as f32],
+            tile_draws: vec![],
+            tile_uploads: vec![],
+            alive_tiles: Default::default(),
+            alive_layers: Default::default(),
+            layers: vec![LayerDraw {
+                key: (1, 0),
+                composite_group: 1,
+                chunks: geometry.chunks.clone(),
+                style: DrawStyle {
+                    fill_color: [0.3, 0.7, 0.4, 1.0],
+                    // GEOPQ_OUTLINES=1 draws borders, the rendition a
+                    // colour map now turns off.
+                    line_color: if outlines { [0.15, 0.18, 0.2, 1.0] } else { [0.0; 4] },
+                    point_color: [0.0; 4],
+                    line_half_width_px: if outlines { 0.6 } else { 0.0 },
+                    point_radius_px: 0.0,
+                    bin_colors: style_by
+                        .as_ref()
+                        .map(|sb| std::sync::Arc::new(sb.bin_colors())),
+                    hidden_bins: style_by.as_ref().map_or(0, |sb| sb.hidden_bins),
+                },
+            }],
+            background: [0.05, 0.05, 0.08, 1.0],
+        };
+        let mk_tex = |samples: u32, usage: wgpu::TextureUsages| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: samples,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let msaa_view = mk_tex(MSAA_SAMPLES, wgpu::TextureUsages::RENDER_ATTACHMENT)
+            .create_view(&Default::default());
+        let resolve_tex = mk_tex(
+            1,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let resolve_view = resolve_tex.create_view(&Default::default());
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [w, h],
+            pixels_per_point: 1.0,
+        };
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let bufs = cb.prepare(&device, &queue, &screen, &mut encoder, &mut resources);
+        queue.submit(bufs);
+        {
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    multiview_mask: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &msaa_view,
+                        depth_slice: None,
+                        resolve_target: Some(&resolve_view),
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.05,
+                                g: 0.05,
+                                b: 0.08,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                })
+                .forget_lifetime();
+            let info = eframe::egui::PaintCallbackInfo {
+                viewport: eframe::egui::Rect::from_min_size(
+                    Default::default(),
+                    eframe::egui::vec2(w as f32, h as f32),
+                ),
+                clip_rect: eframe::egui::Rect::from_min_size(
+                    Default::default(),
+                    eframe::egui::vec2(w as f32, h as f32),
+                ),
+                pixels_per_point: 1.0,
+                screen_size_px: [w, h],
+            };
+            cb.paint(info, &mut pass, &resources);
+        }
+        let out = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (w * h * 4) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &resolve_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &out,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        queue.submit([encoder.finish()]);
+        let slice = out.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range().to_vec();
+        let painted = data
+            .chunks_exact(4)
+            .filter(|px| px[1] > 60 && px[1] > px[2])
+            .count();
+        eprintln!(
+            "painted {painted} of {} pixels ({:.1}%)",
+            w * h,
+            100.0 * painted as f64 / (w * h) as f64
+        );
+        let dst = std::env::var("GEOPQ_PNG").unwrap_or_else(|_| "/tmp/boxes.png".into());
+        image::RgbaImage::from_raw(w, h, data).unwrap().save(&dst).ok();
+        eprintln!("wrote {dst}");
+    }
+
     /// Frame-time measurement against a real file (set GEOPQ_BENCH_FILE).
     /// Run: GEOPQ_BENCH_FILE=... cargo test --release real_file_frame -- --ignored --nocapture
     #[test]

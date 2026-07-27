@@ -26,6 +26,13 @@ pub struct Context {
     pub basemap: Option<usize>,
     pub show_graticule: bool,
     pub show_coastline: bool,
+    /// Pixel width below which a feature is drawn from its bounding box.
+    /// Absent in contexts written before it was configurable.
+    #[serde(default)]
+    pub box_threshold_px: Option<f64>,
+    /// Geometry cap for one refinement pass, in MB.
+    #[serde(default)]
+    pub refine_budget_mb: Option<u32>,
     /// Bottom-to-top draw order.
     pub layers: Vec<LayerCtx>,
 }
@@ -323,6 +330,8 @@ mod tests {
             basemap: Some(1),
             show_graticule: false,
             show_coastline: true,
+            box_threshold_px: None,
+            refine_budget_mb: None,
             layers: vec![
                 LayerCtx {
                     source: SourceCtx::Local {

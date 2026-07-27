@@ -20,6 +20,14 @@ const TESS_SCALE: f32 = 1.0e7;
 /// Small cells also make per-chunk viewport culling effective at city zoom.
 pub const CHUNK_WORLD: f64 = 1.0 / 2048.0;
 
+/// Chunk grid for box builds: 16× coarser per axis, 256× fewer chunks.
+///
+/// Boxes cover a whole dataset at wide zoom, where fine culling cells buy
+/// nothing and each one costs a set of page-backed GPU buffers. A cell is
+/// ~313 km at the equator and chunk-local f32 still resolves centimetres
+/// across it, far below anything visible at the zoom boxes are used at.
+pub const BOX_CHUNK_WORLD: f64 = 1.0 / 128.0;
+
 /// Reference to one feature: its global row index in the source file.
 /// 4 bytes, so the per-point pick index stays cheap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -101,6 +109,30 @@ impl LineLod {
             }
         }
         count
+    }
+}
+
+impl ChunkMesh {
+    /// Heap bytes held by this chunk's arrays, split by role: fills
+    /// (vertices + indices), line segments across every LOD level, and
+    /// points. The mesh is what a layer actually costs in memory, and on
+    /// vertex-heavy polygons it dwarfs the parquet it came from.
+    #[allow(dead_code)] // exercised by the opt-in real-file benchmark
+    pub fn heap_bytes(&self) -> (usize, usize, usize) {
+        let fills = self.fill_vertices.capacity() * std::mem::size_of::<[f32; 2]>()
+            + self.fill_indices.capacity() * std::mem::size_of::<u32>();
+        let lines: usize = self
+            .lines
+            .iter()
+            .map(|l| {
+                l.segments.capacity() * std::mem::size_of::<[f32; 4]>()
+                    + l.extents.capacity() * std::mem::size_of::<f32>()
+                    + l.size_index.capacity() * std::mem::size_of::<(f32, u32)>()
+            })
+            .sum();
+        let points = self.point_instances.capacity() * std::mem::size_of::<[f32; 2]>()
+            + self.point_refs.capacity() * std::mem::size_of::<FeatureRef>();
+        (fills, lines, points)
     }
 }
 
@@ -204,6 +236,15 @@ impl GeomKind {
 /// worker thread; merge with `merge_into`.
 pub struct MeshBuilder {
     chunks: HashMap<(i64, i64, u8, bool), ChunkMesh>,
+    /// Chunk grid size in world units. `CHUNK_WORLD` for geometry; box
+    /// builds coarsen it (see [`Self::new`]).
+    cell: f64,
+    /// Emit polygon outlines. False for a fill-only palette: the LOD
+    /// stack is most of a polygon mesh, and building borders the style
+    /// will not draw is the largest avoidable cost there is.
+    /// Line and point features are unaffected — for them the geometry
+    /// *is* the line.
+    outlines: bool,
     /// Style bin applied to subsequently added features.
     pub bin: u8,
     tess: FillTessellator,
@@ -219,6 +260,8 @@ impl Default for MeshBuilder {
     fn default() -> Self {
         Self {
             chunks: HashMap::new(),
+            cell: CHUNK_WORLD,
+            outlines: true,
             bin: 0,
             tess: FillTessellator::new(),
             scratch: VertexBuffers::new(),
@@ -257,17 +300,34 @@ fn spans_underlay(bbox: [f64; 4]) -> bool {
 }
 
 impl MeshBuilder {
+    /// Build on a given chunk grid, with or without polygon outlines.
+    ///
+    /// Every chunk becomes its own set of GPU buffers, and a buffer is
+    /// page-backed whatever it holds: a whole-extent box build filled
+    /// 32k chunks with ~74 features each and spent gigabytes on nearly
+    /// empty pages. Boxes only exist at wide zoom, where a coarse
+    /// culling grid costs nothing — and chunk-local f32 still resolves
+    /// centimetres over a 300 km cell.
+    pub fn new(cell: f64, outlines: bool) -> Self {
+        Self {
+            cell,
+            outlines,
+            ..Default::default()
+        }
+    }
+
     fn chunk_for(&mut self, bbox: [f64; 4]) -> &mut ChunkMesh {
         let cx = (bbox[0] + bbox[2]) * 0.5;
         let cy = (bbox[1] + bbox[3]) * 0.5;
+        let cell = self.cell;
         let key = (
-            (cx / CHUNK_WORLD).floor() as i64,
-            (cy / CHUNK_WORLD).floor() as i64,
+            (cx / cell).floor() as i64,
+            (cy / cell).floor() as i64,
             self.bin,
             spans_underlay(bbox),
         );
         self.chunks.entry(key).or_insert_with(|| ChunkMesh {
-            origin: [key.0 as f64 * CHUNK_WORLD, key.1 as f64 * CHUNK_WORLD],
+            origin: [key.0 as f64 * cell, key.1 as f64 * cell],
             bin: key.2,
             underlay: key.3,
             ..Default::default()
@@ -519,7 +579,7 @@ impl MeshBuilder {
                 Ok(()) => {
                     let chunk = self
                         .chunks
-                        .get_mut(&key_of(origin, self.bin, spans_underlay(bbox)))
+                        .get_mut(&key_of(origin, self.cell, self.bin, spans_underlay(bbox)))
                         .expect("chunk exists");
                     let base = chunk.fill_vertices.len() as u32;
                     chunk.fill_vertices.extend_from_slice(&self.scratch.vertices);
@@ -531,9 +591,48 @@ impl MeshBuilder {
             }
         }
 
-        // Outlines as line segments (with LODs).
-        for ring in rings {
-            self.add_polyline(ring, bbox, true);
+        // Outlines as line segments (with LODs), unless the style has
+        // none to draw.
+        if self.outlines {
+            for ring in rings {
+                self.add_polyline(ring, bbox, true);
+            }
+        }
+    }
+
+    /// Emit an axis-aligned rectangle: two triangles and four outline
+    /// segments, written straight into the chunk.
+    ///
+    /// The general polygon path builds a lyon `Path` and runs the
+    /// tessellator per feature. For a rectangle that is all overhead,
+    /// and at millions of features the allocation churn dominates the
+    /// build: measured 1.9 µs and about 2 kB of transient allocation per
+    /// feature through `add`, against ~100 ns and none here.
+    ///
+    /// `rect` is [minx, miny, maxx, maxy] in world space.
+    ///
+    /// Fill only, no outline. The LOD stack would have to carry the same
+    /// four segments at every level, since a rectangle has nothing to
+    /// simplify and dropping it from the coarse levels would make the
+    /// layer vanish at exactly the zoom this exists for: ten copies of
+    /// every border, measured at 640 MB per million features, to draw
+    /// one-pixel outlines around one-pixel boxes. The fills carry the
+    /// map; the outlines arrive with the real geometry on zoom.
+    pub fn add_rect(&mut self, rect: [f64; 4]) -> Added {
+        self.kind = self.kind.merge(GeomKind::Polygon);
+        expand(&mut self.bounds, rect);
+        let chunk = self.chunk_for(rect);
+        let o = chunk.origin;
+        let (a, b) = (local(o, rect[0], rect[1]), local(o, rect[2], rect[3]));
+        let corners = [[a[0], a[1]], [b[0], a[1]], [b[0], b[1]], [a[0], b[1]]];
+        let base = chunk.fill_vertices.len() as u32;
+        chunk.fill_vertices.extend_from_slice(&corners);
+        chunk
+            .fill_indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        Added {
+            bbox: rect,
+            needs_rtree: true,
         }
     }
 
@@ -652,10 +751,12 @@ impl MeshBuilder {
     }
 }
 
-fn key_of(origin: [f64; 2], bin: u8, underlay: bool) -> (i64, i64, u8, bool) {
+/// Recover a chunk's key from its origin. `cell` must be the grid the
+/// origin was placed on, or the key misses and the chunk looks absent.
+fn key_of(origin: [f64; 2], cell: f64, bin: u8, underlay: bool) -> (i64, i64, u8, bool) {
     (
-        (origin[0] / CHUNK_WORLD).round() as i64,
-        (origin[1] / CHUNK_WORLD).round() as i64,
+        (origin[0] / cell).round() as i64,
+        (origin[1] / cell).round() as i64,
         bin,
         underlay,
     )
@@ -1035,7 +1136,7 @@ mod split_tests {
             c.lines[1].extents.push(1.0);
         }
         let mut mb = MeshBuilder::default();
-        mb.chunks.insert(key_of([0.5, 0.5], 0, false), c);
+        mb.chunks.insert(key_of([0.5, 0.5], CHUNK_WORLD, 0, false), c);
         let caps = SplitCaps {
             line_instances: 12,
             ..SplitCaps::default()

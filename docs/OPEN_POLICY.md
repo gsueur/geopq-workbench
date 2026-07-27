@@ -43,10 +43,64 @@ Two display modes, decided once at open, stored on the layer:
 There is no middle state. A stride preview may exist only in Indexed
 mode, where zooming in provably replaces it with exact rows.
 
+### Bounding-box display (Indexed only)
+
+A third read state sits beside the stride preview: `GroupLoad::Boxes`,
+every feature drawn as its GeoParquet covering bbox, no geometry column
+read at all. Chosen instead of a preview when the selection is over
+budget and the file offers both a covering column and polygon-only `geo`
+metadata.
+
+It exists because decimation is the wrong answer for a coverage. CORINE
+land cover tiles the plane: dropping 14 of every 15 polygons produces
+holes, not less detail. And the byte budget was being spent on geometry
+the screen cannot resolve — Europe-wide, a pixel is ~3 km across while
+CORINE's minimum mapping unit is 25 ha, so nearly every feature is
+sub-pixel and its box *is* its outline on screen.
+
+Measured on `U2018_CLC2018_V2020_20u1.parquet` (2,375,406 features,
+7.71 GB of uncompressed WKB, 231 row groups):
+
+| | Stride preview | Boxes |
+|---|---|---|
+| Features drawn | 158,463 (1/15) | 2,375,406 (all) |
+| Geometry read | all pages decompressed | none |
+| Mesh | 0.65 GB per 15k features | 206 MB total |
+| Chunks | — | 264 (31,949 on the fine grid) |
+| Peak RSS, app | 6–8 GB (OOM on an 18 GB machine) | **1.1 GB** |
+| Load, app | seconds, then crash | **0.66 s** |
+
+A stride selection reads every page anyway — one row in fifteen touches
+all of them — so the preview saved tessellation but not decode. Boxes
+read the covering column and nothing else.
+
+Rules:
+
+- Fills only. Ten LOD levels of four identical segments cost 640 MB per
+  million features to outline one-pixel boxes; outlines arrive with the
+  real geometry.
+- `covers()` is always false, so refinement replaces boxes with real
+  rows on zoom exactly as it replaces a preview.
+- Rectangles are written straight into the chunk mesh (`add_rect`), not
+  routed through `geo` + lyon: per feature that path measured 1.9 µs and
+  ~2 kB of transient allocation, which at these counts is the build.
+- Polygons only, and only from declared `geometry_types`. A line's box
+  is a rectangle the line does not follow.
+- Coarse chunk grid (`BOX_CHUNK_WORLD`, 1/128): every chunk is its own
+  set of page-backed GPU buffers, and a whole-extent box build on the
+  fine grid filled 31,949 of them with ~74 features each — 3 GB of
+  nearly empty pages, on top of a 206 MB mesh.
+- Refinement counts geometry bytes, not only rows. CORINE is 2.38M rows
+  (under the row budget) and 7.7 GB of geometry: on rows alone the first
+  camera settle decoded the entire file, undoing the load that had just
+  avoided it.
+
 ### Invariants
 
-1. Decimated geometry is never on screen without a visible badge saying
-   so, and never in a state that cannot refine to exact rows.
+1. Decimated or approximated geometry is never on screen without a
+   visible badge saying so, and never in a state that cannot refine to
+   exact rows. Boxes badge as "all features drawn from their bounding
+   boxes — zoom in for real geometry".
 2. Direct mode never decodes fewer than all rows (modulo an explicit
    user filter) and never runs viewport-driven work on camera moves.
 3. The quality dialog appears exactly when, without user action, the
@@ -92,6 +146,8 @@ cannot fall into it.
 | `RG_ROWS_MIN` | 16_000 | Below this, footer size and per-group overhead dominate. Warn only. |
 | `DIRECT_MAX_ROWS` | 12_000_000 | Hard ceiling for "Load all anyway". Provisional; calibrate. |
 | `DIRECT_MAX_GEOM_BYTES` | 8 GiB | Uncompressed geometry-column bytes from footer (`total_byte_size` of geometry leaves) as a decode-size proxy. Whichever ceiling hits first. Provisional; calibrate. |
+| `MAX_BUILD_GEOM_BYTES` | 512 MiB | A build costs ≈8× the geometry bytes it reads: 0.18 GB of CORINE WKB measured 0.65 GB of mesh (240 MB fills, 413 MB line LODs) and 1.45 GB of peak RSS. This is a mesh budget expressed in source bytes, so it is calibrated as one. The former 1 GiB authorized an 8 GB peak, which on a machine without swap takes the machine down rather than the app. |
+| `BATCH_TARGET_BYTES` | 16 MiB | Read batches sized by bytes, not rows (`FeatureStore::batch_rows`): with one batch in flight per worker this times the core count is the decode footprint. A fixed row count makes that a property of the dataset — a single CORINE feature reaches 200k vertices, over 3 MB in one row. |
 
 Calibration references: `parcelles_quebec_optimized.parquet` (65k
 rows/rg, covering, Hilbert) must pass; `parcelles_quebec.parquet` (no

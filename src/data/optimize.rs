@@ -779,6 +779,21 @@ pub fn optimize(
     };
     let make_props = || {
         let mut props = WriterProperties::builder()
+            // The parquet envelope follows the GeoParquet flavour. 2.0
+            // means the native GEOMETRY logical type, which only a recent
+            // reader understands, and such a reader certainly handles V2
+            // data pages — announcing the newest geo spec inside the
+            // oldest envelope is a mismatch of intent, and inspection
+            // tools rightly flag it. Older flavours stay on V1 pages,
+            // where being readable by everything is the whole point.
+            // Measured on CORINE and on 47-column parcels: no size
+            // difference either way once zstd has run, so this is about
+            // what the file says it is, not about bytes.
+            .set_writer_version(if opts.version == GpVersion::V2_0 {
+                parquet::file::properties::WriterVersion::PARQUET_2_0
+            } else {
+                parquet::file::properties::WriterVersion::PARQUET_1_0
+            })
             .set_compression(opts.codec.compression())
             .set_max_row_group_row_count(Some(opts.row_group_size))
             .set_max_row_group_bytes(Some(opts.row_group_bytes))
@@ -1958,6 +1973,11 @@ mod tests {
         assert_eq!(boxes.len(), report.rg_after);
         assert!(info.geo.version_label.contains("1.1"), "{}", info.geo.version_label);
         assert_rows_consistent(&dst);
+
+        // The 1.1 flavour keeps the widely readable envelope: V1 data
+        // pages, so anything that reads parquet at all can read it.
+        let b = ParquetRecordBatchReaderBuilder::try_new(File::open(&dst).unwrap()).unwrap();
+        assert_eq!(b.metadata().file_metadata().version(), 1);
     }
 
     #[test]
@@ -1983,6 +2003,13 @@ mod tests {
         // Native GEOMETRY logical type with the CRS, plus geo statistics.
         let b = ParquetRecordBatchReaderBuilder::try_new(File::open(&dst).unwrap()).unwrap();
         let meta = b.metadata();
+        // The parquet envelope matches the flavour: a file announcing the
+        // 2.0 geo spec must not report the legacy format version.
+        assert_eq!(
+            meta.file_metadata().version(),
+            2,
+            "GeoParquet 2.0 output must be written as Parquet 2.0"
+        );
         let geom = meta.row_groups()[0]
             .columns()
             .iter()

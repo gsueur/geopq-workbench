@@ -74,6 +74,11 @@ pub struct FeatureStore {
     /// GeoParquet `edges: spherical`: segments are great-circle arcs, so
     /// long edges are densified on the sphere before projection.
     pub spherical_edges: bool,
+    /// The `geo` metadata declares polygons only. A polygon is the one
+    /// geometry its bounding box can stand in for on screen; a line's
+    /// box is a rectangle the line does not follow, and a point is its
+    /// own box already.
+    pub polygons_only: bool,
     /// Rows per row group, global order across fragments.
     rg_rows: Vec<u64>,
     /// Cumulative start row of each row group (len = rg_rows.len() + 1).
@@ -180,6 +185,7 @@ impl FeatureStore {
             xy_geom,
             hidden_wkb: None,
             spherical_edges: false,
+            polygons_only: false,
             rg_rows,
             rg_starts,
             rg_frag,
@@ -201,6 +207,32 @@ impl FeatureStore {
         self.schema.fields().len()
             - self.part_cols.len()
             - self.xy_geom.map_or(0, |_| 1)
+    }
+
+    /// Columns a style can be built from, each flagged numeric (graduated)
+    /// or not (categorical). Geometry and the WKB column a GeoArrow
+    /// sibling supersedes are excluded, as are the virtual x/y and
+    /// partition fields.
+    pub fn style_columns(&self) -> Vec<(String, bool)> {
+        use arrow::datatypes::DataType as DT;
+        self.schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                *i != self.geom_col && Some(*i) != self.hidden_wkb && *i < self.base_fields()
+            })
+            .filter_map(|(_, f)| match f.data_type() {
+                DT::Int8 | DT::Int16 | DT::Int32 | DT::Int64 | DT::UInt8 | DT::UInt16
+                | DT::UInt32 | DT::UInt64 | DT::Float16 | DT::Float32 | DT::Float64 => {
+                    Some((f.name().clone(), true))
+                }
+                DT::Utf8 | DT::LargeUtf8 | DT::Utf8View | DT::Boolean | DT::Dictionary(_, _) => {
+                    Some((f.name().clone(), false))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Schema index of the first virtual partition column.
@@ -252,6 +284,24 @@ impl FeatureStore {
             })
             .map(|c| c.uncompressed_size().max(0) as u64)
             .sum()
+    }
+
+    /// Rows per read batch for a group, sized so one batch carries about
+    /// `target_bytes` of geometry instead of a fixed row count.
+    ///
+    /// Row size spans orders of magnitude between datasets: a point file
+    /// runs 20 bytes a row, a land-cover polygon averages 3 kB and its
+    /// largest features reach 200k vertices, over 3 MB in one row. A
+    /// fixed row count is then a memory lottery, and it is the batches
+    /// in flight across every worker that decide the peak. Never returns
+    /// zero: one row at a time is the floor, however big that row is.
+    pub fn batch_rows(&self, group: usize, target_bytes: u64, max_rows: usize) -> usize {
+        let rows = self.rg_rows.get(group).copied().unwrap_or(0);
+        if rows == 0 {
+            return max_rows;
+        }
+        let per_row = (self.rg_geom_bytes(group as u32) / rows).max(1);
+        (target_bytes / per_row).clamp(1, max_rows as u64) as usize
     }
 
     /// Partition column `k`'s value for rows of a global row group.

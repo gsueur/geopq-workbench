@@ -25,6 +25,10 @@ use super::source::Source;
 use super::store::{CoveringCol, FeatureStore};
 
 const BATCH_SIZE: usize = 64 * 1024;
+/// Geometry bytes a single read batch should carry. With one batch in
+/// flight per worker, this times the core count is the decode footprint,
+/// whatever the dataset's rows weigh.
+const BATCH_TARGET_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Error string of a user-cancelled load (the app treats it quietly).
 pub const CANCELLED: &str = "load cancelled";
@@ -68,6 +72,8 @@ pub enum LoadMsg {
     RefineDeferred {
         layer_id: u64,
         at_least_rows: u64,
+        /// Set when geometry bytes, not the row count, stopped it.
+        geom_bytes: Option<u64>,
     },
     /// A projection/filter rebuild ended without geometry (error or
     /// cancel). The layer keeps its previous sections; the app clears its
@@ -258,13 +264,31 @@ pub enum GroupSel {
         rect: Option<[f64; 4]>,
         stride: u32,
     },
+    /// Every feature drawn from its covering bbox, no geometry read.
+    /// Chosen over `Preview` for polygon coverages that carry a covering
+    /// column (see `GroupLoad::Boxes`).
+    Boxes {
+        group: u32,
+        rect: Option<[f64; 4]>,
+    },
+    /// Boxes for exactly these group-relative rows.
+    ///
+    /// A group refined for one viewport holds real geometry for those
+    /// rows and nothing for the rest, which on a box layer would punch a
+    /// row-group-shaped hole in the coverage as soon as the camera moved
+    /// on. The complement is drawn as boxes instead, so the map stays
+    /// complete and the refined part simply gets its true outlines.
+    BoxRanges { group: u32, ranges: Vec<(u32, u32)> },
 }
 
 impl GroupSel {
     fn group(&self) -> u32 {
         match self {
             GroupSel::All(g) | GroupSel::Rect(g, _) | GroupSel::Ranges(g, _) => *g,
-            GroupSel::Preview { group, .. } | GroupSel::ResolvedRect { group, .. } => *group,
+            GroupSel::Preview { group, .. }
+            | GroupSel::Boxes { group, .. }
+            | GroupSel::BoxRanges { group, .. }
+            | GroupSel::ResolvedRect { group, .. } => *group,
         }
     }
 }
@@ -276,11 +300,50 @@ pub const MAX_BUILD_ROWS: u64 = 2_500_000;
 /// work. 2.5M parcels carry ~1 GB of WKB and build fine; 2.4M land-cover
 /// polygons carry 7 GB and take tens of gigabytes of RAM to tessellate,
 /// while sitting *under* the row budget and looking harmless.
-pub const MAX_BUILD_GEOM_BYTES: u64 = 1 << 30;
+///
+/// Calibrated against the mesh, which is what actually occupies memory.
+/// Measured on CORINE: 0.18 GB of WKB becomes 0.65 GB of mesh (240 MB of
+/// fills, 413 MB of line segments across the LOD stack) and peaks at
+/// 1.45 GB of RSS, so a build costs about 8× the geometry bytes it
+/// reads. The earlier 1 GB budget therefore authorized an 8 GB peak,
+/// which is more than many machines can give and, on one without swap,
+/// takes the machine down rather than the app.
+pub const MAX_BUILD_GEOM_BYTES: u64 = 256 << 20;
 /// Preview decimation targets roughly this many features.
 const PREVIEW_TARGET_ROWS: u64 = 1_200_000;
-/// …and roughly this many geometry bytes.
-const PREVIEW_TARGET_BYTES: u64 = 512 << 20;
+/// …and roughly this many geometry bytes: ≈0.5 GB of mesh, ≈1 GB of peak
+/// at the measured expansion. Quartered from 512 MB, which costs the
+/// MassGIS parcels stride levels at world zoom (1/3 → 1/8) and takes
+/// CORINE from 1/15 to 1/57 — except that CORINE now draws boxes
+/// instead, keeping every feature. Zooming in refines to real geometry
+/// under the same budget either way, so what this really sets is how
+/// coarse the whole-dataset view is, not what the user works with.
+const PREVIEW_TARGET_BYTES: u64 = 128 << 20;
+
+/// What a selection that exceeds the build budget falls back to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverBudget {
+    /// Every feature, drawn from its covering bbox.
+    Boxes,
+    /// One feature in `stride`, drawn from its geometry.
+    Stride,
+}
+
+/// Which fallback a store can offer.
+///
+/// Boxes need a covering column to read and polygons to stand in for.
+/// Given both they are the better answer: a stride preview throws away
+/// most of the features, which on data that tiles the plane reads as
+/// holes, while boxes keep every feature at a resolution the screen can
+/// show. Without a covering column there is nothing to draw but the
+/// geometry, and for lines a bounding box is not a stand-in for anything.
+fn over_budget_plan(covering: bool, polygons_only: bool) -> OverBudget {
+    if covering && polygons_only {
+        OverBudget::Boxes
+    } else {
+        OverBudget::Stride
+    }
+}
 
 /// Decimation stride for a candidate selection, or None when it fits
 /// both budgets. Rows and geometry bytes are separate limits because
@@ -634,6 +697,7 @@ fn build_opened(
         info,
         rg_meta,
     } = opened;
+    log::debug!("build_opened: job {job}, layer {layer_id}, direct {direct}");
     let n_rg = store.rg_starts().len().saturating_sub(1);
     // The pruning rect is in the DATA CRS, so it stays valid
     // across a display switch — compute it with the display the
@@ -680,9 +744,20 @@ fn build_opened(
             &store.source.label(),
             rg_meta.as_ref().map(|(_, b)| b.as_slice()),
             rect,
+            "initial load",
         )
     };
+    let box_layer = sel.iter().any(|s| matches!(s, GroupSel::Boxes { .. }));
     let build_t0 = Instant::now();
+    // No style asked for (a plain open, not a restored context): let the
+    // schema speak. A column named for a published nomenclature gets
+    // that nomenclature's colours, binned in this very build — the same
+    // style applied afterwards would cost a full rebuild.
+    let style = style.or_else(|| {
+        let sb = crate::data::colormap::schema_style(&store.style_columns())?;
+        log::info!("auto colour map on column {}", sb.column);
+        Some(sb)
+    });
     let style_sel = style.as_ref().and_then(|sb| resolve_style(&store, sb));
     match build_geometry(
         &store,
@@ -733,6 +808,18 @@ fn build_opened(
                 "loaded {name}: {rows} features in {} ms",
                 t0.elapsed().as_millis()
             );
+            // The geometry is binned for `style`, so the layer must carry
+            // it: the app overwrites this for a restored context, which
+            // passed the very same style in.
+            let mut layer_style = super::layer::LayerStyle::new(color);
+            layer_style.style_by = style_sel.is_some().then_some(style).flatten();
+            if layer_style
+                .style_by
+                .as_ref()
+                .is_some_and(|sb| sb.mode.is_color_map())
+            {
+                layer_style.adopt_palette();
+            }
             let layer = VectorLayer {
                 id: layer_id,
                 generation: 0,
@@ -740,7 +827,9 @@ fn build_opened(
                 store,
                 crs,
                 sections: vec![geometry],
-                style: super::layer::LayerStyle::new(color),
+                box_layer,
+                draw_gen: 0,
+                style: layer_style,
                 feature_count: rows,
                 stats,
                 info,
@@ -770,6 +859,58 @@ fn build_opened(
 /// Rebuild geometry for an existing layer under a new display projection,
 /// re-streaming exactly the loaded rows (consolidates any appended
 /// sections into one).
+/// The selections a rebuild runs for each group's current decode state.
+///
+/// `box_gaps`: the layer draws its unrefined data from covering boxes, so
+/// every group must contribute *something* — a group that contributes
+/// nothing is a hole in the coverage that no camera move can fill.
+fn rebuild_selection(loaded: &[GroupLoad], starts: &[u64], box_gaps: bool) -> Vec<GroupSel> {
+    loaded
+        .iter()
+        .enumerate()
+        .flat_map(|(g, st)| {
+            let group = g as u32;
+            let rows = (starts[g + 1] - starts[g]) as u32;
+            match st {
+                GroupLoad::None => Vec::new(),
+                GroupLoad::Full => vec![GroupSel::All(group)],
+                // Empty ranges: either a layer-filter group with no
+                // matching rows, or a group whose bbox met the viewport
+                // while none of its features did. The second is routine —
+                // row-group boxes are coarse — and on a box layer dropping
+                // it takes the group's boxes with it, leaving a
+                // row-group-shaped hole that only a full reload refills.
+                GroupLoad::Rows { ranges, .. } if ranges.is_empty() => {
+                    if box_gaps {
+                        vec![GroupSel::Boxes { group, rect: None }]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                GroupLoad::Rows { ranges, .. } => {
+                    let mut out = vec![GroupSel::Ranges(group, ranges.clone())];
+                    // The rest of the group as boxes: without it the group
+                    // shows geometry for one old viewport and nothing
+                    // anywhere else.
+                    if box_gaps {
+                        let gaps = complement_ranges(ranges, rows);
+                        if !gaps.is_empty() {
+                            out.push(GroupSel::BoxRanges { group, ranges: gaps });
+                        }
+                    }
+                    out
+                }
+                GroupLoad::Preview { stride, rect } => vec![GroupSel::Preview {
+                    group,
+                    rect: *rect,
+                    stride: *stride,
+                }],
+                GroupLoad::Boxes { rect } => vec![GroupSel::Boxes { group, rect: *rect }],
+            }
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_rebuild(
     handle: LoaderHandle,
@@ -781,27 +922,14 @@ pub fn spawn_rebuild(
     loaded: Vec<GroupLoad>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     style: Option<crate::data::layer::StyleBy>,
+    // Draw boxes for the rows a partly refined group did not decode, so
+    // a box layer keeps complete coverage as the camera moves on.
+    box_gaps: bool,
 ) {
     std::thread::spawn(move || {
         let t0 = Instant::now();
-        let sel: Vec<GroupSel> = loaded
-            .iter()
-            .enumerate()
-            .filter_map(|(g, st)| match st {
-                GroupLoad::None => None,
-                GroupLoad::Full => Some(GroupSel::All(g as u32)),
-                // Empty ranges: a layer-filter group with no matching rows.
-                GroupLoad::Rows { ranges, .. } if ranges.is_empty() => None,
-                GroupLoad::Rows { ranges, .. } => {
-                    Some(GroupSel::Ranges(g as u32, ranges.clone()))
-                }
-                GroupLoad::Preview { stride, rect } => Some(GroupSel::Preview {
-                    group: g as u32,
-                    rect: *rect,
-                    stride: *stride,
-                }),
-            })
-            .collect();
+        let starts = store.rg_starts().to_vec();
+        let sel: Vec<GroupSel> = rebuild_selection(&loaded, &starts, box_gaps);
         let style_sel = style.as_ref().and_then(|sb| resolve_style(&store, sb));
         match build_geometry(&store, &crs, &display, None, sel, Some(&cancel), style_sel.as_ref())
         {
@@ -845,20 +973,29 @@ pub fn spawn_append(
     jobs: Vec<GroupSel>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     style: Option<crate::data::layer::StyleBy>,
-    refinement_budget: Option<u64>,
+    refinement_budget: Option<(u64, u64)>,
 ) {
     std::thread::spawn(move || {
-        let jobs = if let Some(budget) = refinement_budget {
-            match prepare_refinement_jobs(&store, jobs, budget, &cancel) {
+        let jobs = if let Some((budget, geom_budget)) = refinement_budget {
+            match prepare_refinement_jobs(&store, jobs, budget, geom_budget, &cancel) {
                 Ok(RefinePlan::Ready(jobs)) => jobs,
-                Ok(RefinePlan::Deferred(at_least_rows)) => {
-                    log::debug!(
-                        "{}: exact refinement exceeds {budget} rows (at least {at_least_rows}) — zoom in further",
-                        store.source.label()
-                    );
+                Ok(RefinePlan::Deferred { rows: at_least_rows, geom_bytes }) => {
+                    match geom_bytes {
+                        Some(b) => log::debug!(
+                            "{}: refining that viewport would decode {} of geometry \
+                             ({at_least_rows} rows) — zoom in further",
+                            store.source.label(),
+                            crate::data::info::fmt_bytes(b),
+                        ),
+                        None => log::debug!(
+                            "{}: exact refinement exceeds {budget} rows (at least {at_least_rows}) — zoom in further",
+                            store.source.label()
+                        ),
+                    }
                     handle.send(LoadMsg::RefineDeferred {
                         layer_id,
                         at_least_rows,
+                        geom_bytes,
                     });
                     return;
                 }
@@ -972,7 +1109,11 @@ fn append_batches_with(
 
 enum RefinePlan {
     Ready(Vec<GroupSel>),
-    Deferred(u64),
+    /// Over budget: the rows the selection had reached, and the geometry
+    /// bytes they carry when bytes are what stopped it. A land-cover
+    /// viewport blows the byte budget at a row count that reads as
+    /// trivial, so saying "too many rows" would name the wrong thing.
+    Deferred { rows: u64, geom_bytes: Option<u64> },
 }
 
 /// Resolve viewport rects and enforce the refinement budget using the exact
@@ -983,10 +1124,17 @@ fn prepare_refinement_jobs(
     store: &FeatureStore,
     jobs: Vec<GroupSel>,
     budget: u64,
+    geom_budget: u64,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<RefinePlan, String> {
     let starts = store.rg_starts();
     let mut rows = 0u64;
+    // Geometry bytes alongside rows, for the same reason the initial plan
+    // counts them: CORINE is 2.38M rows, comfortably under the row
+    // budget, and 7.7 GB of geometry. Refining it on a row count alone
+    // decodes the whole file the moment the camera settles, whatever the
+    // initial load carefully avoided.
+    let mut geom_bytes = 0u64;
     let mut resolved = Vec::with_capacity(jobs.len());
 
     for job in jobs {
@@ -1039,10 +1187,25 @@ fn prepare_refinement_jobs(
             preview @ GroupSel::Preview { stride, .. } => {
                 (group_rows.div_ceil(stride.max(2) as u64), preview)
             }
+            // Boxes read four doubles a row and tessellate two triangles;
+            // against a refine budget meant for geometry, that is not
+            // work worth counting.
+            boxes @ (GroupSel::Boxes { .. } | GroupSel::BoxRanges { .. }) => (0, boxes),
         };
         rows = rows.saturating_add(count);
-        if rows > budget {
-            return Ok(RefinePlan::Deferred(rows));
+        // The group's bytes in proportion to the rows this job selects.
+        geom_bytes = geom_bytes.saturating_add(
+            store
+                .rg_geom_bytes(group)
+                .saturating_mul(count)
+                .checked_div(group_rows.max(1))
+                .unwrap_or(0),
+        );
+        if rows > budget || geom_bytes > geom_budget {
+            return Ok(RefinePlan::Deferred {
+                rows,
+                geom_bytes: (geom_bytes > geom_budget).then_some(geom_bytes),
+            });
         }
         resolved.push(job);
     }
@@ -1120,8 +1283,36 @@ fn plan_viewport_selection(
     label: &str,
     boxes: Option<&[[f64; 4]]>,
     rect: Option<[f64; 4]>,
+    caller: &str,
 ) -> Vec<GroupSel> {
+    log::debug!("plan_viewport_selection from {caller}");
     let n_rg = store.rg_starts().len().saturating_sub(1);
+    // A dataset that will be drawn from covering boxes loads all of them,
+    // whatever the camera is looking at. Boxes are four doubles a feature
+    // and no geometry read at all, and pruning them to the opening
+    // viewport is how a layer opened while the camera sits on another
+    // continent ends up with nothing: every group outside the viewport
+    // stays unloaded, and zooming towards it finds no boxes to show.
+    // Complete coverage from the first frame is the property that makes
+    // this display mode worth having.
+    let all_boxes = matches!(
+        over_budget_plan(store.covering.is_some(), store.polygons_only),
+        OverBudget::Boxes
+    ) && preview_stride(
+        store.total_rows(),
+        (0..n_rg as u32).map(|g| store.rg_geom_bytes(g)).sum(),
+    )
+    .is_some();
+    if all_boxes {
+        log::info!(
+            "{label}: {} rows of polygons with a covering column: drawing \
+             every feature from its bounding box",
+            store.total_rows()
+        );
+        return (0..n_rg as u32)
+            .map(|group| GroupSel::Boxes { group, rect: None })
+            .collect();
+    }
     let groups: Vec<u32> = match (boxes, rect) {
         (Some(b), Some(r)) => intersecting_rgs(b, r),
         _ => (0..n_rg as u32).collect(),
@@ -1164,17 +1355,35 @@ fn plan_viewport_selection(
         .sum();
     let bytes: u64 = groups.iter().map(|&g| store.rg_geom_bytes(g)).sum();
     if let Some(stride) = preview_stride(est, bytes) {
-        log::info!(
-            "{label}: {est} candidate rows / {} of geometry exceed the budget — \
-             preview at 1/{stride}",
-            crate::data::info::fmt_bytes(bytes)
+        let boxes_ok = matches!(
+            over_budget_plan(store.covering.is_some(), store.polygons_only),
+            OverBudget::Boxes
         );
+        if boxes_ok {
+            log::info!(
+                "{label}: {est} candidate rows / {} of geometry exceed the budget — \
+                 drawing all features from their bounding boxes",
+                crate::data::info::fmt_bytes(bytes)
+            );
+        } else {
+            log::info!(
+                "{label}: {est} candidate rows / {} of geometry exceed the budget — \
+                 preview at 1/{stride}",
+                crate::data::info::fmt_bytes(bytes)
+            );
+        }
         sel = sel
             .into_iter()
-            .map(|s| match s {
-                GroupSel::All(g) => GroupSel::Preview { group: g, rect: None, stride },
-                GroupSel::Rect(g, r) => GroupSel::Preview { group: g, rect: Some(r), stride },
-                other => other,
+            .map(|s| match (s, boxes_ok) {
+                (GroupSel::All(g), true) => GroupSel::Boxes { group: g, rect: None },
+                (GroupSel::Rect(g, r), true) => GroupSel::Boxes { group: g, rect: Some(r) },
+                (GroupSel::All(g), false) => {
+                    GroupSel::Preview { group: g, rect: None, stride }
+                }
+                (GroupSel::Rect(g, r), false) => {
+                    GroupSel::Preview { group: g, rect: Some(r), stride }
+                }
+                (other, _) => other,
             })
             .collect();
     }
@@ -1202,8 +1411,14 @@ pub fn spawn_reload(
         let t0 = Instant::now();
         let n_rg = store.rg_starts().len().saturating_sub(1);
         let rect = viewport_to_data_bbox(view_world, &display, &crs);
-        let sel =
-            plan_viewport_selection(&store, &store.source.label(), boxes.as_deref(), rect);
+        log::debug!("spawn_reload: layer {layer_id}, generation {generation}");
+        let sel = plan_viewport_selection(
+            &store,
+            &store.source.label(),
+            boxes.as_deref(),
+            rect,
+            "viewport reload",
+        );
         let style_sel = style.as_ref().and_then(|sb| resolve_style(&store, sb));
         match build_geometry(
             &store,
@@ -1288,6 +1503,14 @@ fn open_store_with_view(
     );
     store.hidden_wkb = f.hidden_wkb;
     store.spherical_edges = f.spherical_edges;
+    // Declared types only: an undeclared file stays out of the bbox
+    // path rather than guessing from the first feature it decodes.
+    store.polygons_only = !f.info.geo.geometry_types.is_empty()
+        && f.info
+            .geo
+            .geometry_types
+            .iter()
+            .all(|t| t.trim_end_matches(" Z").ends_with("Polygon"));
     Ok((store, f.crs, f.info, f.rg_boxes))
 }
 
@@ -2439,6 +2662,11 @@ pub struct StyleSel {
     /// Normalize by polygon area (data-CRS units) before binning:
     /// bin = f(value / area). Graduated styling only.
     pub per_area: bool,
+    /// Build polygon outlines at all. A colour map defines fills and
+    /// nothing else, and outlines are where a polygon mesh's memory
+    /// goes: on CORINE, 413 MB of a 653 MB mesh was line segments across
+    /// ten LOD levels, for borders the style never draws.
+    pub outlines: bool,
 }
 
 #[derive(Clone)]
@@ -2477,7 +2705,12 @@ pub fn resolve_style(
     };
     let per_area =
         sb.per_area && matches!(sb.mode, crate::data::layer::StyleMode::Graduated { .. });
-    Some(StyleSel { col, binning, per_area })
+    Some(StyleSel {
+        col,
+        binning,
+        per_area,
+        outlines: !sb.mode.is_color_map(),
+    })
 }
 
 /// Sample up to `cap` values of a column from the already-loaded rows of
@@ -2531,6 +2764,10 @@ pub fn sample_loaded_values(
             GroupLoad::Preview { stride, rect: None } => {
                 (starts[g + 1] - starts[g]).div_ceil(*stride as u64)
             }
+            // Boxes hold every feature of the group; a rect-filtered one
+            // holds fewer, and sampling a superset of what is visible is
+            // what the unfiltered preview case does too.
+            GroupLoad::Boxes { .. } => starts[g + 1] - starts[g],
             GroupLoad::None => 0,
         })
         .sum();
@@ -2579,6 +2816,9 @@ pub fn sample_loaded_values(
             }
             GroupLoad::Preview { stride: ps, rect: None } => {
                 push_span(0, (starts[g + 1] - starts[g]) as u32, &mut c, *ps as usize)
+            }
+            GroupLoad::Boxes { .. } => {
+                push_span(0, (starts[g + 1] - starts[g]) as u32, &mut c, 1)
             }
             GroupLoad::None => {}
         }
@@ -2823,8 +3063,40 @@ fn build_geometry(
     proj.sort_unstable();
     let geom_pos = proj.binary_search(&store.geom_col).unwrap();
     let style_pos = style.map(|st| proj.binary_search(&st.col).unwrap());
+    // Second projection for box selections: the covering column stands in
+    // for the geometry, so the geometry column is never touched. Four
+    // doubles a row against, on land cover, three kilobytes.
+    let covering = store.covering.clone();
+    let mut box_proj: Vec<usize> = covering.iter().map(|c| c.root).collect();
+    if let Some(st) =
+        style.filter(|st| covering.as_ref().is_some_and(|c| st.col != c.root))
+    {
+        box_proj.push(st.col);
+    }
+    box_proj.sort_unstable();
+    let box_pos = covering
+        .as_ref()
+        .map(|c| box_proj.binary_search(&c.root).unwrap());
+    let box_style_pos = style
+        .zip(covering.as_ref())
+        .map(|(st, _)| box_proj.binary_search(&st.col).unwrap());
+    // One chunk grid for the whole build: the key is a cell index, so
+    // two grids in one mesh would collide. A build carrying any box
+    // group takes the coarse grid — that is the build that would
+    // otherwise open tens of thousands of GPU buffers.
+    let cell = if sel
+        .iter()
+        .any(|s| matches!(s, GroupSel::Boxes { .. } | GroupSel::BoxRanges { .. }))
+    {
+        crate::data::geometry::BOX_CHUNK_WORLD
+    } else {
+        crate::data::geometry::CHUNK_WORLD
+    };
+    // A fill-only palette needs no outlines built (boxes never carry any).
+    let outlines = style.is_none_or(|st| st.outlines);
     let rg_starts = store.rg_starts();
     let proj_ref: &[usize] = &proj;
+    let box_proj_ref: &[usize] = &box_proj;
     let stream_error: Mutex<Option<String>> = Mutex::new(None);
     let resolved: Mutex<Vec<(u32, GroupLoad)>> = Mutex::new(Vec::with_capacity(sel.len()));
 
@@ -2848,71 +3120,100 @@ fn build_geometry(
     // One task per group: group reads run concurrently (essential for
     // remote sources, where each group is a series of range requests) and
     // the flattened batches then tessellate in parallel.
-    let per_group = move |job: GroupSel| -> Vec<(RowMap, RecordBatch)> {
-        if cancelled() {
-            return Vec::new();
-        }
+    let per_group = move |job: GroupSel| {
         let g = job.group();
         let start = starts[g as usize];
         let group_rows = (starts[g as usize + 1] - start) as u32;
+        // Cancelled work resolves to an empty selection rather than
+        // returning early: every path has to yield the same iterator
+        // type, and an empty one reads nothing.
+        let stop = cancelled();
         // Resolve the job to optional group-relative ranges + final state.
-        let (ranges, state): (Option<Vec<(u32, u32)>>, GroupLoad) = match &job {
-            GroupSel::All(_) => (None, GroupLoad::Full),
-            GroupSel::Ranges(_, r) => (Some(r.clone()), GroupLoad::Full),
-            GroupSel::ResolvedRect { rect, ranges, .. } => (
-                Some(ranges.clone()),
-                GroupLoad::Rows {
-                    ranges: ranges.clone(),
-                    rect: *rect,
-                },
-            ),
-            GroupSel::Rect(_, rect) => {
-                match covering_select(store, g, *rect) {
-                    Ok(Some(r)) if r == [(0, group_rows)] => (None, GroupLoad::Full),
-                    Ok(Some(r)) => (
-                        Some(r.clone()),
-                        GroupLoad::Rows {
-                            ranges: r,
-                            rect: *rect,
-                        },
-                    ),
-                    Ok(None) => (None, GroupLoad::Full),
-                    Err(e) => {
-                        *err_ref.lock().unwrap() = Some(e);
-                        (Some(vec![]), GroupLoad::None)
-                    }
-                }
-            }
-            GroupSel::Preview { rect, stride, .. } => {
-                // Optional rect filter first, then every stride-th row of
-                // the selection as explicit 1-row ranges (the reader skips
-                // decoding the rest).
-                let base: Option<Vec<(u32, u32)>> = match rect {
-                    Some(r) => match covering_select(store, g, *r) {
-                        Ok(v) => v,
+        let (ranges, state): (Option<Vec<(u32, u32)>>, GroupLoad) = if stop {
+            (Some(Vec::new()), GroupLoad::None)
+        } else {
+            match &job {
+                GroupSel::All(_) => (None, GroupLoad::Full),
+                GroupSel::Ranges(_, r) => (Some(r.clone()), GroupLoad::Full),
+                GroupSel::ResolvedRect { rect, ranges, .. } => (
+                    Some(ranges.clone()),
+                    GroupLoad::Rows {
+                        ranges: ranges.clone(),
+                        rect: *rect,
+                    },
+                ),
+                GroupSel::Rect(_, rect) => {
+                    match covering_select(store, g, *rect) {
+                        Ok(Some(r)) if r == [(0, group_rows)] => (None, GroupLoad::Full),
+                        Ok(Some(r)) => (
+                            Some(r.clone()),
+                            GroupLoad::Rows {
+                                ranges: r,
+                                rect: *rect,
+                            },
+                        ),
+                        Ok(None) => (None, GroupLoad::Full),
                         Err(e) => {
                             *err_ref.lock().unwrap() = Some(e);
-                            Some(vec![])
+                            (Some(vec![]), GroupLoad::None)
                         }
-                    },
-                    None => None,
-                };
-                let stride = (*stride).max(2) as usize;
-                let sampled: Vec<u32> = match &base {
-                    Some(rs) => rs
-                        .iter()
-                        .flat_map(|&(s, e)| s..e)
-                        .step_by(stride)
-                        .collect(),
-                    None => (0..group_rows).step_by(stride).collect(),
-                };
-                (
-                    Some(rows_to_ranges(sampled.into_iter())),
-                    GroupLoad::Preview { stride: stride as u32, rect: *rect },
-                )
+                    }
+                }
+                GroupSel::Preview { rect, stride, .. } => {
+                    // Optional rect filter first, then every stride-th row of
+                    // the selection as explicit 1-row ranges (the reader skips
+                    // decoding the rest).
+                    let base: Option<Vec<(u32, u32)>> = match rect {
+                        Some(r) => match covering_select(store, g, *r) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                *err_ref.lock().unwrap() = Some(e);
+                                Some(vec![])
+                            }
+                        },
+                        None => None,
+                    };
+                    let stride = (*stride).max(2) as usize;
+                    let sampled: Vec<u32> = match &base {
+                        Some(rs) => rs
+                            .iter()
+                            .flat_map(|&(s, e)| s..e)
+                            .step_by(stride)
+                            .collect(),
+                        None => (0..group_rows).step_by(stride).collect(),
+                    };
+                    (
+                        Some(rows_to_ranges(sampled.into_iter())),
+                        GroupLoad::Preview { stride: stride as u32, rect: *rect },
+                    )
+                }
+                GroupSel::Boxes { rect, .. } => {
+                    // The row selection a rect load would make; only the
+                    // columns read differ.
+                    let ranges = match rect {
+                        Some(r) => match covering_select(store, g, *r) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                *err_ref.lock().unwrap() = Some(e);
+                                Some(vec![])
+                            }
+                        },
+                        None => None,
+                    };
+                    (ranges, GroupLoad::Boxes { rect: *rect })
+                }
+                // Gap filler beside a refined group: the group's own state
+                // belongs to the geometry selection, so this one records
+                // nothing.
+                GroupSel::BoxRanges { ranges, .. } => (Some(ranges.clone()), GroupLoad::None),
             }
         };
-        resolved_ref.lock().unwrap().push((g, state));
+        let boxes = matches!(job, GroupSel::Boxes { .. } | GroupSel::BoxRanges { .. });
+        // A gap filler must not overwrite the state its group already has.
+        let record = !matches!(job, GroupSel::BoxRanges { .. });
+        if !stop && record {
+            resolved_ref.lock().unwrap().push((g, state));
+        }
         // Global rows of the selection, for sparse batches.
         let sparse: Option<Arc<Vec<u32>>> = ranges.as_ref().map(|rs| {
             Arc::new(
@@ -2921,15 +3222,21 @@ fn build_geometry(
                     .collect::<Vec<u32>>(),
             )
         });
-        let empty = sparse.as_ref().is_some_and(|s| s.is_empty());
-        let reader = if empty {
+        let reader = if sparse.as_ref().is_some_and(|s| s.is_empty()) {
             None
         } else {
+            // Batch by bytes, not by rows: this group's own footer says
+            // how heavy its rows are.
+            let batch_rows = if boxes {
+                BATCH_SIZE
+            } else {
+                store.batch_rows(g as usize, BATCH_TARGET_BYTES, BATCH_SIZE)
+            };
             match store.reader_for_group(
                 g as usize,
-                BATCH_SIZE,
+                batch_rows,
                 ranges.as_deref(),
-                Some(proj_ref),
+                Some(if boxes { box_proj_ref } else { proj_ref }),
             ) {
                 Ok(r) => Some(r),
                 Err(e) => {
@@ -2938,11 +3245,17 @@ fn build_geometry(
                 }
             }
         };
-        let mut out = Vec::new();
+        // Yielded lazily: the worker tessellates each batch and drops it
+        // before pulling the next, so a group's decoded rows are never
+        // all alive at once. Collecting them here would put a whole row
+        // group per worker in memory, which on heavy geometry is
+        // hundreds of megabytes per core.
+        let err_ref = err_ref;
+        let cancel = cancel;
         let mut consumed = 0usize;
-        for res in reader.into_iter().flatten() {
-            if cancelled() {
-                return out;
+        reader.into_iter().flatten().map_while(move |res| {
+            if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                return None;
             }
             match res {
                 Ok(batch) => {
@@ -2951,49 +3264,79 @@ fn build_geometry(
                         Some(rows) => RowMap::Sparse(rows.clone(), consumed),
                     };
                     consumed += batch.num_rows();
-                    out.push((map, batch));
+                    Some((map, batch, boxes))
                 }
                 Err(e) => {
                     *err_ref.lock().unwrap() = Some(e.to_string());
-                    break;
+                    None
                 }
             }
-        }
-        out
+        })
     };
 
     let (builder, items, rows, bad, rg_boxes) = sel
         .into_par_iter()
-        .flat_map(per_group)
-        .map(|(map, batch)| {
-            let mut mb = MeshBuilder::default();
-            let mut items: Vec<PickItem> = Vec::new();
-            let mut bad = 0usize;
-            let mut rg_boxes: std::collections::HashMap<u32, [f64; 4]> = Default::default();
-            let tr = BulkTransformer::new(crs, display);
-            let rows = process_batch(
-                &batch, &map, encoding, &tr, display, &mut mb, &mut items, &mut bad,
-                rg_starts, &mut rg_boxes, geom_pos,
-                style.map(|st| (style_pos.unwrap(), &st.binning, st.per_area)),
-                crs.is_latlong,
-                spherical,
-            );
-            if let Some((handle, job)) = progress {
-                let d = done.fetch_add(rows, Ordering::Relaxed) + rows;
-                // The parallel decode+tessellate pass is ~70% of a load;
-                // chunking and the pick index follow single-threaded.
-                handle.send(LoadMsg::Progress {
-                    job,
-                    frac: 0.70 * (d as f32 / total as f32).min(1.0),
-                    stage: "decoding & tessellating".into(),
-                });
-            }
-            (mb, items, rows, bad, rg_boxes)
-        })
+        // flat_map_iter keeps each group's batches on the worker that
+        // read them and pulls them one at a time; flat_map would collect
+        // the group first.
+        .flat_map_iter(per_group)
+        // One accumulator per worker rather than one mesh per batch: the
+        // merge tree used to copy every vertex through log(batches)
+        // levels, doubling peak memory on a heavy layer.
+        .fold(
+            || {
+                (
+                    MeshBuilder::new(cell, outlines),
+                    Vec::new(),
+                    0usize,
+                    0usize,
+                    Default::default(),
+                )
+            },
+            |(mut mb, mut items, rows_acc, mut bad, mut rg_boxes): (
+                MeshBuilder,
+                Vec<PickItem>,
+                usize,
+                usize,
+                std::collections::HashMap<u32, [f64; 4]>,
+            ),
+             (map, batch, boxes)| {
+                let tr = BulkTransformer::new(crs, display);
+                let rows = if boxes {
+                    process_box_batch(
+                        &batch, &map, &tr, display, &mut mb, &mut items, &mut bad,
+                        rg_starts, &mut rg_boxes, box_pos.unwrap_or(0),
+                        covering.as_ref().map(|c| &c.children),
+                        style.map(|st| (box_style_pos.unwrap(), &st.binning, st.per_area)),
+                        crs.is_latlong,
+                    )
+                } else {
+                    process_batch(
+                        &batch, &map, encoding, &tr, display, &mut mb, &mut items, &mut bad,
+                        rg_starts, &mut rg_boxes, geom_pos,
+                        style.map(|st| (style_pos.unwrap(), &st.binning, st.per_area)),
+                        crs.is_latlong,
+                        spherical,
+                    )
+                };
+                if let Some((handle, job)) = progress {
+                    let d = done.fetch_add(rows, Ordering::Relaxed) + rows;
+                    // The parallel decode+tessellate pass is ~70% of a
+                    // load; chunking and the pick index follow
+                    // single-threaded.
+                    handle.send(LoadMsg::Progress {
+                        job,
+                        frac: 0.70 * (d as f32 / total as f32).min(1.0),
+                        stage: "decoding & tessellating".into(),
+                    });
+                }
+                (mb, items, rows_acc + rows, bad, rg_boxes)
+            },
+        )
         .reduce(
             || {
                 (
-                    MeshBuilder::default(),
+                    MeshBuilder::new(cell, outlines),
                     Vec::new(),
                     0usize,
                     0usize,
@@ -3235,6 +3578,138 @@ fn process_batch(
         }
     }
     batch.num_rows()
+}
+
+/// Batch path for `GroupSel::Boxes`: every feature drawn as its covering
+/// rectangle, from four doubles a row.
+///
+/// The rectangle is projected by its corners. On a feature small enough
+/// for its box to stand in for it that is exact to well under a pixel;
+/// on a large one it is not, which is the other half of why boxes are a
+/// wide-zoom state that refinement replaces.
+#[allow(clippy::too_many_arguments)]
+fn process_box_batch(
+    batch: &RecordBatch,
+    map: &RowMap,
+    tr: &BulkTransformer,
+    display: &DisplayCrs,
+    mb: &mut MeshBuilder,
+    items: &mut Vec<PickItem>,
+    bad: &mut usize,
+    rg_starts: &[u64],
+    rg_boxes: &mut std::collections::HashMap<u32, [f64; 4]>,
+    box_pos: usize,
+    children: Option<&[String; 4]>,
+    style: Option<(usize, &Binning, bool)>,
+    crs_latlong: bool,
+) -> usize {
+    use arrow::array::{Array, Float64Array, StructArray};
+    let n = batch.num_rows();
+    let Some(children) = children else {
+        *bad += n;
+        return n;
+    };
+    let Some(st) = batch.column(box_pos).as_any().downcast_ref::<StructArray>() else {
+        *bad += n;
+        return n;
+    };
+    let leaf = |name: &str| -> Option<Float64Array> {
+        let col = st.column_by_name(name)?;
+        arrow::compute::cast(col, &arrow::datatypes::DataType::Float64)
+            .ok()
+            .map(|a| a.as_any().downcast_ref::<Float64Array>().unwrap().clone())
+    };
+    let (Some(xmin), Some(ymin), Some(xmax), Some(ymax)) = (
+        leaf(&children[0]),
+        leaf(&children[1]),
+        leaf(&children[2]),
+        leaf(&children[3]),
+    ) else {
+        *bad += n;
+        return n;
+    };
+    let bins: Option<RowBins> = style.map(|(pos, binning, per_area)| match binning {
+        Binning::Breaks(breaks) if per_area => RowBins::PerArea {
+            vals: batch_values(batch.column(pos)),
+            breaks: breaks.clone(),
+            latlong: crs_latlong,
+        },
+        _ => RowBins::Pre(batch_bins(batch.column(pos), binning)),
+    });
+    for row in 0..n {
+        // A feature with no geometry has no box either, and that is the
+        // file stating a fact rather than failing: the geometry path
+        // skips null geometries silently and this one must agree, or a
+        // dataset with a single empty row reports a decode error it does
+        // not have. Present-but-unusable values below are a real fault.
+        if st.is_null(row)
+            || xmin.is_null(row)
+            || ymin.is_null(row)
+            || xmax.is_null(row)
+            || ymax.is_null(row)
+        {
+            continue;
+        }
+        let (x0, y0, x1, y1) = (
+            xmin.value(row),
+            ymin.value(row),
+            xmax.value(row),
+            ymax.value(row),
+        );
+        if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+            *bad += 1;
+            continue;
+        }
+        let global = map.global(row);
+        let fref = FeatureRef { index: global as u32 };
+        grow_rg_box(rg_boxes, rg_of(global, rg_starts), [x0, y0, x1, y1]);
+        match &bins {
+            Some(RowBins::Pre(b)) => mb.bin = b[row],
+            // Area normalization falls back to the box's own area, which
+            // is what there is to work with before the geometry is read.
+            Some(RowBins::PerArea { vals, breaks, latlong }) => {
+                let poly = geo_types::Geometry::Polygon(geo_types::Polygon::new(
+                    geo_types::LineString::from(vec![
+                        (x0, y0),
+                        (x1, y0),
+                        (x1, y1),
+                        (x0, y1),
+                        (x0, y0),
+                    ]),
+                    Vec::new(),
+                ));
+                mb.bin = norm_bin(vals[row], ground_area(&poly, *latlong), breaks);
+            }
+            None => {}
+        }
+        // Project the two corners only. The box is axis-aligned in the
+        // data CRS and stays a box on screen at the scale it is used;
+        // carrying it through geo/lyon instead costs microseconds and
+        // kilobytes of churn per feature, times millions of features.
+        let (mut px0, mut py0, mut px1, mut py1) = (x0, y0, x1, y1);
+        if !tr.apply(&mut px0, &mut py0) || !tr.apply(&mut px1, &mut py1) {
+            *bad += 1;
+            continue;
+        }
+        let w0 = display.world_from_projected(px0, py0);
+        let w1 = display.world_from_projected(px1, py1);
+        let rect = [
+            w0[0].min(w1[0]),
+            w0[1].min(w1[1]),
+            w0[0].max(w1[0]),
+            w0[1].max(w1[1]),
+        ];
+        if !rect.iter().all(|v| v.is_finite()) {
+            *bad += 1;
+            continue;
+        }
+        let added = mb.add_rect(rect);
+        items.push(PickItem {
+            bbox: added.bbox,
+            feature: fref,
+        });
+    }
+    n
 }
 
 /// Accessor over the three arrow binary array flavors.
@@ -3557,6 +4032,31 @@ pub fn build_geometry_for_test(
         .map(|(g, r, b, _, _)| (g, r, b))
 }
 
+/// The first `groups` row groups, from their covering boxes or from
+/// their geometry. Bounded on purpose: the geometry side of a land-cover
+/// file is gigabytes, and a test that quietly took every group would be
+/// the very thing this path exists to avoid.
+#[cfg(test)]
+pub fn build_selection_for_test(
+    store: &FeatureStore,
+    crs: &Crs,
+    display: &DisplayCrs,
+    groups: usize,
+    boxes: bool,
+    style: Option<&StyleSel>,
+) -> Result<(super::layer::LayerGeometry, usize, usize), String> {
+    let sel: Vec<GroupSel> = (0..groups as u32)
+        .map(|g| {
+            if boxes {
+                GroupSel::Boxes { group: g, rect: None }
+            } else {
+                GroupSel::All(g)
+            }
+        })
+        .collect();
+    build_geometry(store, crs, display, None, sel, None, style).map(|(g, r, b, _, _)| (g, r, b))
+}
+
 #[cfg(test)]
 mod bbox_transform_tests {
     use super::*;
@@ -3810,6 +4310,620 @@ mod tess_validation {
 mod pruning_tests {
     use super::*;
 
+    /// Manual harness: build geometry over the first `GEOPQ_GROUPS` row
+    /// groups of `GEOPQ_FILE` and report rows and wall time. Peak memory
+    /// is sampled from outside by the caller.
+    ///
+    /// The point is that peak footprint must be set by how many workers
+    /// are decoding, not by how many row groups the file has. Run it at
+    /// several group counts: a flat peak means the pipeline is bounded,
+    /// a rising one means something accumulates.
+    #[test]
+    #[ignore = "needs a local file; run manually under a memory guard"]
+    fn bounded_build_over_n_groups() {
+        let Ok(file) = std::env::var("GEOPQ_FILE") else {
+            eprintln!("set GEOPQ_FILE");
+            return;
+        };
+        let n: usize = std::env::var("GEOPQ_GROUPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+        let path = std::path::PathBuf::from(&file);
+        let (store, crs, _info, _rg) = open_store(&Source::Local(path)).unwrap();
+        let total = store.rg_starts().len() - 1;
+        let n = n.min(total);
+        let bytes: u64 = (0..n).map(|g| store.rg_geom_bytes(g as u32)).sum();
+        eprintln!(
+            "{n}/{total} row groups, {:.2} GB uncompressed geometry",
+            bytes as f64 / 1e9
+        );
+        let display = crate::data::crs::DisplayCrs::hobo_dyer();
+        // GEOPQ_BOXES=1 draws every feature from its covering box instead
+        // of reading geometry: the same rows, the other representation.
+        let boxes = std::env::var("GEOPQ_BOXES").is_ok_and(|v| v == "1");
+        // GEOPQ_STYLE=1 applies the schema's colour map, as an open does.
+        let style_by = std::env::var("GEOPQ_STYLE")
+            .is_ok_and(|v| v == "1")
+            .then(|| crate::data::colormap::schema_style(&store.style_columns()))
+            .flatten();
+        let style_sel = style_by.as_ref().and_then(|sb| resolve_style(&store, sb));
+        eprintln!(
+            "style: {}",
+            style_sel.as_ref().map_or("none".to_string(), |st| format!(
+                "col {} outlines {}",
+                st.col, st.outlines
+            ))
+        );
+        let jobs: Vec<GroupSel> = (0..n as u32)
+            .map(|g| {
+                if boxes {
+                    GroupSel::Boxes { group: g, rect: None }
+                } else {
+                    GroupSel::All(g)
+                }
+            })
+            .collect();
+        eprintln!("source: {}", if boxes { "covering boxes" } else { "geometry" });
+        // What the planner would decide for a whole-file selection.
+        let all_bytes: u64 = (0..total).map(|g| store.rg_geom_bytes(g as u32)).sum();
+        eprintln!(
+            "planner: covering={} polygons_only={} over_budget={:?}",
+            store.covering.is_some(),
+            store.polygons_only,
+            preview_stride(store.total_rows(), all_bytes),
+        );
+        let t0 = Instant::now();
+        let (geometry, rows, bad, _boxes, _resolved) =
+            build_geometry(&store, &crs, &display, None, jobs, None, style_sel.as_ref())
+                .unwrap();
+        eprintln!("bad geometries: {bad}");
+        let ms = t0.elapsed().as_millis();
+        let (mut fills, mut lines, mut points) = (0usize, 0usize, 0usize);
+        for c in geometry.chunks.iter() {
+            let (f, l, p) = c.heap_bytes();
+            fills += f;
+            lines += l;
+            points += p;
+        }
+        eprintln!(
+            "built {rows} rows, {} chunks in {ms} ms",
+            geometry.chunks.len()
+        );
+        eprintln!(
+            "mesh: fills {:.0} MB, lines {:.0} MB, points {:.0} MB, total {:.2} GB \
+             ({:.1}× the {:.2} GB of source geometry)",
+            fills as f64 / 1e6,
+            lines as f64 / 1e6,
+            points as f64 / 1e6,
+            (fills + lines + points) as f64 / 1e9,
+            (fills + lines + points) as f64 / bytes.max(1) as f64,
+            bytes as f64 / 1e9,
+        );
+    }
+
+    /// A box build keeps every feature, reads no geometry, and costs a
+    /// fraction of the mesh the same rows would tessellate into.
+    #[test]
+    fn boxes_keep_every_feature_for_a_fraction_of_the_mesh() {
+        let path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/parcels_hilbert.parquet"
+        ));
+        if !path.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let (store, crs, _info, _rg) = open_store(&Source::Local(path)).unwrap();
+        assert!(store.covering.is_some(), "fixture must carry a covering column");
+        let display = crate::data::crs::DisplayCrs::hobo_dyer();
+        let groups: Vec<u32> = (0..2.min(store.rg_starts().len() as u32 - 1)).collect();
+        let expected: u64 = groups
+            .iter()
+            .map(|&g| store.rg_starts()[g as usize + 1] - store.rg_starts()[g as usize])
+            .sum();
+
+        let boxes: Vec<GroupSel> = groups
+            .iter()
+            .map(|&g| GroupSel::Boxes { group: g, rect: None })
+            .collect();
+        let (box_geom, box_rows, bad, _rg, resolved) =
+            build_geometry(&store, &crs, &display, None, boxes, None, None).unwrap();
+        assert_eq!(box_rows as u64, expected, "every row is represented");
+        assert_eq!(bad, 0, "no feature should fail from its own bbox");
+        for (_, st) in &resolved {
+            assert!(matches!(st, GroupLoad::Boxes { .. }));
+            // Boxes are an approximation, so the viewport is never
+            // satisfied by them and refinement always has work to do.
+            assert!(!st.is_full());
+            assert!(!st.covers([0.0, 0.0, 1.0, 1.0]));
+        }
+        // One pick entry per feature: picking still finds every row.
+        assert_eq!(box_geom.rtree.size() as u64, expected);
+        // Two triangles a feature, no outlines.
+        let (bf, bl, _) = box_geom
+            .chunks
+            .iter()
+            .map(|c| c.heap_bytes())
+            .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
+        assert_eq!(bl, 0, "boxes carry no line segments");
+        let quads: usize = box_geom.chunks.iter().map(|c| c.fill_indices.len()).sum();
+        assert_eq!(quads as u64, expected * 6);
+
+        let full: Vec<GroupSel> = groups.iter().copied().map(GroupSel::All).collect();
+        let (geom, rows, _, _, _) =
+            build_geometry(&store, &crs, &display, None, full, None, None).unwrap();
+        assert_eq!(rows as u64, expected);
+        let (gf, gl, _) = geom
+            .chunks
+            .iter()
+            .map(|c| c.heap_bytes())
+            .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
+        assert!(
+            (bf + bl) * 4 < gf + gl,
+            "boxes should be far cheaper: {} vs {} bytes",
+            bf + bl,
+            gf + gl
+        );
+    }
+
+    /// Box mode draws every selected feature at its covering bbox, with
+    /// no geometry read at all, and keeps the pick index exact.
+    #[test]
+    fn boxes_draw_every_feature_without_reading_geometry() {
+        let path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/parcels_hilbert.parquet"
+        ));
+        if !path.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let (store, crs, _info, _rg) = open_store(&Source::Local(path)).unwrap();
+        assert!(store.covering.is_some(), "fixture must carry a covering column");
+        let display = crate::data::crs::DisplayCrs::hobo_dyer();
+        let groups = [0u32, 1];
+        let rows_expected: u64 = groups
+            .iter()
+            .map(|&g| store.rg_starts()[g as usize + 1] - store.rg_starts()[g as usize])
+            .sum();
+
+        let jobs: Vec<GroupSel> = groups
+            .iter()
+            .map(|&g| GroupSel::Boxes { group: g, rect: None })
+            .collect();
+        let (geom, rows, bad, _boxes, resolved) =
+            build_geometry(&store, &crs, &display, None, jobs, None, None).unwrap();
+        assert_eq!(rows as u64, rows_expected, "every row is represented");
+        assert_eq!(bad, 0);
+        for (_, st) in &resolved {
+            assert!(
+                matches!(st, GroupLoad::Boxes { rect: None }),
+                "expected a box state, got {st:?}"
+            );
+            // A box state never satisfies a viewport, so zooming refines it.
+            assert!(!st.covers([0.0, 0.0, 1.0, 1.0]));
+        }
+
+        // Two triangles a feature and not one line segment: the outline of
+        // a box is not worth storing, and its absence is what makes the
+        // mesh two orders of magnitude smaller than the geometry's.
+        let tris: usize = geom.chunks.iter().map(|c| c.fill_indices.len() / 3).sum();
+        assert_eq!(tris, 2 * rows_expected as usize);
+        let segs: usize = geom
+            .chunks
+            .iter()
+            .flat_map(|c| c.lines.iter())
+            .map(|l| l.segments.len())
+            .sum();
+        assert_eq!(segs, 0, "boxes carry no outline");
+
+        // Each feature is indexed at its own covering bbox: picking works
+        // exactly as it does on real geometry.
+        assert_eq!(geom.rtree.size(), rows_expected as usize);
+        let sample: Vec<u32> = (0..rows_expected.min(200) as u32).collect();
+        let want: std::collections::HashSet<u32> = sample.iter().copied().collect();
+        let mut seen = 0usize;
+        for item in geom.rtree.iter() {
+            if want.contains(&item.feature.index) {
+                seen += 1;
+                assert!(item.bbox[0] <= item.bbox[2] && item.bbox[1] <= item.bbox[3]);
+            }
+        }
+        assert_eq!(seen, sample.len(), "every sampled row is in the pick index");
+    }
+
+    /// A box layer covers its whole extent from the first frame, even
+    /// when it opens while the camera is somewhere else entirely.
+    ///
+    /// Loading a second layer does not move the camera, so a European
+    /// dataset opened over Massachusetts would otherwise select no row
+    /// groups at all, and zooming towards Europe would find nothing to
+    /// draw until the viewport got small enough for real geometry.
+    #[test]
+    fn a_box_layer_loads_every_group_wherever_the_camera_is() {
+        let path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/parcels_hilbert.parquet"
+        ));
+        if !path.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let (store, _crs, _info, rg) = open_store(&Source::Local(path)).unwrap();
+        let (_, boxes) = rg.expect("row-group boxes");
+        let n_rg = store.rg_starts().len() - 1;
+        // A viewport on the far side of the planet from the data.
+        let elsewhere = [-1.0e7, -1.0e7, -9.9e6, -9.9e6];
+        assert!(
+            intersecting_rgs(&boxes, elsewhere).is_empty(),
+            "the fixture must not intersect this rect"
+        );
+        let sel = plan_viewport_selection(
+            &store,
+            "t",
+            Some(&boxes),
+            Some(elsewhere),
+            "test",
+        );
+        assert_eq!(sel.len(), n_rg, "every group is planned, not just visible ones");
+        assert!(sel.iter().all(|s| matches!(s, GroupSel::Boxes { .. })));
+    }
+
+    /// On a box layer every group must draw something, whatever its
+    /// decode state. A group that contributes nothing is a hole the size
+    /// of a row group, and no camera move fills it: zooming out does not
+    /// re-plan a loaded layer.
+    #[test]
+    fn every_group_of_a_box_layer_draws_something() {
+        use super::rebuild_selection;
+        let starts = [0u64, 100, 200, 300, 400, 500];
+        let loaded = vec![
+            // Refined for some viewport.
+            GroupLoad::Rows { ranges: vec![(0, 10)], rect: [0.0; 4] },
+            // Its bbox met the viewport, none of its features did. This
+            // is the state that used to vanish.
+            GroupLoad::Rows { ranges: Vec::new(), rect: [0.0; 4] },
+            GroupLoad::Boxes { rect: None },
+            GroupLoad::Full,
+            GroupLoad::None,
+        ];
+        let sel = rebuild_selection(&loaded, &starts, true);
+        for g in [0u32, 1, 2, 3] {
+            assert!(
+                sel.iter().any(|s| s.group() == g),
+                "group {g} contributes nothing: {sel:?}"
+            );
+        }
+        // The partly refined group brings its geometry and its gaps.
+        assert!(sel.iter().any(|s| matches!(s, GroupSel::Ranges(0, _))));
+        assert!(sel.iter().any(|s| matches!(s, GroupSel::BoxRanges { group: 0, .. })));
+        // The empty one falls back to boxes over the whole group.
+        assert!(sel
+            .iter()
+            .any(|s| matches!(s, GroupSel::Boxes { group: 1, rect: None })));
+        // A group that was never loaded stays absent — there is nothing
+        // to show and nothing was dropped.
+        assert!(!sel.iter().any(|s| s.group() == 4));
+
+        // Without boxes to fall back on, an empty selection is still
+        // empty: an ordinary indexed layer must not gain phantom boxes.
+        let plain = rebuild_selection(&loaded, &starts, false);
+        assert!(!plain.iter().any(|s| s.group() == 1));
+        assert!(!plain.iter().any(|s| matches!(s, GroupSel::BoxRanges { .. })));
+    }
+
+    /// A null geometry is not a decode failure. Real files carry rows
+    /// with no shape (MassGIS parcels has exactly one), and the geometry
+    /// path skips them silently — the box path has to agree, or opening
+    /// such a file reports an error that does not exist.
+    #[test]
+    fn a_row_without_geometry_is_not_a_bad_geometry() {
+        use arrow::array::{ArrayRef, Float64Array, StructArray};
+        use arrow::datatypes::{DataType, Field};
+        // Three features; the middle one has no box, as a null geometry
+        // leaves behind.
+        let leaf = |v: [Option<f64>; 3]| Arc::new(Float64Array::from(v.to_vec())) as ArrayRef;
+        let fields: Vec<Field> = ["xmin", "ymin", "xmax", "ymax"]
+            .iter()
+            .map(|n| Field::new(*n, DataType::Float64, true))
+            .collect();
+        let cols: Vec<ArrayRef> = vec![
+            leaf([Some(0.0), None, Some(2.0)]),
+            leaf([Some(0.0), None, Some(2.0)]),
+            leaf([Some(1.0), None, Some(3.0)]),
+            leaf([Some(1.0), None, Some(3.0)]),
+        ];
+        let st = StructArray::new(fields.clone().into(), cols, None);
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "bbox",
+            DataType::Struct(fields.into()),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(st) as ArrayRef]).unwrap();
+
+        let crs = Crs::wgs84();
+        let display = crate::data::crs::DisplayCrs::hobo_dyer();
+        let tr = BulkTransformer::new(&crs, &display);
+        let mut mb = MeshBuilder::new(crate::data::geometry::BOX_CHUNK_WORLD, false);
+        let mut items: Vec<PickItem> = Vec::new();
+        let mut bad = 0usize;
+        let mut rg_boxes: std::collections::HashMap<u32, [f64; 4]> = Default::default();
+        let children = [
+            "xmin".to_string(),
+            "ymin".to_string(),
+            "xmax".to_string(),
+            "ymax".to_string(),
+        ];
+        let rows = process_box_batch(
+            &batch,
+            &RowMap::Contiguous(0),
+            &tr,
+            &display,
+            &mut mb,
+            &mut items,
+            &mut bad,
+            &[0, 3],
+            &mut rg_boxes,
+            0,
+            Some(&children),
+            None,
+            true,
+        );
+        assert_eq!(rows, 3, "every row is accounted for");
+        assert_eq!(bad, 0, "a missing box is not a failure");
+        assert_eq!(items.len(), 2, "the two real features are drawn and pickable");
+    }
+
+    /// A fill-only palette builds no outlines, and that is most of the
+    /// mesh: the same features, same fills, without the LOD stack.
+    #[test]
+    fn a_fill_only_palette_builds_no_outlines() {
+        let path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/polygons_5k_l93.parquet"
+        ));
+        if !path.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let (store, crs, _info, _rg) = open_store(&Source::Local(path)).unwrap();
+        let display = crate::data::crs::DisplayCrs::hobo_dyer();
+        let col = store
+            .style_columns()
+            .into_iter()
+            .find(|(_, numeric)| !*numeric)
+            .map(|(n, _)| n)
+            .expect("a text column to style by");
+        let segs = |sel: &StyleSel| {
+            let (g, _, _) =
+                build_selection_for_test(&store, &crs, &display, 1, false, Some(sel)).unwrap();
+            let s: usize = g
+                .chunks
+                .iter()
+                .flat_map(|c| c.lines.iter())
+                .map(|l| l.segments.len())
+                .sum();
+            let f: usize = g.chunks.iter().map(|c| c.fill_indices.len()).sum();
+            (s, f)
+        };
+        let base = resolve_style(
+            &store,
+            &crate::data::layer::StyleBy {
+                column: col.clone(),
+                ramp: crate::data::layer::Ramp::Viridis,
+                mode: crate::data::layer::StyleMode::Categorical {
+                    values: vec!["x".to_string()],
+                    colors: None,
+                    labels: None,
+                },
+                hidden_bins: 0,
+                per_area: false,
+                classified_rows: None,
+            },
+        )
+        .expect("styleable");
+        assert!(base.outlines, "a generic palette keeps its outlines");
+        let mut palette = base.clone();
+        palette.outlines = false;
+
+        let (with_segs, with_fills) = segs(&base);
+        let (without_segs, without_fills) = segs(&palette);
+        assert!(with_segs > 0, "the ordinary path outlines its polygons");
+        assert_eq!(without_segs, 0, "a fill palette builds no segments");
+        assert_eq!(with_fills, without_fills, "same fills either way");
+    }
+
+    /// A partly refined group keeps complete coverage: real rows where it
+    /// was refined, boxes everywhere else in the same group.
+    ///
+    /// Without the gap fill, consolidating drops the boxes of any group
+    /// that has been refined once, and the map shows geometry inside the
+    /// old refine rect and a row-group-shaped hole around it.
+    #[test]
+    fn a_partly_refined_group_still_covers_its_gaps() {
+        let path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/parcels_hilbert.parquet"
+        ));
+        if !path.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let (store, crs, _info, _rg) = open_store(&Source::Local(path)).unwrap();
+        let display = crate::data::crs::DisplayCrs::hobo_dyer();
+        let starts = store.rg_starts();
+        let group_rows = (starts[1] - starts[0]) as u32;
+        // Group 0 refined for one viewport: the first tenth of its rows.
+        let refined = vec![(0u32, group_rows / 10)];
+        let gaps = complement_ranges(&refined, group_rows);
+
+        let (geom, rows, _bad, _boxes, _resolved) = build_geometry(
+            &store,
+            &crs,
+            &display,
+            None,
+            vec![
+                GroupSel::Ranges(0, refined.clone()),
+                GroupSel::BoxRanges { group: 0, ranges: gaps },
+            ],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(rows as u64, group_rows as u64, "every row of the group is on the map");
+        // The refined tenth brought outlines; the rest is boxes, which
+        // carry none, so both representations are present at once.
+        let segs: usize = geom
+            .chunks
+            .iter()
+            .flat_map(|c| c.lines.iter())
+            .map(|l| l.segments.len())
+            .sum();
+        assert!(segs > 0, "the refined rows keep their real outlines");
+        let tris: usize = geom.chunks.iter().map(|c| c.fill_indices.len() / 3).sum();
+        let gap_rows = group_rows as usize - refined[0].1 as usize;
+        assert!(
+            tris >= 2 * gap_rows,
+            "at least two triangles per boxed row: {tris} for {gap_rows} gap rows"
+        );
+    }
+
+    /// A consolidating rebuild mixes box groups and refined groups in one
+    /// build, and each row appears exactly once.
+    ///
+    /// This is what stops boxes showing under the real geometry that
+    /// replaced them: an append only adds sections, so the layer has to be
+    /// rebuilt from the per-group states once a group leaves box display.
+    #[test]
+    fn a_mixed_rebuild_draws_each_row_once() {
+        let path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/parcels_hilbert.parquet"
+        ));
+        if !path.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let (store, crs, _info, _rg) = open_store(&Source::Local(path)).unwrap();
+        let display = crate::data::crs::DisplayCrs::hobo_dyer();
+        let starts = store.rg_starts();
+        let expected = starts[2] - starts[0];
+        // Group 0 refined to real rows, group 1 still on boxes: exactly
+        // the state a layer is in mid-zoom.
+        let sel = vec![
+            GroupSel::All(0),
+            GroupSel::Boxes { group: 1, rect: None },
+        ];
+        let (geom, rows, _bad, _boxes, resolved) =
+            build_geometry(&store, &crs, &display, None, sel, None, None).unwrap();
+        assert_eq!(rows as u64, expected, "each row built once, not twice");
+        let mut states: Vec<_> = resolved.iter().map(|(g, st)| (*g, st)).collect();
+        states.sort_by_key(|(g, _)| *g);
+        assert!(matches!(states[0].1, GroupLoad::Full));
+        assert!(matches!(states[1].1, GroupLoad::Boxes { .. }));
+        // The refined group brought outlines, the box group did not, so
+        // the mesh carries both kinds and neither is duplicated.
+        let segs: usize = geom
+            .chunks
+            .iter()
+            .flat_map(|c| c.lines.iter())
+            .map(|l| l.segments.len())
+            .sum();
+        assert!(segs > 0, "the refined group keeps its real outlines");
+    }
+
+    /// The fallback a store can offer when a selection is over budget.
+    #[test]
+    fn boxes_need_a_covering_column_and_polygons() {
+        use super::{over_budget_plan, OverBudget};
+        assert_eq!(over_budget_plan(true, true), OverBudget::Boxes);
+        // No covering column: nothing to draw but the geometry.
+        assert_eq!(over_budget_plan(false, true), OverBudget::Stride);
+        // Lines and points: a bounding box is not the feature. A road's
+        // box is a rectangle the road does not follow.
+        assert_eq!(over_budget_plan(true, false), OverBudget::Stride);
+        assert_eq!(over_budget_plan(false, false), OverBudget::Stride);
+    }
+
+    /// Manual: what refinement decides for a street-level viewport.
+    /// `GEOPQ_FILE=... GEOPQ_KM=8 cargo test --release refine_at_a_small_viewport
+    /// -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a local file"]
+    fn refine_at_a_small_viewport() {
+        let Ok(file) = std::env::var("GEOPQ_FILE") else {
+            eprintln!("set GEOPQ_FILE");
+            return;
+        };
+        let km: f64 = std::env::var("GEOPQ_KM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8.0);
+        let (store, _crs, _info, rg) =
+            open_store(&Source::Local(std::path::PathBuf::from(&file))).unwrap();
+        let (_, boxes) = rg.expect("row-group boxes");
+        // A viewport of `km` across, centred on a populated row group.
+        let b = boxes[boxes.len() / 2];
+        let (cx, cy) = ((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5);
+        let half = km * 1000.0 / 2.0;
+        let rect = [cx - half, cy - half, cx + half, cy + half];
+        let groups = intersecting_rgs(&boxes, rect);
+        eprintln!("{km} km viewport touches {} of {} row groups", groups.len(), boxes.len());
+
+        // What the app now asks for: this viewport's rows, per group.
+        let jobs: Vec<GroupSel> = groups.iter().map(|&g| GroupSel::Rect(g, rect)).collect();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        match prepare_refinement_jobs(&store, jobs, MAX_BUILD_ROWS, MAX_BUILD_GEOM_BYTES, &cancel).unwrap() {
+            RefinePlan::Ready(sel) => {
+                let rows: u64 = sel
+                    .iter()
+                    .map(|s| match s {
+                        GroupSel::ResolvedRect { ranges, .. } => {
+                            ranges.iter().map(|&(a, b)| (b - a) as u64).sum()
+                        }
+                        _ => 0,
+                    })
+                    .sum();
+                eprintln!("READY: {} selections, {rows} rows", sel.len());
+            }
+            RefinePlan::Deferred { rows, geom_bytes } => {
+                panic!("DEFERRED at {km} km: {rows} rows, {geom_bytes:?} bytes");
+            }
+        }
+    }
+
+    /// Read batches are bounded by bytes, whatever a row weighs: one
+    /// batch per worker is the decode footprint, and a fixed row count
+    /// makes it a property of the dataset rather than of the machine.
+    #[test]
+    fn read_batches_are_sized_in_bytes() {
+        let path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/parcels_hilbert.parquet"
+        ));
+        if !path.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let (store, _crs, _info, _rg) = open_store(&Source::Local(path)).unwrap();
+        let n_rg = store.rg_starts().len() - 1;
+        for g in 0..n_rg {
+            let rows = store.rg_starts()[g + 1] - store.rg_starts()[g];
+            let per_row = (store.rg_geom_bytes(g as u32) / rows).max(1);
+            let n = store.batch_rows(g, BATCH_TARGET_BYTES, BATCH_SIZE) as u64;
+            assert!(n >= 1, "group {g} would read nothing");
+            // Within one row of the budget, or capped by the row ceiling.
+            assert!(
+                n == BATCH_SIZE as u64 || (n - 1) * per_row <= BATCH_TARGET_BYTES,
+                "group {g}: {n} rows × {per_row} B over budget"
+            );
+            // A budget smaller than one row still reads that row: a
+            // single 200k-vertex polygon must not stall the decode.
+            assert_eq!(store.batch_rows(g, 1, BATCH_SIZE), 1);
+        }
+    }
+
     /// End-to-end pruning against the Hilbert-sorted covering fixture:
     /// covering stats must be detected, and a small-viewport load must
     /// decode a small fraction of the row groups and rows.
@@ -3898,6 +5012,7 @@ mod pruning_tests {
                 GroupLoad::Full => {} // a group fully inside the viewport
                 GroupLoad::None => panic!("group {g} unresolved"),
                 GroupLoad::Preview { .. } => panic!("group {g} unexpectedly previewed"),
+                GroupLoad::Boxes { .. } => panic!("group {g} unexpectedly boxed"),
             }
         }
         // Every decoded feature actually intersects the viewport rect:
@@ -4782,7 +5897,7 @@ mod native_2_0_tests {
         assert_eq!(selected, 64, "{ranges:?}");
         // And the planner uses Rect for a sub-extent viewport.
         let boxes = vec![[2.0, 48.0, 2.15, 48.15], [2.0, 48.0, 2.15, 48.15]];
-        let sel = plan_viewport_selection(&store, "t", Some(&boxes), Some(rect));
+        let sel = plan_viewport_selection(&store, "t", Some(&boxes), Some(rect), "test");
         assert!(
             sel.iter().all(|s| matches!(s, GroupSel::Rect(_, _))),
             "{sel:?}"
@@ -4894,14 +6009,15 @@ mod reload_plan_tests {
             "t",
             Some(&boxes),
             Some([9.5, -1.0, 12.0, 2.0]),
+            "test",
         );
         assert!(matches!(sel.as_slice(), [GroupSel::Rect(1, _)]), "{sel:?}");
         // Disjoint rect: nothing to read.
         let sel =
-            plan_viewport_selection(&store, "t", Some(&boxes), Some([50.0, 0.0, 60.0, 1.0]));
+            plan_viewport_selection(&store, "t", Some(&boxes), Some([50.0, 0.0, 60.0, 1.0]), "test");
         assert!(sel.is_empty(), "{sel:?}");
         // No rect: everything.
-        let sel = plan_viewport_selection(&store, "t", Some(&boxes), None);
+        let sel = plan_viewport_selection(&store, "t", Some(&boxes), None, "test");
         assert_eq!(sel.len(), 3);
         assert!(matches!(sel[0], GroupSel::All(0)));
         assert!(matches!(sel[2], GroupSel::All(2)));
@@ -5199,6 +6315,7 @@ mod xy_tests {
             col: id_col,
             binning: Binning::Breaks(crate::data::layer::equal_interval_breaks(lo, hi, crate::data::layer::STYLE_BINS)),
             per_area: false,
+            outlines: true,
         };
         let (g_styled, rows_styled, _, _, _) =
             build_geometry_styled_for_test(&store, &crs, &display, &style).unwrap();
@@ -5372,6 +6489,7 @@ mod preview_rect_tests {
             &store,
             vec![GroupSel::Rect(0, rect)],
             in_rect.len() as u64,
+            MAX_BUILD_GEOM_BYTES,
             &cancel,
         )
         .unwrap();
@@ -5384,17 +6502,18 @@ mod preview_rect_tests {
                 }
                 _ => panic!("expected an exact resolved rect"),
             },
-            RefinePlan::Deferred(_) => panic!("selection unexpectedly deferred"),
+            RefinePlan::Deferred { .. } => panic!("selection unexpectedly deferred"),
         }
         assert!(matches!(
             prepare_refinement_jobs(
                 &store,
                 vec![GroupSel::Rect(0, rect)],
                 in_rect.len() as u64 - 1,
+                MAX_BUILD_GEOM_BYTES,
                 &cancel,
             )
             .unwrap(),
-            RefinePlan::Deferred(_)
+            RefinePlan::Deferred { .. }
         ));
 
         let display = crate::data::crs::DisplayCrs::hobo_dyer();
@@ -5433,14 +6552,15 @@ mod budget_tests {
     fn the_budget_counts_bytes_as_well_as_rows() {
         // Points: millions of rows, nothing to decode. Fits.
         assert_eq!(preview_stride(2_000_000, 40 << 20), None);
-        // MassGIS parcels: 2.56M rows, 970 MB. Over on rows only, and
-        // the stride must stay what it has always been.
-        assert_eq!(preview_stride(2_557_399, 969 << 20), Some(3));
+        // MassGIS parcels: 2.56M rows, 970 MB. Over on both counts now
+        // that the byte target reflects the mesh those bytes become —
+        // and bytes, not rows, set the stride (1/8, not 1/3).
+        assert_eq!(preview_stride(2_557_399, 969 << 20), Some(8));
         // CORINE land cover: 2.38M rows — *under* the row budget, which
         // is why this file used to take the full-decode path and eat
         // tens of gigabytes — but 7.18 GB of geometry.
         let stride = preview_stride(2_375_406, 7_180 << 20).unwrap();
-        assert!(stride >= 14, "expected a deep stride, got 1/{stride}");
+        assert!(stride >= 28, "expected a deep stride, got 1/{stride}");
         // Exactly at both limits is still fine; a byte over is not.
         assert_eq!(preview_stride(MAX_BUILD_ROWS, MAX_BUILD_GEOM_BYTES), None);
         assert!(preview_stride(MAX_BUILD_ROWS, MAX_BUILD_GEOM_BYTES + 1).is_some());

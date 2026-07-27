@@ -171,6 +171,14 @@ pub struct ViewerApp {
     /// Bumped when overlays (graticule/coastline) are rebuilt for a new projection.
     graticule_generation: u64,
     show_graticule: bool,
+    /// A feature narrower than this many screen pixels is drawn from its
+    /// bounding box instead of its geometry. Raise it to keep the fast
+    /// box view longer, lower it to get real outlines sooner.
+    box_threshold_px: f64,
+    /// Geometry a single refinement pass may decode, in MB. The safety
+    /// cap, not the display rule: it exists so one dense viewport cannot
+    /// exhaust memory. Raising it loads more before it gives up.
+    refine_budget_mb: u32,
     show_coastline: bool,
     /// Coastline generation the overlay chunks are currently built from
     /// (embedded 1:50m at world zoom, fetched 1:10m when zoomed in).
@@ -225,9 +233,14 @@ pub struct ViewerApp {
     /// Layers whose refinement was stopped by the user: paused until the
     /// camera moves again (else the same viewport would respawn it).
     refine_hold: HashSet<u64>,
-    /// Last RefineDeferred row counts (layer id -> at_least_rows), for
-    /// the "viewport too dense" badge. Cleared with refine_hold.
-    refine_deferred: HashMap<u64, u64>,
+    /// Layers rebuilding purely to merge their sections (after boxes were
+    /// replaced by real rows). They keep drawing throughout: nothing
+    /// about their coordinates has changed.
+    consolidating: HashSet<u64>,
+    /// Last RefineDeferred verdict per layer: the rows the selection had
+    /// reached, and the geometry bytes when those are what stopped it.
+    /// Drives the badge, and is cleared with refine_hold.
+    refine_deferred: HashMap<u64, (u64, Option<u64>)>,
     /// Bumped on every camera move; refinement verdicts carry the epoch
     /// they were spawned under, so a deferral computed for an obsolete
     /// viewport can never arm the hold against the current one.
@@ -697,6 +710,8 @@ impl ViewerApp {
             coastline_chunks,
             graticule_generation: 0,
             show_graticule: true,
+            box_threshold_px: 3.0,
+            refine_budget_mb: 512,
             show_coastline: true,
             coast_level: Default::default(),
             rg_overlays: HashMap::new(),
@@ -730,6 +745,7 @@ impl ViewerApp {
             fit_after_rebuilds: false,
             refine_hold: HashSet::new(),
             refine_deferred: HashMap::new(),
+            consolidating: HashSet::new(),
             cam_epoch: 0,
             refine_epoch: HashMap::new(),
             strip_probe: 0,
@@ -1087,6 +1103,7 @@ impl ViewerApp {
             l.loaded.clone(),
             fresh_cancel(&mut self.rebuild_cancel, l.id),
             l.style.style_by.clone(),
+            l.box_layer,
         );
     }
 
@@ -1119,6 +1136,7 @@ impl ViewerApp {
             l.generation += 1;
             // Free the old meshes immediately — that is the point.
             l.sections = Vec::new();
+            l.draw_gen += 1;
             let n = l.store.rg_starts().len().saturating_sub(1);
             l.loaded = vec![crate::data::layer::GroupLoad::None; n];
             self.rebuilding.insert(l.id);
@@ -1165,6 +1183,7 @@ impl ViewerApp {
             l.loaded.clone(),
             fresh_cancel(&mut self.rebuild_cancel, l.id),
             l.style.style_by.clone(),
+            l.box_layer,
         );
     }
 
@@ -1408,6 +1427,7 @@ impl ViewerApp {
                             layer.loaded.clone(),
                             fresh_cancel(&mut self.rebuild_cancel, layer.id),
                             layer.style.style_by.clone(),
+                            layer.box_layer,
                         );
                     }
                     // Category z-order: polygons at the bottom, lines above,
@@ -1477,9 +1497,11 @@ impl ViewerApp {
                     if let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) {
                         if l.generation == generation {
                             l.sections = vec![geometry];
+                            l.draw_gen += 1;
                             l.stats.build_ms = stats_build_ms;
                             l.stats.bad_geoms = bad_geoms;
                             self.rebuilding.remove(&layer_id);
+                            self.consolidating.remove(&layer_id);
                             self.rebuild_cancel.remove(&layer_id);
                             applied = true;
                         }
@@ -1508,11 +1530,13 @@ impl ViewerApp {
                     if let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) {
                         if l.generation == generation {
                             l.sections = vec![geometry];
+                            l.draw_gen += 1;
                             l.loaded = loaded;
                             l.feature_count = rows;
                             l.stats.build_ms = build_ms;
                             l.stats.bad_geoms = bad_geoms;
                             self.rebuilding.remove(&layer_id);
+                            self.consolidating.remove(&layer_id);
                             self.rebuild_cancel.remove(&layer_id);
                             if self.rebuilding.is_empty() {
                                 release_freed_memory();
@@ -1529,6 +1553,7 @@ impl ViewerApp {
                     loaded,
                     done,
                 } => {
+                    let mut boxes_replaced = false;
                     // Appends stream in batches; the layer stays "appending"
                     // (no re-refine, spinner shown) until the last one.
                     if done {
@@ -1542,14 +1567,45 @@ impl ViewerApp {
                                 l.name,
                                 loaded.len()
                             );
+                            // No draw_gen bump: a push lands at a fresh
+                            // section index, so it takes a key of its own.
+                            // Advancing the generation would re-key the
+                            // sections already uploaded and force them to
+                            // re-upload from CPU meshes that were freed
+                            // after their first upload — the layer would
+                            // blank out on every append.
                             l.sections.push(geometry);
                             l.feature_count += rows;
                             for (g, st) in loaded {
                                 if let Some(slot) = l.loaded.get_mut(g as usize) {
+                                    // A group leaving box display leaves its
+                                    // boxes behind in the earlier section:
+                                    // an append only adds. On a preview that
+                                    // overlap was 1/stride of the features
+                                    // and invisible under real coverage;
+                                    // here it is every feature, so the box
+                                    // fills sit under the real polygons
+                                    // until the layer is consolidated.
+                                    if matches!(slot, crate::data::layer::GroupLoad::Boxes { .. })
+                                    {
+                                        boxes_replaced = true;
+                                    }
                                     *slot = st;
                                 }
                             }
+                            // Every append on a box layer is consolidated:
+                            // its jobs are viewport rects, which re-decode
+                            // rows the layer already had, and the rebuild
+                            // is what removes those duplicates and
+                            // restores boxes over the rest of the group.
+                            if l.box_layer {
+                                boxes_replaced = true;
+                            }
                         }
+                    }
+                    // Rebuild once the append is complete, not per batch.
+                    if boxes_replaced && done {
+                        self.consolidate_after_boxes(layer_id, ctx);
                     }
                 }
                 LoadMsg::RebuildFailed {
@@ -1568,6 +1624,7 @@ impl ViewerApp {
                         .is_some_and(|l| l.generation == generation);
                     if current {
                         self.rebuilding.remove(&layer_id);
+                        self.consolidating.remove(&layer_id);
                         self.rebuild_cancel.remove(&layer_id);
                     }
                     if error != loader::CANCELLED {
@@ -1593,6 +1650,7 @@ impl ViewerApp {
                 LoadMsg::RefineDeferred {
                     layer_id,
                     at_least_rows,
+                    geom_bytes,
                 } => {
                     self.appending.remove(&layer_id);
                     self.append_cancel.remove(&layer_id);
@@ -1604,7 +1662,8 @@ impl ViewerApp {
                     // which the next frame will kick off.
                     if self.refine_epoch.get(&layer_id) == Some(&self.cam_epoch) {
                         self.refine_hold.insert(layer_id);
-                        self.refine_deferred.insert(layer_id, at_least_rows);
+                        self.refine_deferred
+                            .insert(layer_id, (at_least_rows, geom_bytes));
                     }
                 }
                 LoadMsg::QualityGate {
@@ -1748,6 +1807,7 @@ impl ViewerApp {
                 l.loaded.clone(),
                 fresh_cancel(&mut self.rebuild_cancel, l.id),
                 l.style.style_by.clone(),
+                l.box_layer,
             );
         }
     }
@@ -1774,6 +1834,24 @@ impl ViewerApp {
             let Some(rect) = loader::viewport_to_data_bbox(view, &self.display, &l.crs) else {
                 continue;
             };
+            // Box layers switch representation by scale, not by how much
+            // data happens to sit under the viewport. While a typical
+            // feature is a couple of pixels across, its bounding box *is*
+            // its outline on screen and there is nothing to refine to;
+            // past that, every viewport at that zoom refines, whether it
+            // covers a city or a field. A density test instead would
+            // refine one and refuse the other at the same zoom.
+            if l.box_layer {
+                // Data-CRS units per screen pixel: the viewport's data
+                // width over its pixel width (camera scale is px per
+                // world unit).
+                let view_px = ((view[2] - view[0]) * self.camera.scale()).max(1.0);
+                let px = (rect[2] - rect[0]) / view_px;
+                let span = l.feature_span();
+                if span > 0.0 && span < self.box_threshold_px * px {
+                    continue;
+                }
+            }
             let starts = l.store.rg_starts();
             let mut jobs: Vec<GroupSel> = Vec::new();
             for g in loader::intersecting_rgs(&rg.boxes, rect) {
@@ -1790,13 +1868,26 @@ impl ViewerApp {
                     // Preview refines like an unseen group: the in-rect
                     // sampled rows re-decode (a ~1/stride duplicate
                     // fraction — invisible next to real coverage).
-                    GroupLoad::None | GroupLoad::Preview { .. } => {
+                    GroupLoad::None | GroupLoad::Preview { .. } | GroupLoad::Boxes { .. } => {
                         jobs.push(GroupSel::Rect(g, rect))
                     }
                     st @ GroupLoad::Rows { ranges, .. } => {
                         if !st.covers(need) {
-                            let n = (starts[g as usize + 1] - starts[g as usize]) as u32;
-                            jobs.push(GroupSel::Ranges(g, complement_ranges(ranges, n)));
+                            if l.box_layer {
+                                // Ask for what this viewport needs. The
+                                // complement below means "the whole rest of
+                                // the group", which on land cover is tens
+                                // of megabytes of geometry per group and
+                                // busts the budget at every zoom level —
+                                // the layer would ask you to zoom in
+                                // forever. Rows already loaded get decoded
+                                // again and the consolidating rebuild that
+                                // follows drops the duplicates.
+                                jobs.push(GroupSel::Rect(g, rect));
+                            } else {
+                                let n = (starts[g as usize + 1] - starts[g as usize]) as u32;
+                                jobs.push(GroupSel::Ranges(g, complement_ranges(ranges, n)));
+                            }
                         }
                     }
                 }
@@ -1824,7 +1915,10 @@ impl ViewerApp {
                 jobs,
                 cancel,
                 l.style.style_by.clone(),
-                Some(crate::data::loader::MAX_BUILD_ROWS),
+                Some((
+                    crate::data::loader::MAX_BUILD_ROWS,
+                    (self.refine_budget_mb as u64) << 20,
+                )),
             );
         }
     }
@@ -2034,6 +2128,44 @@ impl ViewerApp {
                     self.reload_layers_to_viewport(&ctx);
                 }
                 ui.separator();
+                ui.menu_button("Detail", |ui| {
+                    ui.label(
+                        RichText::new("When a dataset is too heavy to draw in full")
+                            .small()
+                            .weak(),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut self.box_threshold_px)
+                                .speed(0.1)
+                                .range(0.5..=40.0)
+                                .suffix(" px"),
+                        )
+                        .on_hover_text(
+                            "Features narrower than this are drawn from their bounding \
+                             boxes; wider ones get their real geometry. The switch \
+                             depends on scale alone, so it behaves the same over a \
+                             city and over open country. Raise it to keep the fast \
+                             box view longer, lower it for real outlines sooner.",
+                        );
+                        ui.label("box below");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut self.refine_budget_mb)
+                                .speed(16.0)
+                                .range(64..=4096u32)
+                                .suffix(" MB"),
+                        )
+                        .on_hover_text(
+                            "Most geometry one refinement pass may decode. A safety \
+                             cap against a viewport dense enough to exhaust memory, \
+                             not a display rule — a build costs roughly twice this \
+                             in RAM, more when outlines are drawn.",
+                        );
+                        ui.label("per refine");
+                    });
+                });
                 ui.checkbox(&mut self.show_graticule, "Graticule");
                 ui.checkbox(&mut self.show_coastline, "Coastline");
                 ui.menu_button("Basemap", |ui| {
@@ -2246,6 +2378,8 @@ impl ViewerApp {
         let mut grid_open: Option<u64> = None;
         let mut filter_clear: Option<u64> = None;
         let mut reclass_req: Option<u64> = None;
+        // Borders switched back on for a layer built without them.
+        let mut rebuild_outlines: Option<u64> = None;
         let mut renaming = self.rename_layer.take();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2511,12 +2645,26 @@ impl ViewerApp {
                                     egui::Slider::new(&mut l.style.fill_opacity, 0.0..=1.0)
                                         .show_value(false),
                                 );
+                                let before = l.style.lines_on;
                                 toggle(
                                     ui,
                                     &mut l.style.lines_on,
                                     "w:",
                                     "click to toggle borders (fill-only display)",
                                 );
+                                // A colour-map layer is built without
+                                // outlines, so switching them on has
+                                // nothing to draw until the meshes are
+                                // rebuilt with them.
+                                if !before
+                                    && l.style.lines_on
+                                    && l.style
+                                        .style_by
+                                        .as_ref()
+                                        .is_some_and(|sb| sb.mode.is_color_map())
+                                {
+                                    rebuild_outlines = Some(l.id);
+                                }
                                 ui.add_enabled(
                                     l.style.lines_on,
                                     egui::Slider::new(&mut l.style.line_width_px, 0.0..=6.0)
@@ -2616,13 +2764,24 @@ impl ViewerApp {
                             .small(),
                         );
                     }
-                    if let Some(rows) = self.refine_deferred.get(&l.id) {
-                        ui.label(
-                            RichText::new(format!(
-                                "viewport too dense to refine (≥{} rows) — \
-                                 zoom in",
+                    if let Some((rows, geom_bytes)) = self.refine_deferred.get(&l.id) {
+                        // Name what actually stopped it. On land cover the
+                        // row count is trivial and the geometry is
+                        // gigabytes, so "too dense" reads as nonsense
+                        // against a number the user knows is small.
+                        let text = match geom_bytes {
+                            Some(b) => format!(
+                                "real geometry here is {} ({} features)\nzoom in further",
+                                crate::data::info::fmt_bytes(*b),
                                 fmt_count(*rows as usize)
-                            ))
+                            ),
+                            None => format!(
+                                "viewport too dense to refine (≥{} rows)\nzoom in",
+                                fmt_count(*rows as usize)
+                            ),
+                        };
+                        ui.label(
+                            RichText::new(text)
                             .color(Color32::from_rgb(242, 140, 26))
                             .small(),
                         );
@@ -2657,7 +2816,8 @@ impl ViewerApp {
                                                 match &l.loaded[g as usize] {
                                                     GroupLoad::Full => false,
                                                     GroupLoad::None
-                                                    | GroupLoad::Preview { .. } => true,
+                                                    | GroupLoad::Preview { .. }
+                                                    | GroupLoad::Boxes { .. } => true,
                                                     st @ GroupLoad::Rows { .. } => {
                                                         !st.covers(need)
                                                     }
@@ -2667,11 +2827,57 @@ impl ViewerApp {
                                     _ => true,
                                 }
                             };
-                            let (text, attention) = if preview > 0 && view_pending {
+                            let boxes = l.boxes_rgs();
+                            // At a scale where a feature is a couple of
+                            // pixels, its box is its outline: say so
+                            // plainly rather than asking for a zoom that
+                            // would change nothing visible.
+                            let box_scale = {
+                                let view_px = ((self.last_view_world[2]
+                                    - self.last_view_world[0])
+                                    * self.camera.scale())
+                                .max(1.0);
+                                loader::viewport_to_data_bbox(
+                                    self.last_view_world,
+                                    &self.display,
+                                    &l.crs,
+                                )
+                                .map(|r| (r[2] - r[0]) / view_px)
+                                .zip(Some(l.feature_span()))
+                                .is_some_and(|(px, span)| {
+                                    span > 0.0 && span < self.box_threshold_px * px
+                                })
+                            };
+                            let (text, attention) = if boxes > 0 && box_scale {
                                 (
                                     format!(
-                                        "preview: {} of {} row groups decimated — zoom \
-                                         in to load real rows",
+                                        "all {} features drawn from their\nbounding boxes: at this scale a feature\nis under a few pixels wide",
+                                        fmt_count(l.feature_count)
+                                    ),
+                                    false,
+                                )
+                            } else if boxes > 0 && view_pending {
+                                (
+                                    format!(
+                                        "all features drawn from their bounding\nboxes ({} of {} row groups)\nzoom in for real geometry",
+                                        boxes,
+                                        l.total_rgs()
+                                    ),
+                                    true,
+                                )
+                            } else if boxes > 0 {
+                                (
+                                    format!(
+                                        "viewport loaded\n{} of {} row groups still drawn as\nbounding boxes off-screen",
+                                        boxes,
+                                        l.total_rgs()
+                                    ),
+                                    false,
+                                )
+                            } else if preview > 0 && view_pending {
+                                (
+                                    format!(
+                                        "preview: {} of {} row groups decimated\nzoom in to load real rows",
                                         preview,
                                         l.total_rgs()
                                     ),
@@ -2680,8 +2886,7 @@ impl ViewerApp {
                             } else if preview > 0 {
                                 (
                                     format!(
-                                        "viewport loaded — {} of {} row groups still \
-                                         decimated off-screen",
+                                        "viewport loaded\n{} of {} row groups still decimated\noff-screen",
                                         preview,
                                         l.total_rgs()
                                     ),
@@ -2756,6 +2961,7 @@ impl ViewerApp {
             use std::sync::atomic::Ordering;
             self.layers.retain(|l| l.id != id);
             self.rebuilding.remove(&id);
+            self.consolidating.remove(&id);
             self.appending.remove(&id);
             self.refine_hold.remove(&id);
             self.refine_deferred.remove(&id);
@@ -2845,6 +3051,10 @@ impl ViewerApp {
             let ctx = ui.ctx().clone();
             self.clear_layer_filter(id, &ctx);
         }
+        if let Some(id) = rebuild_outlines {
+            let ctx = ui.ctx().clone();
+            self.restyle_layer(id, &ctx);
+        }
         if let Some(id) = style_open {
             let ctx = ui.ctx().clone();
             self.open_style_dialog(id, &ctx);
@@ -2865,9 +3075,9 @@ impl ViewerApp {
                         .enumerate()
                         .filter_map(|(g, st)| match st {
                             GroupLoad::Full => None,
-                            GroupLoad::None | GroupLoad::Preview { .. } => {
-                                Some(GroupSel::All(g as u32))
-                            }
+                            GroupLoad::None
+                            | GroupLoad::Preview { .. }
+                            | GroupLoad::Boxes { .. } => Some(GroupSel::All(g as u32)),
                             GroupLoad::Rows { ranges, .. } => {
                                 let n = (starts[g + 1] - starts[g]) as u32;
                                 Some(GroupSel::Ranges(g as u32, complement_ranges(ranges, n)))
@@ -2910,6 +3120,8 @@ impl ViewerApp {
             basemap: self.basemap,
             show_graticule: self.show_graticule,
             show_coastline: self.show_coastline,
+            box_threshold_px: Some(self.box_threshold_px),
+            refine_budget_mb: Some(self.refine_budget_mb),
             layers: self
                 .layers
                 .iter()
@@ -3003,6 +3215,12 @@ impl ViewerApp {
         self.auto_projection = false;
         self.basemap = saved.basemap;
         self.show_graticule = saved.show_graticule;
+        if let Some(px) = saved.box_threshold_px {
+            self.box_threshold_px = px;
+        }
+        if let Some(mb) = saved.refine_budget_mb {
+            self.refine_budget_mb = mb;
+        }
         self.show_coastline = saved.show_coastline;
         // Loads prune against the restored viewport once the map panel has
         // recomputed it; seed with the whole world until then.
@@ -3842,28 +4060,7 @@ impl ViewerApp {
 
     /// Columns of a layer eligible for styling: (name, numeric).
     fn style_columns(store: &crate::data::store::FeatureStore) -> Vec<(String, bool)> {
-        use arrow::datatypes::DataType as DT;
-        store
-            .schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| {
-                *i != store.geom_col
-                    && Some(*i) != store.hidden_wkb
-                    && *i < store.base_fields()
-            })
-            .filter_map(|(_, f)| match f.data_type() {
-                DT::Int8 | DT::Int16 | DT::Int32 | DT::Int64 | DT::UInt8 | DT::UInt16
-                | DT::UInt32 | DT::UInt64 | DT::Float16 | DT::Float32 | DT::Float64 => {
-                    Some((f.name().clone(), true))
-                }
-                DT::Utf8 | DT::LargeUtf8 | DT::Utf8View | DT::Boolean | DT::Dictionary(_, _) => {
-                    Some((f.name().clone(), false))
-                }
-                _ => None,
-            })
-            .collect()
+        store.style_columns()
     }
 
     fn open_grid_dialog(&mut self, layer_id: u64) {
@@ -4541,7 +4738,9 @@ impl ViewerApp {
                             let before = d.per_area;
                             ui.checkbox(&mut d.per_area, "normalize by area")
                                 .on_hover_text(
-                                    "Classify and color value / polygon area (data-CRS                                      units, e.g. $/m²) so large polygons don't dominate                                      the choropleth",
+                                    "Classify and color value / polygon area \
+                                     (data-CRS units, e.g. $/m²) so large polygons \
+                                     don't dominate the choropleth",
                                 );
                             if d.per_area != before {
                                 reselect = true;
@@ -4683,7 +4882,11 @@ impl ViewerApp {
                         // A map answers on its own; only the generic
                         // palette needs to know which values occur.
                         if let Some(map) = map {
-                            category_preview(ui, &categorical_mode(Vec::new(), Some(map)));
+                            let mode = crate::data::colormap::categorical_mode(
+                                Vec::new(),
+                                Some(map),
+                            );
+                            category_preview(ui, &mode);
                         } else {
                             if d.categories.is_none() {
                                 want_categories = true;
@@ -4703,7 +4906,7 @@ impl ViewerApp {
                             Some(Ok(values)) => {
                                 category_preview(
                                     ui,
-                                    &categorical_mode(values.clone(), None),
+                                    &crate::data::colormap::categorical_mode(values.clone(), None),
                                 );
                             }
                         }
@@ -4714,7 +4917,11 @@ impl ViewerApp {
                         let ready = if d.numeric {
                             matches!(&d.breaks, Some(Ok(_)))
                         } else {
-                            matches!(&d.categories, Some(Ok(v)) if !v.is_empty())
+                            // A kept colour map is a complete class list on
+                            // its own; only the generic palette has to wait
+                            // for the scan.
+                            (d.color_map.is_some() && d.use_color_map)
+                                || matches!(&d.categories, Some(Ok(v)) if !v.is_empty())
                         };
                         if ui.add_enabled(ready, egui::Button::new("Apply")).clicked() {
                             apply = Some(StyleBy {
@@ -4735,7 +4942,7 @@ impl ViewerApp {
                                         Some(Ok(v)) => v.clone(),
                                         _ => Vec::new(),
                                     };
-                                    categorical_mode(
+                                    crate::data::colormap::categorical_mode(
                                         values,
                                         d.color_map.as_ref().filter(|_| d.use_color_map),
                                     )
@@ -4812,6 +5019,10 @@ impl ViewerApp {
                 ) {
                     sb.classified_rows = Some(l.loaded_rows() as usize);
                 }
+                // A colour map brings its own rendition with it.
+                if sb.mode.is_color_map() {
+                    l.style.adopt_palette();
+                }
                 l.style.style_by = Some(sb);
             }
             if needs_rebuild {
@@ -4822,6 +5033,46 @@ impl ViewerApp {
         if !open {
             self.style_dialog = None;
         }
+    }
+
+    /// Rebuild a layer whose refinement just replaced box-drawn groups
+    /// with real geometry, so the boxes stop showing under it.
+    ///
+    /// Sections only ever accumulate, and each one draws: the rebuild is
+    /// what consolidates them back into a single mesh built from the
+    /// per-group states as they now stand. Groups still on boxes rebuild
+    /// as boxes (cheap — four doubles a feature), refined ones as their
+    /// rows.
+    fn consolidate_after_boxes(&mut self, layer_id: u64, ctx: &egui::Context) {
+        let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) else {
+            return;
+        };
+        l.generation += 1;
+        let (generation, store, crs, loaded, style, box_layer) = (
+            l.generation,
+            l.store.clone(),
+            l.crs.clone(),
+            l.loaded.clone(),
+            l.style.style_by.clone(),
+            l.box_layer,
+        );
+        self.rebuilding.insert(layer_id);
+        self.consolidating.insert(layer_id);
+        loader::spawn_rebuild(
+            loader::LoaderHandle {
+                tx: self.load_tx.clone(),
+                egui_ctx: ctx.clone(),
+            },
+            layer_id,
+            generation,
+            store,
+            crs,
+            self.display.clone(),
+            loaded,
+            fresh_cancel(&mut self.rebuild_cancel, layer_id),
+            style,
+            box_layer,
+        );
     }
 
     /// Rebuild a layer's meshes so features land in their style bins.
@@ -4849,7 +5100,8 @@ impl ViewerApp {
         };
         let Some(rg) = &l.rg_bboxes else {
             self.push_error(format!(
-                "{}: no row-group spatial extents — viewport reclassification                  needs a spatially indexed file",
+                "{}: no row-group spatial extents — viewport reclassification \
+                 needs a spatially indexed file",
                 l.name
             ));
             return;
@@ -4924,6 +5176,7 @@ impl ViewerApp {
             l.loaded.clone(),
             fresh_cancel(&mut self.rebuild_cancel, l.id),
             l.style.style_by.clone(),
+            l.box_layer,
         );
     }
 
@@ -7175,7 +7428,7 @@ impl ViewerApp {
             .iter()
             .flat_map(|l| {
                 (0..l.sections.len())
-                    .map(|si| (section_key(l.id, si), l.generation))
+                    .map(|si| (section_key(l.id, si), l.draw_gen))
                     .chain(std::iter::once((RG_OVERLAY_BASE | l.id, l.generation)))
                     .collect::<Vec<_>>()
             })
@@ -7221,12 +7474,19 @@ impl ViewerApp {
             });
         }
         for l in &self.layers {
-            if !l.style.visible || self.rebuilding.contains(&l.id) {
+            // A rebuilding layer is hidden because its mesh is in the
+            // previous projection's coordinates and would draw in the
+            // wrong place. A consolidation changes no coordinates — it
+            // only merges sections — so its old mesh stays correct and
+            // stays on screen until the new one lands.
+            let hidden = self.rebuilding.contains(&l.id)
+                && !self.consolidating.contains(&l.id);
+            if !l.style.visible || hidden {
                 continue;
             }
             for (si, section) in l.sections.iter().enumerate() {
                 draws.push(LayerDraw {
-                    key: (section_key(l.id, si), l.generation),
+                    key: (section_key(l.id, si), l.draw_gen),
                     composite_group: l.id,
                     chunks: section.chunks.clone(),
                     style: resolve_style(&l.style),
@@ -7542,53 +7802,6 @@ fn category_preview(ui: &mut egui::Ui, mode: &crate::data::layer::StyleMode) {
             });
         }
     });
-}
-
-/// Categorical style for `values`, using `map` when one was recognized
-/// and kept.
-///
-/// The map also fixes the order: frequency order scatters the
-/// nomenclature, and a CORINE legend reading 111, 112, 121 … is half the
-/// point of having one.
-fn categorical_mode(
-    values: Vec<String>,
-    map: Option<&crate::data::colormap::ColorMap>,
-) -> crate::data::layer::StyleMode {
-    use crate::data::layer::{StyleMode, STYLE_BINS};
-    let Some(map) = map else {
-        return StyleMode::Categorical {
-            values,
-            colors: None,
-            labels: None,
-        };
-    };
-    // With no scanned values the map itself is the class list — which is
-    // the point: a published nomenclature does not need to be
-    // rediscovered by reading the data.
-    let mut ordered: Vec<&crate::data::colormap::ClassColor> = map
-        .classes
-        .iter()
-        .filter(|c| values.is_empty() || values.iter().any(|v| *v == c.value))
-        .collect();
-    // Values the map does not know keep their place at the end; they
-    // fall into "other" beyond the bin ceiling anyway.
-    ordered.truncate(STYLE_BINS - 1);
-    StyleMode::Categorical {
-        values: ordered.iter().map(|c| c.value.clone()).collect(),
-        colors: Some(ordered.iter().map(|c| c.rgb).collect()),
-        labels: Some(
-            ordered
-                .iter()
-                .map(|c| {
-                    if c.label.is_empty() {
-                        c.value.clone()
-                    } else {
-                        format!("{} — {}", c.value, c.label)
-                    }
-                })
-                .collect(),
-        ),
-    }
 }
 
 /// Rows, saturated to soft: Tableau 10, CARTO Vivid, ColorBrewer Set1,
@@ -8040,7 +8253,7 @@ impl ViewerApp {
                 continue;
             }
             for (si, section) in l.sections.iter_mut().enumerate() {
-                let key = (section_key(l.id, si), l.generation);
+                let key = (section_key(l.id, si), l.draw_gen);
                 if self.stripped.contains(&key) || !res.has_layer_uploaded(key) {
                     continue;
                 }

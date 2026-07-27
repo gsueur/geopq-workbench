@@ -190,6 +190,81 @@ pub fn parse_qgis(text: &str, name: &str) -> Option<ColorMap> {
     })
 }
 
+/// Categorical style for `values`, using `map` when one was recognized
+/// and kept.
+///
+/// The map also fixes the order: frequency order scatters the
+/// nomenclature, and a CORINE legend reading 111, 112, 121 … is half the
+/// point of having one.
+pub fn categorical_mode(
+    values: Vec<String>,
+    map: Option<&ColorMap>,
+) -> crate::data::layer::StyleMode {
+    use crate::data::layer::{StyleMode, STYLE_BINS};
+    let Some(map) = map else {
+        return StyleMode::Categorical {
+            values,
+            colors: None,
+            labels: None,
+        };
+    };
+    // With no scanned values the map itself is the class list — which is
+    // the point: a published nomenclature does not need to be
+    // rediscovered by reading the data.
+    let mut ordered: Vec<&ClassColor> = map
+        .classes
+        .iter()
+        .filter(|c| values.is_empty() || values.iter().any(|v| *v == c.value))
+        .collect();
+    // Values the map does not know keep their place at the end; they
+    // fall into "other" beyond the bin ceiling anyway.
+    ordered.truncate(STYLE_BINS - 1);
+    StyleMode::Categorical {
+        values: ordered.iter().map(|c| c.value.clone()).collect(),
+        colors: Some(ordered.iter().map(|c| c.rgb).collect()),
+        labels: Some(
+            ordered
+                .iter()
+                .map(|c| {
+                    if c.label.is_empty() {
+                        c.value.clone()
+                    } else {
+                        format!("{} — {}", c.value, c.label)
+                    }
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// The style a dataset announces through its own schema, if any:
+/// a text column named for a built-in nomenclature, styled by it.
+///
+/// Applied at load so an authoritative classification arrives drawn in
+/// its own colours instead of a flat fill the user has to replace by
+/// hand. It costs nothing to be sure of: the column name decides, the
+/// class list comes from the map, and the geometry is binned on its
+/// first build like any other style.
+///
+/// Only non-numeric columns qualify. A code column typed as an integer
+/// is styled as a graduated ramp everywhere else in the app, and a
+/// categorical style over it would classify values the renderer bins as
+/// numbers.
+pub fn schema_style(columns: &[(String, bool)]) -> Option<crate::data::layer::StyleBy> {
+    let (column, map) = columns
+        .iter()
+        .filter(|(_, numeric)| !*numeric)
+        .find_map(|(name, _)| match_column(name).map(|m| (name.clone(), m)))?;
+    Some(crate::data::layer::StyleBy {
+        mode: categorical_mode(Vec::new(), Some(&map)),
+        column,
+        ramp: crate::data::layer::Ramp::Viridis, // unused: the map holds the colours
+        hidden_bins: 0,
+        per_area: false,
+        classified_rows: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +299,32 @@ mod tests {
         assert!(match_column("code").is_none());
         assert!(match_column("shapeName").is_none());
         assert!(match_column("").is_none());
+    }
+
+    #[test]
+    fn a_schema_carrying_a_nomenclature_styles_itself() {
+        let cols = vec![
+            ("Area_Ha".to_string(), true),
+            ("Code_18".to_string(), false),
+            ("Remark".to_string(), false),
+        ];
+        let sb = super::schema_style(&cols).expect("CLC schema");
+        assert_eq!(sb.column, "Code_18");
+        match &sb.mode {
+            crate::data::layer::StyleMode::Categorical { values, colors, labels } => {
+                assert_eq!(values.len(), 47, "every class, none read from the data");
+                assert_eq!(values[0], "111");
+                assert_eq!(colors.as_ref().unwrap()[0], [230, 0, 77]);
+                assert!(labels.as_ref().unwrap()[0].contains("Continuous urban"));
+            }
+            m => panic!("expected categorical, got {m:?}"),
+        }
+        // Nothing to recognize.
+        assert!(super::schema_style(&[("shapeName".to_string(), false)]).is_none());
+        assert!(super::schema_style(&[]).is_none());
+        // The same name typed as a number is a graduated column
+        // everywhere else; leave it alone rather than bin codes as values.
+        assert!(super::schema_style(&[("code_18".to_string(), true)]).is_none());
     }
 
     #[test]

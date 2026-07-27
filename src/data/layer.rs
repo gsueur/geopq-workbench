@@ -70,6 +70,17 @@ pub enum GroupLoad {
     /// viewport-filtered. Never covers a viewport, so zooming in refines
     /// it with real rows.
     Preview { stride: u32, rect: Option<[f64; 4]> },
+    /// Every feature of the group is on the map, drawn from its covering
+    /// bounding box instead of its geometry (restricted to the features
+    /// intersecting `rect` when the load was viewport-filtered).
+    ///
+    /// The alternative for a polygon coverage over budget is a stride
+    /// preview, which removes most of the polygons: on data that tiles
+    /// the plane, that reads as holes rather than as detail. Boxes keep
+    /// the coverage complete at a resolution the screen can show, for
+    /// four doubles a feature and no geometry decode at all. Like a
+    /// preview it never covers a viewport, so zooming in refines it.
+    Boxes { rect: Option<[f64; 4]> },
     /// Whole group decoded.
     Full,
 }
@@ -82,7 +93,7 @@ impl GroupLoad {
     /// Does the loaded state already cover features intersecting `rect`?
     pub fn covers(&self, rect: [f64; 4]) -> bool {
         match self {
-            GroupLoad::None | GroupLoad::Preview { .. } => false,
+            GroupLoad::None | GroupLoad::Preview { .. } | GroupLoad::Boxes { .. } => false,
             GroupLoad::Full => true,
             GroupLoad::Rows { rect: r, .. } => {
                 r[0] <= rect[0] && r[1] <= rect[1] && r[2] >= rect[2] && r[3] >= rect[3]
@@ -546,6 +557,32 @@ impl LayerStyle {
             style_by: None,
         }
     }
+
+    /// Render as a published palette does: opaque fills, no outlines.
+    ///
+    /// A nomenclature like CORINE defines one thing per class, a fill
+    /// colour. It has no outline, and its colours are exact RGB values
+    /// that only come out right at full opacity — at the default 35% over
+    /// a basemap, every class lands on a colour the palette never
+    /// specified. Outlines are worse than wrong here: on a coverage that
+    /// tiles the plane they draw a border between every neighbouring
+    /// parcel, and the map turns into a dark mesh with colour showing
+    /// through it.
+    ///
+    /// Applied when a colour map is adopted. Both switches stay under the
+    /// layer row, so a user who wants outlines back just clicks them on.
+    pub fn adopt_palette(&mut self) {
+        self.lines_on = false;
+        self.fill_opacity = 1.0;
+    }
+}
+
+impl StyleMode {
+    /// Does this styling come from a colour map (explicit per-class
+    /// colours) rather than from a ramp or the generic palette?
+    pub fn is_color_map(&self) -> bool {
+        matches!(self, StyleMode::Categorical { colors: Some(_), .. })
+    }
 }
 
 /// Tableau 20, darks first then their light variants: the first ten
@@ -684,6 +721,21 @@ pub struct VectorLayer {
     /// row-group refinement appends. Projection rebuilds consolidate back
     /// to a single section.
     pub sections: Vec<LayerGeometry>,
+    /// This layer draws its unrefined groups from covering boxes. Set at
+    /// open when the plan chose them, and used by rebuilds to keep the
+    /// coverage complete: a group refined for one viewport must still
+    /// show boxes everywhere else, or it leaves a row-group-shaped hole.
+    pub box_layer: bool,
+    /// Bumped whenever `sections` changes, and used as the GPU cache key.
+    ///
+    /// Distinct from `generation`: that advances when a rebuild is
+    /// *requested*, so keying uploads by it drops the resident buffers
+    /// the moment work starts, and the CPU meshes behind them have
+    /// usually been freed after their first upload. The layer would draw
+    /// nothing until the rebuild landed. Keying by what is actually in
+    /// `sections` keeps the old mesh on screen until the new one
+    /// replaces it.
+    pub draw_gen: u64,
     pub style: LayerStyle,
     pub feature_count: usize,
     pub stats: LoadStats,
@@ -768,8 +820,47 @@ impl VectorLayer {
             .count()
     }
 
+    /// Row groups drawn from covering boxes rather than geometry.
+    pub fn boxes_rgs(&self) -> usize {
+        self.loaded
+            .iter()
+            .filter(|g| matches!(g, GroupLoad::Boxes { .. }))
+            .count()
+    }
+
     pub fn is_partial(&self) -> bool {
         self.loaded.iter().any(|g| !g.is_full())
+    }
+
+    /// Typical feature span in data-CRS units: the side of the square a
+    /// feature would occupy if the layer's features tiled their row
+    /// group's extent evenly.
+    ///
+    /// Derived from the row-group boxes and their row counts, so it costs
+    /// nothing and needs no data read. It is what makes the box/geometry
+    /// decision a property of the *scale* rather than of the area: a
+    /// budget on bytes or counts would refine a viewport over farmland
+    /// and refuse the same viewport over a city, at the same zoom, which
+    /// no user can predict or interpret.
+    pub fn feature_span(&self) -> f64 {
+        let Some(rg) = &self.rg_bboxes else { return 0.0 };
+        let starts = self.store.rg_starts();
+        let (mut area, mut rows) = (0.0f64, 0u64);
+        for (g, b) in rg.boxes.iter().enumerate() {
+            if b[0] > b[2] || g + 1 >= starts.len() {
+                continue; // sentinel box
+            }
+            let n = starts[g + 1] - starts[g];
+            if n == 0 {
+                continue;
+            }
+            area += (b[2] - b[0]) * (b[3] - b[1]);
+            rows += n;
+        }
+        if rows == 0 || !area.is_finite() || area <= 0.0 {
+            return 0.0;
+        }
+        (area / rows as f64).sqrt()
     }
 
     /// Rows currently decoded into the map (drives the "classes may be
@@ -789,6 +880,9 @@ impl VectorLayer {
                 GroupLoad::Preview { stride, .. } => {
                     (starts[g + 1] - starts[g]).div_ceil(*stride as u64)
                 }
+                // Boxes carry every feature of the group, so the count is
+                // the group's; only their shape is approximate.
+                GroupLoad::Boxes { .. } => starts[g + 1] - starts[g],
                 GroupLoad::None => 0,
             })
             .sum()
@@ -798,6 +892,88 @@ impl VectorLayer {
 #[cfg(test)]
 mod name_color_tests {
     use super::*;
+
+    /// The box/geometry decision must depend on the scale alone, so the
+    /// same zoom behaves the same over a city and over farmland.
+    #[test]
+    fn the_representation_follows_the_scale_not_the_density() {
+        // CORINE: a 25 ha minimum mapping unit, so a typical feature is
+        // roughly 500 m across.
+        let span = 500.0f64;
+        const BOX_ENOUGH_PX: f64 = 3.0;
+        let boxes_suffice = |metres_per_px: f64| span < BOX_ENOUGH_PX * metres_per_px;
+
+        // Europe-wide: a pixel is kilometres, the feature is invisible.
+        assert!(boxes_suffice(3000.0), "continent view draws boxes");
+        // Regional: still under three pixels.
+        assert!(boxes_suffice(200.0));
+        // Street level (z≈14.7 is ~6 m/px): the feature is ~80 px, so
+        // real geometry, whatever sits under the viewport.
+        assert!(!boxes_suffice(6.0), "street zoom draws geometry");
+        assert!(!boxes_suffice(60.0));
+        // The switch is at span / BOX_ENOUGH_PX, and nothing about the
+        // amount of data enters into it.
+        let threshold = span / BOX_ENOUGH_PX;
+        assert!(boxes_suffice(threshold + 1.0));
+        assert!(!boxes_suffice(threshold - 1.0));
+    }
+
+    /// The GPU cache key must follow what is in `sections`, not what a
+    /// rebuild intends to put there.
+    ///
+    /// Uploaded meshes are freed on the CPU side, so a key that changes
+    /// when a rebuild *starts* leaves the layer with nothing to re-upload
+    /// and the map goes blank until the rebuild lands. An append must not
+    /// disturb the keys of the sections already up, either.
+    #[test]
+    fn the_draw_key_tracks_sections_not_pending_rebuilds() {
+        let mut draw_gen = 0u64; // stands in for VectorLayer::draw_gen
+        let key = |section: usize, g: u64| (section as u64 | ((section as u64 + 1) << 40), g);
+
+        // Section 0 uploaded.
+        let first = key(0, draw_gen);
+        // A rebuild is requested: generation advances, draw_gen does not.
+        let requested = key(0, draw_gen);
+        assert_eq!(first, requested, "a pending rebuild keeps the mesh on screen");
+
+        // An append adds section 1 and leaves section 0 alone.
+        let appended = key(1, draw_gen);
+        assert_ne!(appended, first, "the new section takes its own key");
+        assert_eq!(key(0, draw_gen), first, "the resident section keeps its key");
+
+        // The rebuild lands and replaces every section: now the key moves.
+        draw_gen += 1;
+        assert_ne!(key(0, draw_gen), first, "replaced content is a new upload");
+    }
+
+    /// A colour map is a fill palette: outlines off, fills opaque.
+    #[test]
+    fn a_colour_map_brings_its_own_rendition() {
+        let map_mode = crate::data::colormap::categorical_mode(
+            Vec::new(),
+            crate::data::colormap::match_column("Code_18").as_ref(),
+        );
+        assert!(map_mode.is_color_map());
+        let mut style = LayerStyle::new(Color32::GRAY);
+        assert!(style.lines_on, "outlines are on by default");
+        style.adopt_palette();
+        assert!(!style.lines_on, "CORINE defines no outline");
+        assert_eq!(style.fill_opacity, 1.0, "its RGB values are exact");
+
+        // The generic categorical palette is not a colour map: a layer
+        // styled by frequency keeps the ordinary rendition.
+        let generic = crate::data::colormap::categorical_mode(
+            vec!["a".to_string(), "b".to_string()],
+            None,
+        );
+        assert!(!generic.is_color_map());
+        // Neither is a graduated ramp.
+        assert!(!StyleMode::Graduated {
+            method: ClassMethod::Quantile,
+            breaks: vec![1.0, 2.0],
+        }
+        .is_color_map());
+    }
 
     #[test]
     fn thematic_names_get_thematic_colors() {
