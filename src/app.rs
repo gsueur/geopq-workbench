@@ -288,6 +288,9 @@ pub struct ViewerApp {
     style_dialog: Option<StyleDialog>,
     /// Category-value fetches for the styling dialog.
     cat_tx: Sender<(u64, String, Result<Vec<String>, String>)>,
+    /// (layer, column) scans already started: the dialog asks every
+    /// frame while the values are missing, and one scan is enough.
+    cat_pending: std::collections::HashSet<(u64, String)>,
     cat_rx: Receiver<(u64, String, Result<Vec<String>, String>)>,
     /// Classification runs for the styling dialog (breaks from loaded rows).
     class_tx: Sender<(u64, String, Result<Vec<f64>, String>)>,
@@ -750,6 +753,7 @@ impl ViewerApp {
             filter_dialog: None,
             style_dialog: None,
             cat_tx,
+            cat_pending: std::collections::HashSet::new(),
             cat_rx,
             class_tx,
             vreclass_tx,
@@ -4359,6 +4363,8 @@ impl ViewerApp {
         let Some((_, numeric)) = cols.iter().find(|(n, _)| *n == d.column) else { return };
         d.numeric = *numeric;
         d.categories = None;
+        d.color_map = None;
+        d.use_color_map = true;
         d.breaks = None;
         if d.numeric {
             if auto_bounds {
@@ -4409,21 +4415,15 @@ impl ViewerApp {
                     d.method, d.min, d.max, d.classes,
                 )));
             }
-        } else if let Some(sql) = self.sql_layer_of(d.layer_id) {
-            // Fetch the top category values in the background.
-            let tx = self.cat_tx.clone();
-            let (id, col) = (d.layer_id, d.column.clone());
-            let ctx = ctx.clone();
-            std::thread::spawn(move || {
-                let res = crate::sql::engine::top_values(
-                    &sql,
-                    &col,
-                    crate::data::layer::STYLE_BINS - 1,
-                );
-                let _ = tx.send((id, col, res));
-                ctx.request_repaint();
-            });
+        } else if let Some(map) = crate::data::colormap::match_column(&d.column) {
+            // The map names the classes, so there is nothing to look up:
+            // scanning millions of rows to rediscover a published
+            // nomenclature would be work for its own sake.
+            d.color_map = Some(map);
+            d.use_color_map = true;
         }
+        // No eager scan for text columns: the dialog asks for one only
+        // when the generic palette is actually on screen.
     }
 
     fn poll_classes(&mut self) {
@@ -4467,6 +4467,9 @@ impl ViewerApp {
         };
         let layer_name = self.layers[layer_idx].name.clone();
         let cols = Self::style_columns(&self.layers[layer_idx].store);
+        // Set when the generic palette is on screen with no values yet:
+        // the scan is started only for the path that actually needs it.
+        let mut want_categories = false;
         let current = self.layers[layer_idx].style.style_by.clone();
         let is_poly = matches!(
             self.layers[layer_idx].kind(),
@@ -4627,7 +4630,65 @@ impl ViewerApp {
                             );
                         }
                     } else {
-                        match &d.categories {
+                        let mut load_error: Option<String> = None;
+                        ui.horizontal(|ui| {
+                            if let Some(map) = &d.color_map {
+                                ui.checkbox(
+                                    &mut d.use_color_map,
+                                    format!("{} ({} classes)", map.name, map.classes.len()),
+                                )
+                                .on_hover_text(
+                                    "This column carries a published nomenclature. \
+                                     Its colours, class names and order are used — \
+                                     and the classes are known in advance, so nothing \
+                                     has to be read from the data",
+                                );
+                            }
+                            if ui
+                                .small_button("Load colour map…")
+                                .on_hover_text(
+                                    "A QGIS colour-map export (the .txt beside most \
+                                     published datasets)",
+                                )
+                                .clicked()
+                                && let Some(p) = rfd::FileDialog::new()
+                                    .add_filter("colour map", &["txt", "clr"])
+                                    .pick_file()
+                            {
+                                let name = p
+                                    .file_stem()
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "colour map".into());
+                                match std::fs::read_to_string(&p)
+                                    .ok()
+                                    .and_then(|t| crate::data::colormap::parse_qgis(&t, &name))
+                                {
+                                    Some(m) => {
+                                        d.color_map = Some(m);
+                                        d.use_color_map = true;
+                                    }
+                                    None => {
+                                        load_error = Some(format!(
+                                            "{}: no colour classes found",
+                                            p.display()
+                                        ))
+                                    }
+                                }
+                            }
+                        });
+                        if let Some(e) = &load_error {
+                            ui.label(RichText::new(e).color(Color32::from_rgb(220, 60, 60)));
+                        }
+                        let map = d.color_map.as_ref().filter(|_| d.use_color_map);
+                        // A map answers on its own; only the generic
+                        // palette needs to know which values occur.
+                        if let Some(map) = map {
+                            category_preview(ui, &categorical_mode(Vec::new(), Some(map)));
+                        } else {
+                            if d.categories.is_none() {
+                                want_categories = true;
+                            }
+                            match &d.categories {
                             None => {
                                 ui.horizontal(|ui| {
                                     ui.spinner();
@@ -4640,111 +4701,12 @@ impl ViewerApp {
                                 );
                             }
                             Some(Ok(values)) => {
-                                let mut load_error: Option<String> = None;
-                                ui.horizontal(|ui| {
-                                    if let Some(map) = &d.color_map {
-                                        ui.checkbox(
-                                            &mut d.use_color_map,
-                                            format!("{} colours", map.name),
-                                        )
-                                        .on_hover_text(
-                                            "These values match a published palette. \
-                                             Its colours and class names are used, in \
-                                             nomenclature order rather than by \
-                                             frequency",
-                                        );
-                                    }
-                                    if ui
-                                        .small_button("Load colour map…")
-                                        .on_hover_text(
-                                            "A QGIS colour-map export (the .txt beside \
-                                             most published datasets): its classes are \
-                                             matched against this column's values",
-                                        )
-                                        .clicked()
-                                        && let Some(p) = rfd::FileDialog::new()
-                                            .add_filter("colour map", &["txt", "clr"])
-                                            .pick_file()
-                                    {
-                                        let name = p
-                                            .file_stem()
-                                            .map(|s| s.to_string_lossy().to_string())
-                                            .unwrap_or_else(|| "colour map".into());
-                                        match std::fs::read_to_string(&p)
-                                            .ok()
-                                            .and_then(|t| {
-                                                crate::data::colormap::parse_qgis(&t, &name)
-                                            }) {
-                                            Some(m) => {
-                                                d.color_map = Some(m);
-                                                d.use_color_map = true;
-                                            }
-                                            // Reported inline: the file is
-                                            // the user's own choice and a
-                                            // silent no-op reads as a bug.
-                                            None => load_error = Some(format!(
-                                                "{}: no colour classes found",
-                                                p.display()
-                                            )),
-                                        }
-                                    }
-                                });
-                                if let Some(e) = &load_error {
-                                    ui.label(
-                                        RichText::new(e).color(Color32::from_rgb(220, 60, 60)),
-                                    );
-                                }
-                                // Preview exactly what Apply will produce.
-                                let preview = categorical_mode(
-                                    values.clone(),
-                                    d.color_map.as_ref().filter(|_| d.use_color_map),
-                                );
-                                let (values, colors, labels) = match &preview {
-                                    StyleMode::Categorical {
-                                        values,
-                                        colors,
-                                        labels,
-                                    } => (values, colors, labels),
-                                    _ => unreachable!("categorical column"),
-                                };
-                                egui::ScrollArea::vertical().max_height(220.0).show(
+                                category_preview(
                                     ui,
-                                    |ui| {
-                                        for (i, v) in values.iter().enumerate() {
-                                            ui.horizontal(|ui| {
-                                                let c = match colors {
-                                                    Some(m) if i < m.len() => Color32::from_rgb(
-                                                        m[i][0], m[i][1], m[i][2],
-                                                    ),
-                                                    _ => palette_color(i),
-                                                };
-                                                let v = match labels {
-                                                    Some(l) if i < l.len() => &l[i],
-                                                    _ => v,
-                                                };
-                                                let (r, _) = ui.allocate_exact_size(
-                                                    egui::vec2(12.0, 12.0),
-                                                    egui::Sense::hover(),
-                                                );
-                                                ui.painter().rect_filled(r, 2.0, c);
-                                                ui.label(v);
-                                            });
-                                        }
-                                        ui.horizontal(|ui| {
-                                            let (r, _) = ui.allocate_exact_size(
-                                                egui::vec2(12.0, 12.0),
-                                                egui::Sense::hover(),
-                                            );
-                                            ui.painter().rect_filled(
-                                                r,
-                                                2.0,
-                                                Color32::from_gray(140),
-                                            );
-                                            ui.label(RichText::new("(other)").weak());
-                                        });
-                                    },
+                                    &categorical_mode(values.clone(), None),
                                 );
                             }
+                        }
                         }
                     }
                     ui.separator();
@@ -4794,6 +4756,35 @@ impl ViewerApp {
             let mut d = self.style_dialog.take().unwrap();
             self.style_dialog_select_column(&mut d, ctx, true);
             self.style_dialog = Some(d);
+        }
+        // The generic palette is showing and has nothing to show yet:
+        // start the scan now rather than on column selection, so a
+        // column a colour map already answers never triggers one.
+        if want_categories {
+            let (id, col) = match &self.style_dialog {
+                Some(d) => (d.layer_id, d.column.clone()),
+                None => return,
+            };
+            if let Some(sql) = self.sql_layer_of(id) {
+                if let Some(d) = &mut self.style_dialog {
+                    // Marks the fetch as in flight; the poll fills it in.
+                    d.categories = None;
+                }
+                let tx = self.cat_tx.clone();
+                let ctx = ctx.clone();
+                let started = self.cat_pending.insert((id, col.clone()));
+                if started {
+                    std::thread::spawn(move || {
+                        let res = crate::sql::engine::top_values(
+                            &sql,
+                            &col,
+                            crate::data::layer::STYLE_BINS - 1,
+                        );
+                        let _ = tx.send((id, col, res));
+                        ctx.request_repaint();
+                    });
+                }
+            }
         }
         let clear = self
             .style_dialog
@@ -7515,6 +7506,44 @@ pub(crate) fn build_rg_overlay(
 /// Default border/line color: a darkened shade of the layer color.
 /// Curated, well-balanced palettes for the layer color pickers — picking
 /// from swatches beats the infinite color wheel for a data workbench.
+/// The class list a categorical style will draw: swatch, label, and the
+/// catch-all bin.
+fn category_preview(ui: &mut egui::Ui, mode: &crate::data::layer::StyleMode) {
+    use crate::data::layer::{palette_color, StyleMode, STYLE_BINS};
+    let StyleMode::Categorical {
+        values,
+        colors,
+        labels,
+    } = mode
+    else {
+        return;
+    };
+    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+        for (i, v) in values.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let c = match colors {
+                    Some(m) if i < m.len() => Color32::from_rgb(m[i][0], m[i][1], m[i][2]),
+                    _ => palette_color(i),
+                };
+                let label = match labels {
+                    Some(l) if i < l.len() => &l[i],
+                    _ => v,
+                };
+                let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                ui.painter().rect_filled(r, 2.0, c);
+                ui.label(label);
+            });
+        }
+        if values.len() < STYLE_BINS - 1 {
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                ui.painter().rect_filled(r, 2.0, Color32::from_gray(140));
+                ui.label(RichText::new("(other)").weak());
+            });
+        }
+    });
+}
+
 /// Categorical style for `values`, using `map` when one was recognized
 /// and kept.
 ///
@@ -7533,10 +7562,13 @@ fn categorical_mode(
             labels: None,
         };
     };
+    // With no scanned values the map itself is the class list — which is
+    // the point: a published nomenclature does not need to be
+    // rediscovered by reading the data.
     let mut ordered: Vec<&crate::data::colormap::ClassColor> = map
         .classes
         .iter()
-        .filter(|c| values.iter().any(|v| *v == c.value))
+        .filter(|c| values.is_empty() || values.iter().any(|v| *v == c.value))
         .collect();
     // Values the map does not know keep their place at the end; they
     // fall into "other" beyond the bin ceiling anyway.

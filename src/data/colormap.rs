@@ -23,6 +23,11 @@ pub struct ClassColor {
 pub struct ColorMap {
     pub name: String,
     pub classes: Vec<ClassColor>,
+    /// Column names that carry this map's codes. A dataset's own column
+    /// naming identifies it before a single row is read, which matters:
+    /// the class list comes from the map, so recognizing it by name
+    /// means the style applies with no scan at all.
+    pub columns: Vec<String>,
 }
 
 impl ColorMap {
@@ -98,6 +103,12 @@ const CLC: [(&str, [u8; 3], &str); 47] = [
 pub fn builtins() -> Vec<ColorMap> {
     vec![ColorMap {
         name: "CORINE Land Cover".to_string(),
+        // CLC ships its class code as CODE_<year> (Code_18, CODE_12,
+        // code_06 …); the EEA's own vector products use these names.
+        columns: ["code_18", "code_12", "code_06", "code_00", "code_90", "clc_code"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         classes: CLC
             .iter()
             .map(|(v, rgb, l)| ClassColor {
@@ -107,6 +118,14 @@ pub fn builtins() -> Vec<ColorMap> {
             })
             .collect(),
     }]
+}
+
+/// The built-in map a column of this name carries, if any. Matched
+/// case-insensitively: the same product ships `Code_18` and `CODE_18`.
+pub fn match_column(column: &str) -> Option<ColorMap> {
+    builtins()
+        .into_iter()
+        .find(|m| m.columns.iter().any(|c| c.eq_ignore_ascii_case(column)))
 }
 
 /// The built-in map that covers `values`, if one does.
@@ -167,6 +186,7 @@ pub fn parse_qgis(text: &str, name: &str) -> Option<ColorMap> {
     (!classes.is_empty()).then_some(ColorMap {
         name: name.to_string(),
         classes,
+        columns: Vec::new(),
     })
 }
 
@@ -189,6 +209,21 @@ mod tests {
                 "no class in level {lead}"
             );
         }
+    }
+
+    #[test]
+    fn the_column_name_alone_identifies_a_map() {
+        // The point of this path: no values needed, so no scan.
+        for c in ["Code_18", "CODE_18", "code_12", "clc_code"] {
+            assert_eq!(
+                match_column(c).map(|m| m.name),
+                Some("CORINE Land Cover".to_string()),
+                "{c}"
+            );
+        }
+        assert!(match_column("code").is_none());
+        assert!(match_column("shapeName").is_none());
+        assert!(match_column("").is_none());
     }
 
     #[test]
