@@ -1137,6 +1137,41 @@ fn prepare_refinement_jobs(
     let mut geom_bytes = 0u64;
     let mut resolved = Vec::with_capacity(jobs.len());
 
+    // Resolve every rect selection first, in parallel. Each one is a
+    // read of that group's bbox column, which on a remote source is a
+    // round trip: twenty groups resolved one after another put several
+    // seconds between the camera settling and the first byte of geometry
+    // being asked for. The budget below still walks them in order, so
+    // which groups make the cut does not depend on who answered first.
+    /// A group's resolved row ranges, or None when the store has no
+    /// selector and the whole group must be read.
+    type GroupRanges = Option<Vec<(u32, u32)>>;
+    let resolved_rects: std::collections::HashMap<u32, GroupRanges> = {
+        use rayon::prelude::*;
+        let rects: Vec<(u32, [f64; 4])> = jobs
+            .iter()
+            .filter_map(|j| match j {
+                GroupSel::Rect(g, r) => Some((*g, *r)),
+                _ => None,
+            })
+            .collect();
+        let out: Vec<Result<(u32, GroupRanges), String>> = rects
+            .into_par_iter()
+            .map(|(g, r)| {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(CANCELLED.to_string());
+                }
+                covering_select(store, g, r).map(|ranges| (g, ranges))
+            })
+            .collect();
+        let mut map = std::collections::HashMap::new();
+        for r in out {
+            let (g, ranges) = r?;
+            map.insert(g, ranges);
+        }
+        map
+    };
+
     for job in jobs {
         if cancel.load(Ordering::Relaxed) {
             return Err(CANCELLED.into());
@@ -1144,7 +1179,11 @@ fn prepare_refinement_jobs(
         let group = job.group();
         let group_rows = starts[group as usize + 1] - starts[group as usize];
         let (count, job) = match job {
-            GroupSel::Rect(group, rect) => match covering_select(store, group, rect)? {
+            GroupSel::Rect(group, rect) => match resolved_rects
+                .get(&group)
+                .cloned()
+                .unwrap_or_else(|| covering_select(store, group, rect).ok().flatten())
+            {
                 Some(ranges) => {
                     let count = ranges.iter().map(|&(s, e)| (e - s) as u64).sum();
                     if ranges.as_slice() == [(0, group_rows as u32)] {
@@ -2500,7 +2539,7 @@ fn covering_column(
 /// Extract per-row-group bboxes from file metadata, best source first:
 /// parquet native geospatial statistics (GeoParquet 2.0), then GeoParquet
 /// 1.1 `covering` bbox-column statistics. Returns (source label, boxes).
-fn rg_bboxes_from_metadata(
+pub(crate) fn rg_bboxes_from_metadata(
     builder: &ParquetRecordBatchReaderBuilder<super::source::SourceReader>,
     geo_meta: Option<&Value>,
     geom_leaf: Option<usize>,

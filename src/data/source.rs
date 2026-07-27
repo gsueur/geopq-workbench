@@ -8,7 +8,12 @@
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// The last window a streaming read fetched: its start offset and bytes,
+/// shared between the reader that filled it and the bounded reads that
+/// can be served from it.
+type WindowCache = Arc<Mutex<Option<(u64, Arc<Vec<u8>>)>>>;
 
 use bytes::Bytes;
 use parquet::errors::{ParquetError, Result as PqResult};
@@ -216,11 +221,13 @@ impl Source {
                 Ok(SourceReader {
                     inner: Inner::Local(f),
                     len,
+                    window: Arc::default(),
                 })
             }
             Source::Remote { url, len } | Source::S3 { url, len, .. } => Ok(SourceReader {
                 inner: Inner::Remote { url: url.clone() },
                 len: *len,
+                window: Arc::default(),
             }),
         }
     }
@@ -1218,6 +1225,15 @@ fn header<B>(res: &ureq::http::Response<B>, name: &str) -> Option<String> {
 pub struct SourceReader {
     inner: Inner,
     len: u64,
+    /// The most recent window fetched by a streaming read, kept so the
+    /// bounded read that follows it can be served without a second
+    /// request.
+    ///
+    /// Parquet reads a page header through `get_read` and the page body
+    /// through `get_bytes` at an offset a few bytes later, so the body
+    /// almost always lands inside the window the header already paid
+    /// for. One window, not two requests.
+    window: WindowCache,
 }
 
 enum Inner {
@@ -1277,9 +1293,21 @@ struct WindowedRemote {
     end: u64,
     window: u64,
     chunk: std::io::Cursor<Vec<u8>>,
+    /// Where to publish each fetched window for the bounded read that
+    /// tends to follow it.
+    cache: WindowCache,
 }
 
-const WINDOW_START: u64 = 256 * 1024;
+/// Floor for the first window.
+///
+/// Parquet uses the streaming read for page headers and takes page
+/// bodies through bounded reads, so this is mostly the price of reading
+/// a header. Measured on a viewport export of a sorted fixture, as a
+/// fraction of the file: 16 kB read 161%, 4 kB reads 45%, 1 kB reads
+/// 34%. The last step is not worth it — a header plus its dictionary
+/// header can exceed 1 kB, and a second round trip costs far more on a
+/// remote source than the 3 kB it saves.
+const WINDOW_MIN: u64 = 4 * 1024;
 const WINDOW_MAX: u64 = 8 * 1024 * 1024;
 
 impl Read for WindowedRemote {
@@ -1292,18 +1320,39 @@ impl Read for WindowedRemote {
             if self.pos >= self.end {
                 return Ok(0);
             }
-            let take = self.window.min(self.end - self.pos);
+            // Size the first window to what the caller actually asked
+            // for, then double. An open-ended read has no idea how far
+            // the consumer will go, and parquet's page reader opens one
+            // per column chunk, takes a few kB and drops it: a fixed
+            // 256 kB head start meant a 2 MB file could cost 31 MB to
+            // read. Callers that really do stream reach the ceiling in
+            // a handful of requests anyway.
+            let want = if self.window == 0 {
+                (out.len() as u64).clamp(WINDOW_MIN, WINDOW_MAX)
+            } else {
+                self.window
+            };
+            let take = want.min(self.end - self.pos);
             let data = fetch_range(&self.url, self.pos, self.pos + take - 1)
                 .map_err(std::io::Error::other)?;
-            self.pos += data.len() as u64;
-            self.window = (self.window * 2).min(WINDOW_MAX);
-            self.chunk = std::io::Cursor::new(data);
+            let shared = Arc::new(data);
+            *self.cache.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((self.pos, Arc::clone(&shared)));
+            self.pos += shared.len() as u64;
+            self.window = (want * 2).min(WINDOW_MAX);
+            self.chunk = std::io::Cursor::new(shared.as_ref().clone());
         }
     }
 }
 
 impl Inner {
-    fn ranged(&self, start: u64, end_inclusive: Option<u64>, len: u64) -> PqResult<Box<dyn Read + Send>> {
+    fn ranged(
+        &self,
+        start: u64,
+        end_inclusive: Option<u64>,
+        len: u64,
+        cache: &WindowCache,
+    ) -> PqResult<Box<dyn Read + Send>> {
         match self {
             Inner::Local(f) => {
                 let mut r = f
@@ -1319,8 +1368,10 @@ impl Inner {
                     url: url.clone(),
                     pos: start,
                     end: len,
-                    window: WINDOW_START,
+                    // 0 = unsized: the first read decides.
+                    window: 0,
                     chunk: std::io::Cursor::new(Vec::new()),
+                    cache: Arc::clone(cache),
                 })),
             },
         }
@@ -1587,7 +1638,7 @@ impl ChunkReader for SourceReader {
     type T = Box<dyn Read + Send>;
 
     fn get_read(&self, start: u64) -> PqResult<Self::T> {
-        self.inner.ranged(start, None, self.len)
+        self.inner.ranged(start, None, self.len, &self.window)
     }
 
     fn get_bytes(&self, start: u64, length: usize) -> PqResult<Bytes> {
@@ -1595,10 +1646,22 @@ impl ChunkReader for SourceReader {
             return Ok(Bytes::new());
         }
         let end = start + length as u64 - 1;
+        // Already in the last streaming window? Then the request that
+        // fetched it also paid for this.
+        {
+            let w = self.window.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((base, data)) = w
+                .as_ref()
+                .filter(|(base, data)| start >= *base && end < base + data.len() as u64)
+            {
+                let off = (start - base) as usize;
+                return Ok(Bytes::copy_from_slice(&data[off..off + length]));
+            }
+        }
         let mut buf = Vec::with_capacity(length);
         let read = self
             .inner
-            .ranged(start, Some(end), self.len)?
+            .ranged(start, Some(end), self.len, &self.window)?
             .take(length as u64)
             .read_to_end(&mut buf)
             .map_err(|e| ParquetError::General(format!("range read: {e}")))?;

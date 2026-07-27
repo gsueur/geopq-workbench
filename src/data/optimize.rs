@@ -391,20 +391,53 @@ pub fn optimize(
         .unwrap_or_default();
 
     let rg_before = meta.num_row_groups();
-    let src_rg_rows: Vec<usize> = meta
+    let all_rg_rows: Vec<usize> = meta
         .row_groups()
         .iter()
         .map(|rg| rg.num_rows() as usize)
         .collect();
 
-    // --- read everything, scanning geometry bboxes as batches arrive ---
+    // --- read the rows that can matter, scanning bboxes as they arrive ---
     progress(0.02, "reading rows");
-    let total_rows = fmd.num_rows().max(0) as usize;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(src.open()?)
+    let mut builder = ParquetRecordBatchReaderBuilder::try_new(src.open()?)
         .map_err(|e| format!("not a parquet file: {e}"))?
-        .with_batch_size(READ_BATCH)
-        .build()
-        .map_err(|e| format!("parquet read error: {e}"))?;
+        .with_batch_size(READ_BATCH);
+    // A viewport export reads only the row groups the viewport can touch.
+    // Filtering after the read was correct but cost the whole file: on a
+    // remote source that is the entire download for a handful of
+    // features. Row-group boxes come from the same metadata the viewer
+    // prunes with, so this needs no extra request.
+    let mut src_rg_rows = all_rg_rows.clone();
+    if let Some(rect) = opts.filter_rect {
+        let boxes = super::loader::rg_bboxes_from_metadata(
+            &builder,
+            geo_meta.as_ref(),
+            Some(geom_idx),
+            &primary,
+            src_encoding,
+            // Only used to sanity-check degenerate lon/lat boxes; a
+            // wrong guess here cannot select the wrong groups.
+            false,
+        );
+        if let Some((source, boxes)) = boxes {
+            let keep: Vec<usize> = super::loader::intersecting_rgs(&boxes, rect)
+                .into_iter()
+                .map(|g| g as usize)
+                .collect();
+            if keep.is_empty() {
+                return Err("no features intersect the current viewport".into());
+            }
+            log::info!(
+                "viewport export: {} of {} row groups intersect ({source})",
+                keep.len(),
+                rg_before
+            );
+            src_rg_rows = keep.iter().map(|&g| all_rg_rows[g]).collect();
+            builder = builder.with_row_groups(keep);
+        }
+    }
+    let total_rows: usize = src_rg_rows.iter().sum();
+    let reader = builder.build().map_err(|e| format!("parquet read error: {e}"))?;
 
     // x/y source: extend the schema with the synthesized point column.
     let src_schema = match opts.xy_geom {
@@ -2172,6 +2205,56 @@ mod tests {
         let b = info.geo.bbox.expect("metadata bbox");
         assert!(b[2] <= 5.1 && b[3] <= 5.1, "bbox shrank to the export: {b:?}");
         assert_rows_consistent(&dst);
+
+        // The export must READ only what the viewport can touch, not read
+        // the file and filter afterwards. Over http that difference is
+        // the whole download, and it is why a viewport export of a remote
+        // layer used to pull gigabytes for a handful of features.
+        {
+            use crate::data::net;
+            // Serve a *sorted* source: row-group pruning is what makes a
+            // viewport export cheap, and on scrambled input every group
+            // holds a few of the wanted rows, so nothing can be skipped.
+            let sorted = dir.join("sorted_src.parquet");
+            optimize(
+                &Source::Local(src.clone()),
+                &sorted,
+                &OptimizeOptions { row_group_size: 2048, ..Default::default() },
+                None,
+                None,
+                &|_, _| {},
+            )
+            .unwrap();
+            let server = crate::data::source::testserver::spawn(sorted.clone());
+            let file_len = std::fs::metadata(&sorted).unwrap().len();
+            let remote = Source::Remote { url: server.url.clone(), len: file_len };
+            let before = net::for_source(&server.url).map_or(0, |(b, _)| b);
+            let report_r = optimize(
+                &remote,
+                &dir.join("out_vp_remote.parquet"),
+                &opts,
+                None,
+                None,
+                &|_, _| {},
+            )
+            .unwrap();
+            assert!(
+                (report_r.rows as i64 - report.rows as i64).unsigned_abs() < 500,
+                "same quadrant as the local export: {} vs {}",
+                report_r.rows,
+                report.rows
+            );
+            let read = net::for_source(&server.url).map_or(0, |(b, _)| b) - before;
+            eprintln!(
+                "viewport export read {read} of {file_len} B ({:.0}%)",
+                read as f64 / file_len as f64 * 100.0
+            );
+            // A quadrant of a sorted file: most row groups never open.
+            assert!(
+                read < file_len / 2,
+                "read {read} of {file_len} B for a quadrant"
+            );
+        }
 
         // Empty viewport errors instead of writing a rowless file.
         let err = optimize(
