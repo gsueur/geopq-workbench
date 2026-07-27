@@ -267,7 +267,10 @@ larger files are on the roadmap.
   methods (equal interval, quantile, half-std-dev, Jenks, arithmetic and
   geometric progression, head/tail breaks) with your choice of class
   count up to 16; text columns get a categorical palette of the most
-  frequent values. **Normalize by area** divides each value by its
+  frequent values, or the dataset's own published palette when there is
+  one — CORINE Land Cover styles itself in its 47 official colours and
+  class names, and any QGIS colour-map export can be loaded for the
+  rest. **Normalize by area** divides each value by its
   feature's area before classifying and drawing, so absolute totals stop
   tracking polygon size (the legend then reads `LAND_VAL / m²`, in the
   CRS's own unit). Geographic layers are measured on an equal-area

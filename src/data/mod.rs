@@ -1,5 +1,6 @@
 pub mod attribution;
 pub mod coastline;
+pub mod colormap;
 pub mod crs;
 pub mod geoarrow;
 pub mod geojson;

@@ -149,8 +149,20 @@ pub struct StyleCtx {
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum StyleByMode {
-    Graduated { method: String, breaks: Vec<f64> },
-    Categorical { values: Vec<String> },
+    Graduated {
+        method: String,
+        breaks: Vec<f64>,
+    },
+    Categorical {
+        values: Vec<String>,
+        /// Colour map applied to those values, when the style uses one.
+        /// Absent in contexts written before colour maps existed, where
+        /// the frequency palette is the right answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        colors: Option<Vec<[u8; 3]>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        labels: Option<Vec<String>>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -159,15 +171,15 @@ pub struct StyleByCtx {
     pub ramp: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classified_rows: Option<usize>,
-    #[serde(default, skip_serializing_if = "is_zero_u16")]
-    pub hidden_bins: u16,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub hidden_bins: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub per_area: bool,
     #[serde(flatten)]
     pub mode: StyleByMode,
 }
 
-fn is_zero_u16(v: &u16) -> bool {
+fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
 
@@ -200,9 +212,15 @@ impl StyleCtx {
                         method: method.label().to_string(),
                         breaks: breaks.clone(),
                     },
-                    StyleMode::Categorical { values } => {
-                        StyleByMode::Categorical { values: values.clone() }
-                    }
+                    StyleMode::Categorical {
+                        values,
+                        colors,
+                        labels,
+                    } => StyleByMode::Categorical {
+                        values: values.clone(),
+                        colors: colors.clone(),
+                        labels: labels.clone(),
+                    },
                 },
             }),
         }
@@ -241,9 +259,15 @@ impl StyleCtx {
                             .unwrap_or(crate::data::layer::ClassMethod::EqualInterval),
                         breaks,
                     },
-                    StyleByMode::Categorical { values } => {
-                        StyleMode::Categorical { values }
-                    }
+                    StyleByMode::Categorical {
+                        values,
+                        colors,
+                        labels,
+                    } => StyleMode::Categorical {
+                        values,
+                        colors,
+                        labels,
+                    },
                 },
             }),
         }

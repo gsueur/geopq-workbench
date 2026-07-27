@@ -25,12 +25,12 @@ pub struct DrawStyle {
     /// Bitmask of style bins hidden from the map (legend toggles).
     /// Only honored while `bin_colors` is set: without data styling
     /// every chunk reports bin 0 and the mask would hide the layer.
-    pub hidden_bins: u16,
+    pub hidden_bins: u64,
 }
 
 impl DrawStyle {
     fn bin_hidden(&self, bin: u8) -> bool {
-        self.bin_colors.is_some() && self.hidden_bins & (1u16 << bin) != 0
+        self.bin_colors.is_some() && self.hidden_bins & (1u64 << bin) != 0
     }
 }
 

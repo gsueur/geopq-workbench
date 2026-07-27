@@ -93,7 +93,7 @@ impl GroupLoad {
 
 /// Number of style bins (chunk meshes carry a u8 bin; 0 is the default
 /// bin used when no data-driven styling is active).
-pub const STYLE_BINS: usize = 16;
+pub const STYLE_BINS: usize = 64;
 
 /// Data-driven styling: color features by an attribute column.
 #[derive(Clone, Debug, PartialEq)]
@@ -104,7 +104,7 @@ pub struct StyleBy {
     /// Bitmask of classes hidden from the map (bit i = bin i), toggled
     /// by clicking legend entries. Draw-time filter only; meshes keep
     /// every feature.
-    pub hidden_bins: u16,
+    pub hidden_bins: u64,
     /// Graduated styling: classify and render value / polygon area
     /// (data-CRS units) instead of the absolute value, so large
     /// polygons don't dominate a choropleth.
@@ -121,7 +121,18 @@ pub enum StyleMode {
     /// breaks; bin = number of breaks ≤ value).
     Graduated { method: ClassMethod, breaks: Vec<f64> },
     /// Explicit category values, one bin each (bin STYLE_BINS-1 = other).
-    Categorical { values: Vec<String> },
+    ///
+    /// `colors` and `labels`, when set, are aligned with `values` and
+    /// come from a colour map — a dataset whose classes have an official
+    /// palette (CORINE land cover, soil types, a QGIS export shipped
+    /// beside the data) must be drawn in it, not in whatever the
+    /// frequency order happened to assign.
+    Categorical {
+        values: Vec<String>,
+        #[allow(clippy::type_complexity)]
+        colors: Option<Vec<[u8; 3]>>,
+        labels: Option<Vec<String>>,
+    },
 }
 
 /// Classification method for graduated styling.
@@ -473,14 +484,20 @@ impl StyleBy {
                     *c = self.ramp.sample(i.min(n - 1) as f32 / (n - 1) as f32);
                 }
             }
-            StyleMode::Categorical { values } => {
+            StyleMode::Categorical { values, colors, .. } => {
                 for (i, c) in out.iter_mut().enumerate() {
                     if i < values.len().min(STYLE_BINS - 1) {
-                        let p = palette_color(i);
+                        let rgb = match colors {
+                            Some(m) if i < m.len() => m[i],
+                            _ => {
+                                let p = palette_color(i);
+                                [p.r(), p.g(), p.b()]
+                            }
+                        };
                         *c = [
-                            p.r() as f32 / 255.0,
-                            p.g() as f32 / 255.0,
-                            p.b() as f32 / 255.0,
+                            rgb[0] as f32 / 255.0,
+                            rgb[1] as f32 / 255.0,
+                            rgb[2] as f32 / 255.0,
                         ];
                     } else {
                         *c = [0.55, 0.55, 0.55]; // "other"
@@ -885,7 +902,7 @@ mod class_tests {
                 let b = classify_breaks(*m, &mut vals.clone(), classes);
                 if *m == ClassMethod::HeadTail {
                     // Head/tail decides its own depth; never more than asked.
-                    assert!(!b.is_empty() && b.len() <= classes - 1, "{m:?}");
+                    assert!(!b.is_empty() && b.len() < classes, "{m:?}");
                 } else {
                     assert_eq!(b.len(), classes - 1, "{m:?} classes={classes}");
                 }
@@ -937,8 +954,10 @@ mod class_tests {
     #[test]
     fn breaks_binning_matches_partition() {
         // partition_point semantics: value below first break -> bin 0,
-        // above last -> last bin.
-        let breaks = equal_interval_breaks(0.0, 16.0, STYLE_BINS);
+        // above last -> last bin. Sixteen unit-wide classes, stated here
+        // rather than taken from STYLE_BINS: the property is about the
+        // binning rule, not about how many bins the GPU allows.
+        let breaks = equal_interval_breaks(0.0, 16.0, 16);
         let bin = |v: f64| breaks.partition_point(|b| v >= *b);
         assert_eq!(bin(-1.0), 0);
         assert_eq!(bin(0.5), 0);

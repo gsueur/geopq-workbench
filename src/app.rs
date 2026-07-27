@@ -634,6 +634,12 @@ struct StyleDialog {
     breaks: Option<Result<Vec<f64>, String>>,
     /// Top values for categorical columns (None = fetch in flight).
     categories: Option<Result<Vec<String>, String>>,
+    /// Official colour map recognized from those values (CORINE land
+    /// cover and friends), and whether to use it. Detected on arrival,
+    /// on by default: a dataset with a canonical palette is unreadable
+    /// in any other one.
+    color_map: Option<crate::data::colormap::ColorMap>,
+    use_color_map: bool,
 }
 
 /// Editor for a layer's persistent SQL filter.
@@ -4334,6 +4340,8 @@ impl ViewerApp {
             max: 1.0,
             breaks: None,
             categories: None,
+            color_map: None,
+            use_color_map: true,
         };
         self.style_dialog_select_column(&mut d, ctx, true);
         self.style_dialog = Some(d);
@@ -4436,6 +4444,10 @@ impl ViewerApp {
         while let Ok((layer_id, column, res)) = self.cat_rx.try_recv() {
             if let Some(d) = &mut self.style_dialog {
                 if d.layer_id == layer_id && d.column == column && !d.numeric {
+                    d.color_map = match &res {
+                        Ok(v) => crate::data::colormap::match_builtin(v),
+                        Err(_) => None,
+                    };
                     d.categories = Some(res);
                 }
             }
@@ -4628,12 +4640,88 @@ impl ViewerApp {
                                 );
                             }
                             Some(Ok(values)) => {
+                                let mut load_error: Option<String> = None;
+                                ui.horizontal(|ui| {
+                                    if let Some(map) = &d.color_map {
+                                        ui.checkbox(
+                                            &mut d.use_color_map,
+                                            format!("{} colours", map.name),
+                                        )
+                                        .on_hover_text(
+                                            "These values match a published palette. \
+                                             Its colours and class names are used, in \
+                                             nomenclature order rather than by \
+                                             frequency",
+                                        );
+                                    }
+                                    if ui
+                                        .small_button("Load colour map…")
+                                        .on_hover_text(
+                                            "A QGIS colour-map export (the .txt beside \
+                                             most published datasets): its classes are \
+                                             matched against this column's values",
+                                        )
+                                        .clicked()
+                                        && let Some(p) = rfd::FileDialog::new()
+                                            .add_filter("colour map", &["txt", "clr"])
+                                            .pick_file()
+                                    {
+                                        let name = p
+                                            .file_stem()
+                                            .map(|s| s.to_string_lossy().to_string())
+                                            .unwrap_or_else(|| "colour map".into());
+                                        match std::fs::read_to_string(&p)
+                                            .ok()
+                                            .and_then(|t| {
+                                                crate::data::colormap::parse_qgis(&t, &name)
+                                            }) {
+                                            Some(m) => {
+                                                d.color_map = Some(m);
+                                                d.use_color_map = true;
+                                            }
+                                            // Reported inline: the file is
+                                            // the user's own choice and a
+                                            // silent no-op reads as a bug.
+                                            None => load_error = Some(format!(
+                                                "{}: no colour classes found",
+                                                p.display()
+                                            )),
+                                        }
+                                    }
+                                });
+                                if let Some(e) = &load_error {
+                                    ui.label(
+                                        RichText::new(e).color(Color32::from_rgb(220, 60, 60)),
+                                    );
+                                }
+                                // Preview exactly what Apply will produce.
+                                let preview = categorical_mode(
+                                    values.clone(),
+                                    d.color_map.as_ref().filter(|_| d.use_color_map),
+                                );
+                                let (values, colors, labels) = match &preview {
+                                    StyleMode::Categorical {
+                                        values,
+                                        colors,
+                                        labels,
+                                    } => (values, colors, labels),
+                                    _ => unreachable!("categorical column"),
+                                };
                                 egui::ScrollArea::vertical().max_height(220.0).show(
                                     ui,
                                     |ui| {
                                         for (i, v) in values.iter().enumerate() {
                                             ui.horizontal(|ui| {
-                                                let c = palette_color(i);
+                                                let c = match colors {
+                                                    Some(m) if i < m.len() => Color32::from_rgb(
+                                                        m[i][0], m[i][1], m[i][2],
+                                                    ),
+                                                    _ => palette_color(i),
+                                                };
+                                                let v = match labels {
+                                                    Some(l) if i < l.len() => &l[i],
+                                                    _ => v,
+                                                };
                                                 let (r, _) = ui.allocate_exact_size(
                                                     egui::vec2(12.0, 12.0),
                                                     egui::Sense::hover(),
@@ -4681,12 +4769,14 @@ impl ViewerApp {
                                         },
                                     }
                                 } else {
-                                    StyleMode::Categorical {
-                                        values: match &d.categories {
-                                            Some(Ok(v)) => v.clone(),
-                                            _ => Vec::new(),
-                                        },
-                                    }
+                                    let values = match &d.categories {
+                                        Some(Ok(v)) => v.clone(),
+                                        _ => Vec::new(),
+                                    };
+                                    categorical_mode(
+                                        values,
+                                        d.color_map.as_ref().filter(|_| d.use_color_map),
+                                    )
                                 },
                                 classified_rows: None, // stamped on apply below
                             });
@@ -7425,6 +7515,50 @@ pub(crate) fn build_rg_overlay(
 /// Default border/line color: a darkened shade of the layer color.
 /// Curated, well-balanced palettes for the layer color pickers — picking
 /// from swatches beats the infinite color wheel for a data workbench.
+/// Categorical style for `values`, using `map` when one was recognized
+/// and kept.
+///
+/// The map also fixes the order: frequency order scatters the
+/// nomenclature, and a CORINE legend reading 111, 112, 121 … is half the
+/// point of having one.
+fn categorical_mode(
+    values: Vec<String>,
+    map: Option<&crate::data::colormap::ColorMap>,
+) -> crate::data::layer::StyleMode {
+    use crate::data::layer::{StyleMode, STYLE_BINS};
+    let Some(map) = map else {
+        return StyleMode::Categorical {
+            values,
+            colors: None,
+            labels: None,
+        };
+    };
+    let mut ordered: Vec<&crate::data::colormap::ClassColor> = map
+        .classes
+        .iter()
+        .filter(|c| values.iter().any(|v| *v == c.value))
+        .collect();
+    // Values the map does not know keep their place at the end; they
+    // fall into "other" beyond the bin ceiling anyway.
+    ordered.truncate(STYLE_BINS - 1);
+    StyleMode::Categorical {
+        values: ordered.iter().map(|c| c.value.clone()).collect(),
+        colors: Some(ordered.iter().map(|c| c.rgb).collect()),
+        labels: Some(
+            ordered
+                .iter()
+                .map(|c| {
+                    if c.label.is_empty() {
+                        c.value.clone()
+                    } else {
+                        format!("{} — {}", c.value, c.label)
+                    }
+                })
+                .collect(),
+        ),
+    }
+}
+
 /// Rows, saturated to soft: Tableau 10, CARTO Vivid, ColorBrewer Set1,
 /// Dark2, Set2, Pastel1, CARTO Antique (map-friendly earth tones).
 const SWATCH_ROWS: &[(&str, &[[u8; 3]])] = &[
@@ -7632,7 +7766,7 @@ fn style_legend(
         }
         let mut toggle: Option<u8> = None;
         let mut swatch = |ui: &mut egui::Ui, bin: u8, c: Color32, label: String| {
-            let hidden = sb.hidden_bins & (1u16 << bin) != 0;
+            let hidden = sb.hidden_bins & (1u64 << bin) != 0;
             let row = ui
                 .horizontal(|ui| {
                     let (r, _) = ui
@@ -7681,9 +7815,23 @@ fn style_legend(
                     swatch(ui, i as u8, c, label);
                 }
             }
-            StyleMode::Categorical { values } => {
+            StyleMode::Categorical {
+                values,
+                colors,
+                labels,
+            } => {
                 for (i, v) in values.iter().enumerate() {
-                    swatch(ui, i as u8, crate::data::layer::palette_color(i), v.clone());
+                    let c = match colors {
+                        Some(m) if i < m.len() => {
+                            Color32::from_rgb(m[i][0], m[i][1], m[i][2])
+                        }
+                        _ => crate::data::layer::palette_color(i),
+                    };
+                    let label = match labels {
+                        Some(l) if i < l.len() => l[i].clone(),
+                        _ => v.clone(),
+                    };
+                    swatch(ui, i as u8, c, label);
                 }
                 swatch(
                     ui,
@@ -7694,7 +7842,7 @@ fn style_legend(
             }
         }
         if let Some(bin) = toggle {
-            sb.hidden_bins ^= 1u16 << bin;
+            sb.hidden_bins ^= 1u64 << bin;
         }
     });
     reclass

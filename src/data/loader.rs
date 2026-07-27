@@ -2466,7 +2466,7 @@ pub fn resolve_style(
     }
     let binning = match &sb.mode {
         StyleMode::Graduated { breaks, .. } => Binning::Breaks(breaks.clone()),
-        StyleMode::Categorical { values } => Binning::Categorical {
+        StyleMode::Categorical { values, .. } => Binning::Categorical {
             map: values
                 .iter()
                 .take(STYLE_BINS - 1)
