@@ -2639,6 +2639,13 @@ impl ViewerApp {
         let mut rebuild_outlines: Option<u64> = None;
         let mut renaming = self.rename_layer.take();
 
+        // The basemap, under everything on the map, pinned to the foot of
+        // the panel. A bottom panel has to be declared before the content
+        // that fills the rest, so it is placed here and drawn last.
+        egui::Panel::bottom("basemap_row").show(ui, |ui| {
+            crate::theme::compact(ui);
+            self.basemap_card(ui);
+        });
         egui::ScrollArea::vertical().show(ui, |ui| {
             crate::theme::compact(ui);
             // Top-most layer first in the list.
@@ -3198,11 +3205,6 @@ impl ViewerApp {
                 });
                 ui.add_space(4.0);
             }
-            // The basemap, under everything, so last in a list drawn
-            // top-most first. Not a VectorLayer: it has no geometry, no
-            // attributes and no file, so it gets its own row rather than
-            // being faked into the layer list.
-            self.basemap_card(ui);
         });
         self.rename_layer = renaming;
         if let Some(id) = reclass_req {
