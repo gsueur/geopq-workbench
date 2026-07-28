@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::map::camera::Camera;
 use crate::map::warp::{self, TileMesh, Warp, WarpPlan};
@@ -155,8 +155,11 @@ pub fn nolabels_twin(source_idx: usize) -> Option<usize> {
     TILE_SOURCES.iter().position(|s| s.name == want)
 }
 
+#[derive(Debug)]
 enum TileState {
-    Pending,
+    /// Queued or in flight. Carries the failures so far so a retry keeps
+    /// backing off instead of restarting the clock.
+    Pending { attempts: u32 },
     Ready,
     /// Fetch failed; retried with exponential backoff (transient network
     /// errors must not blank tiles for the whole session).
@@ -276,9 +279,33 @@ struct FetchResult {
     mips: Option<Vec<MipLevel>>,
 }
 
+/// The fetch queue, rebuilt from scratch on every frame that asks for
+/// tiles.
+///
+/// A FIFO was the wrong shape: zooming through six levels queued every
+/// level on the way, and the workers kept grinding through views the user
+/// had already left. What matters is only ever the current view, so the
+/// want list is replaced rather than appended to and obsolete tiles are
+/// dropped before anyone spends a request on them.
+///
+/// Requests already in flight cannot be taken back — a blocking read is
+/// not interruptible — but there are at most `FETCH_THREADS` of those, so
+/// the tail this used to leave behind is gone.
+#[derive(Default)]
+struct Queue {
+    /// Tiles the current view wants, most useful first.
+    want: VecDeque<TileKey>,
+    /// Handed to a worker and not yet finished; never queued twice.
+    in_flight: HashSet<TileKey>,
+    /// Set when the cache is dropped, so workers stop waiting and exit.
+    stop: bool,
+}
+
+type Shared = Arc<(Mutex<Queue>, Condvar)>;
+
 pub struct TileCache {
     entries: HashMap<TileKey, CacheEntry>,
-    req_tx: Sender<TileKey>,
+    queue: Shared,
     res_rx: Receiver<FetchResult>,
     pending_uploads: Vec<TileUpload>,
     frame: u64,
@@ -295,20 +322,32 @@ const MAX_CACHED_MESHES: usize = 2048;
 
 impl TileCache {
     pub fn new(egui_ctx: eframe::egui::Context) -> Self {
-        let (req_tx, req_rx) = channel::<TileKey>();
         let (res_tx, res_rx) = channel::<FetchResult>();
-        let shared_rx = Arc::new(Mutex::new(req_rx));
+        let queue: Shared = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
         for _ in 0..FETCH_THREADS {
-            let rx = shared_rx.clone();
+            let q = queue.clone();
             let tx = res_tx.clone();
             let ctx = egui_ctx.clone();
             std::thread::spawn(move || loop {
                 let key = {
-                    let guard = rx.lock().unwrap();
-                    guard.recv()
+                    let (lock, cv) = &*q;
+                    let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    loop {
+                        if g.stop {
+                            return;
+                        }
+                        if let Some(k) = g.want.pop_front() {
+                            g.in_flight.insert(k);
+                            break k;
+                        }
+                        g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                    }
                 };
-                let Ok(key) = key else { return };
                 let mips = fetch_tile(key);
+                {
+                    let mut g = q.0.lock().unwrap_or_else(|e| e.into_inner());
+                    g.in_flight.remove(&key);
+                }
                 if tx.send(FetchResult { key, mips }).is_err() {
                     return;
                 }
@@ -317,13 +356,27 @@ impl TileCache {
         }
         Self {
             entries: HashMap::new(),
-            req_tx,
+            queue,
             res_rx,
             pending_uploads: Vec::new(),
             frame: 0,
             warp_meshes: HashMap::new(),
             warp_epoch: 0,
         }
+    }
+
+    /// Replace the fetch queue with exactly what this view wants.
+    ///
+    /// Anything queued for an earlier view and not yet picked up is
+    /// dropped here, which is the whole point: a zoom through several
+    /// levels must not spend requests on the levels it passed through.
+    fn set_wanted(&mut self, want: Vec<TileKey>) {
+        let (lock, cv) = &*self.queue;
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let in_flight = std::mem::take(&mut g.in_flight);
+        g.want = want.into_iter().filter(|k| !in_flight.contains(k)).collect();
+        g.in_flight = in_flight;
+        cv.notify_all();
     }
 
     /// Drain results from fetch threads; call once per frame.
@@ -336,6 +389,7 @@ impl TileCache {
                 }
                 None => {
                     let attempts = match self.entries.get(&res.key).map(|e| &e.state) {
+                        Some(TileState::Pending { attempts }) => attempts + 1,
                         Some(TileState::Failed { attempts, .. }) => attempts + 1,
                         _ => 1,
                     };
@@ -450,6 +504,9 @@ impl TileCache {
         self.frame += 1;
         let mut draws: Vec<TileDrawCmd> = Vec::new();
         let mut fallback: Vec<TileId> = Vec::new();
+        // The queue is rebuilt wholesale, so this is the complete list of
+        // what to fetch for this view — not a delta on the last one.
+        let mut want: Vec<TileKey> = Vec::new();
 
         for id in &wanted {
             let key = TileKey {
@@ -465,13 +522,19 @@ impl TileCache {
                             world_rect: id.world_rect(),
                             mesh: None,
                         }),
-                        TileState::Pending => fallback.push(*id),
+                        TileState::Pending { .. } => {
+                            want.push(key);
+                            fallback.push(*id);
+                        }
                         TileState::Failed { at, attempts } => {
                             let backoff =
                                 std::time::Duration::from_secs(1u64 << attempts.min(6));
                             if attempts < TILE_RETRY_MAX && at.elapsed() >= backoff {
-                                e.state = TileState::Pending;
-                                let _ = self.req_tx.send(key);
+                                // Carry the count forward: resetting it here
+                                // would restart the backoff every retry and
+                                // it would never actually back off.
+                                e.state = TileState::Pending { attempts };
+                                want.push(key);
                             }
                             fallback.push(*id);
                         }
@@ -481,15 +544,16 @@ impl TileCache {
                     self.entries.insert(
                         key,
                         CacheEntry {
-                            state: TileState::Pending,
+                            state: TileState::Pending { attempts: 0 },
                             last_used: self.frame,
                         },
                     );
-                    let _ = self.req_tx.send(key);
+                    want.push(key);
                     fallback.push(*id);
                 }
             }
         }
+        self.set_wanted(want);
 
         // Ancestor fallback for missing tiles (drawn first, children on top).
         let mut ancestors: Vec<TileId> = Vec::new();
@@ -548,12 +612,20 @@ impl TileCache {
         }
     }
 
-    /// Number of tiles currently being fetched.
+    /// Tiles queued or in flight for the current view.
     pub fn pending_count(&self) -> usize {
-        self.entries
-            .values()
-            .filter(|e| matches!(e.state, TileState::Pending))
-            .count()
+        let g = self.queue.0.lock().unwrap_or_else(|e| e.into_inner());
+        g.want.len() + g.in_flight.len()
+    }
+}
+
+impl Drop for TileCache {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.queue;
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        g.stop = true;
+        g.want.clear();
+        cv.notify_all();
     }
 }
 
@@ -616,6 +688,110 @@ mod tests {
             assert!(!s.attribution.is_empty(), "{} has no attribution", s.name);
             assert!(s.max_zoom >= 15 && s.max_zoom <= 22, "{}: {}", s.name, s.max_zoom);
         }
+    }
+
+    /// A zoom that crosses several levels must not leave the earlier
+    /// levels queued. This is the behaviour the FIFO got wrong: it kept
+    /// fetching views the user had already left.
+    #[test]
+    fn a_new_view_replaces_the_queue_instead_of_extending_it() {
+        let ctx = eframe::egui::Context::default();
+        let mut cache = TileCache::new(ctx);
+        // Stop the workers before they can drain anything, so what the
+        // queue holds is exactly what each view asked for.
+        {
+            let mut g = cache.queue.0.lock().unwrap();
+            g.stop = true;
+        }
+
+        let ids = |z: u8, n: u32| -> Vec<TileId> {
+            (0..n).map(|x| TileId { z, x, y: 0 }).collect()
+        };
+        cache.resolve(0, ids(8, 6));
+        assert_eq!(cache.pending_count(), 6, "the first view queues its tiles");
+
+        // Zoom in: a different level entirely.
+        cache.resolve(0, ids(14, 3));
+        let g = cache.queue.0.lock().unwrap();
+        assert_eq!(g.want.len(), 3, "only the current view stays queued");
+        assert!(
+            g.want.iter().all(|k| k.id.z == 14),
+            "level 8 tiles survived the zoom: {:?}",
+            g.want.iter().map(|k| k.id.z).collect::<Vec<_>>()
+        );
+    }
+
+    /// A tile handed to a worker must not be queued again by the next
+    /// frame, or a slow fetch would be issued once per frame.
+    #[test]
+    fn in_flight_tiles_are_not_requeued() {
+        let ctx = eframe::egui::Context::default();
+        let mut cache = TileCache::new(ctx);
+        {
+            let mut g = cache.queue.0.lock().unwrap();
+            g.stop = true;
+        }
+        let want = vec![TileId { z: 5, x: 1, y: 1 }, TileId { z: 5, x: 2, y: 1 }];
+        cache.resolve(0, want.clone());
+        // Simulate a worker taking the first one.
+        let taken = {
+            let mut g = cache.queue.0.lock().unwrap();
+            let k = g.want.pop_front().unwrap();
+            g.in_flight.insert(k);
+            k
+        };
+        cache.resolve(0, want);
+        let g = cache.queue.0.lock().unwrap();
+        assert!(
+            !g.want.contains(&taken),
+            "a tile already being fetched was queued again"
+        );
+        assert_eq!(g.in_flight.len(), 1, "in-flight state must survive a rebuild");
+    }
+
+    /// Retry backoff has to grow. Marking a failed tile Pending used to
+    /// erase the attempt count, so every retry started the clock again and
+    /// a dead tile was re-requested every two seconds forever.
+    #[test]
+    fn retry_backoff_keeps_counting() {
+        let ctx = eframe::egui::Context::default();
+        let mut cache = TileCache::new(ctx);
+        {
+            let mut g = cache.queue.0.lock().unwrap();
+            g.stop = true;
+        }
+        let id = TileId { z: 3, x: 1, y: 1 };
+        let key = TileKey { source: 0, id };
+        let failed = |ago: u64, attempts: u32| CacheEntry {
+            state: TileState::Failed {
+                at: std::time::Instant::now() - std::time::Duration::from_secs(ago),
+                attempts,
+            },
+            last_used: 0,
+        };
+
+        // Three failures, long past its 8 s backoff: retried, count kept.
+        cache.entries.insert(key, failed(600, 3));
+        cache.resolve(0, vec![id]);
+        match cache.entries.get(&key).unwrap().state {
+            TileState::Pending { attempts } => assert_eq!(attempts, 3),
+            ref other => panic!("expected a retry, got {other:?}"),
+        }
+        assert_eq!(cache.pending_count(), 1);
+
+        // Still inside the backoff: left alone, and nothing queued.
+        cache.entries.insert(key, failed(1, 3));
+        cache.resolve(0, vec![id]);
+        assert!(
+            matches!(cache.entries.get(&key).unwrap().state, TileState::Failed { .. }),
+            "retried before its backoff elapsed"
+        );
+        assert_eq!(cache.pending_count(), 0);
+
+        // Out of attempts: never retried again.
+        cache.entries.insert(key, failed(6000, TILE_RETRY_MAX));
+        cache.resolve(0, vec![id]);
+        assert_eq!(cache.pending_count(), 0, "retried past the attempt limit");
     }
 
     #[test]
