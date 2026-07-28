@@ -423,13 +423,26 @@ quality gate and display policy).
 
 ## Roadmap
 
-- Overview/pyramid levels for zoomed-out views of huge remote files
-- Remote hive datasets over `https://` (the `s3://` side shipped in 0.3.2)
-- Streaming optimize beyond the 8 GB in-memory cap; multi-file optimize
-- Lazy part-append while panning across STAC collections
-- More SQL: polygon set operations, spatial aggregates
-- Zoom-dependent level of detail for very dense layers; label rendering
-- Basemap tiles warped to non-Mercator projections
+- Basemap tiles warped to non-Mercator projections. The first layer
+  picks an equal-area projection by default, which is exactly when the
+  tiles are currently hidden.
+- Lazy part-append while panning across STAC collections. Parts are
+  resolved once at open against the viewport and capped at 16, so a
+  collection can report parts it will not go and fetch.
+- More SQL: polygon set operations (union, intersection, difference)
+  and spatial aggregates, so the console can produce a layer rather
+  than only filter one.
+- Streaming optimize beyond the 8 GB in-memory cap; multi-file
+  optimize.
+- Remote hive datasets over `https://` (the `s3://` side shipped in
+  0.3.2). Blocked on discovery rather than on reading: `s3://prefix/`
+  works because S3 lists objects, while plain HTTPS has no equivalent,
+  so this needs a manifest convention first.
+- Label rendering.
+
+Zoom-dependent level of detail shipped in 0.5.0, by scale rather than
+by data volume; the overview/pyramid approach it replaced was tried and
+discarded.
 
 ## Development
 
