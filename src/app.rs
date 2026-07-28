@@ -2197,39 +2197,43 @@ impl ViewerApp {
                 ui.checkbox(&mut self.show_graticule, "Graticule");
                 ui.checkbox(&mut self.show_coastline, "Coastline");
                 ui.menu_button("Basemap", |ui| {
-                    // Tiles are Web Mercator and get warped onto a mesh for
-                    // any other projection. The imagery survives that; the
-                    // place names baked into it do not, so say what will
-                    // happen before the user picks.
+                    // Every source is always listed. The label-free swap
+                    // below is an automatic fallback for one view, not a
+                    // different choice, and hiding the entry the user picked
+                    // would leave them unable to pick it again.
                     let warped = !self.display.is_mercator();
+                    let plan = self.basemap_plan(self.last_viewport_px);
                     if warped {
                         ui.label(
-                            RichText::new(format!(
-                                "reprojected to {}",
-                                self.display.name
-                            ))
-                            .weak()
-                            .small(),
+                            RichText::new(format!("reprojected to {}", self.display.name))
+                                .weak()
+                                .small(),
                         );
-                        if let BasemapPlan::Off(Some(why)) = self.basemap_plan(self.last_viewport_px)
-                        {
-                            ui.label(RichText::new(why).weak().small());
+                        let note = match (plan, self.basemap) {
+                            (BasemapPlan::Off(Some(why)), _) => Some(why.to_string()),
+                            (BasemapPlan::Warped(drawn, _), Some(picked)) if drawn != picked => {
+                                Some(format!(
+                                    "labels would shear at this zoom, so {} is \
+                                     drawn instead",
+                                    TILE_SOURCES[drawn].name
+                                ))
+                            }
+                            _ => None,
+                        };
+                        if let Some(n) = note {
+                            ui.label(RichText::new(n).weak().small());
                         }
                         ui.separator();
                     }
                     for (i, s) in TILE_SOURCES.iter().enumerate() {
-                        if warped && s.labels && crate::map::tiles::nolabels_twin(i).is_some() {
-                            // Its twin is listed right below and is what
-                            // would actually be drawn; offering both here
-                            // would be two names for one outcome.
-                            continue;
-                        }
                         let r = ui.selectable_value(&mut self.basemap, Some(i), s.name);
                         if warped && s.labels {
                             r.on_hover_text(
-                                "This source renders place names into the tile \
-                                 pixels, so they shear with the projection. \
-                                 Tiles are dropped where that would show.",
+                                "Place names are drawn into these tiles, so they \
+                                 shear with the projection. Zoomed in they hold \
+                                 up and are kept; zoomed out this falls back to \
+                                 the label-free version, or to no tiles when \
+                                 there is none.",
                             );
                         }
                     }

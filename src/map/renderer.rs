@@ -621,6 +621,17 @@ impl MapResources {
         let Some(base) = up.mips.first() else { return };
         let (w, h) = (base.w, base.h);
         let mips = &up.mips;
+        // Tile PNGs are sRGB-encoded. Whether to declare that depends on the
+        // target: an sRGB target re-encodes on write, so the sampler should
+        // decode; a plain one does not, and egui writes gamma-encoded values
+        // into it directly, so the tile must pass through untouched. Getting
+        // this wrong decodes without ever re-encoding, which barely shows on
+        // a light basemap and crushes a dark one to black.
+        let format = if self.target_format.is_srgb() {
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        } else {
+            wgpu::TextureFormat::Rgba8Unorm
+        };
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("tile"),
             size: wgpu::Extent3d {
@@ -631,7 +642,7 @@ impl MapResources {
             mip_level_count: mips.len() as u32,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -2227,6 +2238,72 @@ mod tests {
         );
     }
 
+    /// A tile's pixels must reach the screen with their values intact.
+    ///
+    /// The target surface is not sRGB (eframe hands us `Bgra8Unorm` and egui
+    /// writes gamma-encoded values into it), so declaring the tile texture
+    /// sRGB made the sampler decode without anything re-encoding. Mid-grey
+    /// 128 came out at 55. It barely showed on a light basemap and turned the
+    /// dark one black.
+    #[test]
+    fn tile_grey_survives_the_trip_to_the_screen() {
+        use crate::map::tiles::{MipLevel, TileDrawCmd, TileId, TileKey, TileUpload};
+
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let size = 64u32;
+        let mut resources = egui_wgpu::CallbackResources::default();
+        resources.insert(MapResources::new(&device, wgpu::TextureFormat::Rgba8Unorm));
+
+        let id = TileId { z: 4, x: 8, y: 5 };
+        let key = TileKey { source: 0, id };
+        let r = id.world_rect();
+        let mut camera = crate::map::camera::Camera::default();
+        // Inside the tile, so every sampled pixel is tile and none is clear.
+        camera.fit(
+            [
+                r[0] + (r[2] - r[0]) * 0.25,
+                r[1] + (r[3] - r[1]) * 0.25,
+                r[0] + (r[2] - r[0]) * 0.75,
+                r[1] + (r[3] - r[1]) * 0.75,
+            ],
+            [size as f32, size as f32],
+            0.0,
+        );
+
+        let cb = MapCallback {
+            camera,
+            viewport_px: [size as f32, size as f32],
+            tile_draws: vec![TileDrawCmd {
+                key,
+                world_rect: r,
+                mesh: None,
+            }],
+            tile_uploads: vec![TileUpload {
+                key,
+                mips: vec![MipLevel {
+                    w: 4,
+                    h: 4,
+                    px: [128u8, 128, 128, 255].repeat(16),
+                }],
+            }],
+            alive_tiles: [key].into_iter().collect(),
+            alive_layers: Default::default(),
+            layers: vec![],
+            background: [0.0; 4],
+        };
+        let data = render_to_pixels(&device, &queue, &mut resources, &cb, size);
+
+        let centre = ((size / 2) * size + size / 2) as usize * 4;
+        let px = &data[centre..centre + 3];
+        assert!(
+            px.iter().all(|&v| (v as i32 - 128).abs() <= 2),
+            "mid-grey came back as {px:?}, expected ~[128, 128, 128]"
+        );
+    }
+
     /// Render a real reprojected basemap to a PNG, for looking at.
     ///
     /// Ignored by default: it fetches live tiles. The things worth checking
@@ -2277,7 +2354,7 @@ mod tests {
 
         // Follow the app's own rule: start from a labelled source and fall
         // back to its label-free twin only when the view would shear text.
-        let mut src = 0usize;
+        let mut src = env("GEOPQ_SNAP_SRC", 0.0) as usize;
         let plan = warp::plan(&w, &camera, [size as f32, size as f32], TILE_SOURCES[src].max_zoom)
             .expect("plans");
         if TILE_SOURCES[src].labels && !plan.labels_survive() {

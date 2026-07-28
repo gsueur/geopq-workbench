@@ -96,6 +96,31 @@ pub const TILE_SOURCES: &[TileSource] = &[
         labels: true,
     },
     TileSource {
+        name: "OpenTopoMap",
+        url: "https://tile.opentopomap.org/{z}/{x}/{y}.png",
+        attribution: "© OpenStreetMap contributors, SRTM · © OpenTopoMap (CC-BY-SA)",
+        max_zoom: 17,
+        labels: true,
+    },
+    TileSource {
+        name: "Esri World Topo",
+        url: "https://server.arcgisonline.com/ArcGIS/rest/services/\
+               World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
+        attribution: "Esri, TomTom, Garmin, FAO, NOAA, USGS, © OpenStreetMap contributors",
+        max_zoom: 19,
+        labels: true,
+    },
+    TileSource {
+        // Imagery carries no rendered text at all, so it reprojects
+        // without any of the label caveats.
+        name: "Esri World Imagery",
+        url: "https://server.arcgisonline.com/ArcGIS/rest/services/\
+               World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attribution: "Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+        max_zoom: 19,
+        labels: false,
+    },
+    TileSource {
         name: "Carto Light (no labels)",
         url: "https://basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}.png",
         attribution: "© OpenStreetMap contributors © CARTO",
@@ -576,6 +601,21 @@ mod tests {
         // OSM has no label-free variant, and must not claim one.
         let osm = TILE_SOURCES.iter().position(|s| s.name == "OpenStreetMap").unwrap();
         assert_eq!(nolabels_twin(osm), None);
+    }
+
+    /// Line continuations inside these URLs have eaten characters before.
+    /// Every source must still be a well-formed https template.
+    #[test]
+    fn every_source_url_is_well_formed() {
+        for s in TILE_SOURCES {
+            assert!(s.url.starts_with("https://"), "{}: {}", s.name, s.url);
+            assert!(!s.url.contains(' '), "{} has whitespace: {}", s.name, s.url);
+            for tag in ["{z}", "{x}", "{y}"] {
+                assert!(s.url.contains(tag), "{} lacks {tag}: {}", s.name, s.url);
+            }
+            assert!(!s.attribution.is_empty(), "{} has no attribution", s.name);
+            assert!(s.max_zoom >= 15 && s.max_zoom <= 22, "{}: {}", s.name, s.max_zoom);
+        }
     }
 
     #[test]

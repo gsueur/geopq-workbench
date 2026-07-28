@@ -285,12 +285,12 @@ larger files are on the roadmap.
   file.
 - **Rename** (layer ⋮ → Rename): a display label for the layer panel and
   legend; the file keeps its name.
-- **Basemaps**: Carto Light/Dark/Voyager and OSM raster tiles, each
-  Carto style also in a label-free variant, plus a Natural Earth
-  coastline and graticule that follow any projection. The coastline is
-  zoom-dependent: the embedded 1:50m version is swapped for the 1:10m
-  one when you zoom in (fetched once, ~3 MB, cached on disk; the app
-  quietly stays on 1:50m offline).
+- **Basemaps**: Carto Light/Dark/Voyager (each also label-free),
+  OpenStreetMap, OpenTopoMap, Esri World Topo and Esri World Imagery,
+  plus a Natural Earth coastline and graticule that follow any
+  projection. The coastline is zoom-dependent: the embedded 1:50m
+  version is swapped for the 1:10m one when you zoom in (fetched once,
+  ~3 MB, cached on disk; the app quietly stays on 1:50m offline).
 - **Tiles outside Mercator**: tiles are published in Web Mercator, so
   in any other display projection each one is drawn as a subdivided
   mesh with its vertices projected exactly. Geometry reprojects
