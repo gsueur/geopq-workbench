@@ -432,6 +432,16 @@ quality gate and display policy).
 - More SQL: polygon set operations (union, intersection, difference)
   and spatial aggregates, so the console can produce a layer rather
   than only filter one.
+- Attribute tables with no geometry, loaded as first-class sources:
+  plain parquet first, then CSV with type inference. They would carry
+  no map presence of their own, only columns to query and join against.
+- Joins between an attribute table and a geo layer, keyed on a shared
+  column, producing a styleable layer. This is the reason the two
+  entries above are worth having.
+- Line styling: dash patterns and caps, plus width driven by a
+  classified column the way colour already is.
+- Export the current view to SVG, for a figure that goes into a
+  document rather than into another dataset.
 - Streaming optimize beyond the 8 GB in-memory cap; multi-file
   optimize.
 - Remote hive datasets over `https://` (the `s3://` side shipped in
