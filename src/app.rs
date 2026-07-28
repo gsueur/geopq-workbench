@@ -7464,8 +7464,11 @@ impl ViewerApp {
                     ui.monospace(format!("{lon:.6}, {lat:.6}"));
                 }
                 if !self.display.crs.is_latlong {
+                    // No CRS name here: some run long enough to push the
+                    // rest of the status bar off, and the projection
+                    // selector in the corner already names it.
                     let (x, y) = self.display.projected_from_world(w);
-                    ui.monospace(format!("| {x:.1}, {y:.1} ({})", self.display.crs.name));
+                    ui.monospace(format!("| {x:.1}, {y:.1}"));
                 }
             }
             if self.pick_pending {
