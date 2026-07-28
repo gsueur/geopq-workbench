@@ -152,7 +152,7 @@ geopq-workbench file.parquet dataset_dir/ https://host/data.parquet
 | HTTPS | File → Open URL… — needs range-request support on the server |
 | S3 (`s3://bucket/key`) | File → Open URL… — profiles from `~/.aws`, custom endpoints (MinIO etc.), anonymous access to public buckets |
 | S3 hive dataset (`s3://bucket/prefix/` or a `*` glob) | File → Open URL… — every matching parquet part loads as one layer (`s3://bucket/d/state=*/roads.parquet` picks one theme across partitions); `key=value` path segments become queryable columns |
-| Catalogs (Overture Maps, Parquetry, your own) | File → Repositories… — browse snapshots, check layers, they load with sensible names and stacking order. Parquetry repos can load a theme across every state of a country as one layer, with `country`/`state` as columns |
+| Catalogs (Overture Maps, Parquetry, your own) | File → Repositories… — browse snapshots, check layers, they load with sensible names and stacking order. Parquetry repos can load a theme across every state of a country as one layer, with `country`/`state` as columns. A STAC collection opens the parts covering most of the current view and adds the others as you pan into them |
 | GeoPackage / Shapefile / GeoJSON | drag & drop or File → Import vector file… — pure-Rust conversion to GeoParquet (no GDAL), with a covering bbox column and byte-sized row groups so the result is readable by viewport from the first open, then opens normally |
 | Sample data | File → Open sample dataset |
 
@@ -433,9 +433,6 @@ quality gate and display policy).
 
 ## Roadmap
 
-- Lazy part-append while panning across STAC collections. Parts are
-  resolved once at open against the viewport and capped at 16, so a
-  collection can report parts it will not go and fetch.
 - More SQL: polygon set operations (union, intersection, difference)
   and spatial aggregates, so the console can produce a layer rather
   than only filter one.
@@ -461,7 +458,9 @@ Zoom-dependent level of detail shipped in 0.5.0, by scale rather than
 by data volume; the overview/pyramid approach it replaced was tried and
 discarded. Basemap tiles now reproject onto a mesh instead of being
 hidden outside Mercator, falling back to a label-free source once the
-view would shear the place names baked into them.
+view would shear the place names baked into them. STAC collections open
+the parts covering most of the view and pick up the rest as you pan,
+instead of refusing to open past a part count.
 
 ## Development
 

@@ -265,6 +265,13 @@ pub struct ViewerApp {
     /// Layers whose refinement was stopped by the user: paused until the
     /// camera moves again (else the same viewport would respawn it).
     refine_hold: HashSet<u64>,
+    /// Layers with a part-file append in flight (distinct from a row
+    /// append: it grows the store before it builds anything).
+    part_appending: HashSet<u64>,
+    /// Layers whose current viewport holds no part files they lack. Held
+    /// separately from `refine_hold` so "no new parts here" never blocks
+    /// row refinement of the parts already open.
+    part_hold: HashSet<u64>,
     /// Layers rebuilding purely to merge their sections (after boxes were
     /// replaced by real rows). They keep drawing throughout: nothing
     /// about their coordinates has changed.
@@ -778,6 +785,8 @@ impl ViewerApp {
             rebuild_cancel: HashMap::new(),
             fit_after_rebuilds: false,
             refine_hold: HashSet::new(),
+            part_appending: HashSet::new(),
+            part_hold: HashSet::new(),
             refine_deferred: HashMap::new(),
             consolidating: HashSet::new(),
             cam_epoch: 0,
@@ -1163,6 +1172,7 @@ impl ViewerApp {
                 c.store(true, Ordering::Relaxed);
             }
             self.refine_hold.remove(&l.id);
+            self.part_hold.remove(&l.id);
             self.refine_deferred.remove(&l.id);
             // Row filters select rows the reload will not decode; clear
             // them rather than silently showing a different subset.
@@ -1625,6 +1635,7 @@ impl ViewerApp {
                     // (no re-refine, spinner shown) until the last one.
                     if done {
                         self.appending.remove(&layer_id);
+                        self.part_appending.remove(&layer_id);
                         self.append_cancel.remove(&layer_id);
                     }
                     if let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) {
@@ -1698,19 +1709,79 @@ impl ViewerApp {
                         self.push_error(error);
                     }
                 }
+                LoadMsg::PartsOpened {
+                    layer_id,
+                    generation,
+                    store,
+                    added_boxes,
+                    added_groups,
+                    names,
+                } => {
+                    if let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) {
+                        if l.generation == generation {
+                            log::info!("{}: opened parts {}", l.name, names.join(", "));
+                            // Fragments append in global order, so every
+                            // row-group index the layer already holds still
+                            // means the same group. The new groups start
+                            // undecoded; the Appended messages behind this
+                            // one fill them in.
+                            // Size everything from the store itself, not
+                            // from the count in the message: `loaded` and
+                            // `rg_bboxes` are indexed by global row group,
+                            // and a length that disagreed with the store
+                            // would silently point refinement at the wrong
+                            // groups rather than fail.
+                            let groups = store.rg_starts().len() - 1;
+                            l.store = store;
+                            l.loaded
+                                .resize(groups, crate::data::layer::GroupLoad::None);
+                            if let Some(rg) = &mut l.rg_bboxes {
+                                if added_boxes.len() == added_groups {
+                                    rg.boxes.extend(added_boxes);
+                                }
+                                if rg.boxes.len() != groups {
+                                    // Better no boxes than boxes that
+                                    // belong to other groups: pruning would
+                                    // read the wrong parts. Dropping them
+                                    // only costs refinement precision.
+                                    log::warn!(
+                                        "{}: row-group boxes out of step after a part append \
+                                         ({} boxes, {groups} groups); dropping them",
+                                        l.name,
+                                        rg.boxes.len()
+                                    );
+                                    l.rg_bboxes = None;
+                                }
+                            }
+                            l.info.files += names.len();
+                        }
+                    }
+                }
                 LoadMsg::AppendEnded { layer_id, error } => {
                     self.appending.remove(&layer_id);
                     self.append_cancel.remove(&layer_id);
-                    // Hold refinement until the camera moves — for cancels
-                    // AND failures: the unchanged viewport would otherwise
+                    let was_parts = self.part_appending.remove(&layer_id);
+                    // Hold until the camera moves — for cancels AND
+                    // failures: the unchanged viewport would otherwise
                     // respawn the identical (failing) job every frame,
                     // spamming errors and network requests. Stale-viewport
                     // endings don't hold: the current viewport still wants
                     // its own check.
-                    if self.refine_epoch.get(&layer_id) == Some(&self.cam_epoch) {
+                    //
+                    // A part append that found nothing holds only itself:
+                    // the parts already open may still have rows worth
+                    // refining in this very viewport.
+                    if was_parts && error == loader::NOTHING_TO_APPEND {
+                        self.part_hold.insert(layer_id);
+                    } else if self.refine_epoch.get(&layer_id) == Some(&self.cam_epoch) {
                         self.refine_hold.insert(layer_id);
+                        if was_parts {
+                            self.part_hold.insert(layer_id);
+                        }
                     }
-                    if error != loader::CANCELLED {
+                    // NOTHING_TO_APPEND is the normal outcome of a pan
+                    // that found no new parts, not a failure to report.
+                    if error != loader::CANCELLED && error != loader::NOTHING_TO_APPEND {
                         self.push_error(error);
                     }
                 }
@@ -1883,9 +1954,64 @@ impl ViewerApp {
     /// unseen row groups get a per-feature viewport selection; groups whose
     /// earlier selection no longer covers the viewport are completed
     /// (complement rows) and become Full.
+    /// Pull in part files of a multi-part collection that the current
+    /// viewport wants and the layer does not have.
+    ///
+    /// Runs before row refinement and takes the same in-flight slot: a
+    /// pass either grows the store or refines what is in it, never both,
+    /// and whichever loses goes on the next camera settle. Growing first
+    /// is the right order — refining rows of parts you are not looking at
+    /// is work for a viewport the user has left.
+    fn append_parts_for_view(&mut self, ctx: &egui::Context) {
+        let view = self.last_view_world;
+        for l in &self.layers {
+            if l.store.stac_collection().is_none()
+                || !l.style.visible
+                || l.mode == crate::data::layer::LayerMode::Direct
+                || self.appending.contains(&l.id)
+                || self.rebuilding.contains(&l.id)
+                || self.part_hold.contains(&l.id)
+            {
+                continue;
+            }
+            // STAC item bboxes are WGS84 lon/lat by spec, whatever the
+            // parts themselves are in.
+            let Some(rect) =
+                loader::viewport_to_data_bbox(view, &self.display, crate::data::crs::wgs84_cached())
+            else {
+                continue;
+            };
+            self.appending.insert(l.id);
+            self.part_appending.insert(l.id);
+            self.refine_epoch.insert(l.id, self.cam_epoch);
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.append_cancel.insert(l.id, Arc::clone(&cancel));
+            loader::spawn_part_append(
+                LoaderHandle {
+                    tx: self.load_tx.clone(),
+                    egui_ctx: ctx.clone(),
+                },
+                l.id,
+                l.generation,
+                l.store.clone(),
+                l.crs.clone(),
+                self.display.clone(),
+                rect,
+                l.box_layer,
+                cancel,
+                l.style.style_by.clone(),
+                Some((
+                    crate::data::loader::MAX_BUILD_ROWS,
+                    (self.refine_budget_mb as u64) << 20,
+                )),
+            );
+        }
+    }
+
     fn refine_partial_layers(&mut self, ctx: &egui::Context) {
         use crate::data::layer::GroupLoad;
         use crate::data::loader::{complement_ranges, GroupSel};
+        self.append_parts_for_view(ctx);
         let view = self.last_view_world;
         for l in &self.layers {
             if !l.is_partial()
@@ -3063,6 +3189,7 @@ impl ViewerApp {
             self.consolidating.remove(&id);
             self.appending.remove(&id);
             self.refine_hold.remove(&id);
+            self.part_hold.remove(&id);
             self.refine_deferred.remove(&id);
             // Stop the removed layer's in-flight workers instead of letting
             // them stream/rebuild into the void.
@@ -3870,8 +3997,8 @@ impl ViewerApp {
                                         if kind == crate::data::repo::RepoKind::Stac {
                                             ui.label(
                                                 RichText::new(format!(
-                                                    "loads the parts intersecting the current \
-                                                     view (max {} files per layer)",
+                                                    "opens the {} parts covering most of the \
+                                                     current view; the rest load as you pan",
                                                     crate::data::loader::STAC_PART_CAP
                                                 ))
                                                 .weak()
@@ -7604,6 +7731,7 @@ impl ViewerApp {
                 self.cam_changed_at = now;
                 self.cam_epoch += 1;
                 self.refine_hold.clear();
+                self.part_hold.clear();
                 self.refine_deferred.clear();
                 // A moved viewport obsoletes in-flight refinements:
                 // cancel them so the new view's check starts at settle

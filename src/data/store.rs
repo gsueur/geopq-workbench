@@ -25,6 +25,7 @@ pub struct CoveringCol {
 
 /// One file of a (possibly multi-file) dataset: its own source and parquet
 /// footer, plus the hive partition-key values parsed from its path.
+#[derive(Clone)]
 pub struct Fragment {
     pub source: Source,
     /// Parsed parquet footer of this file (schema + metadata + page index).
@@ -49,6 +50,7 @@ pub struct Fragment {
 ///
 /// Nothing but schemas and per-row-group row counts is kept in memory;
 /// attribute and geometry values are re-read from the files on demand.
+#[derive(Clone)]
 pub struct FeatureStore {
     /// Display source: the file, or the dataset root directory.
     pub source: Source,
@@ -190,6 +192,47 @@ impl FeatureStore {
             rg_starts,
             rg_frag,
         }
+    }
+
+    /// The STAC collection this store's parts were selected from, if it
+    /// came from one. Panning re-reads the collection to find parts the
+    /// store does not hold yet.
+    pub fn stac_collection(&self) -> Option<&str> {
+        match &self.source {
+            Source::Stac { url, .. } => Some(url),
+            _ => None,
+        }
+    }
+
+    /// URLs of the parts already open, so a part is never opened twice.
+    pub fn part_urls(&self) -> std::collections::HashSet<String> {
+        self.fragments.iter().filter_map(|f| f.source.url()).collect()
+    }
+
+    /// The same store with more fragments on the end.
+    ///
+    /// Growing a multi-part dataset while panning depends on this being
+    /// index-stable: fragments are numbered in global order and the new
+    /// ones go last, so every existing row-group index, row offset and
+    /// fragment offset still means what it meant before. That is what lets
+    /// a layer keep the geometry and decode state it already has instead of
+    /// rebuilding when a part is added.
+    pub fn with_fragments_appended(&self, more: Vec<(Fragment, Vec<u64>)>) -> Self {
+        let mut out = self.clone();
+        let mut acc = out.total_rows();
+        for (mut f, rows) in more {
+            f.rg_offset = out.rg_rows.len();
+            f.row_offset = acc;
+            let frag_idx = out.fragments.len();
+            for r in rows {
+                out.rg_frag.push(frag_idx);
+                out.rg_rows.push(r);
+                acc += r;
+                out.rg_starts.push(acc);
+            }
+            out.fragments.push(f);
+        }
+        out
     }
 
     pub fn total_rows(&self) -> u64 {

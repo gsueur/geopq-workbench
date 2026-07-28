@@ -32,6 +32,9 @@ const BATCH_TARGET_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Error string of a user-cancelled load (the app treats it quietly).
 pub const CANCELLED: &str = "load cancelled";
+/// An append that found nothing to do. Not an error: the viewport simply
+/// holds no part files the layer has not already opened.
+pub const NOTHING_TO_APPEND: &str = "no parts to add";
 
 pub enum LoadMsg {
     Progress {
@@ -82,6 +85,24 @@ pub enum LoadMsg {
     },
     /// A row append ended without a result (error or user cancel).
     AppendEnded { layer_id: u64, error: String },
+    /// Extra part files of a multi-part collection were opened and the
+    /// layer's store has grown to include them.
+    ///
+    /// Always precedes the `Appended` messages that carry their geometry:
+    /// those address row groups by global index, which only exist once the
+    /// bigger store is in place. Appending fragments is index-stable, so
+    /// the geometry and decode state already on the layer stay valid.
+    PartsOpened {
+        layer_id: u64,
+        generation: u64,
+        store: Arc<FeatureStore>,
+        /// Row-group boxes for the appended groups only, in order.
+        added_boxes: Vec<[f64; 4]>,
+        /// How many row groups the store gained.
+        added_groups: usize,
+        /// Part file names, for the status line.
+        names: Vec<String>,
+    },
     /// Exact viewport selection is still too large for a safe refinement.
     /// This is not an error: retry after the camera moves to a tighter view.
     RefineDeferred {
@@ -1007,8 +1028,31 @@ pub fn spawn_append(
     refinement_budget: Option<(u64, u64)>,
 ) {
     std::thread::spawn(move || {
+        run_append(
+            &handle, layer_id, generation, &store, &crs, &display, jobs, &cancel, style,
+            refinement_budget,
+        );
+    });
+}
+
+/// Resolve, budget and stream an append for `jobs` against `store`.
+/// Shared by row refinement and by opening new part files.
+#[allow(clippy::too_many_arguments)]
+fn run_append(
+    handle: &LoaderHandle,
+    layer_id: u64,
+    generation: u64,
+    store: &Arc<FeatureStore>,
+    crs: &Crs,
+    display: &DisplayCrs,
+    jobs: Vec<GroupSel>,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+    style: Option<crate::data::layer::StyleBy>,
+    refinement_budget: Option<(u64, u64)>,
+) {
+    {
         let jobs = if let Some((budget, geom_budget)) = refinement_budget {
-            match prepare_refinement_jobs(&store, jobs, budget, geom_budget, &cancel) {
+            match prepare_refinement_jobs(store, jobs, budget, geom_budget, cancel) {
                 Ok(RefinePlan::Ready(jobs)) => jobs,
                 Ok(RefinePlan::Deferred { rows: at_least_rows, geom_bytes }) => {
                     match geom_bytes {
@@ -1048,19 +1092,19 @@ pub fn spawn_append(
         } else {
             jobs
         };
-        let style_sel = style.as_ref().and_then(|sb| resolve_style(&store, sb));
+        let style_sel = style.as_ref().and_then(|sb| resolve_style(store, sb));
         // Stream the append: content appears within ~a second instead of
         // after the whole (up to budget-sized) build.
-        let batches = append_batches(&store, jobs);
+        let batches = append_batches(store, jobs);
         let last = batches.len().saturating_sub(1);
         for (bi, batch) in batches.into_iter().enumerate() {
             match build_geometry(
-                &store,
-                &crs,
-                &display,
+                store,
+                crs,
+                display,
                 None,
                 batch,
-                Some(&cancel),
+                Some(cancel),
                 style_sel.as_ref(),
             ) {
                 Ok((geometry, rows, _bad, _rg, resolved)) => handle.send(LoadMsg::Appended {
@@ -1087,6 +1131,204 @@ pub fn spawn_append(
                 }
             }
         }
+    }
+}
+
+/// Part files one pan may add. Each costs a length probe plus a footer
+/// fetch, so this bounds the round-trips a single camera move can spend
+/// while still letting a sustained pan pull a collection in steadily.
+pub const PART_APPEND_PER_PASS: usize = 8;
+
+/// Total parts a layer may hold. Footers are small next to geometry, but
+/// they are not free, and a pan across a large collection would otherwise
+/// accumulate every one of them.
+pub const PART_TOTAL_CAP: usize = 256;
+
+/// Parts the viewport wants that the layer does not have, best first.
+///
+/// "Best" is intersection area with the viewport: a pan should pull in
+/// what it is heading into before what it is only clipping the corner of.
+/// Parts with no bbox are skipped rather than guessed at — an unbounded
+/// item would sort as if it covered everything and crowd out the rest.
+fn parts_to_add(
+    parts: Vec<crate::data::repo::StacPart>,
+    have: &std::collections::HashSet<String>,
+    rect: [f64; 4],
+    room: usize,
+) -> Vec<crate::data::repo::StacPart> {
+    let mut scored: Vec<(f64, crate::data::repo::StacPart)> = parts
+        .into_iter()
+        .filter(|p| !have.contains(&p.url))
+        .filter_map(|p| {
+            let a = overlap_area(p.bbox, rect);
+            (a > 0.0).then_some((a, p))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(room);
+    scored.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Open the part files of a STAC collection that the viewport wants and
+/// the layer does not have yet, then build their geometry.
+///
+/// This is what makes a collection pannable. Parts are chosen at open from
+/// the viewport, and without this the layer stayed frozen at that choice:
+/// panning somewhere else showed nothing, and the collection could only
+/// report the parts it was refusing to fetch.
+///
+/// Sends `PartsOpened` first (the store grows), then streams `Appended`
+/// for the new row groups exactly as a row append does.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_part_append(
+    handle: LoaderHandle,
+    layer_id: u64,
+    generation: u64,
+    store: Arc<FeatureStore>,
+    crs: Crs,
+    display: DisplayCrs,
+    // Viewport in WGS84 lon/lat: STAC item bboxes are WGS84 by spec.
+    rect: [f64; 4],
+    box_layer: bool,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    style: Option<crate::data::layer::StyleBy>,
+    refinement_budget: Option<(u64, u64)>,
+) {
+    use std::sync::atomic::Ordering;
+    std::thread::spawn(move || {
+        let ended = |error: &str| {
+            handle.send(LoadMsg::AppendEnded {
+                layer_id,
+                error: error.into(),
+            });
+        };
+        let Some(collection) = store.stac_collection().map(str::to_string) else {
+            ended(NOTHING_TO_APPEND);
+            return;
+        };
+        if store.fragments.len() >= PART_TOTAL_CAP {
+            ended(NOTHING_TO_APPEND);
+            return;
+        }
+        // Disk-cached after the first call, so panning does not re-read
+        // the collection document.
+        let parts = match crate::data::repo::fetch_stac_parts(&collection) {
+            Ok(p) => p,
+            Err(e) => return ended(&format!("{collection}: {e}")),
+        };
+        let have = store.part_urls();
+        let room = PART_APPEND_PER_PASS.min(PART_TOTAL_CAP - store.fragments.len());
+        let wanted = parts_to_add(parts, &have, rect, room);
+        if wanted.is_empty() {
+            ended(NOTHING_TO_APPEND);
+            return;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            ended(CANCELLED);
+            return;
+        }
+
+        // Resolve and read footers in parallel: each part is a round trip.
+        let opened: Vec<(Source, String, FileOpen)> = {
+            use rayon::prelude::*;
+            let r: Result<Vec<_>, String> = wanted
+                .par_iter()
+                .map(|p| {
+                    let short = p
+                        .url
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(p.url.as_str())
+                        .to_string();
+                    let src = Source::Remote {
+                        url: p.url.clone(),
+                        len: 0,
+                    }
+                    .resolve()
+                    .map_err(|e| format!("{short}: {e}"))?;
+                    let f = open_file(&src).map_err(|e| format!("{short}: {e}"))?;
+                    Ok((src, short, f))
+                })
+                .collect();
+            match r {
+                Ok(v) => v,
+                Err(e) => return ended(&e),
+            }
+        };
+
+        // A part that does not match the dataset is dropped, not fatal:
+        // one odd item must not stop a collection from being pannable.
+        let base = &store;
+        let mut frags: Vec<(super::store::Fragment, Vec<u64>)> = Vec::new();
+        let mut added_boxes: Vec<[f64; 4]> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut boxes_ok = true;
+        for (src, short, f) in opened {
+            if !f.crs.same_as(&crs) || f.encoding != base.encoding || f.geom_col != base.geom_col {
+                log::warn!("{short}: does not match the collection's schema; skipped");
+                continue;
+            }
+            match (&f.rg_boxes, f.info.geo.bbox) {
+                (Some((_, b)), _) => added_boxes.extend_from_slice(b),
+                (None, Some(b)) => added_boxes.extend(std::iter::repeat_n(b, f.rg_rows.len())),
+                (None, None) => boxes_ok = false,
+            }
+            frags.push((
+                super::store::Fragment {
+                    source: src,
+                    meta: f.meta.clone(),
+                    part_values: vec![None; base.part_cols.len()],
+                    rg_offset: 0,
+                    row_offset: 0,
+                },
+                f.rg_rows.clone(),
+            ));
+            names.push(short);
+        }
+        if frags.is_empty() || !boxes_ok {
+            ended(NOTHING_TO_APPEND);
+            return;
+        }
+        let first_new = base.rg_starts().len() - 1;
+        let added_groups: usize = frags.iter().map(|(_, r)| r.len()).sum();
+        let grown = Arc::new(base.with_fragments_appended(frags));
+        if grown.total_rows() >= u32::MAX as u64 {
+            ended("collection exceeds the maximum supported row count");
+            return;
+        }
+        log::info!(
+            "{}: +{} part(s), {} row groups",
+            grown.source.label(),
+            names.len(),
+            added_groups
+        );
+        handle.send(LoadMsg::PartsOpened {
+            layer_id,
+            generation,
+            store: grown.clone(),
+            added_boxes,
+            added_groups,
+            names,
+        });
+
+        // The new groups only. Boxes when the layer draws boxes, otherwise
+        // the same viewport-bounded selection a refinement would make.
+        let jobs: Vec<GroupSel> = (first_new..first_new + added_groups)
+            .map(|g| {
+                if box_layer {
+                    GroupSel::Boxes {
+                        group: g as u32,
+                        rect: None,
+                    }
+                } else {
+                    GroupSel::All(g as u32)
+                }
+            })
+            .collect();
+        run_append(
+            &handle, layer_id, generation, &grown, &crs, &display, jobs, &cancel, style,
+            refinement_budget,
+        );
     });
 }
 
@@ -1644,10 +1886,20 @@ fn open_dir_store(source: &Source, dir: &std::path::Path) -> Result<StoreOpen, S
     open_multi_store(source, files, hive)
 }
 
-/// Cap on part files a STAC load opens: each part costs a content-length
+/// Part files a STAC load opens up front: each costs a content-length
 /// probe plus a footer fetch, so a world view of a 512-part collection
-/// must zoom in rather than stream half a terabyte of metadata.
+/// opens the parts covering most of it and picks the rest up while
+/// panning rather than stalling on half a terabyte of metadata.
 pub const STAC_PART_CAP: usize = 16;
+
+/// Area of the intersection of a part's bbox with the viewport, 0 when
+/// they miss or the part has no bbox.
+fn overlap_area(bbox: Option<[f64; 4]>, r: [f64; 4]) -> f64 {
+    let Some(b) = bbox else { return 0.0 };
+    let w = (b[2].min(r[2]) - b[0].max(r[0])).max(0.0);
+    let h = (b[3].min(r[3]) - b[1].max(r[1])).max(0.0);
+    w * h
+}
 
 /// Open a fixed set of remote parquet parts (repository "all states"
 /// loads) as one multi-fragment layer. Hive `key=value` URL path
@@ -1865,12 +2117,26 @@ fn open_stac_store(
     if keep.is_empty() {
         return Err("no parts of this collection intersect the current view".into());
     }
+    // Over the cap, open the parts covering most of the view and let
+    // panning bring in the rest (see `spawn_part_append`). Refusing the
+    // load was the old behaviour and it left the collection unopenable
+    // from any view wide enough to want it.
+    let mut keep = keep;
     if keep.len() > STAC_PART_CAP {
-        return Err(format!(
-            "{} of {total} parts intersect the current view (cap {STAC_PART_CAP} \
-             files per load) — zoom in and retry",
+        if let Some(r) = rect {
+            keep.sort_by(|a, b| {
+                overlap_area(b.bbox, r)
+                    .partial_cmp(&overlap_area(a.bbox, r))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        log::info!(
+            "{}: {} of {total} parts intersect; opening {STAC_PART_CAP}, \
+             the rest load as you pan",
+            source.label(),
             keep.len()
-        ));
+        );
+        keep.truncate(STAC_PART_CAP);
     }
     if keep.len() < total {
         log::info!(
@@ -5003,6 +5269,204 @@ mod pruning_tests {
     /// has nothing to fetch — so the tiles could only start once the build
     /// finished. `Framed` has to reach the app strictly before `Loaded`,
     /// and has to point at the same place the layer eventually lands.
+    /// Appending fragments must not disturb a single existing index.
+    ///
+    /// The whole lazy-part scheme rests on this: a layer keeps the geometry
+    /// and per-row-group decode state it already built, and the new parts
+    /// simply extend the global row-group space. If offsets shifted, every
+    /// `GroupLoad` on the layer would silently point at the wrong group.
+    fn part(url: &str, bbox: Option<[f64; 4]>) -> crate::data::repo::StacPart {
+        crate::data::repo::StacPart {
+            url: url.into(),
+            bbox,
+            rows: 1,
+        }
+    }
+
+    /// Panning must find the parts it is moving into, skip the ones it
+    /// already has, and take the most useful ones first.
+    /// End to end against a real collection: a view that wants more parts
+    /// than the cap opens anyway, and panning elsewhere finds parts it does
+    /// not have. Overture's buildings collection is 512 items, which is the
+    /// case that used to refuse to open at all.
+    ///
+    ///   cargo test --bin geopq-workbench overture_collection -- --ignored --nocapture
+    #[test]
+    #[ignore = "hits the network: Overture's STAC catalog"]
+    fn overture_collection_opens_capped_and_grows() {
+        let url = "https://stac.overturemaps.org/2026-07-22.0/buildings/building/collection.json";
+        let src = Source::Stac {
+            url: url.into(),
+            name: "building".into(),
+        };
+        // Western Europe: far more than the cap intersects.
+        let europe = [-5.0, 42.0, 15.0, 55.0];
+        let (store, _crs, info, _rg) = match open_stac_store(&src, url, Some(europe)) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("skipping: {e}");
+                return;
+            }
+        };
+        eprintln!(
+            "opened {} parts, {} rows",
+            store.fragments.len(),
+            store.total_rows()
+        );
+        assert!(
+            store.fragments.len() <= STAC_PART_CAP,
+            "opened {} parts, cap is {STAC_PART_CAP}",
+            store.fragments.len()
+        );
+        assert!(store.fragments.len() > 1, "expected a multi-part store");
+        assert_eq!(store.stac_collection(), Some(url));
+        assert_eq!(store.part_urls().len(), store.fragments.len());
+        assert!(info.files >= store.fragments.len());
+
+        // Pan to California: parts the store does not hold.
+        let parts = crate::data::repo::fetch_stac_parts(url).expect("part list");
+        let total = parts.len();
+        let california = [-122.0, 36.0, -118.0, 39.0];
+        let add = parts_to_add(parts, &store.part_urls(), california, PART_APPEND_PER_PASS);
+        eprintln!("{total} parts total; panning west finds {} to add", add.len());
+        assert!(!add.is_empty(), "panning off the opened parts must find more");
+        assert!(add.len() <= PART_APPEND_PER_PASS);
+        for p in &add {
+            assert!(!store.part_urls().contains(&p.url), "offered an open part");
+        }
+    }
+
+    #[test]
+    fn part_selection_prefers_the_biggest_overlap() {
+        let have: std::collections::HashSet<String> =
+            ["https://x/have.parquet".to_string()].into_iter().collect();
+        let parts = vec![
+            // Already open: never offered again, however good the overlap.
+            part("https://x/have.parquet", Some([0.0, 0.0, 10.0, 10.0])),
+            // Clips one corner.
+            part("https://x/corner.parquet", Some([9.0, 9.0, 20.0, 20.0])),
+            // Covers the viewport.
+            part("https://x/centre.parquet", Some([0.0, 0.0, 10.0, 10.0])),
+            // Misses entirely.
+            part("https://x/far.parquet", Some([50.0, 50.0, 60.0, 60.0])),
+            // No bbox: unusable for a viewport decision.
+            part("https://x/nobbox.parquet", None),
+        ];
+        let got = parts_to_add(parts, &have, [0.0, 0.0, 10.0, 10.0], 8);
+        let urls: Vec<&str> = got.iter().map(|p| p.url.as_str()).collect();
+        assert_eq!(urls, vec!["https://x/centre.parquet", "https://x/corner.parquet"]);
+    }
+
+    /// One pan opens a bounded number of parts, keeping the best.
+    #[test]
+    fn part_selection_respects_the_per_pass_room() {
+        let parts: Vec<_> = (0..20)
+            .map(|i| {
+                let w = 1.0 + i as f64;
+                part(&format!("https://x/{i}.parquet"), Some([0.0, 0.0, w, w]))
+            })
+            .collect();
+        let got = parts_to_add(parts, &Default::default(), [0.0, 0.0, 100.0, 100.0], 3);
+        assert_eq!(got.len(), 3);
+        // Largest overlap first: the last three indices, descending.
+        let urls: Vec<&str> = got.iter().map(|p| p.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec!["https://x/19.parquet", "https://x/18.parquet", "https://x/17.parquet"]
+        );
+    }
+
+    /// A viewport with nothing new in it must produce no work at all,
+    /// which is what stops a stationary camera re-probing every frame.
+    #[test]
+    fn part_selection_returns_nothing_when_all_are_open() {
+        let parts = vec![
+            part("https://x/a.parquet", Some([0.0, 0.0, 10.0, 10.0])),
+            part("https://x/b.parquet", Some([0.0, 0.0, 10.0, 10.0])),
+        ];
+        let have: std::collections::HashSet<String> = parts
+            .iter()
+            .map(|p| p.url.clone())
+            .collect();
+        assert!(parts_to_add(parts, &have, [0.0, 0.0, 10.0, 10.0], 8).is_empty());
+    }
+
+    /// Touching bboxes are not overlapping ones: a part that only shares
+    /// an edge with the viewport contributes nothing to it.
+    #[test]
+    fn part_selection_ignores_edge_contact() {
+        let parts = vec![part("https://x/edge.parquet", Some([10.0, 0.0, 20.0, 10.0]))];
+        assert!(parts_to_add(parts, &Default::default(), [0.0, 0.0, 10.0, 10.0], 8).is_empty());
+    }
+
+    #[test]
+    fn appending_parts_leaves_existing_indices_alone() {
+        let path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/parcels_hilbert.parquet"
+        ));
+        if !path.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let source = Source::Local(path.clone());
+        let (base, _crs, _info, _rg) = open_store(&source).unwrap();
+        let n_rg = base.rg_starts().len() - 1;
+        let base_rows = base.total_rows();
+        let before: Vec<u64> = base.rg_starts().to_vec();
+        let row_10 = base.fetch_row(10).expect("row 10 of the base store");
+
+        // The same file again, as a second fragment.
+        let f = open_file(&source).unwrap();
+        let grown = base.with_fragments_appended(vec![(
+            crate::data::store::Fragment {
+                source: source.clone(),
+                meta: f.meta.clone(),
+                part_values: Vec::new(),
+                rg_offset: 0,
+                row_offset: 0,
+            },
+            f.rg_rows.clone(),
+        )]);
+
+        assert_eq!(grown.rg_starts().len() - 1, n_rg * 2);
+        assert_eq!(grown.total_rows(), base_rows * 2);
+        // Every pre-existing boundary is byte-for-byte what it was.
+        assert_eq!(&grown.rg_starts()[..=n_rg], &before[..]);
+        let new_frag = grown.frag_of_group(n_rg);
+        assert_eq!(new_frag.rg_offset, n_rg);
+        assert_eq!(new_frag.row_offset, base_rows);
+        assert_eq!(grown.frag_of_group(0).rg_offset, 0);
+
+        // Arithmetic is not enough: the reads have to land in the right
+        // file. Row 10 must still be row 10, and its twin in the appended
+        // fragment must read identically.
+        let same = grown.fetch_row(10).expect("row 10 of the grown store");
+        assert_eq!(format!("{same:?}"), format!("{row_10:?}"));
+        let twin = grown
+            .fetch_row(base_rows as u32 + 10)
+            .expect("the appended fragment's row 10");
+        assert_eq!(format!("{twin:?}"), format!("{row_10:?}"));
+    }
+
+    /// A store that did not come from a collection has nothing to append,
+    /// and one that did knows which parts it already holds.
+    #[test]
+    fn only_stac_stores_offer_parts() {
+        let path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/parcels_hilbert.parquet"
+        ));
+        if !path.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let (store, _, _, _) = open_store(&Source::Local(path)).unwrap();
+        assert_eq!(store.stac_collection(), None);
+        // A local fragment has no URL, so it can never look "already open".
+        assert!(store.part_urls().is_empty());
+    }
+
     #[test]
     fn framing_arrives_before_the_geometry() {
         let path = std::path::PathBuf::from(concat!(
