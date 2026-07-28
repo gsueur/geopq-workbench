@@ -212,6 +212,16 @@ pub struct ViewerApp {
 
     tiles: TileCache,
     basemap: Option<usize>,
+    /// Basemap opacity. It sits under the data, so fading it back is how
+    /// you keep context without the data competing with it.
+    basemap_opacity: f32,
+    /// The source to come back to when the basemap is switched off and on.
+    last_basemap: usize,
+    /// Last frame's basemap decision, so the layers panel can explain a
+    /// substitution without redoing the projection sampling that produced
+    /// it. The panel draws before the map, so it is one frame behind — for
+    /// a note about the current view that is not worth a second pass.
+    last_basemap_plan: BasemapPlan,
 
     load_tx: Sender<LoadMsg>,
     load_rx: Receiver<LoadMsg>,
@@ -247,10 +257,6 @@ pub struct ViewerApp {
     /// the original full-world viewport" is what first-layer adoption
     /// checks before fitting to the layer.
     camera_moved: bool,
-    /// Map viewport in physical pixels, as of the last frame. Menus are
-    /// built before the map panel runs, so anything view-dependent shown in
-    /// one (the basemap notes) reads it from here.
-    last_viewport_px: [f32; 2],
     /// Cancel flags of in-flight appends (layer id -> flag).
     append_cancel: HashMap<u64, Arc<std::sync::atomic::AtomicBool>>,
     /// Cancel flags of in-flight rebuilds (layer id -> flag). Spawning a
@@ -756,6 +762,9 @@ impl ViewerApp {
             rg_overlays: HashMap::new(),
             tiles: TileCache::new(cc.egui_ctx.clone()),
             basemap: Some(0),
+            basemap_opacity: 1.0,
+            last_basemap: 0,
+            last_basemap_plan: BasemapPlan::Off(None),
             load_tx,
             load_rx,
             opt_tx,
@@ -780,7 +789,6 @@ impl ViewerApp {
             projection_decider: None,
             deferred_loads: Vec::new(),
             camera_moved: false,
-            last_viewport_px: [1024.0, 768.0],
             append_cancel: HashMap::new(),
             rebuild_cancel: HashMap::new(),
             fit_after_rebuilds: false,
@@ -2361,49 +2369,6 @@ impl ViewerApp {
                 });
                 ui.checkbox(&mut self.show_graticule, "Graticule");
                 ui.checkbox(&mut self.show_coastline, "Coastline");
-                ui.menu_button("Basemap", |ui| {
-                    // Every source is always listed. The label-free swap
-                    // below is an automatic fallback for one view, not a
-                    // different choice, and hiding the entry the user picked
-                    // would leave them unable to pick it again.
-                    let warped = !self.display.is_mercator();
-                    let plan = self.basemap_plan(self.last_viewport_px);
-                    if warped {
-                        ui.label(
-                            RichText::new(format!("reprojected to {}", self.display.name))
-                                .weak()
-                                .small(),
-                        );
-                        let note = match (plan, self.basemap) {
-                            (BasemapPlan::Off(Some(why)), _) => Some(why.to_string()),
-                            (BasemapPlan::Warped(drawn, _), Some(picked)) if drawn != picked => {
-                                Some(format!(
-                                    "labels would shear at this zoom, so {} is \
-                                     drawn instead",
-                                    TILE_SOURCES[drawn].name
-                                ))
-                            }
-                            _ => None,
-                        };
-                        if let Some(n) = note {
-                            ui.label(RichText::new(n).weak().small());
-                        }
-                        ui.separator();
-                    }
-                    for (i, s) in TILE_SOURCES.iter().enumerate() {
-                        let r = ui.selectable_value(&mut self.basemap, Some(i), s.name);
-                        if warped && s.labels {
-                            r.on_hover_text(
-                                "Place names are drawn into these tiles, so they \
-                                 shear with the projection. Zoomed in they hold \
-                                 up and are kept; zoomed out this falls back to \
-                                 the label-free version, or to no tiles when \
-                                 there is none.",
-                            );
-                        }
-                    }
-                    ui.selectable_value(&mut self.basemap, None, "None");
-                });
                 ui.separator();
                 ui.checkbox(&mut self.sql.open, "SQL console");
             });
@@ -2566,6 +2531,73 @@ impl ViewerApp {
                 self.auto_projection = true;
             }
         }
+    }
+
+    /// The basemap row at the foot of the layers panel: visibility, which
+    /// source, and how far to fade it back.
+    ///
+    /// It behaves like a layer because that is what it is on screen, and
+    /// the two controls that matter for it — which one, and how strongly —
+    /// belong next to the data it sits under, not in a menu.
+    fn basemap_card(&mut self, ui: &mut egui::Ui) {
+        let plan = self.last_basemap_plan;
+        crate::theme::card(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let mut on = self.basemap.is_some();
+                if ui.checkbox(&mut on, "").changed() {
+                    // Remember the choice across an off/on toggle.
+                    self.basemap = on.then_some(self.last_basemap);
+                }
+                ui.label(RichText::new(ph::MAP_TRIFOLD).weak())
+                    .on_hover_text("Basemap");
+                let current = match self.basemap {
+                    Some(i) => TILE_SOURCES[i].name,
+                    None => "None",
+                };
+                egui::ComboBox::from_id_salt("basemap_source")
+                    .selected_text(current)
+                    .width(150.0)
+                    .show_ui(ui, |ui| {
+                        for (i, src) in TILE_SOURCES.iter().enumerate() {
+                            if ui
+                                .selectable_value(&mut self.basemap, Some(i), src.name)
+                                .clicked()
+                            {
+                                self.last_basemap = i;
+                            }
+                        }
+                        ui.selectable_value(&mut self.basemap, None, "None");
+                    });
+            });
+            if self.basemap.is_some() {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.basemap_opacity, 0.0..=1.0)
+                            .show_value(false)
+                            .text(""),
+                    )
+                    .on_hover_text("Basemap opacity");
+                    ui.label(
+                        RichText::new(format!("{:.0}%", self.basemap_opacity * 100.0))
+                            .weak()
+                            .small(),
+                    );
+                });
+                // Why the map may not match the choice above: outside
+                // Mercator a labelled style can be substituted or dropped.
+                let note = match (plan, self.basemap) {
+                    (BasemapPlan::Off(Some(why)), _) => Some(why.to_string()),
+                    (BasemapPlan::Warped(drawn, _), Some(picked)) if drawn != picked => {
+                        Some(format!("drawn as {}", TILE_SOURCES[drawn].name))
+                    }
+                    _ => None,
+                };
+                if let Some(n) = note {
+                    ui.label(RichText::new(n).weak().small());
+                }
+            }
+        });
+        ui.add_space(4.0);
     }
 
     fn layers_panel(&mut self, ui: &mut egui::Ui) {
@@ -3166,6 +3198,11 @@ impl ViewerApp {
                 });
                 ui.add_space(4.0);
             }
+            // The basemap, under everything, so last in a list drawn
+            // top-most first. Not a VectorLayer: it has no geometry, no
+            // attributes and no file, so it gets its own row rather than
+            // being faked into the layer list.
+            self.basemap_card(ui);
         });
         self.rename_layer = renaming;
         if let Some(id) = reclass_req {
@@ -3344,6 +3381,7 @@ impl ViewerApp {
             projection: crate::context::projection_token(&self.display),
             projection_name: Some(self.display.name.clone()),
             basemap: self.basemap,
+            basemap_opacity: Some(self.basemap_opacity),
             show_graticule: self.show_graticule,
             show_coastline: self.show_coastline,
             box_threshold_px: Some(self.box_threshold_px),
@@ -3440,6 +3478,8 @@ impl ViewerApp {
         self.pending_fit = false;
         self.auto_projection = false;
         self.basemap = saved.basemap;
+        self.basemap_opacity = saved.basemap_opacity.unwrap_or(1.0).clamp(0.0, 1.0);
+        self.last_basemap = saved.basemap.unwrap_or(self.last_basemap);
         self.show_graticule = saved.show_graticule;
         if let Some(px) = saved.box_threshold_px {
             self.box_threshold_px = px;
@@ -7654,7 +7694,6 @@ impl ViewerApp {
         self.map_rect = rect;
         let ppp = ctx.pixels_per_point();
         let vp = [rect.width() * ppp, rect.height() * ppp];
-        self.last_viewport_px = vp;
 
         // --- input ---
         if response.dragged_by(egui::PointerButton::Primary)
@@ -7757,6 +7796,7 @@ impl ViewerApp {
         // --- build draw call ---
         self.tiles.poll();
         let basemap = self.basemap_plan(vp);
+        self.last_basemap_plan = basemap;
         let tile_draws = match basemap {
             BasemapPlan::Mercator(src) => self.tiles.draws(src, &self.camera, vp),
             BasemapPlan::Warped(src, plan) => {
@@ -7928,6 +7968,7 @@ impl ViewerApp {
             MapCallback {
                 camera: self.camera,
                 viewport_px: vp,
+                tile_opacity: self.basemap_opacity,
                 tile_draws,
                 tile_uploads,
                 alive_tiles,
@@ -8841,6 +8882,7 @@ mod tests {
         let cb = MapCallback {
             camera,
             viewport_px: [w as f32, h as f32],
+            tile_opacity: 1.0,
             tile_draws: vec![],
             tile_uploads: vec![],
             alive_tiles: Default::default(),

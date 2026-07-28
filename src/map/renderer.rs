@@ -59,6 +59,8 @@ pub struct LayerDraw {
 pub struct MapCallback {
     pub camera: Camera,
     pub viewport_px: [f32; 2],
+    /// Basemap opacity, 0..=1. Applied to every tile, warped or not.
+    pub tile_opacity: f32,
     pub tile_draws: Vec<TileDrawCmd>,
     pub tile_uploads: Vec<TileUpload>,
     pub alive_tiles: HashSet<TileKey>,
@@ -880,7 +882,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                         &mut uniforms,
                         m.origin,
                         [1.0, 1.0],
-                        [1.0, 1.0, 1.0, 1.0],
+                        [1.0, 1.0, 1.0, self.tile_opacity],
                         0.0,
                     );
                     draw_list.push(DrawCmd::TileMesh {
@@ -897,7 +899,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                         &mut uniforms,
                         [r[0], r[1]],
                         [r[2] - r[0], r[3] - r[1]],
-                        [1.0, 1.0, 1.0, 1.0],
+                        [1.0, 1.0, 1.0, self.tile_opacity],
                         0.0,
                     );
                     draw_list.push(DrawCmd::Tile {
@@ -1328,6 +1330,7 @@ mod tests {
         let cb = MapCallback {
             camera,
             viewport_px: [w as f32, h as f32],
+            tile_opacity: 1.0,
             tile_draws: vec![],
             tile_uploads: vec![],
             alive_tiles: Default::default(),
@@ -1506,6 +1509,7 @@ mod tests {
         let cb = MapCallback {
             camera,
             viewport_px: [w as f32, h as f32],
+            tile_opacity: 1.0,
             tile_draws: vec![],
             tile_uploads: vec![],
             alive_tiles: Default::default(),
@@ -1631,7 +1635,8 @@ mod tests {
             let cb2 = MapCallback {
                 camera: cam2,
                 viewport_px: [w as f32, h as f32],
-                tile_draws: vec![],
+                tile_opacity: 1.0,
+            tile_draws: vec![],
                 tile_uploads: vec![],
                 alive_tiles: Default::default(),
                 alive_layers: Default::default(),
@@ -1839,6 +1844,7 @@ mod tests {
         let cb = MapCallback {
             camera,
             viewport_px: [w as f32, h as f32],
+            tile_opacity: 1.0,
             tile_draws: vec![],
             tile_uploads: vec![],
             alive_tiles: Default::default(),
@@ -1979,6 +1985,7 @@ mod tests {
                 zoom: 10.0,
             },
             viewport_px: [size as f32, size as f32],
+            tile_opacity: 1.0,
             tile_draws: vec![],
             tile_uploads: vec![],
             alive_tiles: Default::default(),
@@ -2181,6 +2188,7 @@ mod tests {
         let cb = MapCallback {
             camera,
             viewport_px: [size as f32, size as f32],
+            tile_opacity: 1.0,
             tile_draws: vec![
                 TileDrawCmd {
                     key: keys[0],
@@ -2276,6 +2284,7 @@ mod tests {
         let cb = MapCallback {
             camera,
             viewport_px: [size as f32, size as f32],
+            tile_opacity: 1.0,
             tile_draws: vec![TileDrawCmd {
                 key,
                 world_rect: r,
@@ -2302,6 +2311,72 @@ mod tests {
             px.iter().all(|&v| (v as i32 - 128).abs() <= 2),
             "mid-grey came back as {px:?}, expected ~[128, 128, 128]"
         );
+    }
+
+    /// Fading the basemap must actually fade it. The slider is only
+    /// useful if it reaches the tiles, and a warped tile takes a different
+    /// pipeline from a flat one, so both are checked.
+    #[test]
+    fn tile_opacity_fades_the_basemap() {
+        use crate::map::tiles::{MipLevel, TileDrawCmd, TileId, TileKey, TileUpload};
+
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let size = 64u32;
+        let id = TileId { z: 4, x: 8, y: 5 };
+        let key = TileKey { source: 0, id };
+        let r = id.world_rect();
+
+        let sample = |opacity: f32| -> u8 {
+            let mut resources = egui_wgpu::CallbackResources::default();
+            resources.insert(MapResources::new(&device, wgpu::TextureFormat::Rgba8Unorm));
+            let mut camera = crate::map::camera::Camera::default();
+            camera.fit(
+                [
+                    r[0] + (r[2] - r[0]) * 0.25,
+                    r[1] + (r[3] - r[1]) * 0.25,
+                    r[0] + (r[2] - r[0]) * 0.75,
+                    r[1] + (r[3] - r[1]) * 0.75,
+                ],
+                [size as f32, size as f32],
+                0.0,
+            );
+            let cb = MapCallback {
+                camera,
+                viewport_px: [size as f32, size as f32],
+                tile_opacity: opacity,
+                tile_draws: vec![TileDrawCmd {
+                    key,
+                    world_rect: r,
+                    mesh: None,
+                }],
+                tile_uploads: vec![TileUpload {
+                    key,
+                    mips: vec![MipLevel {
+                        w: 4,
+                        h: 4,
+                        px: [200u8, 200, 200, 255].repeat(16),
+                    }],
+                }],
+                alive_tiles: [key].into_iter().collect(),
+                alive_layers: Default::default(),
+                layers: vec![],
+                background: [0.0; 4],
+            };
+            let data = render_to_pixels(&device, &queue, &mut resources, &cb, size);
+            let centre = ((size / 2) * size + size / 2) as usize * 4;
+            data[centre]
+        };
+
+        // Over a black clear, the tile arrives scaled by its opacity.
+        let full = sample(1.0);
+        let half = sample(0.5);
+        let none = sample(0.0);
+        assert!((full as i32 - 200).abs() <= 2, "opaque: {full}");
+        assert!((half as i32 - 100).abs() <= 3, "half: {half}");
+        assert_eq!(none, 0, "fully transparent should leave the clear colour");
     }
 
     /// Render a real reprojected basemap to a PNG, for looking at.
@@ -2405,6 +2480,7 @@ mod tests {
         let cb = MapCallback {
             camera,
             viewport_px: [size as f32, size as f32],
+            tile_opacity: 1.0,
             tile_draws: draws,
             tile_uploads: uploads,
             alive_tiles: alive,

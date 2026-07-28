@@ -285,7 +285,8 @@ larger files are on the roadmap.
   file.
 - **Rename** (layer ⋮ → Rename): a display label for the layer panel and
   legend; the file keeps its name.
-- **Basemaps**: Carto Light/Dark/Voyager (each also label-free),
+- **Basemaps** (bottom of the layers panel, with a source list and an
+  opacity slider): Carto Light/Dark/Voyager (each also label-free),
   OpenStreetMap, OpenTopoMap, Esri World Topo and Esri World Imagery,
   plus a Natural Earth coastline and graticule that follow any
   projection. The coastline is zoom-dependent: the embedded 1:50m

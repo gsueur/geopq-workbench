@@ -24,6 +24,10 @@ pub struct Context {
     #[serde(default)]
     pub projection_name: Option<String>,
     pub basemap: Option<usize>,
+    /// Basemap opacity. Absent in contexts written before it existed,
+    /// where the basemap was always fully opaque.
+    #[serde(default)]
+    pub basemap_opacity: Option<f32>,
     pub show_graticule: bool,
     pub show_coastline: bool,
     /// Pixel width below which a feature is drawn from its bounding box.
@@ -328,6 +332,7 @@ mod tests {
             projection: "epsg:2154".into(),
             projection_name: None,
             basemap: Some(1),
+            basemap_opacity: Some(1.0),
             show_graticule: false,
             show_coastline: true,
             box_threshold_px: None,
