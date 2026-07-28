@@ -46,6 +46,21 @@ pub enum LoadMsg {
         /// built in it). false = the app must run a projection rebuild.
         adopt_display: Option<(DisplayCrs, bool)>,
     },
+    /// Where this layer will land, known from metadata alone and sent
+    /// before a byte of geometry is read.
+    ///
+    /// The camera used to sit on the whole world until the build finished,
+    /// which meant the basemap had nothing to fetch for however long that
+    /// took, then everything at once. Framing early lets the tiles load
+    /// alongside the data. The exact bounds still refine the fit when the
+    /// layer itself arrives.
+    Framed {
+        job: u64,
+        /// The auto-selected projection `world` is expressed in, when the
+        /// app is not already on it.
+        display: Option<DisplayCrs>,
+        world: [f64; 4],
+    },
     /// Geometry rebuilt for a new display projection (replaces all sections).
     Rebuilt {
         layer_id: u64,
@@ -731,6 +746,21 @@ fn build_opened(
             adopt_display = Some((d, true));
         }
     }
+    // Frame the view now that the projection is settled. The row-group
+    // boxes give the extent for free, so the map can point at the right
+    // place — and the basemap start downloading for it — while the
+    // geometry is still being read.
+    if let Some(world) = rg_meta
+        .as_ref()
+        .and_then(|(_, boxes)| union_of(boxes))
+        .and_then(|b| data_bbox_to_world(b, &crs, &display))
+    {
+        handle.send(LoadMsg::Framed {
+            job,
+            display: adopt_display.as_ref().map(|(d, _)| d.clone()),
+            world,
+        });
+    }
     let sel = if direct {
         // Direct mode: every group in full — no viewport planning, no
         // preview fallback (docs/OPEN_POLICY.md).
@@ -928,6 +958,7 @@ pub fn spawn_rebuild(
 ) {
     std::thread::spawn(move || {
         let t0 = Instant::now();
+        log::debug!("spawn_rebuild: layer {layer_id}, generation {generation}");
         let starts = store.rg_starts().to_vec();
         let sel: Vec<GroupSel> = rebuild_selection(&loaded, &starts, box_gaps);
         let style_sel = style.as_ref().and_then(|sb| resolve_style(&store, sb));
@@ -4966,6 +4997,85 @@ mod pruning_tests {
     /// End-to-end pruning against the Hilbert-sorted covering fixture:
     /// covering stats must be detected, and a small-viewport load must
     /// decode a small fraction of the row groups and rows.
+    /// The map must be framed from metadata before any geometry is read.
+    ///
+    /// Until it is, the camera sits on the whole world, where the basemap
+    /// has nothing to fetch — so the tiles could only start once the build
+    /// finished. `Framed` has to reach the app strictly before `Loaded`,
+    /// and has to point at the same place the layer eventually lands.
+    #[test]
+    fn framing_arrives_before_the_geometry() {
+        let path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/parcels_hilbert.parquet"
+        ));
+        if !path.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let source = Source::Local(path);
+        let (store, crs, info, rg_meta) = open_store(&source).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = LoaderHandle {
+            tx,
+            egui_ctx: eframe::egui::Context::default(),
+        };
+        let display = crate::data::crs::DisplayCrs::hobo_dyer();
+        build_opened(
+            &handle,
+            1,
+            1,
+            OpenedStore {
+                store: Arc::new(store),
+                crs,
+                info,
+                rg_meta,
+            },
+            display,
+            eframe::egui::Color32::RED,
+            [0.0, 0.0, 1.0, 1.0],
+            true,
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+            false,
+            Instant::now(),
+        );
+        drop(handle);
+
+        let mut framed: Option<[f64; 4]> = None;
+        let mut framed_display: Option<DisplayCrs> = None;
+        let mut layer_bounds: Option<[f64; 4]> = None;
+        for msg in rx {
+            match msg {
+                LoadMsg::Framed { display, world, .. } => {
+                    assert!(layer_bounds.is_none(), "Framed arrived after Loaded");
+                    framed_display = display;
+                    framed = Some(world);
+                }
+                LoadMsg::Loaded { layer, .. } => layer_bounds = Some(layer.bounds_world()),
+                _ => {}
+            }
+        }
+        let framed = framed.expect("a file with covering stats must frame early");
+        let actual = layer_bounds.expect("the layer still loads");
+        assert!(
+            framed_display.is_some(),
+            "Massachusetts parcels adopt their own projected CRS"
+        );
+        // Same place: the metadata extent should contain the built one, up
+        // to a small slack for the box-corner sampling.
+        let slack = (actual[2] - actual[0]).max(actual[3] - actual[1]) * 0.02;
+        assert!(
+            framed[0] <= actual[0] + slack
+                && framed[1] <= actual[1] + slack
+                && framed[2] >= actual[2] - slack
+                && framed[3] >= actual[3] - slack,
+            "framed {framed:?} does not cover built {actual:?}"
+        );
+        // And it must be a real framing, not the whole world.
+        assert!(framed[2] - framed[0] < 0.05, "framed span too wide: {framed:?}");
+    }
+
     #[test]
     fn covering_stats_prune_row_groups() {
         let path = std::path::PathBuf::from(concat!(

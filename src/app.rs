@@ -227,6 +227,11 @@ pub struct ViewerApp {
     palette_idx: usize,
     pending_fit: bool,
     fit_bounds: Option<[f64; 4]>,
+    /// Provisional framing from a loading layer's metadata extent, applied
+    /// before its geometry exists. Unlike `fit_bounds` this does not count
+    /// as the user moving the camera, so the exact fit still happens when
+    /// the layer lands.
+    frame_bounds: Option<[f64; 4]>,
     /// Pick the display projection automatically from the first loaded
     /// layer (data CRS if projected, extent-based equal-area otherwise);
     /// turned off by any manual projection choice.
@@ -762,6 +767,7 @@ impl ViewerApp {
             palette_idx: 0,
             pending_fit: true,
             fit_bounds: None,
+            frame_bounds: None,
             auto_projection: true,
             appending: HashSet::new(),
             projection_decider: None,
@@ -1397,6 +1403,39 @@ impl ViewerApp {
                     if let Some(j) = self.loading.get_mut(&job) {
                         j.frac = frac;
                         j.stage = stage;
+                    }
+                }
+                LoadMsg::Framed {
+                    job,
+                    display,
+                    world,
+                } => {
+                    // Only worth doing for the first layer onto an empty
+                    // map that nobody has framed themselves: a restored
+                    // context brings its own camera, and a second layer
+                    // must not yank the view off the first.
+                    let restored = self.pending_styles.contains_key(&job);
+                    if self.layers.is_empty()
+                        && !self.camera_moved
+                        && !restored
+                        && self.loading.contains_key(&job)
+                    {
+                        if let Some(d) = display {
+                            // Switch now so the framing, and the tiles it
+                            // triggers, are already in the projection the
+                            // layer will arrive in. No layers exist yet, so
+                            // nothing has to be rebuilt.
+                            self.adopt_display_lite(d);
+                            // This job is building geometry for the display
+                            // we just moved to — it is the reason we moved.
+                            // Without this the generation bump would read as
+                            // "projection changed mid-load" and cost a full
+                            // second build on arrival.
+                            if let Some(j) = self.loading.get_mut(&job) {
+                                j.display_gen = self.display_gen;
+                            }
+                        }
+                        self.frame_bounds = Some(world);
                     }
                 }
                 LoadMsg::Loaded {
@@ -7531,6 +7570,13 @@ impl ViewerApp {
         if let Some(b) = self.fit_bounds.take() {
             self.camera.fit(b, vp, 40.0);
             self.camera_moved = true;
+            self.pending_fit = false;
+        }
+        // Provisional framing wins over the empty-map fit that set_display
+        // arms, which would otherwise pull the camera back out to the whole
+        // projection and leave the basemap with nothing to fetch again.
+        if let Some(b) = self.frame_bounds.take() {
+            self.camera.fit(b, vp, 40.0);
             self.pending_fit = false;
         }
         if self.pending_fit {
