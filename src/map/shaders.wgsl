@@ -161,6 +161,21 @@ fn vs_tile(@builtin(vertex_index) vi: u32) -> TileOut {
     return out;
 }
 
+// Warped tiles: outside Mercator a tile is a curved patch, so it arrives as
+// a subdivided mesh whose vertices were projected on the CPU. Positions are
+// world offsets from the tile's own origin (same scheme as vector chunks, so
+// f32 keeps its precision at deep zoom).
+@vertex
+fn vs_tile_mesh(
+    @location(0) pos: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+) -> TileOut {
+    var out: TileOut;
+    out.pos = vec4<f32>(pos * u.ab + u.t, 0.0, 1.0);
+    out.uv = uv;
+    return out;
+}
+
 @group(1) @binding(0) var tile_tex: texture_2d<f32>;
 @group(1) @binding(1) var tile_samp: sampler;
 

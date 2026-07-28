@@ -179,6 +179,31 @@ struct TileGpu {
     _texture: wgpu::Texture,
 }
 
+/// Reuse a buffer when it is big enough, otherwise allocate the next power
+/// of two. Warped tile meshes are rebuilt every frame but barely change
+/// size, so this settles after the first few.
+fn grow_and_write(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    existing: Option<wgpu::Buffer>,
+    bytes: &[u8],
+    usage: wgpu::BufferUsages,
+    label: &str,
+) -> wgpu::Buffer {
+    let need = bytes.len() as u64;
+    let buf = match existing {
+        Some(b) if b.size() >= need => b,
+        _ => device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: need.next_power_of_two().max(4096),
+            usage: usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }),
+    };
+    queue.write_buffer(&buf, 0, bytes);
+    buf
+}
+
 /// Offscreen fill target for one layer (resolved, viewport-sized).
 struct CompositeTarget {
     view: wgpu::TextureView,
@@ -193,6 +218,12 @@ pub struct MapResources {
     line_pipeline: wgpu::RenderPipeline,
     point_pipeline: wgpu::RenderPipeline,
     tile_pipeline: wgpu::RenderPipeline,
+    /// Warped tiles: same texture and fragment shader, but vertices come
+    /// from a buffer instead of being generated from the vertex index.
+    tile_mesh_pipeline: wgpu::RenderPipeline,
+    /// Per-frame scratch holding every warped tile's mesh, grown as needed.
+    tile_mesh_vbuf: Option<wgpu::Buffer>,
+    tile_mesh_ibuf: Option<wgpu::Buffer>,
     chunk_bgl: wgpu::BindGroupLayout,
     tile_bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -222,6 +253,15 @@ enum DrawCmd {
     Tile {
         key: TileKey,
         uoffset: u32,
+    },
+    /// A tile warped into the display projection, indexed out of the shared
+    /// per-frame mesh buffers.
+    TileMesh {
+        key: TileKey,
+        uoffset: u32,
+        index_start: u32,
+        index_count: u32,
+        base_vertex: i32,
     },
     /// Full-viewport quad compositing a group's offscreen fill texture at
     /// the layer's fill opacity (uniform tone regardless of feature overlap).
@@ -416,14 +456,30 @@ impl MapResources {
             }],
         );
         let tile_pipeline = make_pipeline("tile", &tile_layout, "vs_tile", "fs_tile", &[]);
+        let tile_mesh_pipeline = make_pipeline(
+            "tile mesh",
+            &tile_layout,
+            "vs_tile_mesh",
+            "fs_tile",
+            &[wgpu::VertexBufferLayout {
+                array_stride: 16,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
+            }],
+        );
 
+        // Reprojection minifies a tile hard along one axis (roughly 1/cos²φ
+        // against a cylindrical equal-area, so 4:1 at 60°N), which is what
+        // anisotropic filtering exists for. It needs a mip chain and linear
+        // filtering on every axis to have anything to work with.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("tile sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
+            anisotropy_clamp: 16,
             ..Default::default()
         });
 
@@ -436,6 +492,9 @@ impl MapResources {
             line_pipeline,
             point_pipeline,
             tile_pipeline,
+            tile_mesh_pipeline,
+            tile_mesh_vbuf: None,
+            tile_mesh_ibuf: None,
             chunk_bgl,
             tile_bgl,
             sampler,
@@ -559,7 +618,9 @@ impl MapResources {
     }
 
     fn upload_tile(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, up: &TileUpload) {
-        let (w, h) = (up.rgba.width(), up.rgba.height());
+        let Some(base) = up.mips.first() else { return };
+        let (w, h) = (base.w, base.h);
+        let mips = &up.mips;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("tile"),
             size: wgpu::Extent3d {
@@ -567,32 +628,34 @@ impl MapResources {
                 height: h,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: 1,
+            mip_level_count: mips.len() as u32,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            up.rgba.as_raw(),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * w),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
+        for (level, m) in mips.iter().enumerate() {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &m.px,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * m.w),
+                    rows_per_image: Some(m.h),
+                },
+                wgpu::Extent3d {
+                    width: m.w,
+                    height: m.h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         let view = texture.create_view(&Default::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tile bg"),
@@ -788,23 +851,73 @@ impl egui_wgpu::CallbackTrait for MapCallback {
             offset
         };
 
-        // Tiles first (under vector data).
+        // Tiles first (under vector data). Warped ones carry a mesh and are
+        // packed into one shared vertex/index buffer for the frame.
+        let mut mesh_verts: Vec<[f32; 4]> = Vec::new();
+        let mut mesh_indices: Vec<u16> = Vec::new();
         for tile in &self.tile_draws {
             if !res.tiles.contains_key(&tile.key) {
                 continue;
             }
-            let r = tile.world_rect;
-            let uoffset = push_uniform(
-                &mut uniforms,
-                [r[0], r[1]],
-                [r[2] - r[0], r[3] - r[1]],
-                [1.0, 1.0, 1.0, 1.0],
-                0.0,
-            );
-            draw_list.push(DrawCmd::Tile {
-                key: tile.key,
-                uoffset,
-            });
+            match &tile.mesh {
+                Some(m) => {
+                    let base_vertex = mesh_verts.len() as i32;
+                    let index_start = mesh_indices.len() as u32;
+                    mesh_verts.extend_from_slice(&m.verts);
+                    mesh_indices.extend_from_slice(&m.indices);
+                    let uoffset = push_uniform(
+                        &mut uniforms,
+                        m.origin,
+                        [1.0, 1.0],
+                        [1.0, 1.0, 1.0, 1.0],
+                        0.0,
+                    );
+                    draw_list.push(DrawCmd::TileMesh {
+                        key: tile.key,
+                        uoffset,
+                        index_start,
+                        index_count: m.indices.len() as u32,
+                        base_vertex,
+                    });
+                }
+                None => {
+                    let r = tile.world_rect;
+                    let uoffset = push_uniform(
+                        &mut uniforms,
+                        [r[0], r[1]],
+                        [r[2] - r[0], r[3] - r[1]],
+                        [1.0, 1.0, 1.0, 1.0],
+                        0.0,
+                    );
+                    draw_list.push(DrawCmd::Tile {
+                        key: tile.key,
+                        uoffset,
+                    });
+                }
+            }
+        }
+        if !mesh_indices.is_empty() {
+            // write_buffer needs a multiple of 4 bytes; cells contribute six
+            // indices each, so this only ever pads a malformed mesh.
+            if !mesh_indices.len().is_multiple_of(2) {
+                mesh_indices.push(0);
+            }
+            res.tile_mesh_vbuf = Some(grow_and_write(
+                device,
+                queue,
+                res.tile_mesh_vbuf.take(),
+                bytemuck::cast_slice(&mesh_verts),
+                wgpu::BufferUsages::VERTEX,
+                "tile mesh verts",
+            ));
+            res.tile_mesh_ibuf = Some(grow_and_write(
+                device,
+                queue,
+                res.tile_mesh_ibuf.take(),
+                bytemuck::cast_slice(&mesh_indices),
+                wgpu::BufferUsages::INDEX,
+                "tile mesh indices",
+            ));
         }
 
         // Vector layers: fills (grouped per composite_group), then lines,
@@ -1025,6 +1138,31 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                     pass.set_bind_group(0, &res.uniform_bg, &[*uoffset]);
                     pass.set_bind_group(1, &tile.bind_group, &[]);
                     pass.draw(0..6, 0..1);
+                }
+                DrawCmd::TileMesh {
+                    key,
+                    uoffset,
+                    index_start,
+                    index_count,
+                    base_vertex,
+                } => {
+                    let (Some(tile), Some(vb), Some(ib)) = (
+                        res.tiles.get(key),
+                        res.tile_mesh_vbuf.as_ref(),
+                        res.tile_mesh_ibuf.as_ref(),
+                    ) else {
+                        continue;
+                    };
+                    pass.set_pipeline(&res.tile_mesh_pipeline);
+                    pass.set_bind_group(0, &res.uniform_bg, &[*uoffset]);
+                    pass.set_bind_group(1, &tile.bind_group, &[]);
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint16);
+                    pass.draw_indexed(
+                        *index_start..*index_start + *index_count,
+                        *base_vertex,
+                        0..1,
+                    );
                 }
                 DrawCmd::Composite { group, uoffset } => {
                     let Some(target) = res.composites.get(group) else {
@@ -1970,5 +2108,348 @@ mod tests {
         assert!(red > 5_000, "fill pixels: {red}");
         assert!(green > 500, "outline pixels: {green}");
         assert!(blue > 20, "point pixels: {blue}");
+    }
+
+    /// Two neighbouring tiles warped into a non-Mercator projection and drawn
+    /// together. They share one vertex/index buffer, so this is what catches a
+    /// wrong `base_vertex` or index range: get either wrong and the second
+    /// tile lands on top of the first, or vanishes.
+    #[test]
+    fn warped_tiles_draw_side_by_side() {
+        use crate::map::tiles::{MipLevel, TileDrawCmd, TileId, TileKey, TileUpload};
+        use crate::map::warp::{self, Warp};
+
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let size = 256u32;
+        let mut resources = egui_wgpu::CallbackResources::default();
+        resources.insert(MapResources::new(&device, format));
+
+        let display = crate::data::crs::DisplayCrs::from_epsg(3035).expect("EPSG:3035");
+        let w = Warp::new(&display);
+        let (z, y) = (6u8, 21u32);
+        let ids = [TileId { z, x: 32, y }, TileId { z, x: 33, y }];
+        let meshes: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                std::sync::Arc::new(
+                    warp::tile_mesh(&w, *id, warp::TILE_SUBDIV).expect("mesh"),
+                )
+            })
+            .collect();
+
+        // Frame both tiles, with room to spare so neither touches the edge.
+        let mut b = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+        for m in &meshes {
+            for v in &m.verts {
+                if !v[0].is_finite() {
+                    continue;
+                }
+                let (x, y) = (m.origin[0] + v[0] as f64, m.origin[1] + v[1] as f64);
+                b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+            }
+        }
+        let mut camera = crate::map::camera::Camera::default();
+        camera.fit(b, [size as f32, size as f32], 16.0);
+
+        // Flat colours: one tile red, its neighbour blue.
+        let solid = |c: [u8; 4]| -> Vec<MipLevel> {
+            crate::map::tiles::mip_chain(&c.repeat(64 * 64), 64, 64)
+        };
+        let keys: Vec<TileKey> = ids
+            .iter()
+            .map(|id| TileKey {
+                source: 0,
+                id: *id,
+            })
+            .collect();
+
+        let cb = MapCallback {
+            camera,
+            viewport_px: [size as f32, size as f32],
+            tile_draws: vec![
+                TileDrawCmd {
+                    key: keys[0],
+                    world_rect: ids[0].world_rect(),
+                    mesh: Some(meshes[0].clone()),
+                },
+                TileDrawCmd {
+                    key: keys[1],
+                    world_rect: ids[1].world_rect(),
+                    mesh: Some(meshes[1].clone()),
+                },
+            ],
+            tile_uploads: vec![
+                TileUpload {
+                    key: keys[0],
+                    mips: solid([255, 0, 0, 255]),
+                },
+                TileUpload {
+                    key: keys[1],
+                    mips: solid([0, 0, 255, 255]),
+                },
+            ],
+            alive_tiles: keys.iter().copied().collect(),
+            alive_layers: Default::default(),
+            layers: vec![],
+            background: [0.0; 4],
+        };
+
+        let data = render_to_pixels(&device, &queue, &mut resources, &cb, size);
+
+        // Centroid per colour, in pixels.
+        let mut acc = [(0f64, 0f64, 0usize); 2];
+        for (i, px) in data.chunks_exact(4).enumerate() {
+            let (x, y) = ((i as u32 % size) as f64, (i as u32 / size) as f64);
+            let slot = if px[0] > 128 && px[2] < 100 {
+                0
+            } else if px[2] > 128 && px[0] < 100 {
+                1
+            } else {
+                continue;
+            };
+            acc[slot].0 += x;
+            acc[slot].1 += y;
+            acc[slot].2 += 1;
+        }
+        let [red, blue] = acc;
+        assert!(red.2 > 2_000, "red tile pixels: {}", red.2);
+        assert!(blue.2 > 2_000, "blue tile pixels: {}", blue.2);
+        // x=32 is the western tile, so red must sit left of blue.
+        assert!(
+            red.0 / red.2 as f64 + 20.0 < blue.0 / blue.2 as f64,
+            "red centroid {:.1} not left of blue {:.1}",
+            red.0 / red.2 as f64,
+            blue.0 / blue.2 as f64
+        );
+    }
+
+    /// Render a real reprojected basemap to a PNG, for looking at.
+    ///
+    /// Ignored by default: it fetches live tiles. The things worth checking
+    /// in the output are that coastlines run continuously across tile
+    /// boundaries (the meshes agree on their shared edges) and that the
+    /// graticule-shaped curvature is present at all (a flat quad per tile
+    /// would leave straight tile edges and visible kinks).
+    ///
+    /// The view is set by environment so both halves of the rule can be
+    /// looked at: a continental view (labels shear, so the label-free twin
+    /// is drawn) and a metro one (labels survive, so they are kept).
+    ///
+    ///   cargo test --bin geopq-workbench warped_basemap_snapshot -- --ignored --nocapture
+    ///   GEOPQ_SNAP_EPSG=2154 GEOPQ_SNAP_LON=1.44 GEOPQ_SNAP_LAT=43.60 \
+    ///   GEOPQ_SNAP_ZOOM=12 cargo test ... (same)
+    #[test]
+    #[ignore]
+    fn warped_basemap_snapshot() {
+        use crate::map::tiles::{self, TileDrawCmd, TileKey, TileUpload, TILE_SOURCES};
+        use crate::map::warp::{self, Warp};
+
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let size = 640u32;
+        let mut resources = egui_wgpu::CallbackResources::default();
+        resources.insert(MapResources::new(&device, wgpu::TextureFormat::Rgba8Unorm));
+
+        let env = |k: &str, d: f64| {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        // Default: Europe LAEA over the continent, far enough out that the
+        // meridians visibly converge and close enough that tiles still exist.
+        let epsg = env("GEOPQ_SNAP_EPSG", 3035.0) as u32;
+        let display = crate::data::crs::DisplayCrs::from_epsg(epsg).expect("display CRS");
+        let w = Warp::new(&display);
+        let centre = w
+            .display_world(warp::merc_world_from_lonlat(
+                env("GEOPQ_SNAP_LON", 10.0),
+                env("GEOPQ_SNAP_LAT", 50.0),
+            ))
+            .expect("centre projects");
+        let camera = crate::map::camera::Camera {
+            center: centre,
+            zoom: env("GEOPQ_SNAP_ZOOM", 5.0),
+        };
+
+        // Follow the app's own rule: start from a labelled source and fall
+        // back to its label-free twin only when the view would shear text.
+        let mut src = 0usize;
+        let plan = warp::plan(&w, &camera, [size as f32, size as f32], TILE_SOURCES[src].max_zoom)
+            .expect("plans");
+        if TILE_SOURCES[src].labels && !plan.labels_survive() {
+            src = tiles::nolabels_twin(src).expect("twin");
+        }
+        eprintln!(
+            "level {}, rotation {:.1}°, anisotropy {:.2}, labels survive: {}",
+            plan.zoom,
+            plan.rotation_deg,
+            plan.anisotropy,
+            plan.labels_survive()
+        );
+
+        let ids = warp::tiles_for(plan.merc_bbox, plan.zoom, 64);
+        eprintln!("fetching {} tiles from {}", ids.len(), TILE_SOURCES[src].name);
+        let mut draws = Vec::new();
+        let mut uploads = Vec::new();
+        let mut alive = std::collections::HashSet::new();
+        for id in ids {
+            let key = TileKey {
+                source: src as u8,
+                id,
+            };
+            let Some(mips) = tiles::fetch_tile_blocking(key) else {
+                eprintln!("  tile {id:?} failed to fetch");
+                continue;
+            };
+            // GEOPQ_SNAP_QUAD renders through the plain Mercator quad path
+            // instead, which is what most views still use and what the mip
+            // chain and anisotropic sampler could regress.
+            let mesh = match std::env::var("GEOPQ_SNAP_QUAD").is_ok() {
+                true => None,
+                false => match warp::tile_mesh(&w, id, warp::TILE_SUBDIV) {
+                    Some(m) => Some(std::sync::Arc::new(m)),
+                    None => continue,
+                },
+            };
+            uploads.push(TileUpload { key, mips });
+            draws.push(TileDrawCmd {
+                key,
+                world_rect: id.world_rect(),
+                mesh,
+            });
+            alive.insert(key);
+        }
+        assert!(!draws.is_empty(), "no tiles fetched; is the network up?");
+
+        let cb = MapCallback {
+            camera,
+            viewport_px: [size as f32, size as f32],
+            tile_draws: draws,
+            tile_uploads: uploads,
+            alive_tiles: alive,
+            alive_layers: Default::default(),
+            layers: vec![],
+            background: [0.0; 4],
+        };
+        let data = render_to_pixels(&device, &queue, &mut resources, &cb, size);
+
+        let out = std::env::var("GEOPQ_SNAPSHOT")
+            .unwrap_or_else(|_| "target/warped-basemap.png".into());
+        image::RgbaImage::from_raw(size, size, data)
+            .expect("frame")
+            .save(&out)
+            .expect("write png");
+        eprintln!("wrote {out}");
+    }
+
+    /// Run one callback through prepare + paint and read the frame back.
+    fn render_to_pixels(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        resources: &mut egui_wgpu::CallbackResources,
+        cb: &MapCallback,
+        size: u32,
+    ) -> Vec<u8> {
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mk_tex = |samples: u32, usage: wgpu::TextureUsages| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: samples,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let msaa = mk_tex(MSAA_SAMPLES, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let resolve = mk_tex(
+            1,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let msaa_view = msaa.create_view(&Default::default());
+        let resolve_view = resolve.create_view(&Default::default());
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [size, size],
+            pixels_per_point: 1.0,
+        };
+        queue.submit(cb.prepare(device, queue, &screen, &mut encoder, resources));
+        {
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    multiview_mask: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &msaa_view,
+                        depth_slice: None,
+                        resolve_target: Some(&resolve_view),
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                })
+                .forget_lifetime();
+            let r = eframe::egui::Rect::from_min_size(
+                Default::default(),
+                eframe::egui::vec2(size as f32, size as f32),
+            );
+            cb.paint(
+                eframe::egui::PaintCallbackInfo {
+                    viewport: r,
+                    clip_rect: r,
+                    pixels_per_point: 1.0,
+                    screen_size_px: [size, size],
+                },
+                &mut pass,
+                resources,
+            );
+        }
+        let out = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (size * size * 4) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &resolve,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &out,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(size * 4),
+                    rows_per_image: Some(size),
+                },
+            },
+            wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        let slice = out.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        slice.get_mapped_range().to_vec()
     }
 }

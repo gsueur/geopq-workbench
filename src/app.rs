@@ -26,6 +26,29 @@ const COASTLINE_KEY: u64 = u64::MAX - 3;
 /// Row-group bbox overlays: key = RG_OVERLAY_BASE | layer id.
 const RG_OVERLAY_BASE: u64 = 1 << 62;
 
+/// How the raster basemap meets the current display projection.
+#[derive(Clone, Copy)]
+enum BasemapPlan {
+    /// Display is Web Mercator: tiles are axis-aligned quads, drawn as-is.
+    Mercator(usize),
+    /// Tiles are reprojected onto a mesh. The index is the source actually
+    /// drawn, which may be the label-free twin of the one selected.
+    Warped(usize, crate::map::warp::WarpPlan),
+    /// No tiles this frame. Carries the reason when there is one worth
+    /// showing; None simply means the user chose no basemap.
+    Off(Option<&'static str>),
+}
+
+impl BasemapPlan {
+    /// The tile source on screen, for attribution.
+    fn drawn_source(&self) -> Option<usize> {
+        match self {
+            BasemapPlan::Mercator(s) | BasemapPlan::Warped(s, _) => Some(*s),
+            BasemapPlan::Off(_) => None,
+        }
+    }
+}
+
 struct LoadingJob {
     label: String,
     frac: f32,
@@ -219,6 +242,10 @@ pub struct ViewerApp {
     /// the original full-world viewport" is what first-layer adoption
     /// checks before fitting to the layer.
     camera_moved: bool,
+    /// Map viewport in physical pixels, as of the last frame. Menus are
+    /// built before the map panel runs, so anything view-dependent shown in
+    /// one (the basemap notes) reads it from here.
+    last_viewport_px: [f32; 2],
     /// Cancel flags of in-flight appends (layer id -> flag).
     append_cancel: HashMap<u64, Arc<std::sync::atomic::AtomicBool>>,
     /// Cancel flags of in-flight rebuilds (layer id -> flag). Spawning a
@@ -740,6 +767,7 @@ impl ViewerApp {
             projection_decider: None,
             deferred_loads: Vec::new(),
             camera_moved: false,
+            last_viewport_px: [1024.0, 768.0],
             append_cancel: HashMap::new(),
             rebuild_cancel: HashMap::new(),
             fit_after_rebuilds: false,
@@ -2169,13 +2197,41 @@ impl ViewerApp {
                 ui.checkbox(&mut self.show_graticule, "Graticule");
                 ui.checkbox(&mut self.show_coastline, "Coastline");
                 ui.menu_button("Basemap", |ui| {
-                    if !self.display.is_mercator() {
+                    // Tiles are Web Mercator and get warped onto a mesh for
+                    // any other projection. The imagery survives that; the
+                    // place names baked into it do not, so say what will
+                    // happen before the user picks.
+                    let warped = !self.display.is_mercator();
+                    if warped {
                         ui.label(
-                            RichText::new("tiles render in Web Mercator only").weak().small(),
+                            RichText::new(format!(
+                                "reprojected to {}",
+                                self.display.name
+                            ))
+                            .weak()
+                            .small(),
                         );
+                        if let BasemapPlan::Off(Some(why)) = self.basemap_plan(self.last_viewport_px)
+                        {
+                            ui.label(RichText::new(why).weak().small());
+                        }
+                        ui.separator();
                     }
                     for (i, s) in TILE_SOURCES.iter().enumerate() {
-                        ui.selectable_value(&mut self.basemap, Some(i), s.name);
+                        if warped && s.labels && crate::map::tiles::nolabels_twin(i).is_some() {
+                            // Its twin is listed right below and is what
+                            // would actually be drawn; offering both here
+                            // would be two names for one outcome.
+                            continue;
+                        }
+                        let r = ui.selectable_value(&mut self.basemap, Some(i), s.name);
+                        if warped && s.labels {
+                            r.on_hover_text(
+                                "This source renders place names into the tile \
+                                 pixels, so they shear with the projection. \
+                                 Tiles are dropped where that would show.",
+                            );
+                        }
                     }
                     ui.selectable_value(&mut self.basemap, None, "None");
                 });
@@ -7322,6 +7378,42 @@ impl ViewerApp {
         ));
     }
 
+    /// How the basemap is drawn for the current view, if at all.
+    ///
+    /// Tiles are Web Mercator, so any other display projection has to warp
+    /// them. That is fine for the imagery and wrong for the text baked into
+    /// it, which is why a labelled source falls back to its label-free twin
+    /// once the view deforms enough for a place name to look tilted.
+    fn basemap_plan(&self, viewport_px: [f32; 2]) -> BasemapPlan {
+        use crate::map::warp;
+        let Some(src) = self.basemap else {
+            return BasemapPlan::Off(None);
+        };
+        if self.display.is_mercator() {
+            return BasemapPlan::Mercator(src);
+        }
+        let w = warp::Warp::new(&self.display);
+        let plan = match warp::plan(
+            &w,
+            &self.camera,
+            viewport_px,
+            TILE_SOURCES[src].max_zoom,
+        ) {
+            Ok(p) => p,
+            Err(e) => return BasemapPlan::Off(Some(e.reason())),
+        };
+        if !TILE_SOURCES[src].labels || plan.labels_survive() {
+            return BasemapPlan::Warped(src, plan);
+        }
+        match crate::map::tiles::nolabels_twin(src) {
+            Some(twin) => BasemapPlan::Warped(twin, plan),
+            None => BasemapPlan::Off(Some(
+                "no tiles: this source draws its place names into the pixels, \
+                 which this projection would shear. Pick a \"no labels\" source.",
+            )),
+        }
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if let Some(w) = self.cursor_world {
@@ -7389,6 +7481,7 @@ impl ViewerApp {
         self.map_rect = rect;
         let ppp = ctx.pixels_per_point();
         let vp = [rect.width() * ppp, rect.height() * ppp];
+        self.last_viewport_px = vp;
 
         // --- input ---
         if response.dragged_by(egui::PointerButton::Primary)
@@ -7482,9 +7575,15 @@ impl ViewerApp {
 
         // --- build draw call ---
         self.tiles.poll();
-        let tile_draws = match (self.basemap, self.display.is_mercator()) {
-            (Some(src), true) => self.tiles.draws(src, &self.camera, vp),
-            _ => Vec::new(),
+        let basemap = self.basemap_plan(vp);
+        let tile_draws = match basemap {
+            BasemapPlan::Mercator(src) => self.tiles.draws(src, &self.camera, vp),
+            BasemapPlan::Warped(src, plan) => {
+                let warp = crate::map::warp::Warp::new(&self.display);
+                let epoch = self.graticule_generation;
+                self.tiles.draws_warped(src, &plan, &warp, epoch)
+            }
+            BasemapPlan::Off(_) => Vec::new(),
         };
         let tile_uploads = self.tiles.take_uploads();
         let alive_tiles = self.tiles.alive_keys();
@@ -7671,7 +7770,9 @@ impl ViewerApp {
         // layer that asks for one. Licences like CC BY want the credit
         // where the data is seen, not buried in a dialog.
         let mut credits: Vec<&str> = Vec::new();
-        if let (Some(src), true) = (self.basemap, self.display.is_mercator()) {
+        // The source actually drawn, which outside Mercator may be the
+        // label-free twin of the one selected.
+        if let Some(src) = basemap.drawn_source() {
             credits.push(TILE_SOURCES[src].attribution);
         }
         for l in &self.layers {

@@ -285,11 +285,21 @@ larger files are on the roadmap.
   file.
 - **Rename** (layer ⋮ → Rename): a display label for the layer panel and
   legend; the file keeps its name.
-- **Basemaps**: Carto Light/Dark/Voyager and OSM raster tiles (Web
-  Mercator), plus a Natural Earth coastline and graticule that follow
-  any projection. The coastline is zoom-dependent: the embedded 1:50m
-  version is swapped for the 1:10m one when you zoom in (fetched once,
-  ~3 MB, cached on disk; the app quietly stays on 1:50m offline).
+- **Basemaps**: Carto Light/Dark/Voyager and OSM raster tiles, each
+  Carto style also in a label-free variant, plus a Natural Earth
+  coastline and graticule that follow any projection. The coastline is
+  zoom-dependent: the embedded 1:50m version is swapped for the 1:10m
+  one when you zoom in (fetched once, ~3 MB, cached on disk; the app
+  quietly stays on 1:50m offline).
+- **Tiles outside Mercator**: tiles are published in Web Mercator, so
+  in any other display projection each one is drawn as a subdivided
+  mesh with its vertices projected exactly. Geometry reprojects
+  cleanly; the place names rendered into the pixels do not, since they
+  shear with the raster carrying them. So a labelled source switches to
+  its label-free twin once the view deforms enough to show, and at
+  world scale tiles are dropped altogether, where Mercator's ±85° cut
+  would leave a blank cap over each pole and the coastline overlay is
+  the better basemap.
 - **Layer filters** (⋮ → Filter…): a persistent SQL predicate per layer;
   only matching rows are decoded, drawn, picked and queried until you
   clear it. Spatial predicates prune at the file level, so a location
@@ -423,9 +433,6 @@ quality gate and display policy).
 
 ## Roadmap
 
-- Basemap tiles warped to non-Mercator projections. The first layer
-  picks an equal-area projection by default, which is exactly when the
-  tiles are currently hidden.
 - Lazy part-append while panning across STAC collections. Parts are
   resolved once at open against the viewport and capped at 16, so a
   collection can report parts it will not go and fetch.
@@ -452,7 +459,9 @@ quality gate and display policy).
 
 Zoom-dependent level of detail shipped in 0.5.0, by scale rather than
 by data volume; the overview/pyramid approach it replaced was tried and
-discarded.
+discarded. Basemap tiles now reproject onto a mesh instead of being
+hidden outside Mercator, falling back to a label-free source once the
+view would shear the place names baked into them.
 
 ## Development
 
