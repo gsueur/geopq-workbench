@@ -2197,6 +2197,15 @@ impl ViewerApp {
     /// the plan is approved: inference is a guess, and a column silently
     /// typed wrong is found much later and in the wrong place.
     fn open_attr_table_named(&mut self, source: Source, name: String) {
+        // Remote sources carry no length until probed, and an unprobed
+        // one reads as an empty file rather than failing.
+        let source = match source.resolve() {
+            Ok(s) => s,
+            Err(e) => {
+                self.push_error(format!("{name}: {e}"));
+                return;
+            }
+        };
         match crate::data::attrs::inspect(&source) {
             Ok(preview) => {
                 self.attr_import = Some(AttrImport {
@@ -6141,8 +6150,13 @@ impl ViewerApp {
                 }
             });
         if let Some(src) = submit {
-            // Length probe / presign run in the loader thread.
-            self.enqueue_load(src, ctx);
+            if crate::data::attrs::is_tabular(&src) {
+                // A CSV has no geometry to draw wherever it lives.
+                self.open_attr_table(src);
+            } else {
+                // Length probe / presign run in the loader thread.
+                self.enqueue_load(src, ctx);
+            }
             self.url_input = None;
         } else if !open {
             self.url_input = None;

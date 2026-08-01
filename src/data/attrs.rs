@@ -698,6 +698,16 @@ pub fn inspect(source: &Source) -> Result<Preview, String> {
             include: true,
         });
     }
+    if plan.columns.is_empty() {
+        // A remote source that was never length-probed reads as empty
+        // rather than failing, and an import dialog with no columns in it
+        // says nothing about why.
+        return Err(format!(
+            "{}: no columns found. If it is remote, it may not have been \
+             reachable; if it is local, it may not be tabular.",
+            source.name(),
+        ));
+    }
     let sampled_rows = cols.first().map(Vec::len).unwrap_or(0);
     if let Some(g) = suggest_points(&plan.columns, &cols, plan.numbers) {
         plan.geometry = g;
@@ -1426,6 +1436,55 @@ mod tests {
             store.schema.fields().iter().any(|f| f.name() == "name"),
             "columns survive alongside the geometry",
         );
+    }
+
+    /// Remote sources go through the same reader the layer path uses, so
+    /// a CSV or parquet on HTTPS or S3 imports like a local one.
+    ///
+    /// The catch this pins: a remote source carries no length until it is
+    /// probed, and an unprobed one reads as an empty file — no error, no
+    /// columns, an import dialog with nothing in it. Resolving first is
+    /// the fix; failing loudly is the backstop.
+    #[test]
+    fn remote_sources_import_once_resolved() {
+        let dir = std::env::temp_dir().join(format!("geopq_remote_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cities.csv"),
+            "name,lon,lat\nParis,2.35,48.85\nBoston,-71.06,42.36\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("fr.csv"), "code;pop\n01001;120\n02002;340\n").unwrap();
+        let base = crate::data::source::testserver::spawn_dir(dir);
+
+        let raw = Source::Remote {
+            url: format!("{base}/cities.csv"),
+            len: 0,
+        };
+        let err = inspect(&raw).expect_err("an unprobed remote has no readable length");
+        assert!(err.contains("no columns found"), "{err}");
+
+        let src = raw.resolve().expect("length probe");
+        let p = inspect(&src).expect("inspects over HTTP");
+        assert_eq!(
+            p.plan.geometry,
+            GeometryPlan::Points { x: "lon".into(), y: "lat".into(), epsg: 4326 },
+            "coordinates are found over the network too",
+        );
+        assert_eq!(import(&src, &p.plan).unwrap().rows, 2);
+
+        // Separator detection reads the first bytes over the network the
+        // same way it reads them off a disk.
+        let src = Source::Remote {
+            url: format!("{base}/fr.csv"),
+            len: 0,
+        }
+        .resolve()
+        .unwrap();
+        let p = inspect(&src).unwrap();
+        assert_eq!(p.plan.delimiter, b';');
+        assert_eq!(p.plan.columns[0].ty, ColType::Text, "leading zeros kept");
+        assert_eq!(import(&src, &p.plan).unwrap().rows, 2);
     }
 
     #[test]
