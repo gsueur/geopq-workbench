@@ -2211,7 +2211,7 @@ impl ViewerApp {
     }
 
     /// Apply an approved plan.
-    fn import_attr_table(&mut self, job: AttrImport) {
+    fn import_attr_table(&mut self, job: AttrImport, ctx: &egui::Context) {
         use crate::data::attrs::{self, AttrTable};
         let AttrImport {
             source,
@@ -2221,6 +2221,10 @@ impl ViewerApp {
         } = job;
         match attrs::import(&source, &preview.plan) {
             Ok(d) => {
+                if let attrs::GeometryPlan::Points { x, y, epsg } = &preview.plan.geometry {
+                    self.import_as_points(&name, &d, x, y, *epsg, ctx);
+                    return;
+                }
                 let nulled = d.nulled.clone();
                 // The typed, renamed, filtered result written once. Live
                 // reads come from the batches already in hand; the file is
@@ -2287,6 +2291,48 @@ impl ViewerApp {
         match std::fs::copy(&src, &dst) {
             Ok(_) => log::info!("{name}: saved to {}", dst.display()),
             Err(e) => self.push_error(format!("{name}: cannot write {}: {e}", dst.display())),
+        }
+    }
+
+    /// Write the imported rows as GeoParquet points and open the result
+    /// as a layer. A file with coordinates is a map layer, not a table.
+    fn import_as_points(
+        &mut self,
+        name: &str,
+        data: &crate::data::attrs::AttrData,
+        x: &str,
+        y: &str,
+        epsg: u32,
+        ctx: &egui::Context,
+    ) {
+        let crs = match crate::data::crs::Crs::from_epsg(epsg) {
+            Ok(c) => c,
+            Err(e) => {
+                self.push_error(format!("{name}: EPSG:{epsg} — {e}"));
+                return;
+            }
+        };
+        self.next_table_file += 1;
+        let path = std::env::temp_dir().join(format!(
+            "geopq_points_{}_{}.parquet",
+            std::process::id(),
+            self.next_table_file,
+        ));
+        match crate::data::attrs::write_points(&path, data, x, y, &crs) {
+            Ok(placed) => {
+                self.temp_outputs.push(path.clone());
+                let missing = data.rows.saturating_sub(placed);
+                if missing > 0 {
+                    // Rows without coordinates are kept, with no geometry.
+                    // Saying so beats a feature count that does not add up.
+                    self.push_error(format!(
+                        "{name}: {missing} of {} rows had no usable coordinates and                          carry no geometry",
+                        fmt_count(data.rows),
+                    ));
+                }
+                self.enqueue_load(Source::Local(path), ctx);
+            }
+            Err(e) => self.push_error(format!("{name}: {e}")),
         }
     }
 
@@ -2816,6 +2862,20 @@ impl ViewerApp {
         ui.horizontal(|ui| {
             if ui.button(format!("{} Open…", ph::FOLDER_OPEN)).clicked() {
                 self.spawn_pick(PickFor::OpenFiles, &ctx, pick_parquet_files);
+            }
+            if ui
+                .button(format!("{} Table…", ph::TABLE))
+                .on_hover_text(
+                    "Open a parquet or CSV file with no geometry: columns to                      query and to join a layer against",
+                )
+                .clicked()
+            {
+                self.spawn_pick(PickFor::AttributeTable, &ctx, |d| {
+                    awaited_paths(
+                        d.add_filter("Tabular data", &["parquet", "csv", "tsv", "txt"])
+                            .pick_files(),
+                    )
+                });
             }
             if ui.button(format!("{} URL…", ph::GLOBE)).clicked() && self.url_input.is_none() {
                 self.url_input = Some((
@@ -3518,7 +3578,7 @@ impl ViewerApp {
                                 filter_open = Some(l.id);
                             }
                             if ui
-                                .small_button("✕")
+                                .small_button(ph::X)
                                 .on_hover_text("Clear the filter (reload all rows)")
                                 .clicked()
                             {
@@ -7675,6 +7735,94 @@ impl ViewerApp {
                 });
 
                 ui.separator();
+                {
+                    use crate::data::attrs::GeometryPlan;
+                    let numeric: Vec<String> = job
+                        .preview
+                        .plan
+                        .columns
+                        .iter()
+                        .filter(|c| matches!(c.ty, ColType::Integer | ColType::Float))
+                        .map(|c| c.name.clone())
+                        .collect();
+                    let is_points = matches!(job.preview.plan.geometry, GeometryPlan::Points { .. });
+                    ui.horizontal(|ui| {
+                        ui.label("geometry:");
+                        if ui.selectable_label(!is_points, "none (a table)").clicked() {
+                            job.preview.plan.geometry = GeometryPlan::None;
+                        }
+                        let can = numeric.len() >= 2;
+                        let mut pick_points = is_points;
+                        if ui
+                            .add_enabled_ui(can, |ui| {
+                                ui.selectable_value(&mut pick_points, true, "points from X, Y")
+                            })
+                            .inner
+                            .on_disabled_hover_text(
+                                "needs two numeric columns to take coordinates from",
+                            )
+                            .clicked()
+                            && !is_points
+                        {
+                            job.preview.plan.geometry = GeometryPlan::Points {
+                                x: numeric[0].clone(),
+                                y: numeric[1].clone(),
+                                epsg: 4326,
+                            };
+                        }
+                    });
+                    if let GeometryPlan::Points { x, y, epsg } = &mut job.preview.plan.geometry {
+                        ui.horizontal(|ui| {
+                            let pick = |ui: &mut egui::Ui, salt: &str, cur: &mut String| {
+                                egui::ComboBox::from_id_salt(salt)
+                                    .selected_text(cur.as_str())
+                                    .width(130.0)
+                                    .show_ui(ui, |ui| {
+                                        for n in &numeric {
+                                            if ui.selectable_label(cur == n, n).clicked() {
+                                                *cur = n.clone();
+                                            }
+                                        }
+                                    });
+                            };
+                            ui.label("X");
+                            pick(ui, "geom_x", x);
+                            ui.label("Y");
+                            pick(ui, "geom_y", y);
+                            ui.label("EPSG");
+                            ui.add(
+                                egui::DragValue::new(epsg)
+                                    .speed(1.0)
+                                    .range(0..=99_999u32),
+                            )
+                            .on_hover_text(
+                                "The CRS the coordinates are in. 4326 is \
+                                 longitude/latitude in degrees",
+                            );
+                        });
+                        if *epsg == 0 {
+                            ui.label(
+                                RichText::new(
+                                    "These coordinates are outside the range of \
+                                     degrees, so they are a projected grid. Give \
+                                     its EPSG code — guessing 4326 would put the \
+                                     data a continent away.",
+                                )
+                                .small()
+                                .color(Color32::from_rgb(242, 140, 26)),
+                            );
+                        }
+                        ui.label(
+                            RichText::new(
+                                "It becomes a layer, written as GeoParquet, not a table.",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                    }
+                }
+
+                ui.separator();
                 let any = job.preview.plan.columns.iter().any(|c| c.include);
                 let lost: usize = job
                     .preview
@@ -7686,8 +7834,21 @@ impl ViewerApp {
                     .map(|(_, p)| p.bad)
                     .sum();
                 ui.horizontal(|ui| {
+                    let points = matches!(
+                        job.preview.plan.geometry,
+                        crate::data::attrs::GeometryPlan::Points { epsg, .. } if epsg != 0
+                    );
+                    let blocked = matches!(
+                        job.preview.plan.geometry,
+                        crate::data::attrs::GeometryPlan::Points { epsg: 0, .. }
+                    );
+                    let (icon, what) = if points {
+                        (ph::STACK, "Import as layer")
+                    } else {
+                        (ph::TABLE, "Import")
+                    };
                     if ui
-                        .add_enabled(any, egui::Button::new(format!("{} Import", ph::TABLE)))
+                        .add_enabled(any && !blocked, egui::Button::new(format!("{icon} {what}")))
                         .clicked()
                     {
                         go = true;
@@ -7730,7 +7891,7 @@ impl ViewerApp {
 
         if go {
             if let Some(job) = self.attr_import.take() {
-                self.import_attr_table(job);
+                self.import_attr_table(job, ctx);
             }
         } else if !open {
             self.attr_import = None;

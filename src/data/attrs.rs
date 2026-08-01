@@ -189,6 +189,22 @@ pub fn normalize_number(v: &str, fmt: NumberFormat) -> std::borrow::Cow<'_, str>
     }
 }
 
+/// Whether the file describes places or only values.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum GeometryPlan {
+    /// Columns only: a table, with no presence on the map.
+    #[default]
+    None,
+    /// A point per row, built from two coordinate columns.
+    Points {
+        x: String,
+        y: String,
+        /// What the coordinates are in. Guessed only when the values
+        /// leave no doubt; see [`suggest_points`].
+        epsg: u32,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct ImportPlan {
     /// Ignored for parquet.
@@ -197,6 +213,7 @@ pub struct ImportPlan {
     pub has_header: bool,
     /// Ignored for parquet, where numbers are already numbers.
     pub numbers: NumberFormat,
+    pub geometry: GeometryPlan,
     pub columns: Vec<ColumnPlan>,
 }
 
@@ -576,6 +593,56 @@ fn detect_number_format(cols: &[Vec<String>]) -> NumberFormat {
     }
 }
 
+/// Column names that conventionally hold a coordinate, most specific
+/// first so `longitude` beats a bare `x` in a file carrying both.
+const X_NAMES: [&str; 6] = ["longitude", "lon", "lng", "long", "x", "easting"];
+const Y_NAMES: [&str; 5] = ["latitude", "lat", "y", "northing", "north"];
+
+/// Propose a coordinate pair, and the CRS only when the values settle it.
+///
+/// Names find the columns; the values decide the CRS. Degrees fit inside
+/// ±180 and ±90, and a projected grid does not — a national grid in
+/// metres runs to the hundreds of thousands. Guessing WGS84 for those
+/// would put the data a continent away from where it belongs and look
+/// like a projection bug, so an EPSG of 0 means "the user must say".
+fn suggest_points(
+    plan: &[ColumnPlan],
+    cols: &[Vec<String>],
+    fmt: NumberFormat,
+) -> Option<GeometryPlan> {
+    let find = |wanted: &[&str]| -> Option<usize> {
+        wanted.iter().find_map(|w| {
+            plan.iter()
+                .position(|c| c.name == *w || c.name.trim_start_matches('_') == *w)
+        })
+    };
+    let (xi, yi) = (find(&X_NAMES)?, find(&Y_NAMES)?);
+    if xi == yi {
+        return None;
+    }
+    let numeric = |i: usize| {
+        cols.get(i).is_some_and(|v| {
+            let n: Vec<&String> = v.iter().filter(|s| !s.trim().is_empty()).collect();
+            !n.is_empty() && n.iter().all(|s| parses_as(s, ColType::Float, fmt))
+        })
+    };
+    if !numeric(xi) || !numeric(yi) {
+        return None;
+    }
+    let within = |i: usize, limit: f64| {
+        cols[i]
+            .iter()
+            .filter(|s| !s.trim().is_empty())
+            .filter_map(|s| normalize_number(s, fmt).parse::<f64>().ok())
+            .all(|v| v.abs() <= limit)
+    };
+    Some(GeometryPlan::Points {
+        x: plan[xi].name.clone(),
+        y: plan[yi].name.clone(),
+        epsg: if within(xi, 180.0) && within(yi, 90.0) { 4326 } else { 0 },
+    })
+}
+
 /// Read a sample and propose a plan.
 pub fn inspect(source: &Source) -> Result<Preview, String> {
     let csv = is_csv(source);
@@ -586,6 +653,7 @@ pub fn inspect(source: &Source) -> Result<Preview, String> {
         delimiter: if csv { detect_delimiter(source) } else { b',' },
         has_header: true,
         numbers: NumberFormat::Plain,
+        geometry: GeometryPlan::None,
         columns: Vec::new(),
     };
     let (names, cols) = sample_text(source, &plan)?;
@@ -631,6 +699,9 @@ pub fn inspect(source: &Source) -> Result<Preview, String> {
         });
     }
     let sampled_rows = cols.first().map(Vec::len).unwrap_or(0);
+    if let Some(g) = suggest_points(&plan.columns, &cols, plan.numbers) {
+        plan.geometry = g;
+    }
     Ok(Preview {
         plan,
         columns,
@@ -919,6 +990,85 @@ pub fn write_parquet(path: &std::path::Path, data: &AttrData) -> Result<(), Stri
     Ok(())
 }
 
+/// Write an imported table as GeoParquet, one point per row.
+///
+/// The columns keep the types the dialog chose; a `geometry` column of
+/// WKB points is added from `x` and `y`. A row missing either coordinate
+/// gets a null geometry rather than a point at the origin — the Gulf of
+/// Guinea is where bad coordinate handling goes to be noticed, and it is
+/// better not to send anything there.
+///
+/// Returns the number of rows that got a geometry.
+pub fn write_points(
+    path: &std::path::Path,
+    data: &AttrData,
+    x: &str,
+    y: &str,
+    crs: &super::crs::Crs,
+) -> Result<usize, String> {
+    use arrow::array::{BinaryBuilder, Float64Array};
+
+    let xi = data
+        .schema
+        .index_of(x)
+        .map_err(|_| format!("no column named {x}"))?;
+    let yi = data
+        .schema
+        .index_of(y)
+        .map_err(|_| format!("no column named {y}"))?;
+
+    let mut fields: Vec<Field> = data
+        .schema
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    let geom_col = fields.len();
+    fields.push(Field::new("geometry", DataType::Binary, true));
+    let out: SchemaRef = Arc::new(Schema::new(fields));
+
+    let mut w = crate::sql::export::StreamWriter::new(path, &out, geom_col, crs)?;
+    let mut placed = 0usize;
+    let opts = wkb::writer::WriteOptions::default();
+    for batch in &data.batches {
+        let num = |i: usize| -> Result<Float64Array, String> {
+            let c = cast_with_options(batch.column(i), &DataType::Float64, &safe())
+                .map_err(|e| format!("{e}"))?;
+            c.as_any()
+                .downcast_ref::<Float64Array>()
+                .cloned()
+                .ok_or_else(|| "coordinate column is not numeric".to_string())
+        };
+        let (xs, ys) = (num(xi)?, num(yi)?);
+        let mut g = BinaryBuilder::new();
+        let mut buf: Vec<u8> = Vec::new();
+        for r in 0..batch.num_rows() {
+            if xs.is_null(r) || ys.is_null(r) {
+                g.append_null();
+                continue;
+            }
+            let (px, py) = (xs.value(r), ys.value(r));
+            if !px.is_finite() || !py.is_finite() {
+                g.append_null();
+                continue;
+            }
+            buf.clear();
+            let point = geo_types::Geometry::Point(geo_types::Point::new(px, py));
+            wkb::writer::write_geometry(&mut buf, &point, &opts)
+                .map_err(|e| format!("wkb encode: {e}"))?;
+            g.append_value(&buf);
+            placed += 1;
+        }
+        let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
+        cols.push(Arc::new(g.finish()));
+        let b = RecordBatch::try_new(Arc::clone(&out), cols)
+            .map_err(|e| format!("building layer: {e}"))?;
+        w.write(&b)?;
+    }
+    w.finish()?;
+    Ok(placed)
+}
+
 /// Every row, as text, in the source's column order.
 fn read_csv_text(source: &Source, plan: &ImportPlan) -> Result<Vec<RecordBatch>, String> {
     let names: Vec<String> = plan.columns.iter().map(|c| c.source_name.clone()).collect();
@@ -1201,6 +1351,81 @@ mod tests {
             .downcast_ref::<StringArray>()
             .expect("text");
         assert_eq!(code.value(0), "01001", "leading zero survived too");
+    }
+
+    /// Coordinate columns are found by name, but the CRS comes from the
+    /// values: degrees fit inside ±180/±90 and a projected grid does not.
+    #[test]
+    fn coordinate_columns_are_found_and_the_crs_is_only_guessed_when_certain() {
+        let src = temp("pts.csv", "name,lon,lat\na,2.35,48.85\nb,-71.06,42.36\n");
+        let p = inspect(&src).unwrap();
+        assert_eq!(
+            p.plan.geometry,
+            GeometryPlan::Points { x: "lon".into(), y: "lat".into(), epsg: 4326 },
+        );
+
+        // Lambert-93 metres: the same names, but guessing degrees would
+        // put Toulouse in the Gulf of Guinea.
+        let src = temp("l93.csv", "name,x,y\na,573000,6280000\nb,650000,6860000\n");
+        let p = inspect(&src).unwrap();
+        assert_eq!(
+            p.plan.geometry,
+            GeometryPlan::Points { x: "x".into(), y: "y".into(), epsg: 0 },
+            "out of range, so the user has to say",
+        );
+
+        // No coordinate-ish names, no geometry proposed.
+        let src = temp("plain.csv", "code,pop\n01001,120\n");
+        assert_eq!(inspect(&src).unwrap().plan.geometry, GeometryPlan::None);
+        // A longitude with no latitude is not a pair.
+        let src = temp("half.csv", "name,lon\na,2.35\n");
+        assert_eq!(inspect(&src).unwrap().plan.geometry, GeometryPlan::None);
+    }
+
+    /// A CSV of coordinates becomes a real GeoParquet layer: geometry
+    /// written, CRS recorded, and rows with no coordinate kept rather
+    /// than dropped or sent to the origin.
+    #[test]
+    fn a_csv_of_coordinates_becomes_a_geoparquet_layer() {
+        let src = temp(
+            "cities.csv",
+            "name,lon,lat\nParis,2.35,48.85\nBoston,-71.06,42.36\nNowhere,,\n",
+        );
+        let p = inspect(&src).unwrap();
+        let GeometryPlan::Points { x, y, epsg } = p.plan.geometry.clone() else {
+            panic!("expected points");
+        };
+        assert_eq!(epsg, 4326);
+        let data = import(&src, &p.plan).unwrap();
+        assert_eq!(data.rows, 3);
+
+        let out = std::env::temp_dir()
+            .join(format!("geopq_attrs_{}", std::process::id()))
+            .join("cities.parquet");
+        let crs = crate::data::crs::Crs::from_epsg(epsg).unwrap();
+        let placed = write_points(&out, &data, &x, &y, &crs).unwrap();
+        assert_eq!(placed, 2, "the row with no coordinates got no point");
+
+        // It opens as a layer through the ordinary store path, which is
+        // the whole claim: this is GeoParquet, not a table with numbers.
+        let (store, back_crs, _, _) =
+            crate::data::loader::open_store_for_test(&out).expect("opens as a layer");
+        assert_eq!(store.total_rows(), 3, "every row is kept");
+        assert_eq!(back_crs.epsg, Some(4326), "CRS recorded in the file");
+        let geoms = store.fetch_geoms(&[0, 1, 2]).unwrap();
+        let paris = geoms[0].1.clone().expect("Paris has a point");
+        match paris {
+            geo_types::Geometry::Point(pt) => {
+                assert!((pt.x() - 2.35).abs() < 1e-9 && (pt.y() - 48.85).abs() < 1e-9);
+            }
+            other => panic!("expected a point, got {other:?}"),
+        }
+        assert!(geoms[2].1.is_none(), "the coordinate-less row has no geometry");
+        // The attributes came along.
+        assert!(
+            store.schema.fields().iter().any(|f| f.name() == "name"),
+            "columns survive alongside the geometry",
+        );
     }
 
     #[test]

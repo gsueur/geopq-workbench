@@ -266,7 +266,13 @@ impl SqlConsole {
             }
             ui.toggle_value(&mut self.show_help, "ST_* help");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("✕").clicked() {
+                // The phosphor glyph, like every other close button: the
+                // bare ✕ codepoint is not in the font and draws as a box.
+                if ui
+                    .button(egui_phosphor::regular::X)
+                    .on_hover_text("Close the SQL console")
+                    .clicked()
+                {
                     self.open = false;
                 }
             });

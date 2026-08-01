@@ -50,7 +50,9 @@ so it doubles as a hands-on guide to GeoParquet best practices.
 - **Attribute tables and joins**: open a parquet or CSV file with no
   geometry as a SQL table with no map presence, join it to a layer on a
   shared column, and put the result back on the map as a styleable
-  layer.
+  layer. The join builder counts how many features matched before you
+  commit. A file with coordinate columns becomes a real GeoParquet
+  point layer instead.
 - **Cartography that defaults well**: automatic equal-area projection
   choice per dataset, ~30 official national grids, data-driven styling
   with six ramps, seven classification methods and an interactive
@@ -158,7 +160,8 @@ geopq-workbench file.parquet dataset_dir/ https://host/data.parquet
 | S3 (`s3://bucket/key`) | File → Open URL… — profiles from `~/.aws`, custom endpoints (MinIO etc.), anonymous access to public buckets |
 | S3 hive dataset (`s3://bucket/prefix/` or a `*` glob) | File → Open URL… — every matching parquet part loads as one layer (`s3://bucket/d/state=*/roads.parquet` picks one theme across partitions); `key=value` path segments become queryable columns |
 | Catalogs (Overture Maps, Parquetry, your own) | File → Repositories… — browse snapshots, check layers, they load with sensible names and stacking order. Parquetry repos can load a theme across every state of a country as one layer, with `country`/`state` as columns. A STAC collection opens the parts covering most of the current view and adds the others as you pan into them |
-| Attribute table (parquet or CSV, no geometry) | File → Open attribute table…, or drag & drop a `.csv`. Columns become a SQL table to query and to join a layer against; types are inferred for CSV. No map presence |
+| Attribute table (parquet or CSV, no geometry) | File → Open attribute table…, or drag & drop a `.csv`. An import dialog proposes a separator, a name and a type per column, with the sampled values and what each type choice would cost. Columns become a SQL table to query and to join a layer against. No map presence |
+| CSV or parquet with coordinate columns | the same dialog: pick the X and Y columns and their CRS, and it is written as GeoParquet and opened as a layer instead |
 | GeoPackage / Shapefile / GeoJSON | drag & drop or File → Import vector file… — pure-Rust conversion to GeoParquet (no GDAL), with a covering bbox column and byte-sized row groups so the result is readable by viewport from the first open, then opens normally |
 
 Format-wise, anything in the GeoParquet family works: 1.0, 1.1 with WKB
