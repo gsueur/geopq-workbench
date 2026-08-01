@@ -7678,7 +7678,22 @@ impl ViewerApp {
                         .striped(true)
                         .spacing([10.0, 4.0])
                         .show(ui, |ui| {
-                            ui.label(RichText::new("").small());
+                            // Header checkbox: on when everything is in,
+                            // and clicking it takes everything the other
+                            // way. The usual table gesture, and the only
+                            // sane one for a file with sixty columns of
+                            // which you want three.
+                            let all = job.preview.plan.columns.iter().all(|c| c.include);
+                            let mut toggle = all;
+                            if ui
+                                .checkbox(&mut toggle, "")
+                                .on_hover_text(if all { "Select none" } else { "Select all" })
+                                .clicked()
+                            {
+                                for c in job.preview.plan.columns.iter_mut() {
+                                    c.include = !all;
+                                }
+                            }
                             ui.label(RichText::new("column").weak().small());
                             ui.label(RichText::new("name in SQL").weak().small());
                             ui.label(RichText::new("type").weak().small());
@@ -7852,10 +7867,23 @@ impl ViewerApp {
                         job.preview.plan.geometry,
                         crate::data::attrs::GeometryPlan::Points { epsg, .. } if epsg != 0
                     );
-                    let blocked = matches!(
+                    let no_crs = matches!(
                         job.preview.plan.geometry,
                         crate::data::attrs::GeometryPlan::Points { epsg: 0, .. }
                     );
+                    // The coordinates are read from the imported columns,
+                    // so leaving one out leaves the geometry with nothing
+                    // to build from.
+                    let dropped_coords = match &job.preview.plan.geometry {
+                        crate::data::attrs::GeometryPlan::Points { x, y, .. } => job
+                            .preview
+                            .plan
+                            .columns
+                            .iter()
+                            .any(|c| (c.name == *x || c.name == *y) && !c.include),
+                        crate::data::attrs::GeometryPlan::None => false,
+                    };
+                    let blocked = no_crs || dropped_coords;
                     let (icon, what) = if points {
                         (ph::STACK, "Import as layer")
                     } else {
@@ -7869,6 +7897,15 @@ impl ViewerApp {
                     }
                     if !any {
                         ui.label(RichText::new("nothing selected").weak().small());
+                    } else if dropped_coords {
+                        ui.label(
+                            RichText::new(
+                                "the X and Y columns have to be imported for the \
+                                 geometry to be built from them",
+                            )
+                            .small()
+                            .color(Color32::from_rgb(242, 140, 26)),
+                        );
                     } else if lost > 0 {
                         ui.label(
                             RichText::new(format!(
