@@ -520,6 +520,76 @@ impl StyleBy {
     }
 }
 
+/// Marker drawn for each feature of a point layer.
+///
+/// Every shape is sized to the area of the circle it replaces, so
+/// switching symbol keeps the ink weight of the layer and one radius
+/// slider still means the same thing. `reach()` is how far the shape
+/// extends past that radius (a square's corner, a star's tip); the
+/// shader needs it to size the marker quad. Both tables are duplicated
+/// in `shaders.wgsl` and must stay in step with `code()`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PointShape {
+    #[default]
+    Circle,
+    Square,
+    Triangle,
+    Diamond,
+    Hexagon,
+    Star,
+}
+
+impl PointShape {
+    pub const ALL: [PointShape; 6] = [
+        PointShape::Circle,
+        PointShape::Square,
+        PointShape::Triangle,
+        PointShape::Diamond,
+        PointShape::Hexagon,
+        PointShape::Star,
+    ];
+
+    /// Shader id, and the token used in a saved context.
+    pub fn code(self) -> u32 {
+        match self {
+            PointShape::Circle => 0,
+            PointShape::Square => 1,
+            PointShape::Triangle => 2,
+            PointShape::Diamond => 3,
+            PointShape::Hexagon => 4,
+            PointShape::Star => 5,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PointShape::Circle => "circle",
+            PointShape::Square => "square",
+            PointShape::Triangle => "triangle",
+            PointShape::Diamond => "diamond",
+            PointShape::Hexagon => "hexagon",
+            PointShape::Star => "star",
+        }
+    }
+
+    pub fn from_label(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.label() == name)
+    }
+
+    /// Circumradius of the marker: its farthest point from the centre,
+    /// as a multiple of the layer's point radius.
+    pub fn reach(self) -> f32 {
+        match self {
+            PointShape::Circle => 1.0,
+            // corner of an equal-area square, half-side 0.8862 r
+            PointShape::Square | PointShape::Diamond => 1.2534,
+            PointShape::Triangle => 1.5535,
+            PointShape::Hexagon => 1.1000,
+            PointShape::Star => 1.4620,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LayerStyle {
     pub visible: bool,
@@ -530,6 +600,7 @@ pub struct LayerStyle {
     pub line_color: Option<Color32>,
     pub line_width_px: f32,
     pub point_radius_px: f32,
+    pub point_shape: PointShape,
     pub fill_opacity: f32,
     pub opacity: f32,
     /// Master switches for polygon rendition (the panel's clickable
@@ -550,6 +621,7 @@ impl LayerStyle {
             line_color: None,
             line_width_px: 1.2,
             point_radius_px: 3.0,
+            point_shape: PointShape::Circle,
             fill_opacity: 0.35,
             fill_on: true,
             lines_on: true,

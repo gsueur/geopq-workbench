@@ -158,6 +158,9 @@ pub struct StyleCtx {
     pub line_color: Option<[u8; 4]>,
     pub line_width_px: f32,
     pub point_radius_px: f32,
+    /// Point marker name (PointShape::label); absent in older contexts.
+    #[serde(default)]
+    pub point_shape: Option<String>,
     pub fill_opacity: f32,
     pub opacity: f32,
     #[serde(default = "default_true")]
@@ -220,6 +223,7 @@ impl StyleCtx {
             line_color: s.line_color.map(|c| c.to_array()),
             line_width_px: s.line_width_px,
             point_radius_px: s.point_radius_px,
+            point_shape: Some(s.point_shape.label().to_string()),
             fill_opacity: s.fill_opacity,
             opacity: s.opacity,
             fill_on: s.fill_on,
@@ -250,7 +254,7 @@ impl StyleCtx {
     }
 
     pub fn into_style(self) -> LayerStyle {
-        use crate::data::layer::{Ramp, StyleBy, StyleMode};
+        use crate::data::layer::{PointShape, Ramp, StyleBy, StyleMode};
         let color = |a: [u8; 4]| Color32::from_rgba_premultiplied(a[0], a[1], a[2], a[3]);
         LayerStyle {
             visible: self.visible,
@@ -259,6 +263,11 @@ impl StyleCtx {
             line_color: self.line_color.map(color),
             line_width_px: self.line_width_px,
             point_radius_px: self.point_radius_px,
+            point_shape: self
+                .point_shape
+                .as_deref()
+                .and_then(PointShape::from_label)
+                .unwrap_or_default(),
             fill_opacity: self.fill_opacity,
             opacity: self.opacity,
             fill_on: self.fill_on,
@@ -362,6 +371,7 @@ mod tests {
                         line_color: Some([10, 20, 30, 255]),
                         line_width_px: 1.5,
                         point_radius_px: 3.0,
+                        point_shape: Some("star".into()),
                         fill_opacity: 0.4,
                         opacity: 0.9,
                         fill_on: true,

@@ -10,6 +10,11 @@ struct ChunkU {
     size: f32,
     // AA feather in px
     feather: f32,
+    // point marker shape (PointShape::code); ignored by the other passes
+    shape: u32,
+    // marker border width in px; 0 or a transparent edge = no border
+    edge_px: f32,
+    edge: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: ChunkU;
@@ -98,7 +103,74 @@ fn fs_line(in: LineOut) -> @location(0) vec4<f32> {
     return vec4<f32>(u.color.rgb, u.color.a * alpha);
 }
 
-// ---------------- points (instanced circles) ----------------
+// ---------------- points (instanced markers) ----------------
+
+// Marker shapes, sized to the area of the circle of radius u.size they
+// replace so the layer keeps its ink weight when the symbol changes.
+// Codes and reaches mirror PointShape in src/data/layer.rs.
+
+// How far past u.size the shape extends (square corner, star tip, ...).
+fn marker_reach(shape: u32) -> f32 {
+    switch (shape) {
+        case 1u, 3u: { return 1.2534; }  // square, diamond
+        case 2u: { return 1.5535; }      // triangle
+        case 4u: { return 1.1000; }      // hexagon
+        case 5u: { return 1.4620; }      // star
+        default: { return 1.0; }         // circle
+    }
+}
+
+// Signed distance to a box of half-extents b.
+fn sd_box(p: vec2<f32>, b: vec2<f32>) -> f32 {
+    let q = abs(p) - b;
+    return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0);
+}
+
+// Equilateral triangle pointing up, r = half of the base width.
+fn sd_triangle(pin: vec2<f32>, r: f32) -> f32 {
+    let k = sqrt(3.0);
+    var p = vec2<f32>(abs(pin.x) - r, -pin.y + r / k);
+    if (p.x + k * p.y > 0.0) {
+        p = vec2<f32>(p.x - k * p.y, -k * p.x - p.y) * 0.5;
+    }
+    p.x = p.x - clamp(p.x, -2.0 * r, 0.0);
+    return -length(p) * sign(p.y);
+}
+
+// Regular hexagon with vertices up and down, r = apothem.
+fn sd_hexagon(pin: vec2<f32>, r: f32) -> f32 {
+    let k = vec3<f32>(-0.8660254, 0.5, 0.5773503);
+    var p = abs(vec2<f32>(pin.y, pin.x));
+    p = p - 2.0 * min(dot(k.xy, p), 0.0) * k.xy;
+    p = p - vec2<f32>(clamp(p.x, -k.z * r, k.z * r), r);
+    return length(p) * sign(p.y);
+}
+
+// Five-pointed star, r = outer radius, rf = inner/outer ratio.
+fn sd_star5(pin: vec2<f32>, r: f32, rf: f32) -> f32 {
+    let k1 = vec2<f32>(0.80901699, -0.58778525);
+    let k2 = vec2<f32>(-k1.x, k1.y);
+    var p = vec2<f32>(abs(pin.x), -pin.y);
+    p = p - 2.0 * max(dot(k1, p), 0.0) * k1;
+    p = p - 2.0 * max(dot(k2, p), 0.0) * k2;
+    p = vec2<f32>(abs(p.x), p.y - r);
+    let ba = rf * vec2<f32>(-k1.y, k1.x) - vec2<f32>(0.0, 1.0);
+    let h = clamp(dot(p, ba) / dot(ba, ba), 0.0, r);
+    return length(p - ba * h) * sign(p.y * ba.x - p.x * ba.y);
+}
+
+// Distance to the marker's edge: negative inside, in px.
+fn sd_marker(p: vec2<f32>, r: f32, shape: u32) -> f32 {
+    switch (shape) {
+        case 1u: { return sd_box(p, vec2<f32>(r * 0.8862)); }
+        case 2u: { return sd_triangle(p, r * 1.3453); }
+        case 3u: { return sd_box(vec2<f32>(p.x + p.y, p.x - p.y) * 0.7071,
+                                 vec2<f32>(r * 0.8862)); }
+        case 4u: { return sd_hexagon(p, r * 0.9525); }
+        case 5u: { return sd_star5(p, r * 1.4620, 0.5); }
+        default: { return length(p) - r; }
+    }
+}
 
 struct PointOut {
     @builtin(position) pos: vec4<f32>,
@@ -111,7 +183,7 @@ fn vs_point(
     @location(0) center: vec2<f32>,
 ) -> PointOut {
     let c_px = ndc_to_px(center * u.ab + u.t);
-    let r = u.size + u.feather;
+    let r = u.size * marker_reach(u.shape) + u.feather;
     var corner: vec2<f32>;
     switch (vi) {
         case 0u: { corner = vec2<f32>(-r, -r); }
@@ -129,12 +201,18 @@ fn vs_point(
 
 @fragment
 fn fs_point(in: PointOut) -> @location(0) vec4<f32> {
-    let d = length(in.offset_px);
-    let alpha = clamp((u.size - d) / u.feather + 1.0, 0.0, 1.0);
-    // darker rim for cartographic legibility
-    let rim = clamp((u.size - 1.5 - d) / u.feather + 1.0, 0.0, 1.0);
-    let rgb = mix(u.color.rgb * 0.55, u.color.rgb, rim);
-    return vec4<f32>(rgb, u.color.a * alpha);
+    let d = sd_marker(in.offset_px, u.size, u.shape);
+    let alpha = clamp(-d / u.feather + 1.0, 0.0, 1.0);
+    if (u.edge.a <= 0.0 || u.edge_px <= 0.0) {
+        return vec4<f32>(u.color.rgb, u.color.a * alpha);
+    }
+    // Border drawn inside the marker, capped to half the radius so a
+    // small symbol keeps some fill instead of going solid border color.
+    let w = min(u.edge_px, u.size * 0.5);
+    let inner = clamp((-d - w) / u.feather + 1.0, 0.0, 1.0);
+    let rgb = mix(u.edge.rgb, u.color.rgb, inner);
+    let a = mix(u.edge.a, u.color.a, inner);
+    return vec4<f32>(rgb, a * alpha);
 }
 
 // ---------------- raster tiles ----------------

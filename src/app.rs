@@ -3413,27 +3413,25 @@ impl ViewerApp {
                         ) {
                             l.style.color = c;
                         }
-                        if !matches!(l.kind(), crate::data::geometry::GeomKind::Point) {
-                            let mut lc = l
-                                .style
-                                .line_color
-                                .unwrap_or_else(|| derived_line_color(l.style.color));
-                            if swatch_color_button(
-                                ui,
-                                &format!("line{}", l.id),
-                                &mut lc,
-                                "border / line color",
-                            ) {
-                                l.style.line_color = Some(lc);
-                            }
-                            if l.style.line_color.is_some()
-                                && ui
-                                    .small_button("↺")
-                                    .on_hover_text("reset border color to auto")
-                                    .clicked()
-                            {
-                                l.style.line_color = None;
-                            }
+                        let mut lc = l
+                            .style
+                            .line_color
+                            .unwrap_or_else(|| derived_line_color(l.style.color));
+                        if swatch_color_button(
+                            ui,
+                            &format!("line{}", l.id),
+                            &mut lc,
+                            "border / line color",
+                        ) {
+                            l.style.line_color = Some(lc);
+                        }
+                        if l.style.line_color.is_some()
+                            && ui
+                                .small_button("↺")
+                                .on_hover_text("reset border color to auto")
+                                .clicked()
+                        {
+                            l.style.line_color = None;
                         }
                         let te_id = egui::Id::new(("layer_rename", l.id));
                         if renaming.as_ref().is_some_and(|(id, _)| *id == l.id) {
@@ -3619,6 +3617,22 @@ impl ViewerApp {
                         }
                     });
                     ui.horizontal(|ui| {
+                        let toggle = |ui: &mut egui::Ui, on: &mut bool, txt: &str, hover: &str| {
+                            let label = if *on {
+                                RichText::new(txt)
+                            } else {
+                                RichText::new(txt).weak().strikethrough()
+                            };
+                            if ui
+                                .label(label)
+                                .interact(egui::Sense::click())
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text(hover)
+                                .clicked()
+                            {
+                                *on = !*on;
+                            }
+                        };
                         match l.kind() {
                             crate::data::geometry::GeomKind::Point => {
                                 ui.label("r:");
@@ -3626,24 +3640,26 @@ impl ViewerApp {
                                     egui::Slider::new(&mut l.style.point_radius_px, 0.5..=12.0)
                                         .show_value(false),
                                 );
+                                let color = l.style.color;
+                                marker_shape_button(
+                                    ui,
+                                    &format!("layer{}", l.id),
+                                    &mut l.style.point_shape,
+                                    color,
+                                );
+                                toggle(
+                                    ui,
+                                    &mut l.style.lines_on,
+                                    "border:",
+                                    "click to toggle the symbol border",
+                                );
+                                ui.add_enabled(
+                                    l.style.lines_on,
+                                    egui::Slider::new(&mut l.style.line_width_px, 0.0..=4.0)
+                                        .show_value(false),
+                                );
                             }
                             crate::data::geometry::GeomKind::Polygon => {
-                                let toggle = |ui: &mut egui::Ui, on: &mut bool, txt: &str, hover: &str| {
-                                    let label = if *on {
-                                        RichText::new(txt)
-                                    } else {
-                                        RichText::new(txt).weak().strikethrough()
-                                    };
-                                    if ui
-                                        .label(label)
-                                        .interact(egui::Sense::click())
-                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                        .on_hover_text(hover)
-                                        .clicked()
-                                    {
-                                        *on = !*on;
-                                    }
-                                };
                                 toggle(
                                     ui,
                                     &mut l.style.fill_on,
@@ -9426,6 +9442,7 @@ impl ViewerApp {
                     point_color: [0.0; 4],
                     line_half_width_px: 0.4,
                     point_radius_px: 0.0,
+                    point_shape: crate::data::layer::PointShape::Circle,
                     bin_colors: None,
                     hidden_bins: 0,
                 },
@@ -9447,6 +9464,7 @@ impl ViewerApp {
                     point_color: [0.0; 4],
                     line_half_width_px: 0.5,
                     point_radius_px: 0.0,
+                    point_shape: crate::data::layer::PointShape::Circle,
                     bin_colors: None,
                     hidden_bins: 0,
                 },
@@ -9502,6 +9520,7 @@ impl ViewerApp {
                     point_color: [0.0; 4],
                     line_half_width_px: 0.8,
                     point_radius_px: 0.0,
+                    point_shape: crate::data::layer::PointShape::Circle,
                     bin_colors: None,
                     hidden_bins: 0,
                 },
@@ -9535,6 +9554,7 @@ impl ViewerApp {
                     point_color: [0.1, 0.85, 1.0, 1.0],
                     line_half_width_px: 1.8,
                     point_radius_px: 6.0,
+                    point_shape: crate::data::layer::PointShape::Circle,
                     bin_colors: None,
                     hidden_bins: 0,
                 },
@@ -9551,6 +9571,7 @@ impl ViewerApp {
                     point_color: [1.0, 0.8, 0.1, 1.0],
                     line_half_width_px: 1.8,
                     point_radius_px: 6.0,
+                    point_shape: crate::data::layer::PointShape::Circle,
                     bin_colors: None,
                     hidden_bins: 0,
                 },
@@ -9909,6 +9930,120 @@ fn swatch_color_button(
     changed
 }
 
+/// Paint one point marker. Shapes and their area-matched sizing mirror
+/// `sd_marker` in shaders.wgsl, so a picker entry previews what the map
+/// will actually draw.
+fn paint_marker(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    shape: crate::data::layer::PointShape,
+    color: Color32,
+) {
+    use crate::data::layer::PointShape;
+    let poly = |pts: Vec<egui::Pos2>| egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE);
+    // n vertices on a circle of radius r, first one at angle `start`.
+    let ring = |n: usize, r: f32, start: f32| -> Vec<egui::Pos2> {
+        (0..n)
+            .map(|i| {
+                let a = start + std::f32::consts::TAU * i as f32 / n as f32;
+                center + egui::vec2(r * a.cos(), r * a.sin())
+            })
+            .collect()
+    };
+    let up = -std::f32::consts::FRAC_PI_2;
+    // reach() is the circumradius, which is what a regular polygon is
+    // built from; the square is the inscribed one.
+    let r = radius * shape.reach();
+    match shape {
+        PointShape::Circle => {
+            painter.circle_filled(center, r, color);
+        }
+        PointShape::Square => {
+            painter.rect_filled(
+                egui::Rect::from_center_size(center, egui::Vec2::splat(r * std::f32::consts::SQRT_2)),
+                0.0,
+                color,
+            );
+        }
+        PointShape::Triangle => {
+            painter.add(poly(ring(3, r, up)));
+        }
+        PointShape::Diamond => {
+            painter.add(poly(ring(4, r, up)));
+        }
+        PointShape::Hexagon => {
+            painter.add(poly(ring(6, r, up)));
+        }
+        PointShape::Star => {
+            // Concave: egui fills a closed path as a fan, which a star
+            // would tear. Build it from a convex core plus its points.
+            let outer = ring(5, r, up);
+            let inner = ring(5, r * 0.5, up + std::f32::consts::TAU / 10.0);
+            painter.add(poly(inner.clone()));
+            for i in 0..5 {
+                painter.add(poly(vec![inner[(i + 4) % 5], outer[i], inner[i]]));
+            }
+        }
+    }
+}
+
+/// Point-symbol picker: a glyph button opening the shape list.
+/// Returns true when the shape changed.
+fn marker_shape_button(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    shape: &mut crate::data::layer::PointShape,
+    color: Color32,
+) -> bool {
+    use crate::data::layer::PointShape;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 14.0), egui::Sense::click());
+    let resp = resp.on_hover_text("point symbol");
+    paint_marker(
+        ui.painter(),
+        rect.center(),
+        4.5,
+        *shape,
+        ui.style().interact(&resp).fg_stroke.color,
+    );
+    let mut changed = false;
+    egui::Popup::from_toggle_button_response(&resp)
+        .id(egui::Id::new(("marker_popup", id_salt)))
+        .kind(egui::PopupKind::Popup)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(3.0, 2.0);
+            for s in PointShape::ALL {
+                let (r, hit) =
+                    ui.allocate_exact_size(egui::vec2(96.0, 20.0), egui::Sense::click());
+                let hit = hit.on_hover_cursor(egui::CursorIcon::PointingHand);
+                if *shape == s || hit.hovered() {
+                    let bg = if *shape == s {
+                        ui.visuals().selection.bg_fill
+                    } else {
+                        ui.visuals().widgets.hovered.bg_fill
+                    };
+                    ui.painter().rect_filled(r, 3.0, bg);
+                }
+                let p = ui.painter();
+                paint_marker(p, egui::pos2(r.left() + 13.0, r.center().y), 6.0, s, color);
+                p.text(
+                    egui::pos2(r.left() + 28.0, r.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    s.label(),
+                    egui::FontId::proportional(11.0),
+                    ui.visuals().text_color(),
+                );
+                if hit.clicked() {
+                    *shape = s;
+                    changed = true;
+                    ui.close();
+                }
+            }
+        });
+    changed
+}
+
 /// Compact class bound: `sig` significant digits with k/M/G suffixes
 /// (42200 → "42.2k", 718000 → "718k", 0.00123 → "0.00123").
 fn fmt_sig(v: f64, sig: usize) -> String {
@@ -10128,6 +10263,7 @@ fn resolve_style(s: &crate::data::layer::LayerStyle) -> DrawStyle {
         point_color: [r, g, b, s.opacity],
         line_half_width_px: (s.line_width_px * 0.5).max(0.01),
         point_radius_px: s.point_radius_px.max(0.1),
+        point_shape: s.point_shape,
         bin_colors: s.style_by.as_ref().map(|sb| Arc::new(sb.bin_colors())),
         hidden_bins: s.style_by.as_ref().map(|sb| sb.hidden_bins).unwrap_or(0),
     }
@@ -10596,6 +10732,7 @@ mod tests {
                         point_color: [0.0; 4],
                         line_half_width_px: 0.5,
                         point_radius_px: 0.0,
+                        point_shape: crate::data::layer::PointShape::Circle,
                         bin_colors: None,
                         hidden_bins: 0,
                     },
@@ -10610,6 +10747,7 @@ mod tests {
                         point_color: [0.0; 4],
                         line_half_width_px: 0.6,
                         point_radius_px: 0.0,
+                        point_shape: crate::data::layer::PointShape::Circle,
                         bin_colors: None,
                         hidden_bins: 0,
                     },

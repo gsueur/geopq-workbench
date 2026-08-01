@@ -19,6 +19,7 @@ pub struct DrawStyle {
     pub point_color: [f32; 4],
     pub line_half_width_px: f32,
     pub point_radius_px: f32,
+    pub point_shape: crate::data::layer::PointShape,
     /// Data-driven styling: per-bin RGB (chunks carry their bin); alpha
     /// channels come from the colors above. None = uniform colors.
     pub bin_colors: Option<Arc<[[f32; 3]; crate::data::layer::STYLE_BINS]>>,
@@ -40,6 +41,18 @@ impl DrawStyle {
         match &self.bin_colors {
             Some(lut) => lut[bin as usize % lut.len()],
             None => [base[0], base[1], base[2]],
+        }
+    }
+
+    /// Outline / marker border color for a chunk. Under data styling the
+    /// border follows the bin, darkened so it reads against its own fill.
+    fn edge_for(&self, bin: u8) -> [f32; 4] {
+        match &self.bin_colors {
+            Some(lut) => {
+                let c = lut[bin as usize % lut.len()];
+                [c[0] * 0.65, c[1] * 0.65, c[2] * 0.65, self.line_color[3]]
+            }
+            None => self.line_color,
         }
     }
 }
@@ -313,6 +326,18 @@ struct ChunkUniform {
     wh: [f32; 2],
     size: f32,
     feather: f32,
+    shape: u32,
+    edge_px: f32,
+    _pad: [u32; 2],
+    edge: [f32; 4],
+}
+
+/// Point-marker extras: everything the other passes leave at zero.
+#[derive(Clone, Copy, Default)]
+struct MarkerU {
+    shape: u32,
+    edge: [f32; 4],
+    edge_px: f32,
 }
 
 impl MapResources {
@@ -842,7 +867,8 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                                 origin: [f64; 2],
                                 world_scale: [f64; 2],
                                 color: [f32; 4],
-                                size: f32|
+                                size: f32,
+                                marker: MarkerU|
          -> u32 {
             let offset = uniforms.len() as u32;
             let u = ChunkUniform {
@@ -858,6 +884,10 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                 wh: [vw, vh],
                 size,
                 feather: 1.0,
+                shape: marker.shape,
+                edge_px: marker.edge_px,
+                _pad: [0; 2],
+                edge: marker.edge,
             };
             uniforms.extend_from_slice(bytemuck::bytes_of(&u));
             uniforms.resize(uniforms.len().next_multiple_of(UNIFORM_STRIDE as usize), 0);
@@ -884,6 +914,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                         [1.0, 1.0],
                         [1.0, 1.0, 1.0, self.tile_opacity],
                         0.0,
+                        MarkerU::default(),
                     );
                     draw_list.push(DrawCmd::TileMesh {
                         key: tile.key,
@@ -901,6 +932,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                         [r[2] - r[0], r[3] - r[1]],
                         [1.0, 1.0, 1.0, self.tile_opacity],
                         0.0,
+                        MarkerU::default(),
                     );
                     draw_list.push(DrawCmd::Tile {
                         key: tile.key,
@@ -967,7 +999,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                             let rgb = layer.style.rgb_for(chunk.bin, s.fill_color);
                             let opaque = [rgb[0], rgb[1], rgb[2], 1.0];
                             let uoffset =
-                                push_uniform(&mut uniforms, chunk.origin, [1.0, 1.0], opaque, 0.0);
+                                push_uniform(&mut uniforms, chunk.origin, [1.0, 1.0], opaque, 0.0, MarkerU::default());
                             fill_cmds.push((layer.key, ci, uoffset));
                         }
                     }
@@ -983,6 +1015,10 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                     wh: [vw, vh],
                     size: 0.0,
                     feather: 1.0,
+                    shape: 0,
+                    edge_px: 0.0,
+                    _pad: [0; 2],
+                    edge: [0.0; 4],
                 };
                 uniforms.extend_from_slice(bytemuck::bytes_of(&u));
                 uniforms.resize(uniforms.len().next_multiple_of(UNIFORM_STRIDE as usize), 0);
@@ -1015,20 +1051,13 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                             if std::env::var("GEOPQ_DEBUG_DRAWS").is_ok() {
                                 eprintln!("chunk {ci}: lod {lod} count {count}");
                             }
-                            let line_color = match &s.bin_colors {
-                                Some(lut) => {
-                                    let c = lut[chunk.bin as usize % lut.len()];
-                                    // Darkened ramp color keeps outlines readable.
-                                    [c[0] * 0.65, c[1] * 0.65, c[2] * 0.65, s.line_color[3]]
-                                }
-                                None => s.line_color,
-                            };
                             let uoffset = push_uniform(
                                 &mut uniforms,
                                 chunk.origin,
                                 [1.0, 1.0],
-                                line_color,
+                                s.edge_for(chunk.bin),
                                 s.line_half_width_px,
+                                MarkerU::default(),
                             );
                             draw_list.push(DrawCmd::Line {
                                 layer: layer.key,
@@ -1062,6 +1091,13 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                             [1.0, 1.0],
                             [rgb[0], rgb[1], rgb[2], s.point_color[3]],
                             s.point_radius_px,
+                            MarkerU {
+                                shape: s.point_shape.code(),
+                                edge: s.edge_for(chunk.bin),
+                                // The border is inset in the marker, so it
+                                // takes the whole stroke width, not half.
+                                edge_px: s.line_half_width_px * 2.0,
+                            },
                         );
                         draw_list.push(DrawCmd::Point {
                             layer: layer.key,
@@ -1351,6 +1387,7 @@ mod tests {
                     point_color: [0.0; 4],
                     line_half_width_px: if outlines { 0.6 } else { 0.0 },
                     point_radius_px: 0.0,
+                    point_shape: crate::data::layer::PointShape::Circle,
                     bin_colors: style_by
                         .as_ref()
                         .map(|sb| std::sync::Arc::new(sb.bin_colors())),
@@ -1529,6 +1566,7 @@ mod tests {
                         point_color: [0.0; 4],
                         line_half_width_px: 0.6,
                         point_radius_px: 3.0,
+                        point_shape: crate::data::layer::PointShape::Circle,
                         bin_colors: None,
                         hidden_bins: 0,
                     },
@@ -1543,6 +1581,7 @@ mod tests {
                         point_color: [0.0; 4],
                         line_half_width_px: 1.0,
                         point_radius_px: 0.0,
+                        point_shape: crate::data::layer::PointShape::Circle,
                         bin_colors: None,
                         hidden_bins: 0,
                     },
@@ -1655,6 +1694,7 @@ mod tests {
                             point_color: [0.0; 4],
                             line_half_width_px: 0.6,
                             point_radius_px: 3.0,
+                            point_shape: crate::data::layer::PointShape::Circle,
                             bin_colors: None,
                             hidden_bins: 0,
                         },
@@ -1669,6 +1709,7 @@ mod tests {
                             point_color: [0.0; 4],
                             line_half_width_px: 1.2,
                             point_radius_px: 0.0,
+                            point_shape: crate::data::layer::PointShape::Circle,
                             bin_colors: None,
                             hidden_bins: 0,
                         },
@@ -1863,6 +1904,7 @@ mod tests {
                     point_color: [0.2, 0.4, 0.9, 1.0],
                     line_half_width_px: 0.6,
                     point_radius_px: radius,
+                    point_shape: crate::data::layer::PointShape::Circle,
                     bin_colors: None,
                     hidden_bins: 0,
                 },
@@ -2004,6 +2046,7 @@ mod tests {
                     point_color: [0.0, 0.0, 1.0, 1.0],
                     line_half_width_px: 2.0,
                     point_radius_px: 5.0,
+                    point_shape: crate::data::layer::PointShape::Circle,
                     bin_colors: None,
                     hidden_bins: 0,
                 },
@@ -2130,6 +2173,243 @@ mod tests {
         assert!(red > 5_000, "fill pixels: {red}");
         assert!(green > 500, "outline pixels: {green}");
         assert!(blue > 20, "point pixels: {blue}");
+    }
+
+    /// One point at world (0.5, 0.5) drawn through the real pipelines;
+    /// returns the resolved RGBA of a `size` x `size` viewport.
+    fn render_one_point(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        size: u32,
+        style: DrawStyle,
+    ) -> Vec<u8> {
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut resources = egui_wgpu::CallbackResources::default();
+        resources.insert(MapResources::new(device, format));
+        let mut mb = MeshBuilder::default();
+        mb.add(
+            &geo_types::Geometry::Point(geo_types::Point::new(0.5, 0.5)),
+            crate::data::geometry::FeatureRef::INVALID,
+        );
+        let cb = MapCallback {
+            camera: crate::map::camera::Camera {
+                center: [0.5, 0.5],
+                zoom: 10.0,
+            },
+            viewport_px: [size as f32, size as f32],
+            tile_opacity: 1.0,
+            tile_draws: vec![],
+            tile_uploads: vec![],
+            alive_tiles: Default::default(),
+            alive_layers: Default::default(),
+            layers: vec![LayerDraw {
+                key: (1, 0),
+                composite_group: 1,
+                chunks: std::sync::Arc::new(mb.finish()),
+                style,
+            }],
+            background: [0.0; 4],
+        };
+        let mk_tex = |samples: u32, usage: wgpu::TextureUsages| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: samples,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let msaa = mk_tex(MSAA_SAMPLES, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let resolve = mk_tex(
+            1,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let msaa_view = msaa.create_view(&Default::default());
+        let resolve_view = resolve.create_view(&Default::default());
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [size, size],
+            pixels_per_point: 1.0,
+        };
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let bufs = cb.prepare(device, queue, &screen, &mut encoder, &mut resources);
+        queue.submit(bufs);
+        {
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    multiview_mask: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &msaa_view,
+                        depth_slice: None,
+                        resolve_target: Some(&resolve_view),
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                })
+                .forget_lifetime();
+            let rect = eframe::egui::Rect::from_min_size(
+                Default::default(),
+                eframe::egui::vec2(size as f32, size as f32),
+            );
+            cb.paint(
+                eframe::egui::PaintCallbackInfo {
+                    viewport: rect,
+                    clip_rect: rect,
+                    pixels_per_point: 1.0,
+                    screen_size_px: [size, size],
+                },
+                &mut pass,
+                &resources,
+            );
+        }
+        let out = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (size * size * 4) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &resolve,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &out,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(size * 4),
+                    rows_per_image: Some(size),
+                },
+            },
+            wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        let slice = out.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        slice.get_mapped_range().to_vec()
+    }
+
+    /// A borderless blue marker of the given shape.
+    fn marker_style(shape: crate::data::layer::PointShape, radius: f32) -> DrawStyle {
+        DrawStyle {
+            fill_color: [0.0; 4],
+            line_color: [0.0; 4],
+            point_color: [0.0, 0.0, 1.0, 1.0],
+            line_half_width_px: 0.0,
+            point_radius_px: radius,
+            point_shape: shape,
+            bin_colors: None,
+            hidden_bins: 0,
+        }
+    }
+
+    /// Every point symbol draws, and each carries the ink of the circle
+    /// it replaces: the shapes are area-matched so one radius slider
+    /// keeps its meaning when the symbol changes.
+    #[test]
+    fn point_symbols_render_with_matching_ink() {
+        use crate::data::layer::PointShape;
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let size = 128u32;
+        let radius = 24.0f32;
+        let coverage = |shape: PointShape| -> Vec<bool> {
+            render_one_point(&device, &queue, size, marker_style(shape, radius))
+                // The marker is the only thing drawn, so any blue is its ink.
+                .chunks_exact(4)
+                .map(|px| px[2] > 40)
+                .collect()
+        };
+        let ink = |mask: &[bool]| mask.iter().filter(|b| **b).count();
+
+        let circle = coverage(PointShape::Circle);
+        let disk = ink(&circle);
+        let expected = (std::f32::consts::PI * radius * radius) as usize;
+        assert!(
+            disk.abs_diff(expected) * 10 < expected,
+            "circle covers {disk} px, expected ~{expected}"
+        );
+        for shape in PointShape::ALL {
+            let mask = coverage(shape);
+            let n = ink(&mask);
+            assert!(
+                n.abs_diff(disk) * 5 < disk,
+                "{} covers {n} px, circle covers {disk}",
+                shape.label()
+            );
+            // Same ink, different outline: equal areas would also be the
+            // symptom of a shader that ignored the shape entirely.
+            let moved = mask.iter().zip(&circle).filter(|(a, b)| a != b).count();
+            if shape == PointShape::Circle {
+                assert_eq!(moved, 0);
+            } else {
+                assert!(
+                    moved * 20 > disk,
+                    "{} draws the same pixels as a circle",
+                    shape.label()
+                );
+            }
+        }
+    }
+
+    /// The symbol border is a real, colored, switchable border: turning
+    /// it off gives back the pixels it covered rather than shrinking the
+    /// marker.
+    #[test]
+    fn point_border_is_drawn_inside_the_marker_and_can_be_switched_off() {
+        use crate::data::layer::PointShape;
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let size = 128u32;
+        let radius = 24.0f32;
+        let count = |data: &[u8], f: fn(&[u8]) -> bool| {
+            data.chunks_exact(4).filter(|px| f(px)).count()
+        };
+        let blue = |px: &[u8]| px[2] > 40 && px[0] < 40;
+        let red = |px: &[u8]| px[0] > 40 && px[2] < 40;
+
+        let mut style = marker_style(PointShape::Square, radius);
+        style.line_color = [1.0, 0.0, 0.0, 1.0];
+        style.line_half_width_px = 3.0; // 6 px of border, inset
+        let bordered = render_one_point(&device, &queue, size, style.clone());
+        let rim = count(&bordered, red);
+        let core = count(&bordered, blue);
+        assert!(rim > 500, "border pixels: {rim}");
+        assert!(core > 500, "fill pixels: {core}");
+
+        // A transparent border color is the "no border" switch: the fill
+        // must reclaim the rim, not leave a hole.
+        style.line_color[3] = 0.0;
+        let plain = render_one_point(&device, &queue, size, style);
+        assert_eq!(count(&plain, red), 0, "border still drawn");
+        let plain_core = count(&plain, blue);
+        assert!(
+            plain_core > core + rim / 2,
+            "fill did not reclaim the border: {plain_core} vs {core} + {rim}"
+        );
     }
 
     /// Two neighbouring tiles warped into a non-Mercator projection and drawn
