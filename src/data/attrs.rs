@@ -237,6 +237,12 @@ pub struct Preview {
     /// True for parquet, where types are declared rather than guessed and
     /// there is no delimiter to choose.
     pub typed_source: bool,
+    /// Whether the sample values have arrived. False for the first,
+    /// footer-only look at a parquet file: names and types are in the
+    /// footer and cost one small read, while the values behind them cost
+    /// a page of every column and can take half a minute over a network.
+    /// The dialog is worth showing before that finishes.
+    pub sampled: bool,
 }
 
 #[derive(Debug)]
@@ -717,7 +723,89 @@ pub fn inspect(source: &Source) -> Result<Preview, String> {
         columns,
         sampled_rows,
         typed_source: !csv,
+        sampled: true,
     })
+}
+
+/// What can be known about a source immediately.
+///
+/// For parquet that is the footer: every column name and its declared
+/// type, with no values behind them. For CSV there is no such shortcut —
+/// the types are only knowable by reading values — but a CSV is read
+/// sequentially and the first rows arrive at once, so the full inspection
+/// is already the fast one.
+pub fn inspect_fast(source: &Source) -> Result<Preview, String> {
+    if is_csv(source) {
+        return inspect(source);
+    }
+    reject_geoparquet(source)?;
+    let (schema, _) = read_parquet(source, 0, &[])?;
+    let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    if names.is_empty() {
+        return Err(format!("{}: no columns found.", source.name()));
+    }
+    let mut sanitized: Vec<String> = names.iter().map(|n| sanitize(n)).collect();
+    dedupe(&mut sanitized);
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|f| ColumnPreview {
+            inferred: ColType::of(f.data_type()),
+            samples: Vec::new(),
+            bad: 0,
+            bad_examples: Vec::new(),
+        })
+        .collect();
+    let plan = ImportPlan {
+        delimiter: b',',
+        has_header: true,
+        numbers: NumberFormat::Plain,
+        geometry: GeometryPlan::None,
+        columns: names
+            .iter()
+            .zip(&sanitized)
+            .zip(schema.fields())
+            .map(|((source_name, name), f)| ColumnPlan {
+                source_name: source_name.clone(),
+                name: name.clone(),
+                ty: ColType::of(f.data_type()),
+                include: true,
+            })
+            .collect(),
+    };
+    Ok(Preview {
+        plan,
+        columns,
+        sampled_rows: 0,
+        typed_source: true,
+        sampled: false,
+    })
+}
+
+/// The values behind the columns, and a coordinate guess if they suggest
+/// one. The slow half of [`inspect_fast`], run once the dialog is up.
+pub fn sample_columns(
+    source: &Source,
+    plan: &ImportPlan,
+) -> Result<(Vec<ColumnPreview>, usize, Option<GeometryPlan>), String> {
+    let (_, cols) = sample_text(source, plan)?;
+    let columns: Vec<ColumnPreview> = plan
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let values = cols.get(i).cloned().unwrap_or_default();
+            let (bad, bad_examples) = bad_values(&values, c.ty, plan.numbers);
+            ColumnPreview {
+                inferred: c.ty,
+                samples: distinct_samples(&values),
+                bad,
+                bad_examples,
+            }
+        })
+        .collect();
+    let rows = cols.first().map(Vec::len).unwrap_or(0);
+    Ok((columns, rows, suggest_points(&plan.columns, &cols, plan.numbers)))
 }
 
 /// Re-read the sample and recompute names, types and damage. Called when
@@ -754,6 +842,7 @@ pub fn reinspect(source: &Source, delimiter: u8, has_header: bool) -> Result<Pre
         });
     }
     p.sampled_rows = cols.first().map(Vec::len).unwrap_or(0);
+    p.sampled = true;
     Ok(p)
 }
 
@@ -1525,6 +1614,58 @@ mod tests {
         assert_eq!(p.plan.delimiter, b';');
         assert_eq!(p.plan.columns[0].ty, ColType::Text, "leading zeros kept");
         assert_eq!(import(&src, &p.plan).unwrap().rows, 2);
+    }
+
+    /// Names and types come from the footer and cost one small read; the
+    /// values behind them cost a page of every column. Splitting the two
+    /// is what puts the dialog on screen in a second rather than half a
+    /// minute on a wide remote file.
+    #[test]
+    fn a_parquet_gives_its_columns_before_its_values() {
+        use arrow::array::{Int64Array, StringArray};
+        use parquet::arrow::ArrowWriter;
+        let dir = std::env::temp_dir().join(format!("geopq_attrs_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("two_phase.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("Code INSEE", DataType::Utf8, false),
+            Field::new("Pop", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["01001", "01002"])),
+                Arc::new(Int64Array::from(vec![120, 340])),
+            ],
+        )
+        .unwrap();
+        let mut w =
+            ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let src = Source::Local(path);
+        let fast = inspect_fast(&src).unwrap();
+        assert!(!fast.sampled, "values have not been read yet");
+        assert_eq!(fast.sampled_rows, 0);
+        // Everything needed to choose columns is already right.
+        let names: Vec<&str> = fast.plan.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["code_insee", "pop"], "renamed from the footer");
+        assert_eq!(fast.plan.columns[0].ty, ColType::Text);
+        assert_eq!(fast.plan.columns[1].ty, ColType::Integer);
+        assert!(fast.columns.iter().all(|c| c.samples.is_empty()));
+
+        // And the second pass fills in what it could not know.
+        let (cols, rows, _) = sample_columns(&src, &fast.plan).unwrap();
+        assert_eq!(rows, 2);
+        assert_eq!(cols[0].samples, vec!["01001", "01002"]);
+        assert_eq!(cols.len(), fast.columns.len(), "same shape, so it can be swapped in");
+
+        // Importing straight off the fast pass works: the plan is whole
+        // without the samples, which is what makes showing it early safe.
+        let data = import(&src, &fast.plan).unwrap();
+        assert_eq!(data.rows, 2);
+        assert!(data.nulled.is_empty());
     }
 
     #[test]

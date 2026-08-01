@@ -565,6 +565,18 @@ struct JoinDialog {
 /// A finished attribute-file job from the worker thread.
 enum AttrMsg {
     Inspected(String, Source, Result<Box<crate::data::attrs::Preview>, String>),
+    /// The sample values for a dialog already on screen.
+    Sampled(
+        Source,
+        Result<
+            (
+                Vec<crate::data::attrs::ColumnPreview>,
+                usize,
+                Option<crate::data::attrs::GeometryPlan>,
+            ),
+            String,
+        >,
+    ),
     Imported(
         String,
         Source,
@@ -2240,7 +2252,7 @@ impl ViewerApp {
             let result = source
                 .clone()
                 .resolve()
-                .and_then(|s| crate::data::attrs::inspect(&s).map(|p| (s, Box::new(p))));
+                .and_then(|s| crate::data::attrs::inspect_fast(&s).map(|p| (s, Box::new(p))));
             let msg = match result {
                 Ok((resolved, p)) => AttrMsg::Inspected(name, resolved, Ok(p)),
                 Err(e) => AttrMsg::Inspected(name, source, Err(e)),
@@ -2250,17 +2262,58 @@ impl ViewerApp {
         });
     }
 
+    /// Fetch the sample values for a dialog that is already up.
+    fn spawn_sampling(&self, source: &Source, plan: &crate::data::attrs::ImportPlan) {
+        let (tx, egui_ctx) = (self.attr_tx.clone(), self.egui_ctx.clone());
+        let (source, plan) = (source.clone(), plan.clone());
+        std::thread::spawn(move || {
+            let out = crate::data::attrs::sample_columns(&source, &plan);
+            let _ = tx.send(AttrMsg::Sampled(source, out));
+            egui_ctx.request_repaint();
+        });
+    }
+
     fn poll_attrs(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.attr_rx.try_recv() {
             self.attr_busy = None;
             match msg {
                 AttrMsg::Inspected(name, source, Ok(preview)) => {
+                    // Up immediately with names and types; the values
+                    // behind them follow.
+                    if !preview.sampled {
+                        self.spawn_sampling(&source, &preview.plan);
+                    }
                     self.attr_import = Some(AttrImport {
                         source,
                         name,
                         preview: *preview,
                         reread: false,
                     });
+                }
+                AttrMsg::Sampled(source, result) => {
+                    let Some(job) = &mut self.attr_import else { continue };
+                    // The dialog may have moved on to another file.
+                    if job.source.label() != source.label() {
+                        continue;
+                    }
+                    match result {
+                        Ok((columns, rows, points)) => {
+                            if columns.len() == job.preview.columns.len() {
+                                job.preview.columns = columns;
+                                job.preview.sampled_rows = rows;
+                                job.preview.sampled = true;
+                                // A coordinate pair can only be spotted
+                                // once the values are in.
+                                if let Some(g) = points {
+                                    job.preview.plan.geometry = g;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            job.preview.sampled = true;
+                            self.push_error(format!("could not read sample values: {e}"));
+                        }
+                    }
                 }
                 AttrMsg::Inspected(name, _, Err(e)) => {
                     self.push_error(format!("{name}: {e}"))
@@ -7693,15 +7746,31 @@ impl ViewerApp {
             .constrain_to(floating_area)
             .show(ctx, |ui| {
                 crate::theme::compact(ui);
-                ui.label(
-                    RichText::new(format!(
-                        "{} columns, {} rows sampled",
-                        job.preview.plan.columns.len(),
-                        fmt_count(job.preview.sampled_rows),
-                    ))
-                    .weak()
-                    .small(),
-                );
+                ui.horizontal(|ui| {
+                    if job.preview.sampled {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} columns, {} rows sampled",
+                                job.preview.plan.columns.len(),
+                                fmt_count(job.preview.sampled_rows),
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    } else {
+                        // Names and types are already right; only the
+                        // values and the coordinate guess are pending.
+                        ui.spinner();
+                        ui.label(
+                            RichText::new(format!(
+                                "{} columns from the file's footer — reading values…",
+                                job.preview.plan.columns.len(),
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    }
+                });
                 if !job.preview.typed_source {
                     ui.horizontal(|ui| {
                         ui.label("separator:");
@@ -7815,6 +7884,9 @@ impl ViewerApp {
                                     ui.label("");
                                 }
                                 ui.vertical(|ui| {
+                                    if !job.preview.sampled {
+                                        ui.label(RichText::new("…").weak().small());
+                                    }
                                     if !pv.samples.is_empty() {
                                         ui.label(
                                             RichText::new(pv.samples.join("  ·  "))
