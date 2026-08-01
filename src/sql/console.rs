@@ -14,6 +14,7 @@ use egui_extras::{Column, TableBuilder};
 
 use super::engine::{self, QueryOutput, SqlDone, SqlLayer, SqlMsg, MAX_RESULT_ROWS};
 use super::{export, udf};
+use crate::data::attrs::AttrTable;
 use crate::data::crs::{Crs, DisplayCrs};
 use crate::data::layer::VectorLayer;
 use crate::data::loader::{decode_wkb, viewport_to_data_bbox};
@@ -83,6 +84,10 @@ pub struct SqlConsole {
     /// (for full-result re-run exports).
     last_sql: String,
     last_layers: Vec<SqlLayer>,
+    /// Attribute tables the last run saw, kept for the same reason
+    /// `last_layers` is: a streaming re-export must query what the result
+    /// on screen came from.
+    last_tables: Vec<engine::SqlTable>,
     tx: Sender<SqlMsg>,
     rx: Receiver<SqlMsg>,
     next_id: u64,
@@ -150,6 +155,7 @@ impl SqlConsole {
             query: String::new(),
             last_sql: String::new(),
             last_layers: Vec::new(),
+            last_tables: Vec::new(),
             tx,
             rx,
             next_id: 0,
@@ -237,12 +243,13 @@ impl SqlConsole {
         &mut self,
         ui: &mut egui::Ui,
         layers: &[VectorLayer],
+        attrs: &[AttrTable],
         view_world: [f64; 4],
         display: &DisplayCrs,
     ) -> Option<ConsoleAction> {
         let mut action = None;
-        let tables = table_names(layers);
-        let dict = completion_dict(layers, &tables);
+        let (tables, attr_tables) = sql_names(layers, attrs);
+        let dict = completion_dict(layers, attrs, &tables, &attr_tables);
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -266,8 +273,15 @@ impl SqlConsole {
         });
 
         match self.mode {
-            Mode::Browse => self.browse_bar(ui, layers, &tables, &dict, view_world, display),
-            Mode::Query => self.query_editor(ui, layers, &tables, &dict),
+            Mode::Browse => {
+                // Browsing works on anything registered, geometry or not.
+                let all: Vec<String> =
+                    tables.iter().chain(&attr_tables).cloned().collect();
+                self.browse_bar(ui, layers, attrs, &all, &dict, view_world, display)
+            }
+            Mode::Query => {
+                self.query_editor(ui, layers, attrs, &tables, &attr_tables, &dict)
+            }
         }
 
         if self.show_help {
@@ -278,7 +292,9 @@ impl SqlConsole {
                     egui::Grid::new("sql_help_grid").num_columns(2).striped(true).show(
                         ui,
                         |ui| {
-                            for (sig, desc) in udf::catalog() {
+                            for (sig, desc) in
+                                udf::catalog().iter().chain(super::agg::catalog())
+                            {
                                 ui.label(RichText::new(*sig).monospace().small());
                                 ui.label(RichText::new(*desc).weak().small());
                                 ui.end_row();
@@ -501,6 +517,7 @@ impl SqlConsole {
         &mut self,
         ui: &mut egui::Ui,
         layers: &[VectorLayer],
+        attrs: &[AttrTable],
         tables: &[String],
         dict: &CompletionDict,
         view_world: [f64; 4],
@@ -592,7 +609,7 @@ impl SqlConsole {
             if !preds.is_empty() {
                 sql.push_str(&format!(" where {}", preds.join(" and ")));
             }
-            self.run(ui.ctx().clone(), layers, sql);
+            self.run(ui.ctx().clone(), layers, attrs, sql);
         }
     }
 
@@ -629,18 +646,42 @@ impl SqlConsole {
         &mut self,
         ui: &mut egui::Ui,
         layers: &[VectorLayer],
+        attrs: &[AttrTable],
         tables: &[String],
+        attr_tables: &[String],
         dict: &CompletionDict,
     ) {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("tables:").weak().small());
-            if layers.is_empty() {
+            if layers.is_empty() && attrs.is_empty() {
                 ui.label(RichText::new("none (load a layer first)").weak().small());
             }
-            for (l, t) in layers.iter().zip(tables) {
+            let chips: Vec<(&str, &String, bool)> = layers
+                .iter()
+                .map(|l| l.name.as_str())
+                .zip(tables)
+                .map(|(n, t)| (n, t, false))
+                .chain(
+                    attrs
+                        .iter()
+                        .map(|a| a.name.as_str())
+                        .zip(attr_tables)
+                        .map(|(n, t)| (n, t, true)),
+                )
+                .collect();
+            for (name, t, is_attr) in chips {
+                let label = RichText::new(t).monospace().small();
+                // Tables read weaker than layers: same namespace, but one
+                // of them is on the map and the other is not.
+                let label = if is_attr { label.weak() } else { label };
+                let hover = if is_attr {
+                    format!("{name} (attribute table) — click to insert")
+                } else {
+                    format!("{name} — click to insert")
+                };
                 if ui
-                    .add(egui::Button::new(RichText::new(t).monospace().small()).frame(false))
-                    .on_hover_text(format!("{} — click to insert", l.name))
+                    .add(egui::Button::new(label).frame(false))
+                    .on_hover_text(hover)
                     .clicked()
                 {
                     if self.query.trim().is_empty() {
@@ -717,7 +758,7 @@ impl SqlConsole {
             {
                 let sql = self.query.clone();
                 self.push_history(&sql);
-                self.run(ui.ctx().clone(), layers, sql);
+                self.run(ui.ctx().clone(), layers, attrs, sql);
             }
 
             if !self.history.is_empty() {
@@ -755,10 +796,10 @@ impl SqlConsole {
         });
     }
 
-    fn sql_layers(layers: &[VectorLayer]) -> Vec<SqlLayer> {
+    fn sql_layers(layers: &[VectorLayer], names: Vec<String>) -> Vec<SqlLayer> {
         layers
             .iter()
-            .zip(table_names(layers))
+            .zip(names)
             .map(|(l, table)| SqlLayer {
                 table,
                 store: Arc::clone(&l.store),
@@ -776,16 +817,39 @@ impl SqlConsole {
             .collect()
     }
 
-    fn run(&mut self, egui_ctx: egui::Context, layers: &[VectorLayer], sql: String) {
+    fn run(
+        &mut self,
+        egui_ctx: egui::Context,
+        layers: &[VectorLayer],
+        attrs: &[AttrTable],
+        sql: String,
+    ) {
         let id = self.next_id;
         self.next_id += 1;
         self.running = Some(id);
         self.error = None;
         self.last_sql = sql.clone();
-        self.last_layers = Self::sql_layers(layers);
-        engine::spawn_query(id, sql, self.last_layers.clone(), self.tx.clone(), move || {
-            egui_ctx.request_repaint();
-        });
+        let (layer_names, attr_names) = sql_names(layers, attrs);
+        self.last_layers = Self::sql_layers(layers, layer_names);
+        self.last_tables = attrs
+            .iter()
+            .zip(attr_names)
+            .map(|(t, table)| engine::SqlTable {
+                table,
+                schema: Arc::clone(&t.schema),
+                batches: Arc::clone(&t.batches),
+            })
+            .collect();
+        engine::spawn_query(
+            id,
+            sql,
+            self.last_layers.clone(),
+            self.last_tables.clone(),
+            self.tx.clone(),
+            move || {
+                egui_ctx.request_repaint();
+            },
+        );
     }
 
     /// "Result as layer": materialized fast path when complete, streaming
@@ -816,6 +880,7 @@ impl SqlConsole {
             id,
             self.last_sql.clone(),
             self.last_layers.clone(),
+            self.last_tables.clone(),
             path,
             self.tx.clone(),
             || {},
@@ -932,11 +997,29 @@ fn ctrl_z_alias(ui: &mut egui::Ui, field: egui::Id) {
 pub(crate) struct CompletionDict {
     pub tables: Vec<String>,
     pub all: Vec<String>,
+    /// Column names per table, for qualified completion.
+    pub columns: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl CompletionDict {
-    /// The candidate list for a token whose preceding text is `before`.
-    fn for_context(&self, before: &str) -> &[String] {
+    /// The candidate list for a token whose preceding text is `before`,
+    /// within the query `sql`.
+    ///
+    /// `sql` is the whole text, not just what precedes the cursor: the
+    /// FROM clause that names an alias is usually typed after the select
+    /// list that uses it, so resolving `c.` from `before` alone would
+    /// work only when the query is written backwards.
+    fn for_context(&self, sql: &str, before: &str) -> &[String] {
+        if let Some(q) = qualifier(before) {
+            let by = aliases(sql);
+            let table = by.get(&q).cloned().unwrap_or(q);
+            if let Some(cols) = self.columns.get(&table) {
+                return cols;
+            }
+            // An unknown qualifier is a typo or a table not loaded;
+            // everything is a better answer than nothing.
+            return &self.all;
+        }
         if from_context(before) {
             &self.tables
         } else {
@@ -945,7 +1028,81 @@ impl CompletionDict {
     }
 }
 
-fn completion_dict(layers: &[VectorLayer], tables: &[String]) -> CompletionDict {
+/// The table qualifier a token is written under: the `c` of `c.nom`.
+///
+/// `before` is the text up to the token, so a qualified token leaves it
+/// ending in `<ident>.`.
+fn qualifier(before: &str) -> Option<String> {
+    let rest = before.strip_suffix('.')?;
+    let ident: String = rest
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    // A dot after a digit is a decimal point, not a qualifier.
+    if ident.is_empty() || ident.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(ident.to_lowercase())
+}
+
+/// Table aliases declared in a query, mapping alias to table.
+///
+/// `from communes c`, `join codes as k`, and the bare `from communes`
+/// which lets `communes.` qualify itself.
+fn aliases(sql: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let words: Vec<String> = sql
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_lowercase())
+        .collect();
+    let mut i = 0;
+    while i < words.len() {
+        if words[i] != "from" && words[i] != "join" {
+            i += 1;
+            continue;
+        }
+        let Some(table) = words.get(i + 1) else { break };
+        if is_sql_word(table) {
+            i += 1;
+            continue;
+        }
+        out.insert(table.clone(), table.clone());
+        // `as` is optional, and the next word is only an alias if it is
+        // not the keyword that ends the clause.
+        let mut j = i + 2;
+        if words.get(j).is_some_and(|w| w == "as") {
+            j += 1;
+        }
+        if let Some(alias) = words.get(j).filter(|w| !is_sql_word(w)) {
+            out.insert(alias.clone(), table.clone());
+            i = j + 1;
+        } else {
+            i += 2;
+        }
+    }
+    out
+}
+
+/// A word that ends a table reference rather than aliasing it.
+fn is_sql_word(w: &str) -> bool {
+    SQL_KEYWORDS
+        .iter()
+        .any(|k| k.split_whitespace().any(|kw| kw == w))
+        || udf::NAMES.contains(&w)
+        || super::agg::NAMES.contains(&w)
+}
+
+fn completion_dict(
+    layers: &[VectorLayer],
+    attrs: &[AttrTable],
+    tables: &[String],
+    attr_tables: &[String],
+) -> CompletionDict {
     let mut dict: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut push = |s: String| {
@@ -953,23 +1110,41 @@ fn completion_dict(layers: &[VectorLayer], tables: &[String]) -> CompletionDict 
             dict.push(s);
         }
     };
-    for l in layers {
-        for f in l.store.schema.fields() {
-            push(f.name().to_lowercase());
+    let mut columns: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for (l, name) in layers.iter().zip(tables) {
+        // The SQL-visible names, which is what a qualified token has to
+        // match: the layer table lowercases and dedupes them.
+        let cols = super::table::sql_column_names(&l.store.schema);
+        for c in &cols {
+            push(c.clone());
         }
+        columns.insert(name.clone(), cols);
     }
-    for t in tables {
+    for (t, name) in attrs.iter().zip(attr_tables) {
+        let cols: Vec<String> = t
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().to_lowercase())
+            .collect();
+        for c in &cols {
+            push(c.clone());
+        }
+        columns.insert(name.clone(), cols);
+    }
+    for t in tables.iter().chain(attr_tables) {
         push(t.clone());
     }
-    for n in udf::NAMES {
+    for n in udf::NAMES.iter().chain(super::agg::NAMES) {
         push((*n).to_string());
     }
     for k in SQL_KEYWORDS {
         push((*k).to_string());
     }
     CompletionDict {
-        tables: tables.to_vec(),
+        tables: tables.iter().chain(attr_tables).cloned().collect(),
         all: dict,
+        columns,
     }
 }
 
@@ -984,6 +1159,7 @@ fn from_context(before: &str) -> bool {
             .iter()
             .any(|k| k.split_whitespace().any(|kw| kw == w))
             || udf::NAMES.contains(&w)
+            || super::agg::NAMES.contains(&w)
     };
     let chars: Vec<char> = before.chars().collect();
     let mut i = chars.len();
@@ -1076,8 +1252,9 @@ pub(crate) fn autocomplete_edit(
                 let prefix: String = chars[start..cur].iter().collect();
                 let prefix_l = prefix.to_lowercase();
                 let before: String = chars[..start].iter().collect();
+                let full: String = chars.iter().collect();
                 let items: Vec<String> = dict
-                    .for_context(&before)
+                    .for_context(&full, &before)
                     .iter()
                     .filter(|c| c.starts_with(&prefix_l) && **c != prefix_l)
                     .take(8)
@@ -1154,21 +1331,40 @@ fn apply_completion(
 
 /// SQL identifier per layer; same-named layers get `_2`, `_3`, ...
 /// suffixes so both stay queryable.
-fn table_names(layers: &[VectorLayer]) -> Vec<String> {
+/// SQL identifiers for everything queryable: layers first, then attribute
+/// tables, deduped against each other.
+///
+/// One namespace, because a query joining a layer to a table writes both
+/// names in the same FROM clause. Layers keep their existing names when a
+/// table would collide, so adding a table never renames a layer out from
+/// under a query the user already wrote.
+pub fn attr_sql_names(layers: &[VectorLayer], attrs: &[AttrTable]) -> Vec<String> {
+    sql_names(layers, attrs).1
+}
+
+/// SQL identifiers for layers and attribute tables, in their own order.
+pub fn sql_table_names(
+    layers: &[VectorLayer],
+    attrs: &[AttrTable],
+) -> (Vec<String>, Vec<String>) {
+    sql_names(layers, attrs)
+}
+
+fn sql_names(layers: &[VectorLayer], attrs: &[AttrTable]) -> (Vec<String>, Vec<String>) {
     let mut seen: std::collections::HashMap<String, usize> = Default::default();
-    layers
-        .iter()
-        .map(|l| {
-            let base = engine::table_name(&l.name);
-            let n = seen.entry(base.clone()).or_insert(0);
-            *n += 1;
-            if *n > 1 {
-                format!("{base}_{n}")
-            } else {
-                base
-            }
-        })
-        .collect()
+    let mut dedupe = |name: &str| {
+        let base = engine::table_name(name);
+        let n = seen.entry(base.clone()).or_insert(0);
+        *n += 1;
+        if *n > 1 {
+            format!("{base}_{n}")
+        } else {
+            base
+        }
+    };
+    let l: Vec<String> = layers.iter().map(|l| dedupe(&l.name)).collect();
+    let a: Vec<String> = attrs.iter().map(|t| dedupe(&t.name)).collect();
+    (l, a)
 }
 
 /// Decode the geometry of one result row (underlying index).
@@ -1427,7 +1623,76 @@ fn geom_cell(col: &dyn Array, i: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::from_context;
+    use super::{aliases, from_context, qualifier, CompletionDict};
+
+    fn dict() -> CompletionDict {
+        let mut columns = std::collections::HashMap::new();
+        columns.insert(
+            "communes".to_string(),
+            vec!["code_insee".into(), "nom_officiel".into(), "geometrie".into()],
+        );
+        columns.insert(
+            "ec_nais_com".to_string(),
+            vec!["code".into(), "_2025".into()],
+        );
+        CompletionDict {
+            tables: vec!["communes".into(), "ec_nais_com".into()],
+            all: vec!["code_insee".into(), "nom_officiel".into(), "code".into(), "select".into()],
+            columns,
+        }
+    }
+
+    #[test]
+    fn a_qualifier_is_an_identifier_before_a_dot() {
+        assert_eq!(qualifier("select c."), Some("c".into()));
+        assert_eq!(qualifier("select a.b, ec_nais_com."), Some("ec_nais_com".into()));
+        assert_eq!(qualifier("select C."), Some("c".into()), "case folded");
+        assert_eq!(qualifier("select "), None);
+        // A decimal point is not a qualifier.
+        assert_eq!(qualifier("where x > 3."), None);
+    }
+
+    #[test]
+    fn aliases_are_read_from_from_and_join() {
+        let a = aliases("select * from communes c join ec_nais_com as n on c.code_insee = n.code");
+        assert_eq!(a.get("c"), Some(&"communes".to_string()));
+        assert_eq!(a.get("n"), Some(&"ec_nais_com".to_string()));
+        // A table with no alias qualifies itself.
+        assert_eq!(a.get("communes"), Some(&"communes".to_string()));
+        // A keyword after the table is not an alias.
+        let a = aliases("select * from communes where x = 1");
+        assert_eq!(a.get("communes"), Some(&"communes".to_string()));
+        assert!(!a.contains_key("where"));
+        let a = aliases("select * from communes order by nom");
+        assert!(!a.contains_key("order"));
+    }
+
+    /// The point of the whole thing: after `from communes c`, `c.` offers
+    /// that table's columns and nothing else.
+    #[test]
+    fn a_qualified_token_offers_only_that_tables_columns() {
+        let d = dict();
+        let sql = "select c.nom, n.code from communes c join ec_nais_com n on c.code_insee = n.code";
+        assert_eq!(
+            d.for_context(sql, "select c."),
+            &["code_insee".to_string(), "nom_officiel".into(), "geometrie".into()],
+        );
+        assert_eq!(
+            d.for_context(sql, "select c.nom, n."),
+            &["code".to_string(), "_2025".into()],
+        );
+        // The alias is declared after the cursor in a query being written
+        // front to back, which is how they are actually typed.
+        assert_eq!(
+            d.for_context("select c. from communes c", "select c."),
+            &["code_insee".to_string(), "nom_officiel".into(), "geometrie".into()],
+        );
+        // An unqualified token still gets everything.
+        assert_eq!(d.for_context(sql, "select "), &d.all[..]);
+        // A qualifier naming nothing loaded falls back rather than
+        // offering an empty list.
+        assert_eq!(d.for_context(sql, "select zz."), &d.all[..]);
+    }
 
     #[test]
     fn from_context_detects_table_position() {

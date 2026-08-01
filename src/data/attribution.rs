@@ -100,13 +100,8 @@ pub fn parse(text: &str) -> Option<Attribution> {
                 .map(str::to_string)
         })
         .filter(|c| !c.is_empty())?;
-    // The map corner is not the place for a paragraph.
-    let credit = match credit.char_indices().nth(90) {
-        Some((i, _)) => format!("{}…", credit[..i].trim_end()),
-        None => credit,
-    };
     Some(Attribution {
-        credit,
+        credit: cut_for_corner(credit),
         text: text.to_string(),
     })
 }
@@ -114,6 +109,15 @@ pub fn parse(text: &str) -> Option<Attribution> {
 /// A short `Key: value` opener, the shape these notices use for their
 /// fields. A bare URL is not one: `https://…` has no space after its
 /// colon, so a wrapped line carrying a link stays part of its value.
+/// The map corner is not the place for a paragraph. The full text stays
+/// in `Attribution::text` for the info panel.
+fn cut_for_corner(credit: String) -> String {
+    match credit.char_indices().nth(90) {
+        Some((i, _)) => format!("{}…", credit[..i].trim_end()),
+        None => credit,
+    }
+}
+
 fn is_labelled_line(line: &str) -> bool {
     line.split_once(": ").is_some_and(|(k, _)| {
         !k.is_empty()
@@ -142,15 +146,20 @@ fn sidecar(source: &Source) -> Option<Attribution> {
     match source {
         Source::Local(p) => local_chain(p.parent()?),
         Source::Dir(p) => local_chain(p),
-        Source::Remote { url, .. } => remote_chain(url),
+        Source::Remote { url, .. } => remote_chain(url).or_else(|| configured(url)),
         Source::S3 { url, uri, .. } => {
             // The signed URL is what can actually be fetched; the s3://
             // form is only a display name.
             let base = if url.is_empty() { uri } else { url };
-            remote_chain(base)
+            remote_chain(base).or_else(|| configured(base))
         }
-        Source::Stac { url, .. } => remote_chain(url),
-        Source::Multi { urls, .. } => remote_chain(urls.first()?),
+        // A STAC catalog describes its own licensing, so ask the
+        // collection before hunting for a sidecar that is not there.
+        Source::Stac { url, .. } => stac(url).or_else(|| remote_chain(url)),
+        Source::Multi { urls, .. } => {
+            let first = urls.first()?;
+            remote_chain(first).or_else(|| configured(first))
+        }
     }
 }
 
@@ -201,6 +210,77 @@ fn local_chain(dir: &Path) -> Option<Attribution> {
         cur = d.parent();
     }
     None
+}
+
+/// Credit for a STAC collection, built from what the catalog states.
+///
+/// Overture's parquet carries no attribution metadata and its bucket has
+/// no `ATTRIBUTION.txt`, so the sidecar walk found nothing and every
+/// Overture layer drew with no credit — for data that is ODbL or CC BY,
+/// where a credit is the licence condition. What the catalog does state
+/// is the licence, per collection, and it differs between them.
+///
+/// The publisher comes from the repository entry the URL belongs to,
+/// since the STAC spec's `providers` block is optional and Overture omits
+/// it. A collection that does declare providers is credited from those
+/// instead: the data describing itself beats our configuration.
+fn stac(url: &str) -> Option<Attribution> {
+    cached(&format!("stac:{url}"), || stac_uncached(url))
+}
+
+/// Last resort for a remote source whose data says nothing: the credit
+/// the repository it lives in requires. A failed sidecar fetch does not
+/// make the licence go away.
+fn configured(url: &str) -> Option<Attribution> {
+    let credit = super::repo::credit_for_url(url, None)?;
+    Some(build(credit, None, url))
+}
+
+fn stac_uncached(url: &str) -> Option<Attribution> {
+    let col = super::repo::fetch_stac_collection(url).ok()?;
+    // The collection's licence selects which credit the repository asks
+    // for: Overture's ODbL themes carry OSM and must name its
+    // contributors, its CC0 ones must not.
+    let repo_credit = super::repo::credit_for_url(url, col.license.as_deref());
+    stac_credit(&col, repo_credit.as_deref(), url)
+}
+
+/// Compose the credit from a collection's own declaration and the
+/// repository's configured one. Kept separate from the fetch so the
+/// precedence can be tested without a catalog or a config file.
+fn stac_credit(
+    col: &super::repo::StacCollection,
+    repo_credit: Option<&str>,
+    url: &str,
+) -> Option<Attribution> {
+    // Data describing itself beats our configuration.
+    let publisher = if col.providers.is_empty() {
+        repo_credit?.to_string()
+    } else {
+        col.providers.join(", ")
+    };
+    // "other" and "proprietary" are the spec's placeholders for "look it
+    // up"; naming either in the map corner would say nothing.
+    let license = col
+        .license
+        .as_deref()
+        .filter(|l| !l.eq_ignore_ascii_case("other") && !l.eq_ignore_ascii_case("proprietary"));
+    Some(build(publisher, license, url))
+}
+
+/// Assemble an `Attribution` from parts the data or the configuration
+/// stated, rather than from a notice document.
+fn build(publisher: String, license: Option<&str>, url: &str) -> Attribution {
+    let credit = cut_for_corner(match license {
+        Some(l) => format!("{publisher} ({l})"),
+        None => publisher.clone(),
+    });
+    let mut text = format!("Attribution: {publisher}\n");
+    if let Some(l) = license {
+        text.push_str(&format!("License: {l}\n"));
+    }
+    text.push_str(&format!("Source: {url}\n"));
+    Attribution { credit, text }
 }
 
 fn remote_chain(url: &str) -> Option<Attribution> {
@@ -400,6 +480,81 @@ project at the William & Mary geoLab.
         assert!(a.credit.contains("Copernicus"), "{}", a.credit);
         // The wrapped credit must arrive whole, agency and all.
         assert!(a.credit.contains("European Environment Agency"), "{}", a.credit);
+    }
+
+    /// Overture's parquet carries no attribution metadata and its bucket
+    /// has no ATTRIBUTION.txt, so the sidecar walk found nothing and the
+    /// layers drew uncredited. The catalog does state a licence, and it
+    /// differs per collection.
+    #[test]
+    fn stac_credits_publisher_with_the_collection_licence() {
+        use super::super::repo::StacCollection;
+        let col = |license: Option<&str>, providers: Vec<&str>| StacCollection {
+            license: license.map(str::to_string),
+            providers: providers.into_iter().map(str::to_string).collect(),
+            parts: 1,
+        };
+        let url = "https://stac.example/2026-06/buildings/building/collection.json";
+
+        // Overture's shape: no providers, so the repository entry names
+        // the publisher and the collection supplies the licence.
+        let a = stac_credit(&col(Some("ODbL-1.0"), vec![]), Some("Overture"), url).unwrap();
+        assert_eq!(a.credit, "Overture (ODbL-1.0)");
+        assert!(a.text.contains("License: ODbL-1.0"));
+
+        // A collection that names its own rights holders is credited from
+        // those, whatever the repository entry says.
+        let a = stac_credit(
+            &col(Some("CC-BY-4.0"), vec!["The Publisher"]),
+            Some("Overture"),
+            url,
+        )
+        .unwrap();
+        assert_eq!(a.credit, "The Publisher (CC-BY-4.0)");
+
+        // "other" is the spec's placeholder for "look it up" — printing it
+        // in the map corner would say nothing.
+        let a = stac_credit(&col(Some("other"), vec![]), Some("Overture"), url).unwrap();
+        assert_eq!(a.credit, "Overture");
+        assert!(!a.text.contains("License:"));
+
+        // Nothing to go on: no credit rather than an invented one.
+        assert!(stac_credit(&col(Some("ODbL-1.0"), vec![]), None, url).is_none());
+    }
+
+    /// Live probe of the Overture catalog, opt-in:
+    /// cargo test overture_attribution_live -- --ignored --nocapture
+    #[test]
+    #[ignore = "hits the network: Overture's STAC catalog"]
+    fn overture_attribution_live() {
+        let rel = "2026-07-22.0";
+        // The ODbL themes carry OpenStreetMap and must name its
+        // contributors; the permissively licensed ones must not, because
+        // saying so of CC0 bathymetry would be false.
+        for (theme, ty, want_licence, want_osm) in [
+            ("buildings", "building", "ODbL-1.0", true),
+            ("transportation", "segment", "ODbL-1.0", true),
+            ("base", "land_cover", "CC-BY-4.0", false),
+            ("base", "bathymetry", "CC0-1.0", false),
+        ] {
+            let url = format!(
+                "https://stac.overturemaps.org/{rel}/{theme}/{ty}/collection.json"
+            );
+            let src = Source::Stac {
+                url: url.clone(),
+                name: ty.to_string(),
+            };
+            let a = find(&src, &[]).expect("credit from the STAC collection");
+            eprintln!("{theme}/{ty}: {}", a.credit);
+            assert!(a.credit.contains("Overture Maps Foundation"), "{}", a.credit);
+            assert!(a.credit.contains(want_licence), "{}", a.credit);
+            assert_eq!(
+                a.credit.contains("OpenStreetMap"),
+                want_osm,
+                "{theme}/{ty}: {}",
+                a.credit,
+            );
+        }
     }
 
     #[test]

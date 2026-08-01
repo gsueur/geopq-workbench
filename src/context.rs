@@ -39,6 +39,18 @@ pub struct Context {
     pub refine_budget_mb: Option<u32>,
     /// Bottom-to-top draw order.
     pub layers: Vec<LayerCtx>,
+    /// Attribute tables: sources with no map presence, restored so a
+    /// saved query still has everything it referenced. Absent in contexts
+    /// written before they existed.
+    #[serde(default)]
+    pub tables: Vec<TableCtx>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TableCtx {
+    pub source: SourceCtx,
+    /// Display name, which is also what its SQL identifier derives from.
+    pub name: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -369,10 +381,25 @@ mod tests {
                     name: None,
                 },
             ],
+            tables: vec![TableCtx {
+                source: SourceCtx::Local {
+                    path: "/data/codes.csv".into(),
+                },
+                name: "codes".into(),
+            }],
         };
         let json = serde_json::to_string_pretty(&ctx).unwrap();
         let back: Context = serde_json::from_str(&json).unwrap();
         assert_eq!(back.layers.len(), 2);
+        // Attribute tables come back too: a saved query that joined one
+        // would otherwise restore into a session missing half its FROM.
+        assert_eq!(back.tables.len(), 1);
+        assert_eq!(back.tables[0].name, "codes");
+
+        // A context written before tables existed still loads, with none.
+        let older = json.replace("\"tables\"", "\"tables_removed\"");
+        let back: Context = serde_json::from_str(&older).unwrap();
+        assert!(back.tables.is_empty(), "absent means none, not an error");
         // The display label is the one piece of layer state a user types
         // by hand; a session that forgets it loses work silently.
         assert_eq!(back.layers[0].name.as_deref(), Some("Parcels (2024)"));

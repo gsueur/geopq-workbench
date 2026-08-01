@@ -1,4 +1,5 @@
 pub mod attribution;
+pub mod attrs;
 pub mod coastline;
 pub mod colormap;
 pub mod crs;

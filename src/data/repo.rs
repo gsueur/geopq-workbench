@@ -14,7 +14,10 @@
 //! publishes one; otherwise a built-in ISO 3166-2 table (US/CA/MX) is
 //! probed concurrently for `_manifest.json` files.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,6 +26,9 @@ use super::source::http_agent;
 
 const USER_AGENT: &str =
     concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+
+/// Concurrency for the many-small-documents fetches a STAC tree needs.
+const FETCH_THREADS: usize = 8;
 
 /// Repository protocol.
 #[derive(Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -42,6 +48,52 @@ pub struct Repository {
     pub url: String,
     #[serde(default)]
     pub kind: RepoKind,
+    /// Credit the publisher requires, for data that carries none of its
+    /// own. A STAC catalog has no `ATTRIBUTION.txt` and its collections
+    /// declare a licence but no provider, so without this an Overture
+    /// layer showed no credit at all. For a repository that does publish
+    /// a sidecar this is the fallback for when it cannot be reached.
+    #[serde(default)]
+    pub attribution: Option<String>,
+    /// Credit to use instead of `attribution` when the data declares one
+    /// of these licences, by SPDX identifier.
+    ///
+    /// Overture applies ODbL precisely where OpenStreetMap is in the mix,
+    /// and OSM's licence asks for its contributors by name — so an ODbL
+    /// collection needs a different line from the CC0 one next to it.
+    #[serde(default)]
+    pub attribution_by_license: BTreeMap<String, String>,
+}
+
+impl Repository {
+    /// The credit this repository requires for data published under
+    /// `license`, most specific first.
+    pub fn credit_for(&self, license: Option<&str>) -> Option<&str> {
+        license
+            .and_then(|l| {
+                self.attribution_by_license
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(l))
+                    .map(|(_, v)| v)
+            })
+            .or(self.attribution.as_ref())
+            .map(String::as_str)
+    }
+}
+
+/// The credit a configured repository requires for a URL under it, when
+/// the data carries none of its own.
+///
+/// The longest matching base wins, and does not fall through to a shorter
+/// one: `parquetry.geomermaids.com/geoboundaries` sits under the OSM
+/// repository's base, and crediting geoBoundaries polygons to OpenStreetMap
+/// would be worse than crediting them to nobody.
+pub fn credit_for_url(url: &str, license: Option<&str>) -> Option<String> {
+    load_repos()
+        .into_iter()
+        .filter(|r| url.starts_with(&r.url))
+        .max_by_key(|r| r.url.len())
+        .and_then(|r| r.credit_for(license).map(str::to_string))
 }
 
 pub fn default_repos() -> Vec<Repository> {
@@ -50,21 +102,43 @@ pub fn default_repos() -> Vec<Repository> {
             name: "Geomermaids Parquetry (OSM North America)".into(),
             url: "https://parquetry.geomermaids.com".into(),
             kind: RepoKind::Parquetry,
+            // This one publishes an ATTRIBUTION.txt at its root saying the
+            // same thing, and that is what normally supplies the credit.
+            // Here it is the answer for when the sidecar cannot be
+            // fetched: OSM's licence does not stop applying because a
+            // request failed.
+            attribution: Some("© OpenStreetMap contributors".into()),
+            attribution_by_license: BTreeMap::new(),
         },
         Repository {
             name: "Geomermaids geoBoundaries (global admin)".into(),
             url: "https://parquetry.geomermaids.com/geoboundaries".into(),
             kind: RepoKind::Parquetry,
+            attribution: None,
+            attribution_by_license: BTreeMap::new(),
         },
         Repository {
             name: "Geomermaids CORINE Land Cover (Europe)".into(),
             url: "https://parquetry.geomermaids.com/clc".into(),
             kind: RepoKind::Parquetry,
+            attribution: None,
+            attribution_by_license: BTreeMap::new(),
         },
         Repository {
             name: "Overture Maps (STAC)".into(),
             url: "https://stac.overturemaps.org".into(),
             kind: RepoKind::Stac,
+            // The citation Overture's own attribution page gives. The
+            // licence comes from each collection, which is where the
+            // themes differ: buildings are ODbL, base/land_cover CC BY
+            // 4.0, base/bathymetry CC0.
+            attribution: Some("Overture Maps Foundation, overturemaps.org".into()),
+            // Overture's ODbL themes carry OpenStreetMap data, and their
+            // attribution page asks for this line when they do.
+            attribution_by_license: BTreeMap::from([(
+                "ODbL-1.0".to_string(),
+                "© OpenStreetMap contributors, Overture Maps Foundation".to_string(),
+            )]),
         },
     ]
 }
@@ -534,31 +608,142 @@ pub fn discover_datasets_stac(base: &str, snapshot: &str) -> Result<Vec<Dataset>
         .collect())
 }
 
+/// What a STAC collection document says about itself, apart from the list
+/// of items: everything the app needs from it that is not a part.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StacCollection {
+    /// The `license` field: an SPDX identifier ("ODbL-1.0", "CC-BY-4.0",
+    /// "CC0-1.0") or the spec's "other"/"proprietary" placeholders.
+    pub license: Option<String>,
+    /// `providers` entries that hold the rights (licensor or producer),
+    /// most authoritative first. Overture declares none; other catalogs do.
+    #[serde(default)]
+    pub providers: Vec<String>,
+    /// How many parts the collection has, for the browser's part count.
+    pub parts: u64,
+}
+
+/// `~/.config/geopq-workbench/stac_collections_cache.json`: one entry per
+/// collection URL. Same immutability argument as the part cache — release
+/// prefixes are dated and never rewritten — and cleared by the same ⟳.
+fn collections_cache_file() -> Option<PathBuf> {
+    config_file().map(|p| p.with_file_name("stac_collections_cache.json"))
+}
+
+fn read_collections_cache() -> std::collections::HashMap<String, StacCollection> {
+    collections_cache_file()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_collections_cache(cache: &std::collections::HashMap<String, StacCollection>) {
+    let Some(path) = collections_cache_file() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string(cache) {
+        let _ = write_atomic(&path, &json);
+    }
+}
+
+fn parse_stac_collection(col: &Value) -> StacCollection {
+    let parts = col
+        .get("links")
+        .and_then(Value::as_array)
+        .map(|ls| {
+            ls.iter()
+                .filter(|l| l.get("rel").and_then(Value::as_str) == Some("item"))
+                .count()
+        })
+        .unwrap_or(0) as u64;
+    // Rights holders first: a "processor" that merely reformatted the data
+    // is not who the licence asks you to credit.
+    let mut providers: Vec<String> = Vec::new();
+    for p in col.get("providers").and_then(Value::as_array).into_iter().flatten() {
+        let Some(name) = p.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let roles: Vec<&str> = p
+            .get("roles")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if roles.is_empty() || roles.iter().any(|r| *r == "licensor" || *r == "producer") {
+            providers.push(name.to_string());
+        }
+    }
+    StacCollection {
+        license: col
+            .get("license")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|l| !l.is_empty()),
+        providers,
+        parts,
+    }
+}
+
+/// A collection's own description, from the on-disk cache when present.
+///
+/// These documents are mostly their item list — Overture's buildings
+/// collection is 123 KB of links — and the browser used to refetch every
+/// type's copy on every click just to count them. Everything the app takes
+/// from one is small and immutable, so it is worth keeping.
+pub fn fetch_stac_collection(collection_url: &str) -> Result<StacCollection, String> {
+    {
+        let _g = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = read_collections_cache().remove(collection_url) {
+            return Ok(c);
+        }
+    }
+    let col = get_json(collection_url)?
+        .ok_or_else(|| format!("{collection_url}: not found"))?;
+    let parsed = parse_stac_collection(&col);
+    let _g = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = read_collections_cache();
+    cache.insert(collection_url.to_string(), parsed.clone());
+    write_collections_cache(&cache);
+    Ok(parsed)
+}
+
 /// "Manifest" of a STAC theme: its type collections with part counts
 /// (feature totals live in the per-part items — too many to fetch here).
 pub fn fetch_stac_manifest(base: &str, snapshot: &str, theme: &str) -> Result<Manifest, String> {
     let snap = stac_resolve_snapshot(base, snapshot)?;
     let url = format!("{base}/{snap}{theme}/catalog.json");
     let cat = get_json(&url)?.ok_or_else(|| format!("{url}: not found"))?;
-    let mut themes = Vec::new();
-    for ty in stac_children(&cat) {
-        let curl = format!("{base}/{snap}{theme}/{ty}/collection.json");
-        let col = get_json(&curl)?.ok_or_else(|| format!("{curl}: not found"))?;
-        let parts = col
-            .get("links")
-            .and_then(Value::as_array)
-            .map(|ls| {
-                ls.iter()
-                    .filter(|l| l.get("rel").and_then(Value::as_str) == Some("item"))
-                    .count()
-            })
-            .unwrap_or(0);
-        themes.push((ty, parts as u64));
+    let types = stac_children(&cat);
+    // In parallel: a theme has up to six types and each collection is a
+    // separate document, so serially this was six round trips deep.
+    let out: Mutex<Vec<Option<(String, u64)>>> = Mutex::new(vec![None; types.len()]);
+    let first_err = Mutex::new(None::<String>);
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..FETCH_THREADS.min(types.len().max(1)) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(ty) = types.get(i) else { break };
+                let curl = format!("{base}/{snap}{theme}/{ty}/collection.json");
+                match fetch_stac_collection(&curl) {
+                    Ok(c) => out.lock().unwrap()[i] = Some((ty.clone(), c.parts)),
+                    Err(e) => {
+                        first_err.lock().unwrap().get_or_insert(e);
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    if let Some(e) = first_err.into_inner().unwrap() {
+        return Err(e);
     }
     Ok(Manifest {
         state_name: Some(theme.to_string()),
         total_features: None,
-        themes,
+        themes: out.into_inner().unwrap().into_iter().flatten().collect(),
     })
 }
 
@@ -614,7 +799,7 @@ fn stac_bbox_2d(v: &Value) -> Option<[f64; 4]> {
     }
 }
 
-/// `~/.config/geopq-viewer/stac_parts_cache.json`: part lists per
+/// `~/.config/geopq-workbench/stac_parts_cache.json`: part lists per
 /// collection URL. STAC releases live under dated, immutable prefixes,
 /// so entries stay valid until the ⟳ button clears them.
 fn parts_cache_file() -> Option<PathBuf> {
@@ -638,7 +823,7 @@ fn write_parts_cache(cache: &std::collections::HashMap<String, Vec<StacPart>>) {
     }
 }
 
-/// Drop cached part lists of one repository (all its collections).
+/// Drop cached part lists and collection descriptions of one repository.
 pub fn clear_cached_stac_parts(base: &str) {
     let _g = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut cache = read_parts_cache();
@@ -646,6 +831,12 @@ pub fn clear_cached_stac_parts(base: &str) {
     cache.retain(|url, _| !url.starts_with(base));
     if cache.len() != n {
         write_parts_cache(&cache);
+    }
+    let mut cols = read_collections_cache();
+    let n = cols.len();
+    cols.retain(|url, _| !url.starts_with(base));
+    if cols.len() != n {
+        write_collections_cache(&cols);
     }
 }
 
@@ -672,6 +863,16 @@ pub fn fetch_stac_parts(collection_url: &str) -> Result<Vec<StacPart>, String> {
 
 fn fetch_stac_parts_live(collection_url: &str) -> Result<Vec<StacPart>, String> {
     let col = get_json(collection_url)?.ok_or_else(|| format!("{collection_url}: not found"))?;
+    // The document is in hand and carries the licence and part count, so
+    // record them: a layer opened from a pasted URL never went through the
+    // browser, and its credit would otherwise cost a second fetch.
+    {
+        let parsed = parse_stac_collection(&col);
+        let _g = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = read_collections_cache();
+        cache.insert(collection_url.to_string(), parsed);
+        write_collections_cache(&cache);
+    }
     let dir = collection_url
         .rsplit_once('/')
         .map(|(d, _)| d)
@@ -689,9 +890,6 @@ fn fetch_stac_parts_live(collection_url: &str) -> Result<Vec<StacPart>, String> 
         return Err(format!("{collection_url}: no items listed"));
     }
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
-    const FETCH_THREADS: usize = 8;
     let next = AtomicUsize::new(0);
     let parts = Mutex::new(vec![None::<StacPart>; item_urls.len()]);
     let first_err = Mutex::new(None::<String>);
@@ -1010,7 +1208,9 @@ mod tests {
         write_json(
             &root,
             "2026-06/buildings/building/collection.json",
-            json!({"links": [
+            // No providers, like Overture's: the credit has to come from
+            // the repository entry.
+            json!({"license": "ODbL-1.0", "links": [
                 {"rel": "item", "href": "./00000/00000.json"},
                 {"rel": "item", "href": "./00001/00001.json"},
             ]}),
@@ -1018,7 +1218,14 @@ mod tests {
         write_json(
             &root,
             "2026-06/buildings/building_part/collection.json",
-            json!({"links": [{"rel": "item", "href": "./00000/00000.json"}]}),
+            json!({
+                "license": "CC-BY-4.0",
+                "providers": [
+                    {"name": "A Processor", "roles": ["processor"]},
+                    {"name": "The Publisher", "roles": ["producer", "licensor"]},
+                ],
+                "links": [{"rel": "item", "href": "./00000/00000.json"}],
+            }),
         );
         write_json(
             &root,
@@ -1077,6 +1284,107 @@ mod tests {
             m.themes,
             vec![("building".to_string(), 2), ("building_part".to_string(), 1)]
         );
+    }
+
+    #[test]
+    /// Overture's ODbL themes carry OpenStreetMap and must name its
+    /// contributors; the CC0 and CC BY ones next to them must not.
+    fn odbl_collections_get_the_openstreetmap_credit() {
+        let overture = default_repos()
+            .into_iter()
+            .find(|r| r.kind == RepoKind::Stac)
+            .expect("Overture entry");
+        assert_eq!(
+            overture.credit_for(Some("ODbL-1.0")),
+            Some("© OpenStreetMap contributors, Overture Maps Foundation"),
+        );
+        // SPDX identifiers are compared case-insensitively: catalogs write
+        // "ODbL-1.0", the identifier is registered as "ODbL-1.0", and a
+        // catalog writing "odbl-1.0" means the same licence.
+        assert_eq!(
+            overture.credit_for(Some("odbl-1.0")),
+            overture.credit_for(Some("ODbL-1.0")),
+        );
+        for other in ["CC0-1.0", "CC-BY-4.0", "other"] {
+            assert_eq!(
+                overture.credit_for(Some(other)),
+                Some("Overture Maps Foundation, overturemaps.org"),
+                "licence {other}",
+            );
+        }
+        assert_eq!(overture.credit_for(None), overture.attribution.as_deref());
+    }
+
+    #[test]
+    /// The geoBoundaries and CLC repositories sit under the OSM
+    /// repository's base URL. Matching the shorter base would credit their
+    /// polygons to OpenStreetMap, which is worse than crediting nobody.
+    fn a_nested_repository_does_not_inherit_its_parents_credit() {
+        // Defaults are in play only when the user has no config of their
+        // own; these tests share a per-process temp config file.
+        let _ = std::fs::remove_file(config_file().unwrap());
+        assert_eq!(
+            credit_for_url("https://parquetry.geomermaids.com/latest/x.parquet", None),
+            Some("© OpenStreetMap contributors".to_string()),
+        );
+        assert_eq!(
+            credit_for_url(
+                "https://parquetry.geomermaids.com/geoboundaries/6.0.0/a.parquet",
+                None,
+            ),
+            None,
+        );
+        assert_eq!(
+            credit_for_url("https://elsewhere.example/a.parquet", None),
+            None,
+        );
+    }
+
+    #[test]
+    /// The browser used to refetch every type's collection.json on every
+    /// click, just to count its item links — 123 KB of them for Overture's
+    /// buildings. Once read, a collection is cached like its part list is.
+    fn stac_manifest_second_call_needs_no_network() {
+        let (base, root) = spawn_stac_fixture();
+        let first = fetch_stac_manifest(&base, "2026-06/", "buildings").unwrap();
+        // Delete the documents the counts came from: a second call can only
+        // answer from the on-disk cache.
+        std::fs::remove_file(root.join("2026-06/buildings/building/collection.json")).unwrap();
+        std::fs::remove_file(root.join("2026-06/buildings/building_part/collection.json"))
+            .unwrap();
+        let cached = fetch_stac_manifest(&base, "2026-06/", "buildings").unwrap();
+        assert_eq!(cached.themes, first.themes);
+        // ⟳ clears collections alongside parts; the next call goes live.
+        clear_cached_stac_parts(&base);
+        assert!(
+            fetch_stac_manifest(&base, "2026-06/", "buildings").is_err(),
+            "cache cleared, collection documents gone",
+        );
+    }
+
+    #[test]
+    /// Opening a layer records the collection's licence on the way past, so
+    /// a layer opened from a pasted URL is credited without a second fetch.
+    fn opening_parts_records_the_collection() {
+        let (base, root) = spawn_stac_fixture();
+        let url = stac_collection_url(&base, "2026-06/", "buildings", "building");
+        fetch_stac_parts(&url).unwrap();
+        std::fs::remove_file(root.join("2026-06/buildings/building/collection.json")).unwrap();
+        let col = fetch_stac_collection(&url).unwrap();
+        assert_eq!(col.license.as_deref(), Some("ODbL-1.0"));
+        assert_eq!(col.parts, 2);
+        assert!(col.providers.is_empty());
+    }
+
+    #[test]
+    /// Rights holders are credited; a processor that only reformatted the
+    /// data is not who the licence asks for.
+    fn collection_providers_keep_rights_holders_only() {
+        let (base, _root) = spawn_stac_fixture();
+        let url = stac_collection_url(&base, "2026-06/", "buildings", "building_part");
+        let col = fetch_stac_collection(&url).unwrap();
+        assert_eq!(col.providers, vec!["The Publisher".to_string()]);
+        assert_eq!(col.license.as_deref(), Some("CC-BY-4.0"));
     }
 
     #[test]

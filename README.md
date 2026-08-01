@@ -42,11 +42,15 @@ so it doubles as a hands-on guide to GeoParquet best practices.
 - **Catalog browser**: Overture Maps and Geomermaids Parquetry are
   preconfigured; check the layers you want and they load straight onto
   the map.
-- **SQL console**: DataFusion with 24 spatial functions (including
-  `st_transform` reprojection) over every loaded layer, local or
-  remote, with spatial predicate pushdown and persistent query
-  history. Results can be highlighted on the map or exported as new
-  layers.
+- **SQL console**: DataFusion with 28 spatial functions (including
+  `st_transform` reprojection and polygon set operations) and 3 spatial
+  aggregates over every loaded layer, local or remote, with spatial
+  predicate pushdown and persistent query history. Results can be
+  highlighted on the map or exported as new layers.
+- **Attribute tables and joins**: open a parquet or CSV file with no
+  geometry as a SQL table with no map presence, join it to a layer on a
+  shared column, and put the result back on the map as a styleable
+  layer.
 - **Cartography that defaults well**: automatic equal-area projection
   choice per dataset, ~30 official national grids, data-driven styling
   with six ramps, seven classification methods and an interactive
@@ -56,9 +60,9 @@ so it doubles as a hands-on guide to GeoParquet best practices.
   (std, open/close, hillshade) over it, and get the cells or contour
   lines back as a new GeoParquet layer. 2.56M parcels to a 1 km grid in
   ~0.7 s.
-- **No barriers to entry**: built-in sample datasets and a pure-Rust
-  importer for GeoPackage, Shapefile and GeoJSON (no GDAL) if your data
-  is not in GeoParquet yet.
+- **No barriers to entry**: browse public catalogs from the app, and a
+  pure-Rust importer for GeoPackage, Shapefile and GeoJSON (no GDAL) if
+  your data is not in GeoParquet yet.
 
 ## Install
 
@@ -124,9 +128,10 @@ cargo build --release   # binary in target/release/geopq-workbench
 1. **Launch it.** Nothing to configure.
 2. **Get data on the map.** Drag & drop `.parquet` files or a dataset
    folder onto the window, or use File → Open… / Open folder… / Open
-   URL… No GeoParquet at hand? **File → Open sample dataset** streams
-   small hosted samples, and **File → Import vector file…** converts a
-   GeoPackage table, a Shapefile or a GeoJSON file on the spot.
+   URL… No GeoParquet at hand? **File → Repositories…** browses public
+   catalogs (Overture Maps and friends), and **File → Import vector
+   file…** converts a GeoPackage table, a Shapefile or a GeoJSON file on
+   the spot.
 3. **Click around.** Click any feature for its attributes (fetched from
    the file on demand, nothing preloaded). The status bar shows
    coordinates, zoom, frame time and load progress.
@@ -153,8 +158,8 @@ geopq-workbench file.parquet dataset_dir/ https://host/data.parquet
 | S3 (`s3://bucket/key`) | File → Open URL… — profiles from `~/.aws`, custom endpoints (MinIO etc.), anonymous access to public buckets |
 | S3 hive dataset (`s3://bucket/prefix/` or a `*` glob) | File → Open URL… — every matching parquet part loads as one layer (`s3://bucket/d/state=*/roads.parquet` picks one theme across partitions); `key=value` path segments become queryable columns |
 | Catalogs (Overture Maps, Parquetry, your own) | File → Repositories… — browse snapshots, check layers, they load with sensible names and stacking order. Parquetry repos can load a theme across every state of a country as one layer, with `country`/`state` as columns. A STAC collection opens the parts covering most of the current view and adds the others as you pan into them |
+| Attribute table (parquet or CSV, no geometry) | File → Open attribute table…, or drag & drop a `.csv`. Columns become a SQL table to query and to join a layer against; types are inferred for CSV. No map presence |
 | GeoPackage / Shapefile / GeoJSON | drag & drop or File → Import vector file… — pure-Rust conversion to GeoParquet (no GDAL), with a covering bbox column and byte-sized row groups so the result is readable by viewport from the first open, then opens normally |
-| Sample data | File → Open sample dataset |
 
 Format-wise, anything in the GeoParquet family works: 1.0, 1.1 with WKB
 or GeoArrow coordinate arrays, 2.0 with native GEOMETRY/GEOGRAPHY
@@ -434,15 +439,6 @@ quality gate and display policy).
 
 ## Roadmap
 
-- More SQL: polygon set operations (union, intersection, difference)
-  and spatial aggregates, so the console can produce a layer rather
-  than only filter one.
-- Attribute tables with no geometry, loaded as first-class sources:
-  plain parquet first, then CSV with type inference. They would carry
-  no map presence of their own, only columns to query and join against.
-- Joins between an attribute table and a geo layer, keyed on a shared
-  column, producing a styleable layer. This is the reason the two
-  entries above are worth having.
 - Line styling: dash patterns and caps, plus width driven by a
   classified column the way colour already is.
 - Export the current view to SVG, for a figure that goes into a
@@ -455,6 +451,14 @@ quality gate and display policy).
   so this needs a manifest convention first.
 - Label rendering.
 
+Polygon set operations, spatial aggregates, attribute tables and joins
+all shipped together: `st_union/intersection/difference/symdifference`
+on two geometries, `st_union_agg/st_extent/st_collect` over a group, and
+parquet or CSV files with no geometry loaded as SQL tables with no map
+presence. A layer joined to a table on a shared column produces a result
+that is still geometry, so it goes back on the map through the same
+"Result as layer" the console already had.
+
 Zoom-dependent level of detail shipped in 0.5.0, by scale rather than
 by data volume; the overview/pyramid approach it replaced was tried and
 discarded. Basemap tiles now reproject onto a mesh instead of being
@@ -466,7 +470,7 @@ instead of refusing to open past a part count.
 ## Development
 
 ```bash
-cargo test          # 150+ tests, no fixtures needed for most
+cargo test          # 240+ tests, no fixtures needed for most
 cargo run --release testdata/points_1m_wgs84.parquet
 ```
 

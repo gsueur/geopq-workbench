@@ -2164,7 +2164,16 @@ fn open_stac_store(
             .collect::<Result<_, _>>()?
     };
     let hive = vec![Vec::new(); files.len()];
-    open_multi_store(source, files, hive)
+    let mut opened = open_multi_store(source, files, hive)?;
+    // The parts are plain object-store URLs, so the info built from the
+    // first one looked for a credit beside a parquet file in a bucket and
+    // found none. What licenses this data is the collection that lists it.
+    // Only as a fallback: a part that credits itself is more specific than
+    // anything the collection can say about the set.
+    if opened.2.attribution.is_none() {
+        opened.2.attribution = crate::data::attribution::find(source, &[]);
+    }
+    Ok(opened)
 }
 
 /// Open a set of same-schema parquet files as one multi-fragment store.
@@ -5322,6 +5331,13 @@ mod pruning_tests {
         assert_eq!(store.stac_collection(), Some(url));
         assert_eq!(store.part_urls().len(), store.fragments.len());
         assert!(info.files >= store.fragments.len());
+        // The parts are bare object-store URLs with no credit of their
+        // own; the collection is what says who owns this and under what
+        // terms, and ODbL makes the credit a licence condition.
+        let a = info.attribution.expect("credit from the STAC collection");
+        eprintln!("credit: {}", a.credit);
+        assert!(a.credit.contains("Overture Maps Foundation"), "{}", a.credit);
+        assert!(a.credit.contains("ODbL-1.0"), "{}", a.credit);
 
         // Pan to California: parts the store does not hold.
         let parts = crate::data::repo::fetch_stac_parts(url).expect("part list");

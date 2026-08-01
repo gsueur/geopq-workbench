@@ -336,3 +336,115 @@ mod tests {
         let _ = std::fs::remove_file(&dst);
     }
 }
+
+#[cfg(test)]
+mod join_tests {
+    use super::*;
+    use crate::data::attrs;
+    use crate::data::loader::open_store_for_test;
+    use crate::data::source::Source;
+    use crate::sql::engine::{run_join_for_test, SqlLayer, SqlTable};
+
+    /// The whole workflow a CSV attribute takes to reach the map: open the
+    /// file as a table, join it to a layer, export the result, reopen it.
+    ///
+    /// Each half is covered elsewhere; what this pins is that the joined
+    /// column survives to the far end. Styling reads columns off the
+    /// reopened store, so a value that gets as far as the query result and
+    /// no further would look like a working join right up to the point of
+    /// being useless.
+    #[test]
+    fn a_csv_attribute_survives_all_the_way_onto_the_map() {
+        let fixture = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/polygons_5k_l93.parquet"
+        ));
+        if !fixture.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("geopq_join_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // The CSV a user would drop on the window.
+        let csv = dir.join("bands.csv");
+        std::fs::write(&csv, "band,label,score\n0,west,10.5\n1,east,20.5\n").unwrap();
+        let src = Source::Local(csv.clone());
+        let preview = attrs::inspect(&src).expect("csv inspects");
+        let data = attrs::import(&src, &preview.plan).expect("csv imports");
+        let t = attrs::AttrTable::new(0, "bands".into(), src, data);
+        let tables = vec![SqlTable {
+            table: "bands".into(),
+            schema: Arc::clone(&t.schema),
+            batches: Arc::clone(&t.batches),
+        }];
+
+        let (store, crs, _, _) = open_store_for_test(&fixture).unwrap();
+        let layers = vec![SqlLayer {
+            table: "t".into(),
+            store: Arc::new(store),
+            crs,
+            rg_bboxes: None,
+        }];
+
+        // Join on a key the layer computes, keeping the geometry.
+        let out = run_join_for_test(
+            "select t.geometry, b.label, b.score from t \
+             join bands b on b.band = case when st_xmin(t.geometry) > 0 then 1 else 0 end \
+             where t.geometry is not null limit 200",
+            &layers,
+            &tables,
+        )
+        .expect("join runs");
+        let (geom_col, out_crs) = out.geom.clone().expect("result is geometry");
+
+        let dst = dir.join("joined.parquet");
+        write_result(
+            &dst,
+            &out.schema,
+            std::slice::from_ref(&out.batch),
+            geom_col,
+            &out_crs,
+        )
+        .expect("exports");
+
+        // Reopened the way "Result as layer" reopens it.
+        let (store2, crs2, _, _) = open_store_for_test(&dst).expect("reopens as a layer");
+        assert_eq!(store2.total_rows(), 200);
+        assert_eq!(crs2.epsg, Some(2154), "CRS survives the join and the export");
+
+        // The CSV's columns are on the layer, with their inferred types
+        // intact — `score` must still be a number, or classified styling
+        // has nothing to classify.
+        let names: Vec<&str> = store2
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(names.contains(&"label"), "csv label column: {names:?}");
+        assert!(names.contains(&"score"), "csv score column: {names:?}");
+        let score = store2
+            .schema
+            .field_with_name("score")
+            .expect("score field")
+            .data_type()
+            .clone();
+        assert_eq!(score, arrow::datatypes::DataType::Float64, "still numeric");
+
+        // And the values arrived, not just the columns.
+        let batches = store2.fetch(&[0, 1, 2], None).expect("read back");
+        let col = batches[0]
+            .column_by_name("label")
+            .expect("label column")
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("utf8");
+        assert!(
+            (0..col.len()).all(|i| col.value(i) == "west" || col.value(i) == "east"),
+            "labels came from the CSV",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

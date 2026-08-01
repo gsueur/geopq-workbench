@@ -16,10 +16,10 @@ use datafusion::common::{DataFusionError, Result as DfResult};
 use datafusion::logical_expr::{create_udf, ColumnarValue, ScalarUDF, Volatility};
 use datafusion::prelude::SessionContext;
 use geo::{
-    Area, BoundingRect, Buffer, Centroid, Contains, ConvexHull, CoordsIter, Distance, Euclidean,
-    Intersects, Length, Simplify, Within,
+    Area, BooleanOps, BoundingRect, Buffer, Centroid, Contains, ConvexHull, CoordsIter, Distance,
+    Euclidean, Intersects, Length, OpType, Simplify, Within,
 };
-use geo_types::{Geometry, Point, Rect};
+use geo_types::{Geometry, MultiPolygon, Point, Polygon, Rect};
 use wkt::ToWkt;
 
 use crate::data::crs::Crs;
@@ -76,6 +76,10 @@ pub const NAMES: &[&str] = &[
     "st_simplify",
     "st_convexhull",
     "st_transform",
+    "st_union",
+    "st_intersection",
+    "st_difference",
+    "st_symdifference",
 ];
 
 /// Names and signatures for the console's help panel.
@@ -104,6 +108,10 @@ pub fn catalog() -> &'static [(&'static str, &'static str)] {
             "st_transform(geom, 'EPSG:4326', 'EPSG:2154')",
             "reproject between CRSs (EPSG codes or proj4 strings)",
         ),
+        ("st_union(a, b)", "areal union of two geometries"),
+        ("st_intersection(a, b)", "the area both cover"),
+        ("st_difference(a, b)", "a with b cut out of it"),
+        ("st_symdifference(a, b)", "the area exactly one of them covers"),
     ]
 }
 
@@ -221,6 +229,15 @@ fn all_udfs() -> Vec<ScalarUDF> {
         geom_to_geom("st_convexhull", |g| {
             Some(Geometry::Polygon(g.convex_hull()))
         }),
+        // Set operations. Always a MultiPolygon out, even for a single
+        // part: cutting one polygon with another can split it in two, so
+        // the type cannot depend on the values.
+        geom_pair_to_geom("st_union", |a, b| set_op(a, b, OpType::Union)),
+        geom_pair_to_geom("st_intersection", |a, b| {
+            set_op(a, b, OpType::Intersection)
+        }),
+        geom_pair_to_geom("st_difference", |a, b| set_op(a, b, OpType::Difference)),
+        geom_pair_to_geom("st_symdifference", |a, b| set_op(a, b, OpType::Xor)),
         make_udf("st_buffer", vec![Binary, Float64], Binary, |args| {
             let g = geom_array(&args[0])?;
             let d = f64_array(&args[1])?;
@@ -371,6 +388,57 @@ fn geom_to_geom(name: &str, f: fn(&Geometry<f64>) -> Option<Geometry<f64>>) -> S
         }
         Ok(b.finish())
     })
+}
+
+fn geom_pair_to_geom(
+    name: &str,
+    f: fn(&Geometry<f64>, &Geometry<f64>) -> Option<Geometry<f64>>,
+) -> ScalarUDF {
+    make_udf(
+        name,
+        vec![DataType::Binary, DataType::Binary],
+        DataType::Binary,
+        move |args| {
+            let a = geom_array(&args[0])?;
+            let c = geom_array(&args[1])?;
+            let mut b = WkbOut::new();
+            for i in 0..a.len() {
+                match (geom_at(&a, i), geom_at(&c, i)) {
+                    (Some(ga), Some(gb)) => b.push(f(&ga, &gb).as_ref())?,
+                    _ => b.push(None)?,
+                }
+            }
+            Ok(b.finish())
+        },
+    )
+}
+
+/// The areal part of a geometry, as the `MultiPolygon` the set operations
+/// work on.
+///
+/// `BooleanOps` is implemented for `Polygon` and `MultiPolygon` only, which
+/// is not a gap in the library: a line and a point have no area, so there
+/// is no answer to give for "the region both cover". A collection
+/// contributes whatever polygons it holds. Anything else yields None, and
+/// the caller turns that into NULL rather than a wrong answer.
+fn areal(g: &Geometry<f64>) -> Option<MultiPolygon<f64>> {
+    match g {
+        Geometry::Polygon(p) => Some(MultiPolygon::new(vec![p.clone()])),
+        Geometry::MultiPolygon(m) => Some(m.clone()),
+        Geometry::Rect(r) => Some(MultiPolygon::new(vec![r.to_polygon()])),
+        Geometry::Triangle(t) => Some(MultiPolygon::new(vec![t.to_polygon()])),
+        Geometry::GeometryCollection(c) => {
+            let polys: Vec<Polygon<f64>> =
+                c.iter().filter_map(areal).flat_map(|m| m.0).collect();
+            (!polys.is_empty()).then(|| MultiPolygon::new(polys))
+        }
+        _ => None,
+    }
+}
+
+fn set_op(a: &Geometry<f64>, b: &Geometry<f64>, op: OpType) -> Option<Geometry<f64>> {
+    let (a, b) = (areal(a)?, areal(b)?);
+    Some(Geometry::MultiPolygon(a.boolean_op(&b, op)))
 }
 
 fn geom_pair_to_bool(name: &str, f: fn(&Geometry<f64>, &Geometry<f64>) -> bool) -> ScalarUDF {
