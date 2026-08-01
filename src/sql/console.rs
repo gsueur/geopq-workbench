@@ -69,6 +69,38 @@ pub(crate) struct AcState {
     /// Byte range of the token being completed.
     token: std::ops::Range<usize>,
     selected: usize,
+    /// A token the popup must stay shut for. `open` is recomputed from
+    /// the cursor every frame, so without this a dismissal lasts until
+    /// the next frame and no further.
+    dismissed: Option<Dismissed>,
+}
+
+/// A token the completion popup was dismissed for.
+pub(crate) struct Dismissed {
+    /// Start byte of the token, so the same word typed elsewhere in the
+    /// query still completes.
+    start: usize,
+    /// The token, lowercased.
+    word: String,
+    /// Whether it also covers whatever is typed after it. Escape means
+    /// "leave this word alone" and stays shut as the word grows;
+    /// accepting a candidate only suppresses the reopen it would cause
+    /// by itself, so typing on re-triggers the popup. There is no
+    /// keystroke to summon it back, which is why accepting does not
+    /// shut it for the rest of the word.
+    sticky: bool,
+}
+
+/// Should the popup stay shut for the token now under the cursor?
+fn suppressed(d: Option<&Dismissed>, start: usize, prefix: &str) -> bool {
+    d.is_some_and(|d| {
+        d.start == start
+            && if d.sticky {
+                prefix.starts_with(&d.word)
+            } else {
+                prefix == d.word
+            }
+    })
 }
 
 pub struct SqlConsole {
@@ -1215,6 +1247,11 @@ pub(crate) fn autocomplete_edit(
             }
             if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
                 ac.open = false;
+                ac.dismissed = Some(Dismissed {
+                    start: ac.token.start,
+                    word: text.get(ac.token.clone()).unwrap_or_default().to_lowercase(),
+                    sticky: true,
+                });
             }
             if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
                 || i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
@@ -1270,10 +1307,15 @@ pub(crate) fn autocomplete_edit(
                     let byte_start: usize =
                         chars[..start].iter().map(|c| c.len_utf8()).sum();
                     let byte_end: usize = chars[..cur].iter().map(|c| c.len_utf8()).sum();
-                    ac.token = byte_start..byte_end;
-                    ac.selected = ac.selected.min(items.len() - 1);
-                    ac.items = items;
-                    ac.open = true;
+                    if suppressed(ac.dismissed.as_ref(), byte_start, &prefix_l) {
+                        ac.token = byte_start..byte_end;
+                    } else {
+                        ac.dismissed = None;
+                        ac.token = byte_start..byte_end;
+                        ac.selected = ac.selected.min(items.len() - 1);
+                        ac.items = items;
+                        ac.open = true;
+                    }
                 }
             }
         }
@@ -1325,6 +1367,15 @@ fn apply_completion(
         return;
     }
     text.replace_range(range.clone(), word);
+    // The cursor now sits at the end of the word just inserted, which is
+    // itself a prefix of every longer candidate. Without this the popup
+    // reopens on the completion it just applied, and only a character
+    // that breaks the prefix (a comma, a space) closes it.
+    ac.dismissed = Some(Dismissed {
+        start: range.start,
+        word: word.to_lowercase(),
+        sticky: false,
+    });
     let cursor_chars = text[..range.start + word.len()].chars().count();
     if let Some(mut state) = egui::text_edit::TextEditState::load(ctx, id) {
         state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
@@ -1629,7 +1680,39 @@ fn geom_cell(col: &dyn Array, i: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{aliases, from_context, qualifier, CompletionDict};
+    use super::{aliases, from_context, qualifier, suppressed, CompletionDict, Dismissed};
+
+    /// Accepting a candidate must not reopen the popup on the word it
+    /// just inserted, and typing on must bring it back.
+    #[test]
+    fn an_accepted_completion_shuts_the_popup_until_the_word_changes() {
+        let d = Dismissed {
+            start: 7,
+            word: "nom".into(),
+            sticky: false,
+        };
+        assert!(suppressed(Some(&d), 7, "nom"));
+        // one more character: the user is typing again, so offer again
+        assert!(!suppressed(Some(&d), 7, "nom_"));
+        // the same word elsewhere in the query is a different token
+        assert!(!suppressed(Some(&d), 20, "nom"));
+    }
+
+    /// Escape means "leave this word alone", so it has to survive the
+    /// next keystroke: the popup is reopened from the cursor every frame.
+    #[test]
+    fn escape_shuts_the_popup_for_the_rest_of_the_word() {
+        let d = Dismissed {
+            start: 7,
+            word: "nom".into(),
+            sticky: true,
+        };
+        assert!(suppressed(Some(&d), 7, "nom"));
+        assert!(suppressed(Some(&d), 7, "nom_off"));
+        // deleting back past what was dismissed starts a new word
+        assert!(!suppressed(Some(&d), 7, "no"));
+        assert!(!suppressed(None, 7, "nom"));
+    }
 
     fn dict() -> CompletionDict {
         let mut columns = std::collections::HashMap::new();
