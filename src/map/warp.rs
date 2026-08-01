@@ -110,11 +110,23 @@ pub struct WarpPlan {
 }
 
 impl WarpPlan {
-    /// Whether tiles carrying rendered text still look right. Five degrees
-    /// of tilt and a fifth of stretch are both a little under what the eye
-    /// picks up on a place name.
+    /// Whether tiles carrying rendered text still look right.
+    ///
+    /// Tilt and stretch are not equally forgiving. Rotated text reads as
+    /// broken; text stretched along one axis reads as a condensed or
+    /// extended face, which is a thing fonts do on purpose.
+    ///
+    /// The stretch limit was 1.2, and that was too strict to be useful in
+    /// the app's own default projection. Hobo-Dyer is equal-area and
+    /// Mercator is conformal, so the two never agree on aspect: the ratio
+    /// is 1.0 only at the standard parallel (37.5°), rising to 1.59 at the
+    /// equator and 2.5 by 60°. At 1.2 a labelled style survived only
+    /// between roughly 31° and 43°, so anyone working over Europe saw the
+    /// label-free twin every time and concluded the labelled sources were
+    /// broken. 1.6 makes the band continuous from the equator to about
+    /// 51°, which covers most of where the labels are worth having.
     pub fn labels_survive(&self) -> bool {
-        self.rotation_deg <= 5.0 && self.anisotropy <= 1.2
+        self.rotation_deg <= 5.0 && self.anisotropy <= 1.6
     }
 }
 
@@ -432,6 +444,52 @@ mod tests {
         assert!(p.rotation_deg < 1e-6, "{}", p.rotation_deg);
         assert!(approx(p.anisotropy, 1.0, 1e-6), "{}", p.anisotropy);
         assert!(p.labels_survive());
+    }
+
+    /// Where a labelled style survives in the app's default projection.
+    ///
+    /// This is the case that matters most, because it is what every session
+    /// starts in. Hobo-Dyer is equal-area and Mercator is conformal, so
+    /// there is no view where the aspect matches exactly: the question is
+    /// only how much stretch is tolerated. Pinned here so that moving the
+    /// limit is a decision someone makes on purpose, with the latitudes it
+    /// costs written down.
+    #[test]
+    fn hobo_dyer_keeps_labels_from_the_equator_to_northern_europe() {
+        let d = DisplayCrs::hobo_dyer();
+        let w = Warp::new(&d);
+        // Zoomed in far enough that the plan reports the local distortion
+        // rather than the spread across a continent-wide viewport.
+        let at = |lon: f64, lat: f64| {
+            let c = w.display_world(merc_world_from_lonlat(lon, lat)).unwrap();
+            let cam = Camera { center: c, zoom: 12.0 };
+            plan(&w, &cam, [1400.0, 900.0], 20).expect("plans at city scale")
+        };
+        for &(name, lon, lat) in &[
+            ("Nairobi", 36.82, -1.29),
+            ("Cairo", 31.24, 30.04),
+            ("Toulouse", 1.44, 43.60),
+            ("Paris", 2.35, 48.85),
+        ] {
+            let p = at(lon, lat);
+            // Both projections are north-up cylindrical: no tilt anywhere,
+            // which is why stretch alone decides this.
+            assert!(p.rotation_deg < 1e-6, "{name}: rot {}", p.rotation_deg);
+            assert!(
+                p.labels_survive(),
+                "{name}: aniso {:.3} — labelled styles should still be drawn here",
+                p.anisotropy,
+            );
+        }
+        // Far enough north that the stretch is no longer a font, it is a
+        // defect: the label-free twin is the right answer.
+        let oslo = at(10.75, 59.91);
+        assert!(
+            !oslo.labels_survive(),
+            "Oslo: aniso {:.3} — this much stretch should drop labels",
+            oslo.anisotropy,
+        );
+        assert!(crate::map::tiles::nolabels_twin(0).is_some(), "Carto Light has a twin");
     }
 
     fn lambert93() -> DisplayCrs {
