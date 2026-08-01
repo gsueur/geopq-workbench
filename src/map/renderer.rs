@@ -994,79 +994,83 @@ impl egui_wgpu::CallbackTrait for MapCallback {
             }
 
             for layer in group_layers {
-            let Some(gpu) = res.layers.get(&layer.key) else {
-                continue;
-            };
-            let s = &layer.style;
-            if s.line_color[3] <= 0.0 {
-                continue;
-            }
-            let lod = line_lod_for_zoom(cam.zoom);
-            for (ci, chunk) in gpu.chunks.iter().enumerate() {
-                if s.bin_hidden(chunk.bin) {
+                let Some(gpu) = res.layers.get(&layer.key) else {
+                    continue;
+                };
+                let s = &layer.style;
+                // Transparent outlines skip the line pass only: points of
+                // the same layer still have to draw.
+                if s.line_color[3] > 0.0 {
+                    let lod = line_lod_for_zoom(cam.zoom);
+                    for (ci, chunk) in gpu.chunks.iter().enumerate() {
+                        if s.bin_hidden(chunk.bin) {
+                            continue;
+                        }
+                        let count = chunk.line_bufs[lod]
+                            .as_ref()
+                            .map(|(_, index)| line_count_for_scale(index, scale))
+                            .unwrap_or(0);
+                        if count > 0 && visible(&chunk.bounds_world) {
+                            #[cfg(test)]
+                            if std::env::var("GEOPQ_DEBUG_DRAWS").is_ok() {
+                                eprintln!("chunk {ci}: lod {lod} count {count}");
+                            }
+                            let line_color = match &s.bin_colors {
+                                Some(lut) => {
+                                    let c = lut[chunk.bin as usize % lut.len()];
+                                    // Darkened ramp color keeps outlines readable.
+                                    [c[0] * 0.65, c[1] * 0.65, c[2] * 0.65, s.line_color[3]]
+                                }
+                                None => s.line_color,
+                            };
+                            let uoffset = push_uniform(
+                                &mut uniforms,
+                                chunk.origin,
+                                [1.0, 1.0],
+                                line_color,
+                                s.line_half_width_px,
+                            );
+                            draw_list.push(DrawCmd::Line {
+                                layer: layer.key,
+                                chunk: ci,
+                                uoffset,
+                                lod,
+                                count,
+                            });
+                        }
+                    }
+                }
+                if s.point_color[3] <= 0.0 {
                     continue;
                 }
-                let count = chunk.line_bufs[lod]
-                    .as_ref()
-                    .map(|(_, index)| line_count_for_scale(index, scale))
-                    .unwrap_or(0);
-                if count > 0 && visible(&chunk.bounds_world) {
-                    #[cfg(test)]
-                    if std::env::var("GEOPQ_DEBUG_DRAWS").is_ok() {
-                        eprintln!("chunk {ci}: lod {lod} count {count}");
+                for (ci, chunk) in gpu.chunks.iter().enumerate() {
+                    if chunk.point_count > 0
+                        && !s.bin_hidden(chunk.bin)
+                        && visible(&chunk.bounds_world)
+                    {
+                        let b = &chunk.bounds_world;
+                        let chunk_px = [
+                            ((b[2] - b[0]) * scale) as f32,
+                            ((b[3] - b[1]) * scale) as f32,
+                        ];
+                        let count =
+                            point_draw_count(chunk_px, s.point_radius_px, chunk.point_count);
+                        let rgb = s.rgb_for(chunk.bin, s.point_color);
+                        let uoffset = push_uniform(
+                            &mut uniforms,
+                            chunk.origin,
+                            [1.0, 1.0],
+                            [rgb[0], rgb[1], rgb[2], s.point_color[3]],
+                            s.point_radius_px,
+                        );
+                        draw_list.push(DrawCmd::Point {
+                            layer: layer.key,
+                            chunk: ci,
+                            uoffset,
+                            count,
+                        });
                     }
-                    let line_color = match &s.bin_colors {
-                        Some(lut) => {
-                            let c = lut[chunk.bin as usize % lut.len()];
-                            // Darkened ramp color keeps outlines readable.
-                            [c[0] * 0.65, c[1] * 0.65, c[2] * 0.65, s.line_color[3]]
-                        }
-                        None => s.line_color,
-                    };
-                    let uoffset = push_uniform(
-                        &mut uniforms,
-                        chunk.origin,
-                        [1.0, 1.0],
-                        line_color,
-                        s.line_half_width_px,
-                    );
-                    draw_list.push(DrawCmd::Line {
-                        layer: layer.key,
-                        chunk: ci,
-                        uoffset,
-                        lod,
-                        count,
-                    });
                 }
-            }
-            for (ci, chunk) in gpu.chunks.iter().enumerate() {
-                if chunk.point_count > 0
-                    && !s.bin_hidden(chunk.bin)
-                    && visible(&chunk.bounds_world)
-                {
-                    let b = &chunk.bounds_world;
-                    let chunk_px = [
-                        ((b[2] - b[0]) * scale) as f32,
-                        ((b[3] - b[1]) * scale) as f32,
-                    ];
-                    let count =
-                        point_draw_count(chunk_px, s.point_radius_px, chunk.point_count);
-                    let rgb = s.rgb_for(chunk.bin, s.point_color);
-                    let uoffset = push_uniform(
-                        &mut uniforms,
-                        chunk.origin,
-                        [1.0, 1.0],
-                        [rgb[0], rgb[1], rgb[2], s.point_color[3]],
-                        s.point_radius_px,
-                    );
-                    draw_list.push(DrawCmd::Point {
-                        layer: layer.key,
-                        chunk: ci,
-                        uoffset,
-                        count,
-                    });
-                }
-            }
             }
             li = group_end;
         }
