@@ -332,6 +332,15 @@ pub struct ViewerApp {
     pick_dialog: Option<PendingPick>,
     /// Attribute file waiting on the import dialog.
     attr_import: Option<AttrImport>,
+    /// Kept so a worker spawned from a path without one can still wake
+    /// the UI when it finishes.
+    egui_ctx: egui::Context,
+    attr_tx: Sender<AttrMsg>,
+    attr_rx: Receiver<AttrMsg>,
+    /// What the attribute worker is doing, for the status bar. Reading a
+    /// wide remote file takes tens of seconds, which is far too long to
+    /// hold the frame for.
+    attr_busy: Option<String>,
     join_dialog: Option<JoinDialog>,
     join_tx: Sender<crate::sql::engine::SqlMsg>,
     join_rx: Receiver<crate::sql::engine::SqlMsg>,
@@ -361,6 +370,10 @@ pub struct ViewerApp {
     /// URL entry dialog (Some = dialog open): text, selected AWS
     /// profile, discovered profiles, and custom S3 endpoint.
     url_input: Option<(String, Option<String>, Vec<String>, String)>,
+    /// "Open as attribute table" in the URL dialog. A remote parquet
+    /// could be either a layer or a table and nothing in the URL says
+    /// which, so this is asked rather than guessed.
+    url_as_table: bool,
     info_open: Option<u64>,
     /// Layer generations whose CPU-side fill/line arrays were freed after
     /// GPU upload (points are kept for picking).
@@ -547,6 +560,17 @@ struct JoinDialog {
     /// Probe or join in flight, by job id.
     pending: Option<u64>,
     running: bool,
+}
+
+/// A finished attribute-file job from the worker thread.
+enum AttrMsg {
+    Inspected(String, Source, Result<Box<crate::data::attrs::Preview>, String>),
+    Imported(
+        String,
+        Source,
+        crate::data::attrs::GeometryPlan,
+        Result<Box<crate::data::attrs::AttrData>, String>,
+    ),
 }
 
 /// An attribute file being set up for import.
@@ -831,6 +855,7 @@ impl ViewerApp {
         let (pick_tx, pick_rx) = channel();
         let (repo_tx, repo_rx) = channel();
         let (join_tx, join_rx) = channel();
+        let (attr_tx, attr_rx) = channel();
         let (cat_tx, cat_rx) = channel();
         let (class_tx, class_rx) = channel();
         let (vreclass_tx, vreclass_rx) = channel();
@@ -905,6 +930,10 @@ impl ViewerApp {
             confirm_reset: false,
             pick_dialog: None,
             attr_import: None,
+            egui_ctx: cc.egui_ctx.clone(),
+            attr_tx,
+            attr_rx,
+            attr_busy: None,
             join_dialog: None,
             join_tx,
             join_rx,
@@ -921,6 +950,7 @@ impl ViewerApp {
             errors: Vec::new(),
             show_errors: false,
             url_input: None,
+            url_as_table: false,
             info_open: None,
             stripped: HashSet::new(),
             epsg_input: String::new(),
@@ -2197,90 +2227,130 @@ impl ViewerApp {
     /// the plan is approved: inference is a guess, and a column silently
     /// typed wrong is found much later and in the wrong place.
     fn open_attr_table_named(&mut self, source: Source, name: String) {
-        // Remote sources carry no length until probed, and an unprobed
-        // one reads as an empty file rather than failing.
-        let source = match source.resolve() {
-            Ok(s) => s,
-            Err(e) => {
-                self.push_error(format!("{name}: {e}"));
-                return;
+        if self.attr_busy.is_some() {
+            self.push_error("another table is still being read".into());
+            return;
+        }
+        self.attr_busy = Some(format!("reading {name}"));
+        let tx = self.attr_tx.clone();
+        let egui_ctx = self.egui_ctx.clone();
+        std::thread::spawn(move || {
+            // Remote sources carry no length until probed, and an unprobed
+            // one reads as an empty file rather than failing.
+            let result = source
+                .clone()
+                .resolve()
+                .and_then(|s| crate::data::attrs::inspect(&s).map(|p| (s, Box::new(p))));
+            let msg = match result {
+                Ok((resolved, p)) => AttrMsg::Inspected(name, resolved, Ok(p)),
+                Err(e) => AttrMsg::Inspected(name, source, Err(e)),
+            };
+            let _ = tx.send(msg);
+            egui_ctx.request_repaint();
+        });
+    }
+
+    fn poll_attrs(&mut self, ctx: &egui::Context) {
+        while let Ok(msg) = self.attr_rx.try_recv() {
+            self.attr_busy = None;
+            match msg {
+                AttrMsg::Inspected(name, source, Ok(preview)) => {
+                    self.attr_import = Some(AttrImport {
+                        source,
+                        name,
+                        preview: *preview,
+                        reread: false,
+                    });
+                }
+                AttrMsg::Inspected(name, _, Err(e)) => {
+                    self.push_error(format!("{name}: {e}"))
+                }
+                AttrMsg::Imported(name, source, geometry, Ok(d)) => {
+                    self.finish_attr_import(name, source, geometry, *d, ctx)
+                }
+                AttrMsg::Imported(name, _, _, Err(e)) => {
+                    self.push_error(format!("{name}: {e}"))
+                }
             }
-        };
-        match crate::data::attrs::inspect(&source) {
-            Ok(preview) => {
-                self.attr_import = Some(AttrImport {
-                    source,
-                    name,
-                    preview,
-                    reread: false,
-                });
-            }
-            Err(e) => self.push_error(format!("{name}: {e}")),
         }
     }
 
-    /// Apply an approved plan.
-    fn import_attr_table(&mut self, job: AttrImport, ctx: &egui::Context) {
-        use crate::data::attrs::{self, AttrTable};
+    /// Run an approved plan on a worker. A wide remote file takes tens of
+    /// seconds to read, which is far too long to hold the frame for.
+    fn import_attr_table(&mut self, job: AttrImport, _ctx: &egui::Context) {
         let AttrImport {
             source,
             name,
             preview,
             ..
         } = job;
-        match attrs::import(&source, &preview.plan) {
-            Ok(d) => {
-                if let attrs::GeometryPlan::Points { x, y, epsg } = &preview.plan.geometry {
-                    self.import_as_points(&name, &d, x, y, *epsg, ctx);
-                    return;
-                }
-                let nulled = d.nulled.clone();
-                // The typed, renamed, filtered result written once. Live
-                // reads come from the batches already in hand; the file is
-                // what makes the import survive as something you can keep
-                // or hand to another tool.
-                self.next_table_file += 1;
-                let path = std::env::temp_dir().join(format!(
-                    "geopq_table_{}_{}.parquet",
-                    std::process::id(),
-                    self.next_table_file,
-                ));
-                let written = match attrs::write_parquet(&path, &d) {
-                    Ok(()) => {
-                        self.temp_outputs.push(path.clone());
-                        Some(path)
-                    }
-                    Err(e) => {
-                        // The table is usable without it; say so and move on.
-                        self.push_error(format!("{name}: could not write the imported copy: {e}"));
-                        None
-                    }
-                };
-                let mut t = AttrTable::new(self.next_attr_id, name.clone(), source.clone(), d);
-                t.parquet = written;
-                {
-                log::info!(
-                    "attribute table {name}: {} rows, {} columns, {}",
-                    t.rows,
-                    t.schema.fields().len(),
-                    crate::data::info::fmt_bytes(t.bytes as u64),
-                );
-                self.next_attr_id += 1;
-                self.attr_tables.push(t);
-                // A table has no geometry, so nothing on the map changes;
-                // the console is where it becomes visible.
-                self.sql.open = true;
-                }
-                // Said once, plainly: forcing a type is allowed to lose
-                // values, but never quietly.
-                for (col, n) in nulled {
-                    self.push_error(format!(
-                        "{name}: {n} value{} in {col} did not fit its type and became NULL",
-                        if n == 1 { "" } else { "s" },
-                    ));
-                }
+        self.attr_busy = Some(format!("importing {name}"));
+        let tx = self.attr_tx.clone();
+        let egui_ctx = self.egui_ctx.clone();
+        let plan = preview.plan.clone();
+        std::thread::spawn(move || {
+            let result = crate::data::attrs::import(&source, &plan).map(Box::new);
+            let _ = tx.send(AttrMsg::Imported(name, source, plan.geometry, result));
+            egui_ctx.request_repaint();
+        });
+    }
+
+    /// Take delivery of a finished import.
+    fn finish_attr_import(
+        &mut self,
+        name: String,
+        source: Source,
+        geometry: crate::data::attrs::GeometryPlan,
+        d: crate::data::attrs::AttrData,
+        ctx: &egui::Context,
+    ) {
+        use crate::data::attrs::{AttrTable, GeometryPlan};
+        if let GeometryPlan::Points { x, y, epsg } = &geometry {
+            self.import_as_points(&name, &d, x, y, *epsg, ctx);
+            return;
+        }
+        let nulled = d.nulled.clone();
+        // The typed, renamed, filtered result written once. Live reads
+        // come from the batches already in hand; the file is what makes
+        // the import survive as something you can keep or hand to another
+        // tool.
+        self.next_table_file += 1;
+        let path = std::env::temp_dir().join(format!(
+            "geopq_table_{}_{}.parquet",
+            std::process::id(),
+            self.next_table_file,
+        ));
+        let written = match crate::data::attrs::write_parquet(&path, &d) {
+            Ok(()) => {
+                self.temp_outputs.push(path.clone());
+                Some(path)
             }
-            Err(e) => self.push_error(format!("{name}: {e}")),
+            Err(e) => {
+                // The table is usable without it; say so and move on.
+                self.push_error(format!("{name}: could not write the imported copy: {e}"));
+                None
+            }
+        };
+        let mut t = AttrTable::new(self.next_attr_id, name.clone(), source, d);
+        t.parquet = written;
+        log::info!(
+            "attribute table {name}: {} rows, {} columns, {}",
+            t.rows,
+            t.schema.fields().len(),
+            crate::data::info::fmt_bytes(t.bytes as u64),
+        );
+        self.next_attr_id += 1;
+        self.attr_tables.push(t);
+        // A table has no geometry, so nothing on the map changes; the
+        // console is where it becomes visible.
+        self.sql.open = true;
+        // Said once, plainly: forcing a type is allowed to lose values,
+        // but never quietly.
+        for (col, n) in nulled {
+            self.push_error(format!(
+                "{name}: {n} value{} in {col} did not fit its type and became NULL",
+                if n == 1 { "" } else { "s" },
+            ));
         }
     }
 
@@ -6072,6 +6142,7 @@ impl ViewerApp {
         let Some((url, profile, profiles, endpoint)) = &mut self.url_input else { return };
         let mut open = true;
         let mut submit: Option<Source> = None;
+        let mut as_table = self.url_as_table;
         egui::Window::new("Open URL")
             .id(egui::Id::new("open_url"))
             .open(&mut open)
@@ -6131,6 +6202,10 @@ impl ViewerApp {
                 ui.add_space(4.0);
                 let valid =
                     url.starts_with("http://") || url.starts_with("https://") || is_s3;
+                ui.checkbox(&mut as_table, "open as an attribute table")
+                    .on_hover_text(
+                        "For a file with no geometry: its columns become a SQL                          table to query and to join a layer against. A .csv is                          always one; a parquet could be either, so it is asked",
+                    );
                 if ui.add_enabled(valid, egui::Button::new("Open")).clicked()
                     || (enter && valid)
                 {
@@ -6149,9 +6224,11 @@ impl ViewerApp {
                     });
                 }
             });
+        self.url_as_table = as_table;
         if let Some(src) = submit {
-            if crate::data::attrs::is_tabular(&src) {
-                // A CSV has no geometry to draw wherever it lives.
+            if as_table || crate::data::attrs::is_tabular(&src) {
+                // A CSV has no geometry to draw wherever it lives; a
+                // parquet goes here when asked to.
                 self.open_attr_table(src);
             } else {
                 // Length probe / presign run in the loader thread.
@@ -9104,6 +9181,10 @@ impl ViewerApp {
                         self.show_errors = !self.show_errors;
                     }
                 }
+                if let Some(what) = &self.attr_busy {
+                    ui.spinner();
+                    ui.label(RichText::new(what).weak());
+                }
                 for job in self.loading.values_mut() {
                     if ui
                         .small_button("✖")
@@ -10259,6 +10340,7 @@ impl eframe::App for ViewerApp {
         self.quality_gate_window(&ctx);
         self.about_window(&ctx);
         self.reset_confirm_window(&ctx);
+        self.poll_attrs(&ctx);
         self.attr_import_window(&ctx);
         self.poll_join(&ctx);
         self.join_window(&ctx);
@@ -10291,7 +10373,8 @@ impl eframe::App for ViewerApp {
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.map_panel(ui));
 
-        if !self.loading.is_empty()
+        if self.attr_busy.is_some()
+            || !self.loading.is_empty()
             || !self.rebuilding.is_empty()
             || self.sql.is_running()
             || !self.filter_pending.is_empty()

@@ -474,7 +474,7 @@ fn sample_csv_text(
 }
 
 fn sample_parquet_text(source: &Source) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
-    let (schema, batches) = read_parquet(source, SAMPLE_ROWS)?;
+    let (schema, batches) = read_parquet(source, SAMPLE_ROWS, &[])?;
     let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
     let mut cols: Vec<Vec<String>> = vec![Vec::new(); names.len()];
     for batch in &batches {
@@ -665,7 +665,7 @@ pub fn inspect(source: &Source) -> Result<Preview, String> {
         None
     } else {
         Some(
-            read_parquet(source, 0)?
+            read_parquet(source, 0, &[])?
                 .0
                 .fields()
                 .iter()
@@ -823,25 +823,61 @@ fn reject_geoparquet(source: &Source) -> Result<(), String> {
     Ok(())
 }
 
-/// Read a parquet source. `max_rows` of 0 means schema only.
-fn read_parquet(source: &Source, max_rows: usize) -> Result<(SchemaRef, Vec<RecordBatch>), String> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(source.open()?)
+/// Read a parquet source. `max_rows` of 0 means schema only; `keep`
+/// selects columns by index, or every column when empty.
+///
+/// The selection is pushed into the scan rather than applied after it.
+/// Wide files are the reason: a census extract is ninety columns of ten
+/// million rows, and reading all of them to keep three is the difference
+/// between a table that opens and one that cannot.
+fn read_parquet(
+    source: &Source,
+    max_rows: usize,
+    keep: &[usize],
+) -> Result<(SchemaRef, Vec<RecordBatch>), String> {
+    use parquet::arrow::ProjectionMask;
+
+    let mut builder = ParquetRecordBatchReaderBuilder::try_new(source.open()?)
         .map_err(|e| format!("{}: not a parquet file ({e})", source.name()))?;
-    let declared: i64 = builder
-        .metadata()
+    let meta = builder.metadata().clone();
+    // Only what will actually be read counts against the cap.
+    let declared: i64 = meta
         .row_groups()
         .iter()
-        .map(|rg| rg.total_byte_size())
+        .map(|rg| {
+            if keep.is_empty() {
+                rg.total_byte_size()
+            } else {
+                keep.iter()
+                    .filter_map(|&i| rg.columns().get(i))
+                    .map(|c| c.uncompressed_size().max(0))
+                    .sum()
+            }
+        })
         .sum();
     if max_rows == usize::MAX && declared > MAX_BYTES as i64 {
         return Err(over_cap(declared as usize));
     }
-    let schema = builder.schema().clone();
+    let full = builder.schema().clone();
     if max_rows == 0 {
-        return Ok((schema, Vec::new()));
+        return Ok((full, Vec::new()));
     }
+    let schema: SchemaRef = if keep.is_empty() {
+        full
+    } else {
+        let mask = ProjectionMask::roots(builder.parquet_schema(), keep.iter().copied());
+        builder = builder.with_projection(mask);
+        Arc::new(Schema::new(
+            keep.iter()
+                .filter_map(|&i| full.fields().get(i).map(|f| f.as_ref().clone()))
+                .collect::<Vec<_>>(),
+        ))
+    };
     let reader = builder
         .with_batch_size(BATCH_SIZE)
+        // Bounds the decode as well as the loop: a sample should not pay
+        // for a whole row group of a wide file.
+        .with_limit(max_rows.min(i32::MAX as usize))
         .build()
         .map_err(|e| format!("parquet read error: {e}"))?;
     let mut batches = Vec::new();
@@ -914,12 +950,6 @@ fn numeric_text(col: &ArrayRef, ty: ColType, fmt: NumberFormat) -> ArrayRef {
 /// Apply a plan: read as text, cast to the chosen types, keep the
 /// included columns.
 pub fn import(source: &Source, plan: &ImportPlan) -> Result<AttrData, String> {
-    let text_batches = if is_csv(source) {
-        read_csv_text(source, plan)?
-    } else {
-        read_parquet_text(source)?
-    };
-
     let keep: Vec<(usize, &ColumnPlan)> = plan
         .columns
         .iter()
@@ -929,6 +959,14 @@ pub fn import(source: &Source, plan: &ImportPlan) -> Result<AttrData, String> {
     if keep.is_empty() {
         return Err("no columns selected — an empty table has nothing to join on".into());
     }
+    let idx: Vec<usize> = keep.iter().map(|(i, _)| *i).collect();
+    // Both readers hand back the kept columns, in source order, so the
+    // k-th plan entry is the k-th column of every batch.
+    let text_batches = if is_csv(source) {
+        read_csv_text(source, plan)?
+    } else {
+        read_parquet_text(source, &idx)?
+    };
     let out_schema: SchemaRef = Arc::new(Schema::new(
         keep.iter()
             .map(|(_, c)| Field::new(&c.name, c.ty.arrow(), true))
@@ -940,8 +978,10 @@ pub fn import(source: &Source, plan: &ImportPlan) -> Result<AttrData, String> {
     let mut bytes = 0usize;
     for batch in &text_batches {
         let mut cols: Vec<ArrayRef> = Vec::with_capacity(keep.len());
-        for (k, (i, c)) in keep.iter().enumerate() {
-            let src = batch.column(*i);
+        for (k, (_, c)) in keep.iter().enumerate() {
+            // CSV is read whole (there is no projection to push down), so
+            // its batches still carry every column.
+            let src = batch.column(if is_csv(source) { keep[k].0 } else { k });
             let before = src.null_count();
             // Grouping separators are removed before the cast, not by it:
             // arrow parses `3739`, never `3,739`.
@@ -1100,8 +1140,8 @@ fn read_csv_text(source: &Source, plan: &ImportPlan) -> Result<Vec<RecordBatch>,
     Ok(out)
 }
 
-fn read_parquet_text(source: &Source) -> Result<Vec<RecordBatch>, String> {
-    let (schema, batches) = read_parquet(source, usize::MAX)?;
+fn read_parquet_text(source: &Source, keep: &[usize]) -> Result<Vec<RecordBatch>, String> {
+    let (schema, batches) = read_parquet(source, usize::MAX, keep)?;
     let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
     let text = text_schema(&names);
     batches.iter().map(|b| to_text(b, &text)).collect()
