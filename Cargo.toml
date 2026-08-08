@@ -45,6 +45,7 @@ shapefile = { version = "0.9.0", features = ["geo-types", "yore", "encoding_rs"]
 egui-phosphor = "0.13.0"
 proj4wkt = "0.1.1"
 a5 = "0.9.0"
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 pollster = "1.0.1"
