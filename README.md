@@ -490,11 +490,43 @@ Measured on real datasets, release build:
   geometry), not by file size, and the row budget (~2.5M rows per load)
   keeps worst-case files from exhausting RAM.
 
+## Command-line batch conversion (geopq-cli)
+
+For scripted pipelines — a monthly source refresh, a CI job, a cron
+task — the GUI's Import + Optimize flow is also available headless as
+a second binary, `geopq-cli`, built alongside the app from the same
+crate:
+
+```bash
+cargo build --release   # both binaries
+target/release/geopq-cli --input Data.gpkg --list-layers
+target/release/geopq-cli --input Data.gpkg --layer roads \
+  --output roads.parquet --format geoarrow --h3 8
+```
+
+It wraps the same import (`data::gpkg`/`shp`/`geojson`) and
+optimize (`data::optimize`) machinery the GUI dialogs call, opens no
+window, and touches no GPU — `cargo run --bin geopq-cli -- --help`
+lists every flag (format flavor, row group size/bytes, compression,
+Hilbert sort, covering column, H3 resolution). Point it at an existing
+`.parquet` instead of a raw source to skip straight to the optimize
+pass.
+
+Not yet exposed on the CLI: multi-layer merge, partitioned output, S3
+publish. All work through the GUI today; happy to take a PR extending
+the CLI's flag set to cover them.
+
 ## Under the hood
 
 Pure-Rust stack end to end: parquet/arrow readers, proj4rs
 reprojection, rayon + lyon tessellation, custom wgpu render pipelines
 inside an egui shell. No GDAL, no web view, no server process.
+
+The crate is a `lib.rs` (everything below) plus two thin binaries:
+`main.rs` (the GUI) and `bin/geopq-cli.rs` (the headless converter).
+Both link the full dependency tree — `geopq-cli` never touches wgpu
+or eframe at runtime, but the binary still carries them, since nothing
+splits the CLI's dependencies out of the shared lib today.
 
 | Module | Role |
 |---|---|
@@ -508,9 +540,38 @@ inside an egui shell. No GDAL, no web view, no server process.
 | `map/` | wgpu pipelines, tiles, chunked f64-origin geometry for jitter-free deep zoom, SVG export of the frame |
 | `sql/` | DataFusion integration, ST_* UDFs, spatial pushdown, console UI |
 | `app.rs` | the egui application |
+| `bin/geopq-cli.rs` | headless import + optimize, no window, no GPU |
 
 Design notes live in [docs/OPEN_POLICY.md](docs/OPEN_POLICY.md) (file
 quality gate and display policy).
+
+## Known issues
+
+**Optimize can be killed by the OS on memory-constrained machines,
+below the documented 8 GB cap.** Reproduced exporting a 314k-feature
+polygon layer (WDPA/WDOECM protected areas; some single polygons carry
+over a million vertices) to GeoParquet 2.0 on a 15.5 GB Windows
+machine: the GUI process was killed mid-write (Windows Event Viewer
+logged a `RADAR_PRE_LEAK_64` resource-exhaustion report for
+`geopq-workbench.exe`), leaving a truncated, unreadable output file —
+no error dialog, no partial-write warning, just a dead process.
+
+Two things compound the documented 8 GB uncompressed-size cap
+(`optimize.rs::MAX_IN_MEMORY_BYTES`): it's checked against the row
+groups' `total_byte_size` from the source file's metadata, not
+against actual peak RSS, and the real peak is higher than that number
+— decoded batches, the Hilbert-sort reordering buffers, and the
+writer's own buffers are all live at once. A file that reports safely
+under 8 GB can still exhaust a machine that doesn't have 8 GB free
+*on top of* everything else running.
+
+Retrying the identical conversion through `geopq-cli` (this release)
+on the same machine, same free RAM, succeeded — no GPU/window context
+gave it a meaningfully smaller baseline footprint. That's a workaround,
+not a fix: streaming rewrite (already on the roadmap below) is the
+real one. Until then, on a memory-constrained machine, prefer
+`geopq-cli` for large in-memory-heavy Optimize passes over the GUI,
+and close other memory-heavy applications first.
 
 ## Roadmap
 
