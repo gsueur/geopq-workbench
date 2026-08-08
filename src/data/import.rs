@@ -19,12 +19,17 @@ use serde_json::{json, Value};
 
 pub const IMPORT_BATCH_ROWS: usize = 65_536;
 
-/// Formats the File → Import vector file… dialog accepts.
+/// Formats the File → Import vector file… dialog accepts. `Gdb` only
+/// converts when built with `--features gdal-import` (it needs a system
+/// GDAL — the one format nothing pure-Rust can read); the variant still
+/// exists in default builds so match arms stay exhaustive, `from_path`
+/// just never produces it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ImportFormat {
     Gpkg,
     Shapefile,
     GeoJson,
+    Gdb,
 }
 
 impl ImportFormat {
@@ -33,6 +38,8 @@ impl ImportFormat {
             "gpkg" => Some(Self::Gpkg),
             "shp" => Some(Self::Shapefile),
             "geojson" | "json" => Some(Self::GeoJson),
+            #[cfg(feature = "gdal-import")]
+            "gdb" => Some(Self::Gdb),
             _ => None,
         }
     }
@@ -42,8 +49,29 @@ impl ImportFormat {
             Self::Gpkg => "GeoPackage",
             Self::Shapefile => "Shapefile",
             Self::GeoJson => "GeoJSON",
+            Self::Gdb => "File Geodatabase",
         }
     }
+
+    /// Whether the source path is a directory rather than a single file
+    /// (a File Geodatabase is a `.gdb` folder, not a file).
+    pub fn is_directory(&self) -> bool {
+        matches!(self, Self::Gdb)
+    }
+}
+
+/// One selectable layer inside a multi-layer import source (GeoPackage
+/// feature tables, File Geodatabase layers). Kept independent of the
+/// `gdal` crate so `ImportState` compiles the same with or without the
+/// `gdal-import` feature; only `data::gdb` (cfg-gated) actually builds
+/// these.
+#[derive(Clone)]
+pub struct GdbLayer {
+    pub name: String,
+    pub rows: u64,
+    /// EPSG code, when the layer's spatial reference maps to one.
+    pub epsg: Option<u32>,
+    pub srs_name: String,
 }
 
 /// Byte cap per row group. An import of heavy polygons (land cover,

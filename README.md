@@ -64,7 +64,9 @@ so it doubles as a hands-on guide to GeoParquet best practices.
   ~0.7 s.
 - **No barriers to entry**: browse public catalogs from the app, and a
   pure-Rust importer for GeoPackage, Shapefile and GeoJSON (no GDAL) if
-  your data is not in GeoParquet yet.
+  your data is not in GeoParquet yet. An optional, GDAL-backed importer
+  for Esri File Geodatabase (`.gdb`) is available behind a build flag —
+  see [Importing a File Geodatabase](#importing-a-file-geodatabase).
 
 ## Install
 
@@ -124,6 +126,38 @@ git clone https://github.com/gsueur/geopq-workbench
 cd geopq-workbench
 cargo build --release   # binary in target/release/geopq-workbench
 ```
+
+### Importing a File Geodatabase
+
+Every importer above is pure Rust (no GDAL). Esri's File Geodatabase
+(`.gdb`) is the one exception the app cannot avoid: it is a proprietary,
+undocumented format with no pure-Rust reader, so opening one at all means
+linking GDAL's `OpenFileGDB` driver. That is opt-in, behind the
+`gdal-import` Cargo feature — a default build stays GDAL-free:
+
+```bash
+cargo build --release --features gdal-import
+```
+
+This needs a GDAL install (headers + shared library) reachable at build
+time — typically via `pkg-config`, or `GDAL_HOME`/`GDAL_VERSION` env vars
+on platforms without it, and the shared library at runtime. On Windows,
+an OSGeo4W install (`C:\OSGeo4W\bin` on `PATH`) provides both. See the
+[`gdal` crate docs](https://github.com/georust/gdal#dependencies) for
+platform-specific setup.
+
+With the feature enabled, **File → Import File Geodatabase…** picks a
+`.gdb` folder (it is a directory, not a file — the regular vector-import
+file picker cannot select it), lists its feature layers, and converts
+the chosen one to plain WKB GeoParquet 1.1 exactly like the other
+importers: same covering bbox column, same quality scorecard, same
+one-click Optimize afterward. Dropping a `.gdb` folder onto the window
+does the same thing. Non-spatial tables inside the geodatabase are
+skipped — this dialog only produces GeoParquet layers.
+
+A default build (no `gdal-import`) still recognizes `.gdb` paths but
+reports that the running binary was built without File Geodatabase
+support, rather than silently ignoring the drop.
 
 ## Quick start
 

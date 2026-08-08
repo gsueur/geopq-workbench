@@ -4,6 +4,8 @@ pub mod coastline;
 pub mod colormap;
 pub mod crs;
 pub mod geoarrow;
+#[cfg(feature = "gdal-import")]
+pub mod gdb;
 pub mod geojson;
 pub mod geometry;
 pub mod gpkg;

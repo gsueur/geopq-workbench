@@ -134,7 +134,7 @@ fn gpkg_wkb(blob: &[u8]) -> Result<GpkgGeom<'_>, String> {
 
 /// Base geometry type name (with " Z" for 3D) from a WKB header, for the
 /// `geometry_types` metadata. ISO and EWKB variants.
-fn wkb_type_name(wkb: &[u8]) -> Option<String> {
+pub(crate) fn wkb_type_name(wkb: &[u8]) -> Option<String> {
     let little = *wkb.first()? == 1;
     let b: [u8; 4] = wkb.get(1..5)?.try_into().ok()?;
     let raw = if little { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) };

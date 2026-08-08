@@ -502,6 +502,11 @@ struct ImportState {
     src: PathBuf,
     /// GeoPackage feature tables; empty for single-table formats.
     tables: Vec<crate::data::gpkg::GpkgTable>,
+    /// File Geodatabase layers; empty for every other format. Kept
+    /// separate from `tables` because its element type does not depend
+    /// on the `gdal` crate, so this field compiles the same with or
+    /// without `--features gdal-import`.
+    gdb_layers: Vec<crate::data::import::GdbLayer>,
     selected: usize,
     running: bool,
     progress: f32,
@@ -2839,6 +2844,20 @@ impl ViewerApp {
                             .pick_file(),
                         )
                     });
+                }
+                #[cfg(feature = "gdal-import")]
+                if ui
+                    .button(format!("{} Import File Geodatabase…", ph::TRAY_ARROW_DOWN))
+                    .on_hover_text(
+                        "Convert a layer from a .gdb File Geodatabase to GeoParquet \
+                         (needs GDAL — this build was compiled with gdal-import)",
+                    )
+                    .clicked()
+                    && self.gpkg_import.is_none()
+                {
+                    // A .gdb is a folder, not a file: rfd's file picker
+                    // cannot select it, so this is a folder picker.
+                    self.spawn_pick(PickFor::ImportVector, &ctx, |d| awaited_path(d.pick_folder()));
                 }
                 ui.separator();
                 if ui
@@ -6375,18 +6394,36 @@ impl ViewerApp {
             return;
         }
         let format = ImportFormat::from_path(&path);
-        let (tables, error) = match format {
+        let (tables, gdb_layers, error) = match format {
             Some(ImportFormat::Gpkg) => match crate::data::gpkg::list_tables(&path) {
-                Ok(t) => (t, None),
-                Err(e) => (Vec::new(), Some(e)),
+                Ok(t) => (t, Vec::new(), None),
+                Err(e) => (Vec::new(), Vec::new(), Some(e)),
             },
-            Some(_) => (Vec::new(), None),
-            None => (Vec::new(), Some("unsupported file type".into())),
+            Some(ImportFormat::Gdb) => {
+                #[cfg(feature = "gdal-import")]
+                {
+                    match crate::data::gdb::list_layers(&path) {
+                        Ok(l) => (Vec::new(), l, None),
+                        Err(e) => (Vec::new(), Vec::new(), Some(e)),
+                    }
+                }
+                #[cfg(not(feature = "gdal-import"))]
+                {
+                    (Vec::new(), Vec::new(), Some(
+                        "this build has no File Geodatabase support \
+                         (rebuild with --features gdal-import)"
+                            .to_string(),
+                    ))
+                }
+            }
+            Some(_) => (Vec::new(), Vec::new(), None),
+            None => (Vec::new(), Vec::new(), Some("unsupported file type".into())),
         };
         self.gpkg_import = Some(ImportState {
             format: format.unwrap_or(ImportFormat::Gpkg),
             src: path,
             tables,
+            gdb_layers,
             selected: 0,
             running: false,
             progress: 0.0,
@@ -6432,7 +6469,13 @@ impl ViewerApp {
 
         use crate::data::import::ImportFormat;
         let mut open = true;
-        let mut start: Option<(PathBuf, Option<crate::data::gpkg::GpkgTable>, PathBuf)> = None;
+        type StartTuple = (
+            PathBuf,
+            Option<crate::data::gpkg::GpkgTable>,
+            Option<crate::data::import::GdbLayer>,
+            PathBuf,
+        );
+        let mut start: Option<StartTuple> = None;
         let queued = self.import_queue.len();
         let st = self.gpkg_import.as_mut().unwrap();
         let title = if queued > 0 {
@@ -6473,13 +6516,42 @@ impl ViewerApp {
                 } else {
                     None
                 };
-                let dst = match &table {
-                    Some(t) => {
+                let gdb_layer = if st.format == ImportFormat::Gdb {
+                    ui.add_enabled_ui(!st.running, |ui| {
+                        let label = |t: &crate::data::import::GdbLayer| {
+                            format!(
+                                "{} ({} rows, {})",
+                                t.name,
+                                fmt_count(t.rows as usize),
+                                t.srs_name
+                            )
+                        };
+                        egui::ComboBox::from_label("layer")
+                            .selected_text(label(&st.gdb_layers[st.selected]))
+                            .show_ui(ui, |ui| {
+                                for (i, t) in st.gdb_layers.iter().enumerate() {
+                                    ui.selectable_value(&mut st.selected, i, label(t));
+                                }
+                            });
+                    });
+                    Some(st.gdb_layers[st.selected].clone())
+                } else {
+                    None
+                };
+                let dst = match (&table, &gdb_layer) {
+                    (Some(t), _) => {
                         let stem =
                             st.src.file_stem().unwrap_or_default().to_string_lossy().to_string();
                         st.src.with_file_name(format!("{stem}.{}.parquet", t.name))
                     }
-                    None => st.src.with_extension("parquet"),
+                    (None, Some(l)) => {
+                        // The source is a `.gdb` directory: build the
+                        // output next to it, not inside it.
+                        let stem =
+                            st.src.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                        st.src.with_file_name(format!("{stem}.{}.parquet", l.name))
+                    }
+                    (None, None) => st.src.with_extension("parquet"),
                 };
                 ui.label(RichText::new(format!("→ {}", dst.display())).weak().small())
                     .on_hover_text(
@@ -6491,10 +6563,10 @@ impl ViewerApp {
                     ui.add(egui::ProgressBar::new(st.progress).show_percentage());
                     ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 } else if ui.button("Import").clicked() {
-                    start = Some((st.src.clone(), table, dst));
+                    start = Some((st.src.clone(), table, gdb_layer, dst));
                 }
             });
-        if let Some((src, table, dst)) = start {
+        if let Some((src, table, gdb_layer, dst)) = start {
             let (tx, rx) = std::sync::mpsc::channel();
             let st = self.gpkg_import.as_mut().unwrap();
             let format = st.format;
@@ -6507,17 +6579,31 @@ impl ViewerApp {
                 let prog = move |f: f32| {
                     let _ = tx_prog.send(ImportMsg::Progress(f));
                 };
-                let res = match (format, &table) {
-                    (ImportFormat::Gpkg, Some(t)) => {
+                let res = match (format, &table, &gdb_layer) {
+                    (ImportFormat::Gpkg, Some(t), _) => {
                         crate::data::gpkg::convert(&src, t, &dst, &prog)
                     }
-                    (ImportFormat::Shapefile, _) => {
+                    (ImportFormat::Shapefile, _, _) => {
                         crate::data::shp::convert(&src, &dst, &prog)
                     }
-                    (ImportFormat::GeoJson, _) => {
+                    (ImportFormat::GeoJson, _, _) => {
                         crate::data::geojson::convert(&src, &dst, &prog)
                     }
-                    (ImportFormat::Gpkg, None) => Err("no table selected".into()),
+                    (ImportFormat::Gdb, _, Some(l)) => {
+                        #[cfg(feature = "gdal-import")]
+                        {
+                            crate::data::gdb::convert(&src, l, &dst, &prog)
+                        }
+                        #[cfg(not(feature = "gdal-import"))]
+                        {
+                            let _ = l;
+                            Err("this build has no File Geodatabase support \
+                                 (rebuild with --features gdal-import)"
+                                .to_string())
+                        }
+                    }
+                    (ImportFormat::Gpkg, None, _) => Err("no table selected".into()),
+                    (ImportFormat::Gdb, _, None) => Err("no layer selected".into()),
                 };
                 let _ = tx.send(match res {
                     Ok(_) => ImportMsg::Done(dst),
@@ -10448,10 +10534,16 @@ impl eframe::App for ViewerApp {
                 .collect()
         });
         for p in dropped {
-            let importable = crate::data::import::ImportFormat::from_path(&p).is_some();
+            let format = crate::data::import::ImportFormat::from_path(&p);
+            // Every import format is a single file except a File
+            // Geodatabase, which is a `.gdb` folder — the format's own
+            // `is_directory()` decides which directories are drops to
+            // import versus drops to open as a dataset.
+            let importable =
+                format.is_some_and(|f| p.is_dir() == f.is_directory());
             let tabular =
                 !p.is_dir() && crate::data::attrs::is_tabular(&Source::Local(p.clone()));
-            if !p.is_dir() && importable {
+            if importable {
                 self.begin_import(p);
             } else if tabular {
                 self.open_attr_table(Source::Local(p));

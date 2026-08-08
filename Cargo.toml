@@ -44,6 +44,14 @@ shapefile = { version = "0.9.0", features = ["geo-types", "yore", "encoding_rs"]
 egui-phosphor = "0.13.0"
 proj4wkt = "0.1.1"
 a5 = "0.9.0"
+gdal = { version = "0.19.0", optional = true }
+
+[features]
+# Opt-in File Geodatabase import. Off by default: the app's whole premise
+# is opening GeoParquet with no GDAL, and this pulls in a system GDAL
+# dependency (headers + shared lib at build time, the shared lib at
+# runtime) purely to read the one proprietary format nothing else can.
+gdal-import = ["dep:gdal"]
 
 [dev-dependencies]
 pollster = "1.0.1"
