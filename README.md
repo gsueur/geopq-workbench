@@ -508,13 +508,33 @@ It wraps the same import (`data::gpkg`/`shp`/`geojson`) and
 optimize (`data::optimize`) machinery the GUI dialogs call, opens no
 window, and touches no GPU — `cargo run --bin geopq-cli -- --help`
 lists every flag (format flavor, row group size/bytes, compression,
-Hilbert sort, covering column, H3 resolution). Point it at an existing
-`.parquet` instead of a raw source to skip straight to the optimize
-pass.
+Hilbert sort, covering column, H3 resolution, partitioning). Point it
+at an existing `.parquet` instead of a raw source to skip straight to
+the optimize pass.
 
-Not yet exposed on the CLI: multi-layer merge, partitioned output, S3
-publish. All work through the GUI today; happy to take a PR extending
-the CLI's flag set to cover them.
+Partitioned output works the same way it does in the GUI's Export
+dialog — hive directories by field, or adaptive H3:
+
+```bash
+# hive: <output>/ISO3=FRA/part-0.parquet, one dir per value
+geopq-cli --input roads.gpkg --output by_country/ \
+  --format native2 --partition-by ISO3
+
+# multiple fields nest in order: ISO3=FRA/YEAR=2020/part-0.parquet
+geopq-cli --input roads.gpkg --output by_country_year/ \
+  --format native2 --partition-by ISO3,YEAR
+
+# adaptive H3: cells split until under --partition-h3-target-rows;
+# --h3 doubles as the max resolution to split down to
+geopq-cli --input roads.gpkg --output by_h3/ \
+  --format native2 --h3 8 --partition-h3 --partition-h3-target-rows 100000
+```
+
+`--output` becomes a directory in either case, not a file path.
+
+Not yet exposed on the CLI: multi-layer merge, S3 publish. Both work
+through the GUI today; happy to take a PR extending the CLI's flag set
+to cover them.
 
 ## Under the hood
 
