@@ -27,6 +27,10 @@ pub struct GpkgTable {
     /// EPSG code, when `gpkg_spatial_ref_sys` maps the srs to one.
     pub epsg: Option<u32>,
     pub srs_name: String,
+    /// The srs WKT from `gpkg_spatial_ref_sys.definition`, the fallback
+    /// identity when there is no EPSG code (`"undefined"` for the
+    /// GeoPackage undefined srs ids 0 and -1).
+    pub definition: String,
 }
 
 fn open_ro(path: &Path) -> Result<Connection, String> {
@@ -60,19 +64,19 @@ pub fn list_tables(path: &Path) -> Result<Vec<GpkgTable>, String> {
             let count: i64 = db
                 .query_row(&format!("SELECT COUNT(*) FROM \"{name}\""), [], |r| r.get(0))
                 .map_err(|e| format!("count {name}: {e}"))?;
-            let (org, code, srs_name): (String, i64, String) = db
+            let (org, code, srs_name, definition): (String, i64, String, String) = db
                 .query_row(
-                    "SELECT organization, organization_coordsys_id, srs_name
+                    "SELECT organization, organization_coordsys_id, srs_name, definition
                      FROM gpkg_spatial_ref_sys WHERE srs_id = ?1",
                     [srs_id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
-                .unwrap_or(("NONE".into(), srs_id, format!("srs {srs_id}")));
+                .unwrap_or(("NONE".into(), srs_id, format!("srs {srs_id}"), String::new()));
             let epsg = org
                 .eq_ignore_ascii_case("epsg")
                 .then(|| u32::try_from(code).ok())
                 .flatten();
-            Ok(GpkgTable { name, geom_col, rows: count.max(0) as u64, epsg, srs_name })
+            Ok(GpkgTable { name, geom_col, rows: count.max(0) as u64, epsg, srs_name, definition })
         })
         .collect()
 }
@@ -288,17 +292,29 @@ pub fn convert(
 
     // GeoParquet 1.1 metadata: WKB encoding, observed geometry types, CRS
     // as a minimal PROJJSON id (omitted for 4326: the spec default CRS84).
+    // No EPSG code: fall back to the srs WKT definition, like the .prj
+    // path — an identity or proj4 string when it parses, and an honest
+    // `crs: null` (unknown) when it does not, never a silent lon/lat.
     let mut col = json!({
         "encoding": "WKB",
         "geometry_types": geom_types.iter().collect::<Vec<_>>(),
     });
     match table.epsg {
-        Some(4326) | None => {}
+        Some(4326) => {}
         Some(code) => {
             col["crs"] = json!({
                 "name": table.srs_name,
                 "id": {"authority": "EPSG", "code": code},
             });
+        }
+        None => {
+            let (crs, proj4) = super::shp::wkt_crs(&table.definition, &table.srs_name);
+            if let Some(c) = crs {
+                col["crs"] = c;
+            }
+            if let Some((p4, name)) = proj4 {
+                col["geopq:crs"] = json!({ "proj4": p4, "name": name });
+            }
         }
     }
     if bbox[0].is_finite() && bbox[2].is_finite() {
@@ -339,13 +355,24 @@ mod tests {
 
     /// Minimal spec-shaped GeoPackage with one point table in EPSG:2154.
     fn make_gpkg(path: &Path, rows: usize) {
+        make_gpkg_srs(path, rows, "EPSG", 2154, "RGF93 / Lambert-93", "undefined");
+    }
+
+    /// Same, with the srs row under the caller's identity (srs_id stays
+    /// 2154 so contents, geometry columns and blob headers agree).
+    fn make_gpkg_srs(
+        path: &Path,
+        rows: usize,
+        org: &str,
+        code: i64,
+        srs_name: &str,
+        definition: &str,
+    ) {
         let db = Connection::open(path).unwrap();
         db.execute_batch(
             "PRAGMA application_id = 0x47504B47;
              CREATE TABLE gpkg_spatial_ref_sys (srs_name TEXT, srs_id INTEGER PRIMARY KEY,
                organization TEXT, organization_coordsys_id INTEGER, definition TEXT);
-             INSERT INTO gpkg_spatial_ref_sys VALUES
-               ('RGF93 / Lambert-93', 2154, 'EPSG', 2154, 'undefined');
              CREATE TABLE gpkg_contents (table_name TEXT PRIMARY KEY, data_type TEXT,
                identifier TEXT, srs_id INTEGER);
              INSERT INTO gpkg_contents VALUES ('pts', 'features', 'pts', 2154);
@@ -354,6 +381,11 @@ mod tests {
              INSERT INTO gpkg_geometry_columns VALUES ('pts', 'geom', 'POINT', 2154, 0, 0);
              CREATE TABLE pts (fid INTEGER PRIMARY KEY, geom BLOB, name TEXT,
                height REAL, flag BOOLEAN);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO gpkg_spatial_ref_sys VALUES (?1, 2154, ?2, ?3, ?4)",
+            rusqlite::params![srs_name, org, code, definition],
         )
         .unwrap();
         let mut ins = db
@@ -435,5 +467,82 @@ mod tests {
         assert_eq!(sc.field_with_name("name").unwrap().data_type(), &DataType::Utf8);
         assert_eq!(sc.field_with_name("height").unwrap().data_type(), &DataType::Float64);
         assert_eq!(sc.field_with_name("flag").unwrap().data_type(), &DataType::Boolean);
+    }
+
+    /// The parsed `geo` metadata of a converted file's geometry column.
+    fn geo_col(dst: &Path) -> serde_json::Value {
+        use parquet::file::reader::FileReader;
+        let f = std::fs::File::open(dst).unwrap();
+        let r = parquet::file::reader::SerializedFileReader::new(f).unwrap();
+        let kv = r.metadata().file_metadata().key_value_metadata().unwrap().clone();
+        let geo = kv.iter().find(|k| k.key == "geo").unwrap().value.clone().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&geo).unwrap();
+        v["columns"]["geom"].clone()
+    }
+
+    #[test]
+    fn gpkg_esri_wkt_srs_positions_without_epsg() {
+        let dir = std::env::temp_dir().join("geopq_gpkg_esri");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("mini.gpkg");
+        let _ = std::fs::remove_file(&src);
+        // Lambert-93 as ArcGIS writes it: ESRI identity, no AUTHORITY
+        // node anywhere, only the WKT definition to go on.
+        make_gpkg_srs(
+            &src,
+            3,
+            "ESRI",
+            102110,
+            "RGF 1993 Lambert 93",
+            r#"PROJCS["RGF_1993_Lambert_93",GEOGCS["GCS_RGF_1993",DATUM["D_RGF_1993",SPHEROID["GRS_1980",6378137.0,298.257222101]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Lambert_Conformal_Conic"],PARAMETER["False_Easting",700000.0],PARAMETER["False_Northing",6600000.0],PARAMETER["Central_Meridian",3.0],PARAMETER["Standard_Parallel_1",49.0],PARAMETER["Standard_Parallel_2",44.0],PARAMETER["Latitude_Of_Origin",46.5],UNIT["Meter",1.0]]"#,
+        );
+
+        let tables = list_tables(&src).unwrap();
+        let t = &tables[0];
+        assert_eq!(t.epsg, None);
+        assert!(t.definition.starts_with("PROJCS"), "{}", t.definition);
+
+        let dst = dir.join("mini.pts.parquet");
+        convert(&src, t, &dst, &|_| {}).unwrap();
+
+        // Spec crs stays honest (null = unknown identity), the proj4
+        // rides in the extension, and the app positions the data with it.
+        let col = geo_col(&dst);
+        assert!(col.get("crs").is_some_and(|c| c.is_null()), "{col}");
+        let (_store, crs, _info, _rg) =
+            crate::data::loader::open_store_for_test(&dst).unwrap();
+        assert_eq!(crs.epsg, None);
+        assert!(crs.proj4.contains("+proj=lcc"), "{}", crs.proj4);
+        assert!(!crs.is_latlong);
+        let (lon, lat) = crate::data::crs::transform_point(
+            &crs,
+            &crate::data::crs::Crs::wgs84(),
+            700_000.0,
+            6_600_000.0,
+        )
+        .unwrap();
+        assert!((lon - 3.0).abs() < 0.01, "{lon}");
+        assert!((lat - 46.5).abs() < 0.3, "{lat}");
+    }
+
+    #[test]
+    fn gpkg_undefined_srs_is_unknown_not_lonlat() {
+        let dir = std::env::temp_dir().join("geopq_gpkg_undef");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("mini.gpkg");
+        let _ = std::fs::remove_file(&src);
+        // The GeoPackage undefined srs: organization NONE, definition
+        // the literal string "undefined".
+        make_gpkg_srs(&src, 2, "NONE", -1, "undefined", "undefined");
+
+        let t = &list_tables(&src).unwrap()[0];
+        assert_eq!(t.epsg, None);
+        let dst = dir.join("mini.pts.parquet");
+        convert(&src, t, &dst, &|_| {}).unwrap();
+
+        // An explicit `crs: null` (unknown), not an omitted key, which
+        // the spec would read as CRS84 lon/lat.
+        let col = geo_col(&dst);
+        assert!(col.get("crs").is_some_and(|c| c.is_null()), "{col}");
     }
 }

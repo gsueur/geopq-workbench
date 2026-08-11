@@ -288,15 +288,24 @@ fn prj_crs(path: Option<&Path>) -> (Option<Value>, Option<(String, String)>) {
         Some(t) => t,
         None => return (Some(Value::Null), None),
     };
+    wkt_crs(&text, "from .prj")
+}
+
+/// The text half of [`prj_crs`], shared with the GeoPackage importer
+/// (`gpkg_spatial_ref_sys.definition` is the same WKT a .prj holds).
+pub(crate) fn wkt_crs(
+    text: &str,
+    fallback_name: &str,
+) -> (Option<Value>, Option<(String, String)>) {
     // The WKT name is the first quoted string.
     let name = text
         .split('"')
         .nth(1)
-        .unwrap_or("from .prj")
+        .unwrap_or(fallback_name)
         .replace('_', " ");
 
     let mut last: Option<u32> = None;
-    let mut rest = text.as_str();
+    let mut rest = text;
     while let Some(i) = rest.find("AUTHORITY[\"EPSG\",\"") {
         let tail = &rest[i + 18..];
         if let Some(end) = tail.find('"')
@@ -312,7 +321,7 @@ fn prj_crs(path: Option<&Path>) -> (Option<Value>, Option<(String, String)>) {
             Some(json!({"name": name, "id": {"authority": "EPSG", "code": code}})),
             None,
         ),
-        None => match proj4_from_wkt(&text) {
+        None => match proj4_from_wkt(text) {
             Some(p4) if is_geographic_wgs84(&p4) => (None, None),
             Some(p4) => (Some(Value::Null), Some((p4, name))),
             None => {
