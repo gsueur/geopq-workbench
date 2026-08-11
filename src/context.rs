@@ -157,6 +157,12 @@ pub struct StyleCtx {
     pub color: [u8; 4],
     pub line_color: Option<[u8; 4]>,
     pub line_width_px: f32,
+    /// Dash pattern name (LinePattern::label); absent in older contexts.
+    #[serde(default)]
+    pub line_pattern: Option<String>,
+    /// Cap name (LineCap::label); absent in older contexts.
+    #[serde(default)]
+    pub line_cap: Option<String>,
     pub point_radius_px: f32,
     /// Point marker name (PointShape::label); absent in older contexts.
     #[serde(default)]
@@ -201,6 +207,9 @@ pub struct StyleByCtx {
     pub hidden_bins: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub per_area: bool,
+    /// Line width ramp (min, max) in px; absent = uniform width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width_px: Option<(f32, f32)>,
     #[serde(flatten)]
     pub mode: StyleByMode,
 }
@@ -222,6 +231,8 @@ impl StyleCtx {
             color: s.color.to_array(),
             line_color: s.line_color.map(|c| c.to_array()),
             line_width_px: s.line_width_px,
+            line_pattern: Some(s.line_pattern.label().to_string()),
+            line_cap: Some(s.line_cap.label().to_string()),
             point_radius_px: s.point_radius_px,
             point_shape: Some(s.point_shape.label().to_string()),
             fill_opacity: s.fill_opacity,
@@ -234,6 +245,7 @@ impl StyleCtx {
                 classified_rows: sb.classified_rows,
                 hidden_bins: sb.hidden_bins,
                 per_area: sb.per_area,
+                width_px: sb.width_px,
                 mode: match &sb.mode {
                     StyleMode::Graduated { method, breaks } => StyleByMode::Graduated {
                         method: method.label().to_string(),
@@ -254,7 +266,7 @@ impl StyleCtx {
     }
 
     pub fn into_style(self) -> LayerStyle {
-        use crate::data::layer::{PointShape, Ramp, StyleBy, StyleMode};
+        use crate::data::layer::{LineCap, LinePattern, PointShape, Ramp, StyleBy, StyleMode};
         let color = |a: [u8; 4]| Color32::from_rgba_premultiplied(a[0], a[1], a[2], a[3]);
         LayerStyle {
             visible: self.visible,
@@ -262,6 +274,16 @@ impl StyleCtx {
             color: color(self.color),
             line_color: self.line_color.map(color),
             line_width_px: self.line_width_px,
+            line_pattern: self
+                .line_pattern
+                .as_deref()
+                .and_then(LinePattern::from_label)
+                .unwrap_or_default(),
+            line_cap: self
+                .line_cap
+                .as_deref()
+                .and_then(LineCap::from_label)
+                .unwrap_or_default(),
             point_radius_px: self.point_radius_px,
             point_shape: self
                 .point_shape
@@ -282,6 +304,7 @@ impl StyleCtx {
                 classified_rows: sb.classified_rows,
                 hidden_bins: sb.hidden_bins,
                 per_area: sb.per_area,
+                width_px: sb.width_px,
                 mode: match sb.mode {
                     StyleByMode::Graduated { method, breaks } => StyleMode::Graduated {
                         method: crate::data::layer::ClassMethod::ALL
@@ -370,6 +393,8 @@ mod tests {
                         color: [31, 119, 180, 255],
                         line_color: Some([10, 20, 30, 255]),
                         line_width_px: 1.5,
+                        line_pattern: Some("dash".into()),
+                        line_cap: Some("flat".into()),
                         point_radius_px: 3.0,
                         point_shape: Some("star".into()),
                         fill_opacity: 0.4,

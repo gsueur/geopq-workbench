@@ -18,15 +18,38 @@ pub struct DrawStyle {
     pub line_color: [f32; 4],
     pub point_color: [f32; 4],
     pub line_half_width_px: f32,
+    pub line_pattern: crate::data::layer::LinePattern,
+    pub line_cap: crate::data::layer::LineCap,
     pub point_radius_px: f32,
     pub point_shape: crate::data::layer::PointShape,
     /// Data-driven styling: per-bin RGB (chunks carry their bin); alpha
     /// channels come from the colors above. None = uniform colors.
     pub bin_colors: Option<Arc<[[f32; 3]; crate::data::layer::STYLE_BINS]>>,
+    /// Data-driven line width: per-bin half-widths in px, from the
+    /// classification's width ramp. None = `line_half_width_px` for all.
+    pub bin_half_widths: Option<Arc<[f32; crate::data::layer::STYLE_BINS]>>,
     /// Bitmask of style bins hidden from the map (legend toggles).
     /// Only honored while `bin_colors` is set: without data styling
     /// every chunk reports bin 0 and the mask would hide the layer.
     pub hidden_bins: u64,
+}
+
+impl Default for DrawStyle {
+    fn default() -> Self {
+        Self {
+            fill_color: [0.0; 4],
+            line_color: [0.0; 4],
+            point_color: [0.0; 4],
+            line_half_width_px: 0.5,
+            line_pattern: crate::data::layer::LinePattern::Solid,
+            line_cap: crate::data::layer::LineCap::Round,
+            point_radius_px: 3.0,
+            point_shape: crate::data::layer::PointShape::Circle,
+            bin_colors: None,
+            bin_half_widths: None,
+            hidden_bins: 0,
+        }
+    }
 }
 
 impl DrawStyle {
@@ -41,6 +64,15 @@ impl DrawStyle {
         match &self.bin_colors {
             Some(lut) => lut[bin as usize % lut.len()],
             None => [base[0], base[1], base[2]],
+        }
+    }
+
+    /// Line half-width for a chunk: the width ramp's bin value under
+    /// data styling, the layer-wide width otherwise.
+    fn half_width_for(&self, bin: u8) -> f32 {
+        match &self.bin_half_widths {
+            Some(lut) => lut[bin as usize % lut.len()],
+            None => self.line_half_width_px,
         }
     }
 
@@ -144,37 +176,55 @@ struct LayerGpu {
 }
 
 /// Convert a LOD's 16 B/segment `[x0,y0,x1,y1]` list into a shared point
-/// stream (8 B/point): consecutive segments that chain (`prev.b == cur.a`,
-/// the common case — ring order survives the stable extent sort) share
-/// their joint point, and a NaN sentinel separates runs (its quads collapse
-/// to nothing in the vertex shader). Instance `i` reads `points[i]` from
-/// slot 0 and `points[i+1]` from slot 1 (same buffer bound at +8 bytes),
-/// so segment counts in the size index translate to instance counts here.
-/// Net: ~9 B/segment instead of 16.
+/// stream (12 B/point: x, y, arc length): consecutive segments that chain
+/// (`prev.b == cur.a`, the common case — ring order survives the stable
+/// extent sort) share their joint point, and a NaN sentinel separates
+/// runs (its quads collapse to nothing in the vertex shader). Instance
+/// `i` reads its segment as `points[i]`, `points[i+1]` (same buffer
+/// bound at two offsets), so segment counts in the size index translate
+/// to instance counts here; a sentinel padded at each end lets two more
+/// bindings expose `points[i-1]` / `points[i+2]`, whose NaN marks the
+/// instance as a run end (line caps). Arc length accumulates in
+/// chunk-local units and restarts at every sentinel, so each run
+/// anchors its dash pattern at its own start. Net: ~13 B/segment
+/// instead of 16.
 fn line_point_stream(
     lod: &crate::data::geometry::LineLod,
-) -> (Vec<[f32; 2]>, Vec<(f32, u32)>) {
+) -> (Vec<[f32; 3]>, Vec<(f32, u32)>) {
     let segs = &lod.segments;
     if segs.is_empty() {
         return (Vec::new(), Vec::new());
     }
-    let mut points: Vec<[f32; 2]> = Vec::with_capacity(segs.len() + segs.len() / 8);
+    // The NaN position collapses any instance touching the sentinel;
+    // the negative arc length is the run-end marker for its neighbours
+    // (NaN self-comparison is folded away under fast-math on Metal, so
+    // the shader must not test the NaN itself).
+    const SENTINEL: [f32; 3] = [f32::NAN, f32::NAN, -1.0];
+    let mut points: Vec<[f32; 3]> = Vec::with_capacity(segs.len() + segs.len() / 8 + 2);
+    points.push(SENTINEL); // lead pad: `prev` of instance 0
     // Instance index of each segment (transient; only the size-index
     // prefixes need translating).
     let mut seg_instance: Vec<u32> = Vec::with_capacity(segs.len());
+    let mut cum = 0.0f32;
     for s in segs {
         let (a, b) = ([s[0], s[1]], [s[2], s[3]]);
         // A NaN sentinel never equals `a`, so it breaks runs naturally.
-        if points.last() != Some(&a) {
-            if !points.is_empty() {
-                points.push([f32::NAN, f32::NAN]);
+        let chained = points.last().is_some_and(|p| p[0] == a[0] && p[1] == a[1]);
+        if !chained {
+            if points.len() > 1 {
+                points.push(SENTINEL);
             }
-            points.push(a);
+            cum = 0.0;
+            points.push([a[0], a[1], 0.0]);
         }
-        seg_instance.push((points.len() - 1) as u32);
-        points.push(b);
+        // Instance ids are relative to the +1-point binding offset, so
+        // the lead pad cancels out of the index arithmetic.
+        seg_instance.push((points.len() - 2) as u32);
+        cum += (b[0] - a[0]).hypot(b[1] - a[1]);
+        points.push([b[0], b[1], cum]);
     }
-    let total_instances = (points.len() - 1) as u32;
+    let total_instances = (points.len() - 2) as u32;
+    points.push(SENTINEL); // tail pad: `next` of the last instance
     let index = lod
         .size_index
         .iter()
@@ -328,16 +378,35 @@ struct ChunkUniform {
     feather: f32,
     shape: u32,
     edge_px: f32,
-    _pad: [u32; 2],
+    cap: u32,
+    _pad: u32,
     edge: [f32; 4],
+    dash: [f32; 4],
 }
 
-/// Point-marker extras: everything the other passes leave at zero.
-#[derive(Clone, Copy, Default)]
+/// Pass-specific extras beyond color and size: the point pass's marker
+/// shape and border, the line pass's cap and dash pattern. Everything
+/// the other passes leave at zero (a dash.x of 0 is a dot pattern, so
+/// "no pattern" is negative; `default()` provides it).
+#[derive(Clone, Copy)]
 struct MarkerU {
     shape: u32,
     edge: [f32; 4],
     edge_px: f32,
+    cap: u32,
+    dash: [f32; 4],
+}
+
+impl Default for MarkerU {
+    fn default() -> Self {
+        Self {
+            shape: 0,
+            edge: [0.0; 4],
+            edge_px: 0.0,
+            cap: 0,
+            dash: [-1.0, 0.0, 0.0, 0.0],
+        }
+    }
 }
 
 impl MapResources {
@@ -456,18 +525,31 @@ impl MapResources {
             &vector_layout,
             "vs_line",
             "fs_line",
-            // One shared point stream bound twice, slot 1 offset by one
-            // point: instance i reads its segment as points[i], points[i+1].
+            // One shared [x, y, arc len] point stream bound four times at
+            // one-point offsets over its sentinel-padded ends: instance i
+            // reads its segment as points[i], points[i+1], plus the
+            // neighbours points[i-1] / points[i+2] whose NaN marks a run
+            // end (see line_point_stream).
             &[
                 wgpu::VertexBufferLayout {
-                    array_stride: 8,
+                    array_stride: 12,
                     step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x2],
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 2 => Float32],
                 },
                 wgpu::VertexBufferLayout {
-                    array_stride: 8,
+                    array_stride: 12,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &wgpu::vertex_attr_array![1 => Float32x2],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: 12,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![3 => Float32x3],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: 12,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![4 => Float32x3],
                 },
             ],
         );
@@ -886,8 +968,10 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                 feather: 1.0,
                 shape: marker.shape,
                 edge_px: marker.edge_px,
-                _pad: [0; 2],
+                cap: marker.cap,
+                _pad: 0,
                 edge: marker.edge,
+                dash: marker.dash,
             };
             uniforms.extend_from_slice(bytemuck::bytes_of(&u));
             uniforms.resize(uniforms.len().next_multiple_of(UNIFORM_STRIDE as usize), 0);
@@ -1017,8 +1101,10 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                     feather: 1.0,
                     shape: 0,
                     edge_px: 0.0,
-                    _pad: [0; 2],
+                    cap: 0,
+                    _pad: 0,
                     edge: [0.0; 4],
+                    dash: [-1.0, 0.0, 0.0, 0.0],
                 };
                 uniforms.extend_from_slice(bytemuck::bytes_of(&u));
                 uniforms.resize(uniforms.len().next_multiple_of(UNIFORM_STRIDE as usize), 0);
@@ -1051,13 +1137,18 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                             if std::env::var("GEOPQ_DEBUG_DRAWS").is_ok() {
                                 eprintln!("chunk {ci}: lod {lod} count {count}");
                             }
+                            let half_w = s.half_width_for(chunk.bin);
                             let uoffset = push_uniform(
                                 &mut uniforms,
                                 chunk.origin,
                                 [1.0, 1.0],
                                 s.edge_for(chunk.bin),
-                                s.line_half_width_px,
-                                MarkerU::default(),
+                                half_w,
+                                MarkerU {
+                                    cap: s.line_cap.code(),
+                                    dash: s.line_pattern.dashes_px(s.line_cap, half_w * 2.0),
+                                    ..MarkerU::default()
+                                },
                             );
                             draw_list.push(DrawCmd::Line {
                                 layer: layer.key,
@@ -1097,6 +1188,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                                 // The border is inset in the marker, so it
                                 // takes the whole stroke width, not half.
                                 edge_px: s.line_half_width_px * 2.0,
+                                ..MarkerU::default()
                             },
                         );
                         draw_list.push(DrawCmd::Point {
@@ -1240,8 +1332,13 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                     };
                     pass.set_pipeline(&res.line_pipeline);
                     pass.set_bind_group(0, &res.uniform_bg, &[*uoffset]);
-                    pass.set_vertex_buffer(0, buf.slice(..));
-                    pass.set_vertex_buffer(1, buf.slice(8..));
+                    // The stream is sentinel-padded on both ends: element
+                    // 0 is the pad, so the segment endpoints sit at +12
+                    // and +24, with prev at 0 and next at +36.
+                    pass.set_vertex_buffer(0, buf.slice(12..));
+                    pass.set_vertex_buffer(1, buf.slice(24..));
+                    pass.set_vertex_buffer(2, buf.slice(..));
+                    pass.set_vertex_buffer(3, buf.slice(36..));
                     pass.draw(0..6, 0..*count);
                 }
                 DrawCmd::Point {
@@ -1392,6 +1489,7 @@ mod tests {
                         .as_ref()
                         .map(|sb| std::sync::Arc::new(sb.bin_colors())),
                     hidden_bins: style_by.as_ref().map_or(0, |sb| sb.hidden_bins),
+                    ..Default::default()
                 },
             }],
             background: [0.05, 0.05, 0.08, 1.0],
@@ -1569,6 +1667,7 @@ mod tests {
                         point_shape: crate::data::layer::PointShape::Circle,
                         bin_colors: None,
                         hidden_bins: 0,
+                        ..Default::default()
                     },
                 },
                 LayerDraw {
@@ -1584,6 +1683,7 @@ mod tests {
                         point_shape: crate::data::layer::PointShape::Circle,
                         bin_colors: None,
                         hidden_bins: 0,
+                        ..Default::default()
                     },
                 },
             ],
@@ -1697,6 +1797,7 @@ mod tests {
                             point_shape: crate::data::layer::PointShape::Circle,
                             bin_colors: None,
                             hidden_bins: 0,
+                            ..Default::default()
                         },
                     },
                     LayerDraw {
@@ -1712,6 +1813,7 @@ mod tests {
                             point_shape: crate::data::layer::PointShape::Circle,
                             bin_colors: None,
                             hidden_bins: 0,
+                            ..Default::default()
                         },
                     },
                 ],
@@ -1907,6 +2009,7 @@ mod tests {
                     point_shape: crate::data::layer::PointShape::Circle,
                     bin_colors: None,
                     hidden_bins: 0,
+                    ..Default::default()
                 },
             }],
             background: [0.0; 4],
@@ -2049,6 +2152,7 @@ mod tests {
                     point_shape: crate::data::layer::PointShape::Circle,
                     bin_colors: None,
                     hidden_bins: 0,
+                    ..Default::default()
                 },
             }],
             background: [0.0; 4],
@@ -2183,18 +2287,33 @@ mod tests {
         size: u32,
         style: DrawStyle,
     ) -> Vec<u8> {
+        render_geoms(device, queue, size, 10.0, style, |mb| {
+            mb.add(
+                &geo_types::Geometry::Point(geo_types::Point::new(0.5, 0.5)),
+                crate::data::geometry::FeatureRef::INVALID,
+            );
+        })
+    }
+
+    /// Arbitrary mesh content around world (0.5, 0.5) drawn through the
+    /// real pipelines; returns the resolved RGBA of a square viewport.
+    fn render_geoms(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        size: u32,
+        zoom: f64,
+        style: DrawStyle,
+        build: impl FnOnce(&mut MeshBuilder),
+    ) -> Vec<u8> {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut resources = egui_wgpu::CallbackResources::default();
         resources.insert(MapResources::new(device, format));
         let mut mb = MeshBuilder::default();
-        mb.add(
-            &geo_types::Geometry::Point(geo_types::Point::new(0.5, 0.5)),
-            crate::data::geometry::FeatureRef::INVALID,
-        );
+        build(&mut mb);
         let cb = MapCallback {
             camera: crate::map::camera::Camera {
                 center: [0.5, 0.5],
-                zoom: 10.0,
+                zoom,
             },
             viewport_px: [size as f32, size as f32],
             tile_opacity: 1.0,
@@ -2319,7 +2438,230 @@ mod tests {
             point_shape: shape,
             bin_colors: None,
             hidden_bins: 0,
+            ..Default::default()
         }
+    }
+
+    /// A green stroke with no fill and no points.
+    fn line_style(
+        half_width: f32,
+        pattern: crate::data::layer::LinePattern,
+        cap: crate::data::layer::LineCap,
+    ) -> DrawStyle {
+        DrawStyle {
+            line_color: [0.0, 1.0, 0.0, 1.0],
+            line_half_width_px: half_width,
+            line_pattern: pattern,
+            line_cap: cap,
+            ..Default::default()
+        }
+    }
+
+    /// A horizontal polyline through world (0.5, 0.5) built from `segs`
+    /// chained spans, `px` pixels long in total at zoom 16 (2^24 px per
+    /// world unit, LOD 0 so nothing is decimated away).
+    fn add_horizontal_chain(mb: &mut MeshBuilder, px: f32, segs: usize) {
+        let w = |p: f32| 0.5 + (p - px * 0.5) as f64 / (1u64 << 24) as f64;
+        let pts: Vec<(f64, f64)> = (0..=segs)
+            .map(|i| (w(px * i as f32 / segs as f32), 0.5))
+            .collect();
+        mb.add(
+            &geo_types::Geometry::LineString(geo_types::LineString::from(pts)),
+            crate::data::geometry::FeatureRef::INVALID,
+        );
+    }
+
+    /// Lit runs (count and lengths) along one row of an RGBA readback,
+    /// by the green channel.
+    fn green_runs(data: &[u8], size: u32, row: u32) -> Vec<usize> {
+        let mut runs = Vec::new();
+        let mut cur = 0usize;
+        for x in 0..size {
+            let px = &data[((row * size + x) * 4) as usize..][..4];
+            if px[1] > 128 {
+                cur += 1;
+            } else if cur > 0 {
+                runs.push(cur);
+                cur = 0;
+            }
+        }
+        if cur > 0 {
+            runs.push(cur);
+        }
+        runs
+    }
+
+    /// A dash pattern breaks a polyline into dashes, and the phase runs
+    /// through interior joints: chained segments shorter than one dash
+    /// must not each restart the pattern (that would light the whole
+    /// line and leave no gaps).
+    #[test]
+    fn dashes_break_the_line_and_run_through_joints() {
+        use crate::data::layer::{LineCap, LinePattern};
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let size = 128u32;
+        // 8 chained ~13 px segments; LongDash at width 4 px = 32 px on,
+        // 12 px off. Every segment is shorter than one dash.
+        let draw = |pattern: LinePattern| -> Vec<usize> {
+            let data = render_geoms(
+                &device,
+                &queue,
+                size,
+                16.0,
+                line_style(2.0, pattern, LineCap::Round),
+                |mb| add_horizontal_chain(mb, 105.0, 8),
+            );
+            green_runs(&data, size, size / 2)
+        };
+        let solid = draw(LinePattern::Solid);
+        assert_eq!(solid.len(), 1, "solid runs: {solid:?}");
+        let dashed = draw(LinePattern::LongDash);
+        assert!(
+            (2..=4).contains(&dashed.len()),
+            "expected ~3 dashes over 105 px (period 44), got {dashed:?}"
+        );
+        let lit: usize = dashed.iter().sum();
+        assert!(
+            lit + 8 < solid[0],
+            "dashing must leave real gaps: {lit} lit of {}",
+            solid[0]
+        );
+    }
+
+    /// Caps order the ink of a solid stroke: flat < round < square, and
+    /// round/square extend the lit span past the endpoints while flat
+    /// stops there.
+    #[test]
+    fn line_caps_shape_the_run_ends() {
+        use crate::data::layer::{LineCap, LinePattern};
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let size = 128u32;
+        let measure = |cap: LineCap| -> (usize, usize) {
+            let data = render_geoms(
+                &device,
+                &queue,
+                size,
+                16.0,
+                line_style(10.0, LinePattern::Solid, cap),
+                |mb| add_horizontal_chain(mb, 60.0, 1),
+            );
+            let ink = data.chunks_exact(4).filter(|px| px[1] > 128).count();
+            let span = green_runs(&data, size, size / 2).iter().copied().max().unwrap_or(0);
+            (ink, span)
+        };
+        let (flat, flat_span) = measure(LineCap::Flat);
+        let (round, round_span) = measure(LineCap::Round);
+        let (square, square_span) = measure(LineCap::Square);
+        // 60 x 20 px body; round adds ~pi*100 px², square ~400.
+        assert!(flat + 200 < round, "flat {flat} !< round {round}");
+        assert!(round + 40 < square, "round {round} !< square {square}");
+        assert!(
+            flat_span + 14 < round_span,
+            "round caps must extend the span: {flat_span} vs {round_span}"
+        );
+        assert!(
+            (square_span as i64 - round_span as i64).abs() <= 3,
+            "round and square reach the same length on the axis: {round_span} vs {square_span}"
+        );
+    }
+
+    /// A width ramp over the style bins draws each bin's features at its
+    /// own stroke width, the way per-bin colors already work.
+    #[test]
+    fn line_width_follows_the_class_bin() {
+        use crate::data::layer::{LineCap, LinePattern, STYLE_BINS};
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let size = 128u32;
+        let mut widths = [0.01f32; STYLE_BINS];
+        widths[0] = 2.0;
+        widths[1] = 6.0;
+        let style = DrawStyle {
+            bin_half_widths: Some(std::sync::Arc::new(widths)),
+            ..line_style(1.0, LinePattern::Solid, LineCap::Flat)
+        };
+        // Two horizontal lines 48 px apart, one per bin.
+        let dy = 24.0 / (1u64 << 24) as f64;
+        let data = render_geoms(&device, &queue, size, 16.0, style, |mb| {
+            let mut line = |y: f64, bin: u8| {
+                mb.bin = bin;
+                mb.add(
+                    &geo_types::Geometry::LineString(geo_types::LineString::from(vec![
+                        (0.5 - 40.0 / (1u64 << 24) as f64, y),
+                        (0.5 + 40.0 / (1u64 << 24) as f64, y),
+                    ])),
+                    crate::data::geometry::FeatureRef::INVALID,
+                );
+            };
+            line(0.5 + dy, 0);
+            line(0.5 - dy, 1);
+        });
+        // Stroke thickness at the viewport's centre column, per line.
+        let column_runs = |data: &[u8], size: u32| -> Vec<usize> {
+            let mut runs = Vec::new();
+            let mut cur = 0usize;
+            for y in 0..size {
+                let px = &data[((y * size + size / 2) * 4) as usize..][..4];
+                if px[1] > 128 {
+                    cur += 1;
+                } else if cur > 0 {
+                    runs.push(cur);
+                    cur = 0;
+                }
+            }
+            if cur > 0 {
+                runs.push(cur);
+            }
+            runs
+        };
+        let runs = column_runs(&data, size);
+        assert_eq!(runs.len(), 2, "two strokes: {runs:?}");
+        // World +y is screen down (ab.y flips), so bin 1 draws on top.
+        assert!(
+            (10..=14).contains(&runs[0]),
+            "bin 1 stroke ~12 px, got {runs:?}"
+        );
+        assert!(
+            (3..=6).contains(&runs[1]),
+            "bin 0 stroke ~4 px, got {runs:?}"
+        );
+    }
+
+    /// The line point stream: sentinel-padded ends, arc length that
+    /// accumulates along a run and restarts at the next, and size-index
+    /// prefixes remapped to instance counts past the lead pad.
+    #[test]
+    fn line_point_stream_pads_and_measures_runs() {
+        let lod = crate::data::geometry::LineLod {
+            // Two runs: a 2-segment chain (3+4=7 long), then a break.
+            segments: vec![
+                [0.0, 0.0, 3.0, 0.0],
+                [3.0, 0.0, 3.0, 4.0],
+                [10.0, 0.0, 12.0, 0.0],
+            ],
+            extents: Vec::new(),
+            size_index: vec![(1.0, 3)],
+        };
+        let (points, index) = super::line_point_stream(&lod);
+        let nan = |p: &[f32; 3]| p[0].is_nan();
+        assert_eq!(points.len(), 8, "{points:?}");
+        assert!(nan(&points[0]) && nan(&points[4]) && nan(&points[7]));
+        assert_eq!(points[1], [0.0, 0.0, 0.0]);
+        assert_eq!(points[2], [3.0, 0.0, 3.0]);
+        assert_eq!(points[3], [3.0, 4.0, 7.0], "arc length accumulates");
+        assert_eq!(points[5][2], 0.0, "new run restarts the arc length");
+        assert_eq!(points[6], [12.0, 0.0, 2.0]);
+        // 3 segments over a break = 5 instances (one per stream point
+        // between the pads, minus the final one).
+        assert_eq!(index, vec![(1.0, 5)]);
     }
 
     /// Every point symbol draws, and each carries the ink of the circle

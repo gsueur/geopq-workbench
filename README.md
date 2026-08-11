@@ -270,7 +270,11 @@ larger files are on the roadmap.
 - **Styling**: fill, border and point colors with sensible auto-derived
   defaults, opacity, line width, point radius; fill and border switch
   off independently from the `fill:` / `w:` labels in the layer row, so
-  you can draw outlines only or fills only. **Style by value** colors by any
+  you can draw outlines only or fills only. Lines and polygon outlines
+  take a dash pattern (dash, long dash, dot, dash-dot) and a cap style
+  (round, square, flat) from the swatch next to the width slider; the
+  pattern follows the line's own arc length, so dashes run through
+  vertices instead of restarting at every segment. **Style by value** colors by any
   attribute: numeric columns get six ramps and seven classification
   methods (equal interval, quantile, half-std-dev, Jenks, arithmetic and
   geometric progression, head/tail breaks) with your choice of class
@@ -442,8 +446,6 @@ quality gate and display policy).
 
 ## Roadmap
 
-- Line styling: dash patterns and caps, plus width driven by a
-  classified column the way colour already is.
 - Export the current view to SVG, for a figure that goes into a
   document rather than into another dataset.
 - Streaming optimize beyond the 8 GB in-memory cap; multi-file
@@ -453,6 +455,10 @@ quality gate and display policy).
   works because S3 lists objects, while plain HTTPS has no equivalent,
   so this needs a manifest convention first.
 - Label rendering.
+
+Line styling shipped as planned: dash patterns and caps on the layer
+row, and the classification dialog can drive stroke width across its
+classes (a min-to-max ramp in px) the way colour already is.
 
 Polygon set operations, spatial aggregates, attribute tables and joins
 all shipped together: `st_union/intersection/difference/symdifference`

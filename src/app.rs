@@ -834,6 +834,11 @@ struct StyleDialog {
     /// in any other one.
     color_map: Option<crate::data::colormap::ColorMap>,
     use_color_map: bool,
+    /// Graduated only: also drive line width by the classes, ramping
+    /// linearly from `width_min` to `width_max` px.
+    width_by: bool,
+    width_min: f32,
+    width_max: f32,
 }
 
 /// Editor for a layer's persistent SQL filter.
@@ -3696,12 +3701,28 @@ impl ViewerApp {
                                     egui::Slider::new(&mut l.style.line_width_px, 0.0..=6.0)
                                         .show_value(false),
                                 );
+                                if l.style.lines_on {
+                                    line_style_button(
+                                        ui,
+                                        &format!("layer{}", l.id),
+                                        &mut l.style.line_pattern,
+                                        &mut l.style.line_cap,
+                                        l.style.color,
+                                    );
+                                }
                             }
                             _ => {
                                 ui.label("w:");
                                 ui.add(
                                     egui::Slider::new(&mut l.style.line_width_px, 0.2..=8.0)
                                         .show_value(false),
+                                );
+                                line_style_button(
+                                    ui,
+                                    &format!("layer{}", l.id),
+                                    &mut l.style.line_pattern,
+                                    &mut l.style.line_cap,
+                                    l.style.color,
                                 );
                             }
                         }
@@ -5550,6 +5571,7 @@ impl ViewerApp {
                 (c, Ramp::Viridis, ClassMethod::EqualInterval, 8)
             }
         };
+        let width_px = l.style.style_by.as_ref().and_then(|sb| sb.width_px);
         let mut d = StyleDialog {
             layer_id,
             column,
@@ -5564,6 +5586,9 @@ impl ViewerApp {
             categories: None,
             color_map: None,
             use_color_map: true,
+            width_by: width_px.is_some(),
+            width_min: width_px.map_or(0.6, |(a, _)| a),
+            width_max: width_px.map_or(4.0, |(_, b)| b),
         };
         self.style_dialog_select_column(&mut d, ctx, true);
         self.style_dialog = Some(d);
@@ -5792,6 +5817,28 @@ impl ViewerApp {
                                 reselect = true;
                             }
                         }
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut d.width_by, "line width by class")
+                                .on_hover_text(
+                                    "Ramp the stroke width across the classes, \
+                                     the way the colors already do",
+                                );
+                            if d.width_by {
+                                ui.add(
+                                    egui::DragValue::new(&mut d.width_min)
+                                        .range(0.1..=20.0)
+                                        .speed(0.05)
+                                        .suffix(" px"),
+                                );
+                                ui.label("to");
+                                ui.add(
+                                    egui::DragValue::new(&mut d.width_max)
+                                        .range(0.1..=20.0)
+                                        .speed(0.05)
+                                        .suffix(" px"),
+                                );
+                            }
+                        });
                         if d.method.needs_values() || d.per_area {
                             ui.label(
                                 RichText::new(
@@ -5969,6 +6016,8 @@ impl ViewerApp {
                                     )
                                 },
                                 classified_rows: None, // stamped on apply below
+                                width_px: (d.numeric && d.width_by)
+                                    .then_some((d.width_min, d.width_max)),
                             });
                         }
                         if current.is_some() && ui.button("Remove styling").clicked() {
@@ -9445,6 +9494,7 @@ impl ViewerApp {
                     point_shape: crate::data::layer::PointShape::Circle,
                     bin_colors: None,
                     hidden_bins: 0,
+                    ..Default::default()
                 },
             });
         }
@@ -9467,6 +9517,7 @@ impl ViewerApp {
                     point_shape: crate::data::layer::PointShape::Circle,
                     bin_colors: None,
                     hidden_bins: 0,
+                    ..Default::default()
                 },
             });
         }
@@ -9523,6 +9574,7 @@ impl ViewerApp {
                     point_shape: crate::data::layer::PointShape::Circle,
                     bin_colors: None,
                     hidden_bins: 0,
+                    ..Default::default()
                 },
             });
             if anchors.len() <= 64 {
@@ -9557,6 +9609,7 @@ impl ViewerApp {
                     point_shape: crate::data::layer::PointShape::Circle,
                     bin_colors: None,
                     hidden_bins: 0,
+                    ..Default::default()
                 },
             });
         }
@@ -9574,6 +9627,7 @@ impl ViewerApp {
                     point_shape: crate::data::layer::PointShape::Circle,
                     bin_colors: None,
                     hidden_bins: 0,
+                    ..Default::default()
                 },
             });
         }
@@ -9988,6 +10042,137 @@ fn paint_marker(
     }
 }
 
+/// Stroke a horizontal dash preview the way the line pass draws it:
+/// each dash a slab, the cap's shape at both of its ends. Mirrors
+/// `fs_line` in `shaders.wgsl` so the picker previews what ships.
+fn paint_line_style(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    pattern: crate::data::layer::LinePattern,
+    cap: crate::data::layer::LineCap,
+    width: f32,
+    color: Color32,
+) {
+    use crate::data::layer::LineCap;
+    let y = rect.center().y;
+    let h = width * 0.5;
+    let (x0, x1) = (rect.left() + 2.0, rect.right() - 2.0);
+    let slab = |a: f32, b: f32| {
+        egui::Rect::from_min_max(egui::pos2(a, y - h), egui::pos2(b, y + h))
+    };
+    let draw = |a: f32, b: f32| {
+        let (a, b) = (a.max(x0), b.min(x1));
+        if b < a {
+            return;
+        }
+        match cap {
+            LineCap::Flat => {
+                painter.rect_filled(slab(a, b), 0.0, color);
+            }
+            LineCap::Square => {
+                painter.rect_filled(slab(a - h, b + h), 0.0, color);
+            }
+            LineCap::Round => {
+                if b > a {
+                    painter.rect_filled(slab(a, b), 0.0, color);
+                }
+                painter.circle_filled(egui::pos2(a, y), h, color);
+                painter.circle_filled(egui::pos2(b, y), h, color);
+            }
+        }
+    };
+    let d = pattern.dashes_px(cap, width);
+    if d[0] < 0.0 {
+        draw(x0, x1);
+        return;
+    }
+    let period = (d[0] + d[1] + d[2] + d[3]).max(1.0);
+    let mut x = x0;
+    while x < x1 {
+        draw(x, x + d[0]);
+        if d[2] > 0.0 || d[3] > 0.0 {
+            draw(x + d[0] + d[1], x + d[0] + d[1] + d[2]);
+        }
+        x += period;
+    }
+}
+
+/// Line style picker: a dash-preview button opening the pattern and cap
+/// lists. Unlike the marker picker it stays open on selection, so both
+/// properties can be set in one visit. Returns true when either changed.
+fn line_style_button(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    pattern: &mut crate::data::layer::LinePattern,
+    cap: &mut crate::data::layer::LineCap,
+    color: Color32,
+) -> bool {
+    use crate::data::layer::{LineCap, LinePattern};
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, 14.0), egui::Sense::click());
+    let resp = resp.on_hover_text("dash pattern and line caps");
+    paint_line_style(
+        ui.painter(),
+        rect,
+        *pattern,
+        *cap,
+        3.0,
+        ui.style().interact(&resp).fg_stroke.color,
+    );
+    let mut changed = false;
+    egui::Popup::from_toggle_button_response(&resp)
+        .id(egui::Id::new(("line_style_popup", id_salt)))
+        .kind(egui::PopupKind::Popup)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(3.0, 2.0);
+            let row = |ui: &mut egui::Ui,
+                           selected: bool,
+                           preview_pattern: LinePattern,
+                           preview_cap: LineCap,
+                           preview_w: f32,
+                           label: &str|
+             -> bool {
+                let (r, hit) =
+                    ui.allocate_exact_size(egui::vec2(118.0, 20.0), egui::Sense::click());
+                let hit = hit.on_hover_cursor(egui::CursorIcon::PointingHand);
+                if selected || hit.hovered() {
+                    let bg = if selected {
+                        ui.visuals().selection.bg_fill
+                    } else {
+                        ui.visuals().widgets.hovered.bg_fill
+                    };
+                    ui.painter().rect_filled(r, 3.0, bg);
+                }
+                let strip =
+                    egui::Rect::from_min_max(r.min + egui::vec2(4.0, 0.0), egui::pos2(r.left() + 48.0, r.max.y));
+                paint_line_style(ui.painter(), strip, preview_pattern, preview_cap, preview_w, color);
+                ui.painter().text(
+                    egui::pos2(r.left() + 54.0, r.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::FontId::proportional(11.0),
+                    ui.visuals().text_color(),
+                );
+                hit.clicked()
+            };
+            for p in LinePattern::ALL {
+                if row(ui, *pattern == p, p, *cap, 3.0, p.label()) {
+                    *pattern = p;
+                    changed = true;
+                }
+            }
+            ui.separator();
+            for c in LineCap::ALL {
+                // A fat solid stub: the one preview where caps differ.
+                if row(ui, *cap == c, LinePattern::Solid, c, 7.0, c.label()) {
+                    *cap = c;
+                    changed = true;
+                }
+            }
+        });
+    changed
+}
+
 /// Point-symbol picker: a glyph button opening the shape list.
 /// Returns true when the shape changed.
 fn marker_shape_button(
@@ -10262,10 +10447,18 @@ fn resolve_style(s: &crate::data::layer::LayerStyle) -> DrawStyle {
         ],
         point_color: [r, g, b, s.opacity],
         line_half_width_px: (s.line_width_px * 0.5).max(0.01),
+        line_pattern: s.line_pattern,
+        line_cap: s.line_cap,
         point_radius_px: s.point_radius_px.max(0.1),
         point_shape: s.point_shape,
         bin_colors: s.style_by.as_ref().map(|sb| Arc::new(sb.bin_colors())),
+        bin_half_widths: s
+            .style_by
+            .as_ref()
+            .and_then(|sb| sb.bin_widths())
+            .map(|w| Arc::new(w.map(|x| (x * 0.5).max(0.01)))),
         hidden_bins: s.style_by.as_ref().map(|sb| sb.hidden_bins).unwrap_or(0),
+        ..Default::default()
     }
 }
 
@@ -10735,6 +10928,7 @@ mod tests {
                         point_shape: crate::data::layer::PointShape::Circle,
                         bin_colors: None,
                         hidden_bins: 0,
+                        ..Default::default()
                     },
                 },
                 crate::map::renderer::LayerDraw {
@@ -10750,6 +10944,7 @@ mod tests {
                         point_shape: crate::data::layer::PointShape::Circle,
                         bin_colors: None,
                         hidden_bins: 0,
+                        ..Default::default()
                     },
                 },
             ],

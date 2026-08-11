@@ -124,6 +124,10 @@ pub struct StyleBy {
     /// (quantiles/std-dev/Jenks classify only what is loaded — panning or
     /// zooming afterwards can make the classes stale).
     pub classified_rows: Option<usize>,
+    /// Line width ramp (min, max) in px: class widths interpolate
+    /// linearly from first to last bin, the way colors sample the ramp.
+    /// None = the layer-wide width slider applies to every class.
+    pub width_px: Option<(f32, f32)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -518,6 +522,129 @@ impl StyleBy {
         }
         out
     }
+
+    /// Full line widths per bin in px, when a width ramp is set: linear
+    /// from min to max across the classes, mirroring how `bin_colors`
+    /// samples the color ramp. Bins past the class count keep the max.
+    pub fn bin_widths(&self) -> Option<[f32; STYLE_BINS]> {
+        let (min, max) = self.width_px?;
+        let n = match &self.mode {
+            StyleMode::Graduated { breaks, .. } => (breaks.len() + 1).clamp(2, STYLE_BINS),
+            StyleMode::Categorical { values, .. } => values.len().clamp(2, STYLE_BINS),
+        };
+        let mut out = [max; STYLE_BINS];
+        for (i, w) in out.iter_mut().enumerate().take(n) {
+            *w = min + (max - min) * i as f32 / (n - 1) as f32;
+        }
+        Some(out)
+    }
+}
+
+/// Dash pattern of a line layer's stroke (or a polygon's outline).
+///
+/// Lengths are in multiples of the full line width, converted to px at
+/// draw time, so thicker lines get proportionally longer dashes. A dash
+/// of length 0 is a dot: the cap alone gives it its shape.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LinePattern {
+    #[default]
+    Solid,
+    Dash,
+    LongDash,
+    Dot,
+    DashDot,
+}
+
+impl LinePattern {
+    pub const ALL: [LinePattern; 5] = [
+        LinePattern::Solid,
+        LinePattern::Dash,
+        LinePattern::LongDash,
+        LinePattern::Dot,
+        LinePattern::DashDot,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LinePattern::Solid => "solid",
+            LinePattern::Dash => "dash",
+            LinePattern::LongDash => "long dash",
+            LinePattern::Dot => "dot",
+            LinePattern::DashDot => "dash dot",
+        }
+    }
+
+    pub fn from_label(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.label() == name)
+    }
+
+    /// (dash, gap, dash, gap) in width multiples; dash < 0 = solid.
+    fn spec(self) -> [f32; 4] {
+        match self {
+            LinePattern::Solid => [-1.0, 0.0, 0.0, 0.0],
+            LinePattern::Dash => [4.0, 2.0, 0.0, 0.0],
+            LinePattern::LongDash => [8.0, 3.0, 0.0, 0.0],
+            LinePattern::Dot => [0.0, 3.0, 0.0, 0.0],
+            LinePattern::DashDot => [4.0, 2.0, 0.0, 2.0],
+        }
+    }
+
+    /// The pattern in px for a given full line width, shaped by the cap:
+    /// a flat cap adds nothing past a dash's end, which would erase
+    /// zero-length dots entirely, so dots grow to one width under it.
+    pub fn dashes_px(self, cap: LineCap, width_px: f32) -> [f32; 4] {
+        let mut d = self.spec();
+        if d[0] < 0.0 {
+            return d;
+        }
+        let w = width_px.max(1.0);
+        if cap == LineCap::Flat {
+            if d[0] == 0.0 {
+                d[0] = 1.0;
+            }
+            if d[2] == 0.0 && d[3] > 0.0 {
+                d[2] = 1.0;
+            }
+        }
+        [d[0] * w, d[1] * w, d[2] * w, d[3] * w]
+    }
+}
+
+/// Line end treatment, applied at run ends and both ends of every dash.
+/// Interior joints of a polyline always stay round: any other join
+/// would crack at angles with the segment-instanced line pass. The
+/// codes are duplicated in `shaders.wgsl` and must stay in step.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LineCap {
+    #[default]
+    Round,
+    Square,
+    Flat,
+}
+
+impl LineCap {
+    pub const ALL: [LineCap; 3] = [LineCap::Round, LineCap::Square, LineCap::Flat];
+
+    /// Shader id.
+    pub fn code(self) -> u32 {
+        match self {
+            LineCap::Round => 0,
+            LineCap::Square => 1,
+            LineCap::Flat => 2,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LineCap::Round => "round",
+            LineCap::Square => "square",
+            LineCap::Flat => "flat",
+        }
+    }
+
+    pub fn from_label(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.label() == name)
+    }
 }
 
 /// Marker drawn for each feature of a point layer.
@@ -599,6 +726,8 @@ pub struct LayerStyle {
     /// Border / line color; None = derived from `color` (darkened).
     pub line_color: Option<Color32>,
     pub line_width_px: f32,
+    pub line_pattern: LinePattern,
+    pub line_cap: LineCap,
     pub point_radius_px: f32,
     pub point_shape: PointShape,
     pub fill_opacity: f32,
@@ -620,6 +749,8 @@ impl LayerStyle {
             color,
             line_color: None,
             line_width_px: 1.2,
+            line_pattern: LinePattern::Solid,
+            line_cap: LineCap::Round,
             point_radius_px: 3.0,
             point_shape: PointShape::Circle,
             fill_opacity: 0.35,
@@ -1168,6 +1299,7 @@ mod class_tests {
                 breaks: equal_interval_breaks(0.0, 100.0, 5),
             },
             classified_rows: None,
+            width_px: None,
         };
         let colors = sb.bin_colors();
         assert_eq!(colors[4], Ramp::Viridis.sample(1.0), "last class = ramp end");

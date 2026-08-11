@@ -14,7 +14,11 @@ struct ChunkU {
     shape: u32,
     // marker border width in px; 0 or a transparent edge = no border
     edge_px: f32,
+    // line cap style (LineCap::code): 0 round, 1 square, 2 flat
+    cap: u32,
     edge: vec4<f32>,
+    // dash pattern in px: (dash1, gap1, dash2, gap2); dash1 < 0 = solid
+    dash: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: ChunkU;
@@ -40,13 +44,17 @@ fn fs_fill() -> @location(0) vec4<f32> {
     return u.color;
 }
 
-// ---------------- lines (instanced segments, SDF round caps) ----------------
+// ---------------- lines (instanced segments, SDF caps and dashes) ----------------
 
 struct LineOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) p: vec2<f32>,
     @location(1) a: vec2<f32>,
     @location(2) b: vec2<f32>,
+    // arc length along the run at `a`, in px (dash phase)
+    @location(3) cum_a: f32,
+    // bit 0: `a` is a run end; bit 1: `b` is. Interior joints stay round.
+    @location(4) @interpolate(flat) ends: u32,
 };
 
 @vertex
@@ -54,6 +62,9 @@ fn vs_line(
     @builtin(vertex_index) vi: u32,
     @location(0) seg_a: vec2<f32>,
     @location(1) seg_b: vec2<f32>,
+    @location(2) cum_a: f32,
+    @location(3) prev: vec3<f32>,
+    @location(4) next: vec3<f32>,
 ) -> LineOut {
     // NaN in either endpoint (run sentinel in the shared point stream)
     // yields NaN corners: the primitive is clipped, drawing nothing.
@@ -85,19 +96,65 @@ fn vs_line(
     out.p = corner;
     out.a = a_px;
     out.b = b_px;
+    // The stream stores arc length in chunk-local units; the segment's
+    // own px/local ratio converts it (the camera transform is isotropic).
+    let local_len = length(seg_b - seg_a);
+    out.cum_a = cum_a * len / max(local_len, 1e-12);
+    // A sentinel neighbour (run break, or the stream's padded ends)
+    // marks a run end. Sentinels carry a negative arc length: the NaN
+    // in their position cannot be tested here, fast-math folds it.
+    out.ends = select(0u, 1u, prev.z < 0.0) | select(0u, 2u, next.z < 0.0);
     return out;
 }
 
-fn dist_to_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
-    let ab = b - a;
-    let t = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-9), 0.0, 1.0);
-    return length(p - (a + ab * t));
+// Signed distance past one end of a stroke, in the (along, across)
+// frame: `beyond` is px past the end, `s_d` px off the centerline.
+fn cap_dist(beyond: f32, s_d: f32, cap: u32, r: f32) -> f32 {
+    switch (cap) {
+        case 1u: { return max(beyond - r, s_d - r); }  // square
+        case 2u: { return max(beyond, s_d - r); }      // flat
+        default: { return length(vec2<f32>(max(beyond, 0.0), s_d)) - r; }
+    }
 }
 
 @fragment
 fn fs_line(in: LineOut) -> @location(0) vec4<f32> {
-    let d = dist_to_segment(in.p, in.a, in.b);
-    let alpha = clamp((u.size - d) / u.feather + 1.0, 0.0, 1.0);
+    let ab = in.b - in.a;
+    let len = max(length(ab), 1e-6);
+    let dir = ab / len;
+    let rel = in.p - in.a;
+    let t = dot(rel, dir);
+    let s_d = abs(dot(rel, vec2<f32>(-dir.y, dir.x)));
+    // Run ends take the user cap; interior joints are always round, so
+    // the neighbouring segment's round end fuses with ours at any angle.
+    let cap_a = select(0u, u.cap, (in.ends & 1u) != 0u);
+    let cap_b = select(0u, u.cap, (in.ends & 2u) != 0u);
+    var d = max(cap_dist(-t, s_d, cap_a, u.size),
+                cap_dist(t - len, s_d, cap_b, u.size));
+    if (u.dash.x >= 0.0) {
+        // Dash pattern (dash1, gap1, dash2, gap2) tiled along the run's
+        // arc length. Each on-interval is a stroke with the user cap at
+        // both ends; the nearest of this period's copies and both
+        // neighbours wins, so dashes crossing the wrap stay whole.
+        let period = max(u.dash.x + u.dash.y + u.dash.z + u.dash.w, 1e-3);
+        let l = in.cum_a + t;
+        let lf = l - floor(l / period) * period;
+        let e1 = u.dash.x;
+        let s2 = u.dash.x + u.dash.y;
+        let e2 = s2 + u.dash.z;
+        var pd = 3.4e38;
+        for (var k = -1; k <= 1; k++) {
+            let l0 = lf - f32(k) * period;
+            pd = min(pd, max(cap_dist(-l0, s_d, u.cap, u.size),
+                             cap_dist(l0 - e1, s_d, u.cap, u.size)));
+            if (u.dash.z > 0.0 || u.dash.w > 0.0) {
+                pd = min(pd, max(cap_dist(s2 - l0, s_d, u.cap, u.size),
+                                 cap_dist(l0 - e2, s_d, u.cap, u.size)));
+            }
+        }
+        d = max(d, pd);
+    }
+    let alpha = clamp(-d / u.feather + 1.0, 0.0, 1.0);
     // No discard: zero-alpha fragments blend to nothing, and avoiding the
     // punch-through path keeps the GPU on its fast blend pipeline.
     return vec4<f32>(u.color.rgb, u.color.a * alpha);

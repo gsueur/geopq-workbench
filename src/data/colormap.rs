@@ -262,6 +262,7 @@ pub fn schema_style(columns: &[(String, bool)]) -> Option<crate::data::layer::St
         hidden_bins: 0,
         per_area: false,
         classified_rows: None,
+        width_px: None,
     })
 }
 

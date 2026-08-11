@@ -5065,6 +5065,7 @@ mod pruning_tests {
                 hidden_bins: 0,
                 per_area: false,
                 classified_rows: None,
+                width_px: None,
             },
         )
         .expect("styleable");
