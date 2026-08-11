@@ -2531,6 +2531,48 @@ mod tests {
         );
     }
 
+    /// A dashed hairline at the default 1.2 px width must still read as
+    /// dashed: unfloored, width-scaled gaps (2.4 px minus a round cap
+    /// from each side) sink into the AA feather and the line comes back
+    /// solid — which is how the feature shipped broken the first time.
+    #[test]
+    fn dashes_survive_hairline_widths() {
+        use crate::data::layer::{LineCap, LinePattern};
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let size = 128u32;
+        let data = render_geoms(
+            &device,
+            &queue,
+            size,
+            16.0,
+            line_style(0.6, LinePattern::Dash, LineCap::Round),
+            |mb| add_horizontal_chain(mb, 105.0, 8),
+        );
+        // Threshold low: a 1.2 px stroke straddles two rows under MSAA,
+        // so the centre row rarely reaches full intensity.
+        let mut runs = Vec::new();
+        let mut cur = 0usize;
+        for x in 0..size {
+            let px = &data[(((size / 2) * size + x) * 4) as usize..][..4];
+            if px[1] > 40 {
+                cur += 1;
+            } else if cur > 0 {
+                runs.push(cur);
+                cur = 0;
+            }
+        }
+        if cur > 0 {
+            runs.push(cur);
+        }
+        assert!(
+            runs.len() >= 3,
+            "a hairline Dash must break into dashes, got runs {runs:?}"
+        );
+    }
+
     /// Caps order the ink of a solid stroke: flat < round < square, and
     /// round/square extend the lit span past the endpoints while flat
     /// stops there.

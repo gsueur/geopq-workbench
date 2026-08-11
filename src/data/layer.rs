@@ -592,12 +592,16 @@ impl LinePattern {
     /// The pattern in px for a given full line width, shaped by the cap:
     /// a flat cap adds nothing past a dash's end, which would erase
     /// zero-length dots entirely, so dots grow to one width under it.
+    /// The unit is floored at 3 px: dashes scale with the stroke, but on
+    /// a hairline an unfloored gap sinks into the AA feather (round caps
+    /// eat half a width from each end on top) and the pattern reads as
+    /// solid.
     pub fn dashes_px(self, cap: LineCap, width_px: f32) -> [f32; 4] {
         let mut d = self.spec();
         if d[0] < 0.0 {
             return d;
         }
-        let w = width_px.max(1.0);
+        let w = width_px.max(3.0);
         if cap == LineCap::Flat {
             if d[0] == 0.0 {
                 d[0] = 1.0;
