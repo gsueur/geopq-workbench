@@ -187,10 +187,15 @@ pub fn write_for_output(dst: &Path, title: &str, crs: &Crs) -> Result<PathBuf, S
         let files = parts
             .into_iter()
             .map(|p| {
+                // Hrefs are URL paths whatever the platform: Windows
+                // hands out backslashes here, and a collection published
+                // with them is unreadable everywhere (same rule as
+                // upload_tree's object keys).
                 let rel = p
                     .strip_prefix(dst)
                     .map(|r| format!("./{}", r.display()))
-                    .unwrap_or_else(|_| p.display().to_string());
+                    .unwrap_or_else(|_| p.display().to_string())
+                    .replace('\\', "/");
                 (rel, p)
             })
             .collect::<Vec<_>>();
