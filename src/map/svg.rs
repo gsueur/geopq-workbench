@@ -16,6 +16,7 @@
 //! published colour map's exact RGB values only survive that way.
 
 use std::fmt::Write as _;
+use std::path::Path;
 
 use eframe::egui;
 use geo_types::Geometry;
@@ -316,6 +317,29 @@ fn marker_element(
             poly(pts, out);
         }
     }
+}
+
+/// The document as the bytes the chosen path asks for: gzip (SVGZ) when
+/// the name ends in `.svgz`, the plain text otherwise. SVGZ is what
+/// Inkscape and Illustrator write for exactly this situation — an SVG is
+/// verbose coordinate text and compresses several-fold — and the format
+/// is nothing but the gzip stream, so the choice can live in the file
+/// name alone.
+pub fn encode_for(path: &Path, doc: &str) -> Result<Vec<u8>, String> {
+    let svgz = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("svgz"));
+    if !svgz {
+        return Ok(doc.as_bytes().to_vec());
+    }
+    use std::io::Write as _;
+    let mut enc = flate2::write::GzEncoder::new(
+        Vec::with_capacity(doc.len() / 4),
+        flate2::Compression::best(),
+    );
+    enc.write_all(doc.as_bytes())
+        .and_then(|()| enc.finish())
+        .map_err(|e| format!("svgz compression failed: {e}"))
 }
 
 /// Render the scene as a self-contained SVG 1.1 document.
@@ -940,5 +964,31 @@ mod tests {
         let svg = render(&sc);
         assert_eq!(count(&layer_block(&svg, 0), "<path"), 0);
         assert!(!svg.contains("NaN") && !svg.contains("inf"), "{svg}");
+    }
+
+    /// An .svgz path gets a gzip stream that decodes back to the exact
+    /// document; an .svg path gets the text untouched. Extension case
+    /// must not matter — a file dialog on macOS happily returns .SVGZ.
+    #[test]
+    fn svgz_is_the_same_document_compressed() {
+        use std::io::Read as _;
+        let doc = render(&scene());
+        let plain = encode_for(Path::new("/tmp/map.svg"), &doc).unwrap();
+        assert_eq!(plain, doc.as_bytes());
+        for name in ["/tmp/map.svgz", "/tmp/MAP.SVGZ"] {
+            let gz = encode_for(Path::new(name), &doc).unwrap();
+            assert_eq!(&gz[..2], &[0x1f, 0x8b], "gzip magic");
+            assert!(
+                gz.len() * 2 < doc.len(),
+                "coordinate text must compress well: {} of {}",
+                gz.len(),
+                doc.len()
+            );
+            let mut back = String::new();
+            flate2::read::GzDecoder::new(&gz[..])
+                .read_to_string(&mut back)
+                .unwrap();
+            assert_eq!(back, doc, "decompression is the identity");
+        }
     }
 }

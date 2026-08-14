@@ -358,7 +358,9 @@ rewrite is refused only when the row count alone would not fit.
   in the file's `<desc>` says so. Nor is anything the viewer chose not
   to draw — a hidden legend class, a layer still showing a decimated
   preview (also noted in the file). It is the figure on screen, not a
-  second copy of the dataset.
+  second copy of the dataset. Saving as `.svgz` writes the same
+  document gzip-compressed — coordinate text shrinks several-fold, and
+  Inkscape and Illustrator open it as-is.
 - **Session contexts**: File → Save context… stores layers (including
   remote URLs and S3 sources), styles, order, camera and projection as a
   JSON file; Load context… restores the whole session.

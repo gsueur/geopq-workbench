@@ -2241,7 +2241,11 @@ impl ViewerApp {
             }
             PickFor::Screenshot(img) => self.write_screenshot(&img, &first),
             PickFor::ExportSvg(doc) => {
-                if let Err(e) = std::fs::write(&first, doc.as_bytes()) {
+                let write = crate::map::svg::encode_for(&first, &doc)
+                    .and_then(|bytes| {
+                        std::fs::write(&first, bytes).map_err(|e| e.to_string())
+                    });
+                if let Err(e) = write {
                     self.push_error(format!("could not save {}: {e}", first.display()));
                 }
             }
@@ -8849,6 +8853,7 @@ impl ViewerApp {
             awaited_path(
                 d.set_file_name(name)
                     .add_filter("SVG image", &["svg"])
+                    .add_filter("Compressed SVG", &["svgz"])
                     .save_file(),
             )
         });

@@ -2814,6 +2814,7 @@ dependencies = [
  "egui-phosphor",
  "egui_extras",
  "env_logger",
+ "flate2",
  "futures",
  "geo",
  "geo-traits",
