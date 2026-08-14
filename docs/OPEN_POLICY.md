@@ -6,14 +6,40 @@ GeoParquet](https://github.com/opengeospatial/geoparquet/blob/main/format-specs/
 zstd 15, 50k–150k-row row groups, spatial ordering, page index.
 Selecting 2.0 in the optimizer applies the official recommended
 settings (native GEOMETRY + native stats only); two opt-in flavor
-extras exist: the bbox covering column (page-level spatial pruning —
-which that document lists as unsolved — and the cheapest exact viewport
-selection; without it, WKB files fall back to a per-group WKB envelope
-scan for rect resolution) and
+extras exist: the bbox covering column (page-level spatial pruning
+and the cheapest exact viewport selection; without it, WKB files fall
+back to a per-group WKB envelope scan for rect resolution) and
 an auxiliary GeoArrow coordinate-array sibling column
 (`{primary}_geoarrow`, undeclared in `geo` so the file stays
 conformant 2.0; the loader adopts it for decode and hides the
 redundant WKB primary from attribute UIs).
+
+Re-audited against the document's 2026 revision. Two positions this
+workbench took ahead of the text are now in it explicitly:
+
+- **Covering column beside 2.0 native stats.** The revision's
+  "page-level spatial statistics" discussion concedes that native
+  geo statistics stop at row-group granularity while the 1.1 covering
+  column, being an ordinary struct column, keeps a page index — their
+  benchmark halves a selective query's time with page pruning. Keeping
+  the covering as a 2.0 extra is exactly that trade, spent as file
+  size. It stays opt-in because the official 2.0 recommendation is
+  native stats only.
+- **Row groups sized in bytes well below the 128–256 MB analytics
+  guidance.** The optimizer caps a group at 16 MB encoded (alongside
+  the 65,536-row cap, whichever lands first). The revision's "Usage in
+  Frontend Applications" section now spells out why: for bbox-window
+  display — this app's access pattern — the row group is the fetch
+  unit, and analytics-sized groups drag irrelevant data through the
+  network. Files meant mainly for scan-heavy analytics should size up.
+
+Deliberate deviations that remain: adaptive-H3 (or field/admin) spatial
+partitioning rather than the KD-tree the document currently leads with —
+same goal (balanced file sizes, spatial separation), and the document
+itself accepts any scheme that achieves it. Known gap, not a deviation:
+the publish flow writes no STAC `collection.json` beside its output;
+the document recommends one for distributed data. The repository
+browser already consumes STAC, only the writer side is missing.
 
 ## 1. Problem
 
