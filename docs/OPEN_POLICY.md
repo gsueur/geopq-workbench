@@ -36,10 +36,14 @@ workbench took ahead of the text are now in it explicitly:
 Deliberate deviations that remain: adaptive-H3 (or field/admin) spatial
 partitioning rather than the KD-tree the document currently leads with —
 same goal (balanced file sizes, spatial separation), and the document
-itself accepts any scheme that achieves it. Known gap, not a deviation:
-the publish flow writes no STAC `collection.json` beside its output;
-the document recommends one for distributed data. The repository
-browser already consumes STAC, only the writer side is missing.
+itself accepts any scheme that achieves it. The document's STAC
+recommendation is covered on both sides: the repository browser
+consumes STAC catalogs, and the publish flow uploads a STAC Collection
+(`collection.json`, on by default) beside its output — extent read from
+the parquet footers and transformed to WGS84, one
+`application/vnd.apache.parquet` asset per part. Collection only for
+now; per-part STAC Items for partitioned datasets would be a
+compatible extension.
 
 ## 1. Problem
 

@@ -246,7 +246,10 @@ Beyond the rewrite itself:
   dialog and the output uploads to your bucket (multipart for big
   files) instead of staying local; partitioned datasets upload under a
   prefix that the workbench can reopen as one layer. Already-optimized
-  local files can upload as-is, skipping the rewrite. Needs write
+  local files can upload as-is, skipping the rewrite. A STAC
+  `collection.json` uploads beside the data by default — extent and
+  feature count read from the parquet footers — as the
+  distributing-geoparquet best practices recommend. Needs write
   credentials in `~/.aws` (for R2: an API token plus the account
   endpoint).
 - **Before/after report**: size, row groups, and a spatial-clustering

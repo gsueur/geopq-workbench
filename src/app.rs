@@ -168,6 +168,9 @@ struct OptimizeState {
     /// Publish the source file unchanged (no rewrite) — local sources
     /// with an S3 destination and no rewrite-requiring options only.
     upload_as_is: bool,
+    /// Publish a STAC `collection.json` beside the data, as the
+    /// distributing-geoparquet best practices recommend.
+    stac: bool,
     /// Finished as-is publish: destination and bytes uploaded.
     report_as_is: Option<(S3Dest, u64)>,
 }
@@ -4066,6 +4069,7 @@ impl ViewerApp {
                         open_result: false,
                         recommended,
                         dest_s3: false,
+                        stac: true,
                         s3_uri: String::new(),
                         s3_endpoint: String::new(),
                         s3_profile: None,
@@ -6654,6 +6658,7 @@ impl ViewerApp {
                 (!e.is_empty()).then(|| e.to_string())
             },
         };
+        let stac = o.stac.then(|| (o.crs.clone(), o.layer_name.clone()));
         let tx = self.opt_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
@@ -6663,6 +6668,25 @@ impl ViewerApp {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            // The as-is STAC sidecar: staged in the temp dir (never
+            // beside the user's source file), uploaded after the data.
+            let publish_stac = || -> Result<(), String> {
+                let Some((crs, title)) = &stac else { return Ok(()) };
+                let sibling = crate::data::stac::sibling_uri(&dest.uri)
+                    .ok_or("no prefix for collection.json")?;
+                let json = std::env::temp_dir()
+                    .join(format!("geopq_stac_{}.json", std::process::id()));
+                crate::data::stac::write_for_file_at(&src_path, &json, title, crs)?;
+                let r = crate::data::source::aws::upload_file(
+                    &json,
+                    &sibling,
+                    dest.profile.as_deref(),
+                    dest.endpoint.as_deref(),
+                    &|_, _| {},
+                );
+                let _ = std::fs::remove_file(&json);
+                r.map_err(|e| format!("data uploaded, but collection.json failed: {e}"))
+            };
             let msg = match crate::data::source::aws::upload_file(
                 &src_path,
                 &dest.uri,
@@ -6676,7 +6700,9 @@ impl ViewerApp {
                     ));
                     ctx.request_repaint();
                 },
-            ) {
+            )
+            .and_then(|()| publish_stac())
+            {
                 Ok(()) => OptMsg::PublishedAsIs(dest, size),
                 Err(e) => OptMsg::Failed(e),
             };
@@ -6727,6 +6753,9 @@ impl ViewerApp {
         }
         let admin_sel = (o.admin_layer, o.admin_column.clone(), o.admin_out.clone());
         let (src, opts, epsg) = (o.src.clone(), o.opts.clone(), o.epsg);
+        // STAC sidecar for publishes: needs the CRS (extent goes to
+        // WGS84) and a human title.
+        let stac = (o.dest_s3 && o.stac).then(|| (o.crs.clone(), o.layer_name.clone()));
         let admin: Option<AdminJoinSpec> = admin_sel
             .0
             .and_then(|id| self.layers.iter().find(|l| l.id == id))
@@ -6810,6 +6839,17 @@ impl ViewerApp {
                         // Upload phase: file to key, dataset dir to prefix.
                         use crate::data::info::fmt_bytes;
                         use crate::data::source::aws;
+                        // The STAC sidecar rides inside a dataset dir
+                        // (upload_tree carries it); a single file gets
+                        // it uploaded beside itself afterwards.
+                        let stac_json: Result<Option<PathBuf>, String> = match &stac {
+                            Some((crs, title)) => {
+                                crate::data::stac::write_for_output(&dst, title, crs)
+                                    .map(Some)
+                                    .map_err(|e| format!("STAC collection.json failed: {e}"))
+                            }
+                            None => Ok(None),
+                        };
                         let up = |sent: u64, total: u64, name: &str| {
                             let frac = if total > 0 {
                                 sent as f32 / total as f32
@@ -6825,28 +6865,48 @@ impl ViewerApp {
                                 ),
                             );
                         };
-                        let uploaded = if dst.is_dir() {
-                            aws::upload_tree(
-                                &dst,
-                                &d.uri,
-                                d.profile.as_deref(),
-                                d.endpoint.as_deref(),
-                                &up,
-                            )
-                            .map(|_| ())
-                        } else {
-                            let name = dst
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            aws::upload_file(
-                                &dst,
-                                &d.uri,
-                                d.profile.as_deref(),
-                                d.endpoint.as_deref(),
-                                &|s, t| up(s, t, &name),
-                            )
-                        };
+                        let uploaded = stac_json.and_then(|stac_json| {
+                            if dst.is_dir() {
+                                // collection.json sits inside: one tree upload.
+                                aws::upload_tree(
+                                    &dst,
+                                    &d.uri,
+                                    d.profile.as_deref(),
+                                    d.endpoint.as_deref(),
+                                    &up,
+                                )
+                                .map(|_| ())
+                            } else {
+                                let name = dst
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                aws::upload_file(
+                                    &dst,
+                                    &d.uri,
+                                    d.profile.as_deref(),
+                                    d.endpoint.as_deref(),
+                                    &|s, t| up(s, t, &name),
+                                )?;
+                                if let Some(json) = &stac_json {
+                                    let sibling = crate::data::stac::sibling_uri(&d.uri)
+                                        .ok_or("no prefix for collection.json")?;
+                                    progress(1.0, "uploading collection.json");
+                                    aws::upload_file(
+                                        json,
+                                        &sibling,
+                                        d.profile.as_deref(),
+                                        d.endpoint.as_deref(),
+                                        &|_, _| {},
+                                    )
+                                    .map_err(|e| {
+                                        format!("data uploaded, but collection.json failed: {e}")
+                                    })?;
+                                    let _ = std::fs::remove_file(json);
+                                }
+                                Ok(())
+                            }
+                        });
                         match uploaded {
                             Ok(()) => {
                                 // The local copy was only a staging file.
@@ -7534,6 +7594,14 @@ impl ViewerApp {
                                     }
                                 });
                         });
+                        ui.checkbox(&mut o.stac, "write a STAC collection.json")
+                            .on_hover_text(
+                                "Describe the published data the standard way: a \
+                                 STAC Collection uploaded beside it, with the \
+                                 extent read from the parquet footers. The \
+                                 distributing-geoparquet best practices \
+                                 recommend one for any published dataset.",
+                            );
                         if let Source::Local(p) = &o.src {
                             let mut reasons: Vec<&str> = Vec::new();
                             if !o.merge_with.is_empty() {
@@ -8810,6 +8878,7 @@ impl ViewerApp {
                         open_result: true,
                         recommended,
                         dest_s3: false,
+                        stac: true,
                         s3_uri: String::new(),
                         s3_endpoint: String::new(),
                         s3_profile: None,

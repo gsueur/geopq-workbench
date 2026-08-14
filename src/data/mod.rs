@@ -21,4 +21,5 @@ pub mod quality;
 pub mod repo;
 pub mod shp;
 pub mod source;
+pub mod stac;
 pub mod store;
