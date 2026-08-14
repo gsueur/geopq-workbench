@@ -122,11 +122,15 @@ impl RTreeObject for BoundaryEntry {
 
 /// Point-in-polygon join: each feature centroid (in the boundary layer's
 /// CRS) gets the boundary polygon's attribute value; None when no polygon
-/// contains it.
+/// contains it. Returned interned, because the values come from a boundary
+/// layer of at most 200k polygons however many features are joined — a
+/// `String` per exported row would be the largest allocation of the whole
+/// export, and every one of them a duplicate.
 pub fn admin_join(
     spec: &AdminJoinSpec,
+    out_name: &str,
     centroids_boundary_crs: &[Option<(f64, f64)>],
-) -> Result<Vec<Option<String>>, String> {
+) -> Result<FieldCodes, String> {
     use arrow::util::display::{ArrayFormatter, FormatOptions};
     use geo::BoundingRect;
 
@@ -173,48 +177,171 @@ pub fn admin_join(
         .collect();
     let tree = RTree::bulk_load(entries);
 
-    Ok(centroids_boundary_crs
-        .iter()
-        .map(|c| {
-            let (x, y) = (*c)?;
+    let mut out = Interner::uncapped(centroids_boundary_crs.len());
+    for c in centroids_boundary_crs {
+        let hit = c.and_then(|(x, y)| {
             let p = geo_types::Point::new(x, y);
             tree.locate_in_envelope_intersecting(AABB::from_point([x, y]))
                 .find(|e| e.geom.contains(&p))
-                .map(|e| e.value.clone())
-        })
-        .collect())
+        });
+        out.push(hit.map(|e| e.value.as_str()))?;
+    }
+    Ok(out.finish(out_name))
 }
 
-/// Split a (spatially ordered) row order into hive partitions keyed by the
-/// per-row values of the partition fields. Returns (relative dir, rows)
-/// preserving the input order inside each partition.
+/// Per-row partition values held as dictionary codes: `codes[row]` indexes
+/// `dict`. A formatted `String` per row per field is what a partitioned
+/// export of a large layer spends most of its memory on, and the values are
+/// low-cardinality by construction — a key with more than `MAX_PARTITIONS`
+/// distinct values is refused either way.
+pub struct FieldCodes {
+    pub name: String,
+    pub dict: Vec<Option<String>>,
+    pub codes: Vec<u32>,
+}
+
+impl FieldCodes {
+    /// The value of one row, for callers writing the column back out.
+    pub fn value(&self, row: u32) -> Option<&str> {
+        self.codes
+            .get(row as usize)
+            .and_then(|&c| self.dict.get(c as usize))
+            .and_then(Option::as_deref)
+    }
+}
+
+/// Builds `FieldCodes` one row at a time, so a partition key can be filled
+/// during the scan that reads it. Refuses past the partition ceiling: a
+/// high-cardinality key would otherwise fill the dictionary long before the
+/// partition count itself is checked.
+pub struct Interner {
+    dict: Vec<Option<String>>,
+    index: HashMap<String, u32>,
+    null_code: Option<u32>,
+    codes: Vec<u32>,
+    /// Distinct values allowed before the build is refused.
+    cap: usize,
+}
+
+impl Default for Interner {
+    fn default() -> Self {
+        Self {
+            dict: Vec::new(),
+            index: HashMap::new(),
+            null_code: None,
+            codes: Vec::new(),
+            cap: MAX_PARTITIONS,
+        }
+    }
+}
+
+impl Interner {
+    /// For values that are not a partition key. An admin join against a
+    /// 200k-polygon boundary layer is a legitimate output column, and only
+    /// partitioning has a reason to refuse that many distinct values.
+    pub fn uncapped(rows: usize) -> Self {
+        Self {
+            codes: Vec::with_capacity(rows),
+            cap: usize::MAX,
+            ..Default::default()
+        }
+    }
+
+    pub fn push(&mut self, v: Option<&str>) -> Result<(), String> {
+        let code = match v {
+            None => match self.null_code {
+                Some(c) => c,
+                None => {
+                    let c = self.dict.len() as u32;
+                    self.dict.push(None);
+                    self.null_code = Some(c);
+                    c
+                }
+            },
+            Some(s) => match self.index.get(s) {
+                Some(&c) => c,
+                None => {
+                    let c = self.dict.len() as u32;
+                    self.dict.push(Some(s.to_string()));
+                    self.index.insert(s.to_string(), c);
+                    c
+                }
+            },
+        };
+        if self.dict.len() > self.cap {
+            return Err(format!(
+                "more than {MAX_PARTITIONS} partitions — pick lower-cardinality fields"
+            ));
+        }
+        self.codes.push(code);
+        Ok(())
+    }
+
+    pub fn finish(self, name: &str) -> FieldCodes {
+        FieldCodes { name: name.to_string(), dict: self.dict, codes: self.codes }
+    }
+}
+
+/// `split_by_field_codes` from raw per-row values. The export interns its
+/// partition keys while it scans, so this direct form is only what the
+/// tests below name the behaviour with.
+#[cfg(test)]
 pub fn split_by_fields(
     order: &[u32],
     fields: &[(String, Vec<Option<String>>)],
 ) -> Result<Vec<(String, Vec<u32>)>, String> {
-    // Encode field names once, rather than once per output row. Parquet field
-    // names are unrestricted strings; raw '/' or '\\' here would otherwise
-    // become path separators when optimize joins this relative directory to
-    // the chosen output root.
-    let fields: Vec<(String, &[Option<String>])> = fields
+    let coded: Vec<FieldCodes> = fields
         .iter()
         .map(|(name, values)| {
-            if name.is_empty() {
+            let mut it = Interner::default();
+            for v in values {
+                it.push(v.as_deref())?;
+            }
+            Ok(it.finish(name))
+        })
+        .collect::<Result<_, String>>()?;
+    split_by_field_codes(order, &coded)
+}
+
+/// `split_by_fields` over interned values.
+pub fn split_by_field_codes(
+    order: &[u32],
+    fields: &[FieldCodes],
+) -> Result<Vec<(String, Vec<u32>)>, String> {
+    // Encode field names and dictionary values once, rather than once per
+    // output row. Parquet field names are unrestricted strings; raw '/' or
+    // '\\' here would otherwise become path separators when optimize joins
+    // this relative directory to the chosen output root.
+    let encoded: Vec<(String, Vec<String>)> = fields
+        .iter()
+        .map(|f| {
+            if f.name.is_empty() {
                 return Err("cannot partition by an empty field name".to_string());
             }
-            Ok((encode_hive_component(name), values.as_slice()))
+            let values = f
+                .dict
+                .iter()
+                .map(|v| {
+                    v.as_deref()
+                        .map(sanitize_hive_value)
+                        .unwrap_or_else(|| NULL_PARTITION.to_string())
+                })
+                .collect();
+            Ok((encode_hive_component(&f.name), values))
         })
         .collect::<Result<_, _>>()?;
     let mut parts: HashMap<String, Vec<u32>> = HashMap::new();
     for &r in order {
         let dir = fields
             .iter()
-            .map(|(name, vals)| {
-                let v = vals
+            .zip(&encoded)
+            .map(|(f, (name, values))| {
+                let v = f
+                    .codes
                     .get(r as usize)
-                    .and_then(|v| v.as_deref())
-                    .map(sanitize_hive_value)
-                    .unwrap_or_else(|| NULL_PARTITION.to_string());
+                    .and_then(|&c| values.get(c as usize))
+                    .map(String::as_str)
+                    .unwrap_or(NULL_PARTITION);
                 format!("{name}={v}")
             })
             .collect::<Vec<_>>()

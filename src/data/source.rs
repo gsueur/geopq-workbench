@@ -1294,6 +1294,26 @@ pub struct SourceReader {
     window: WindowCache,
 }
 
+impl SourceReader {
+    /// Another reader over the same remote bytes, sharing the streaming
+    /// window. The parquet builders take a reader by value, so a pass that
+    /// re-opens one row group at a time would otherwise begin every decode
+    /// with a cold window and re-request ranges the previous one paid for.
+    ///
+    /// `None` for a local file: reopening one is free, and a duplicated
+    /// descriptor would share its seek position with the original.
+    pub fn share_remote(&self) -> Option<SourceReader> {
+        let Inner::Remote { url } = &self.inner else {
+            return None;
+        };
+        Some(SourceReader {
+            inner: Inner::Remote { url: url.clone() },
+            len: self.len,
+            window: Arc::clone(&self.window),
+        })
+    }
+}
+
 enum Inner {
     Local(File),
     Remote { url: String },

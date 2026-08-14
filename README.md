@@ -268,8 +268,12 @@ Beyond the rewrite itself:
   published outputs, which reload straight from the bucket. A
   1.89M-parcel cadastral file rewrites in ~7 s.
 
-The optimizer holds the dataset in memory (capped at 8 GB uncompressed);
-larger files are on the roadmap.
+The optimizer is a two-pass streaming rewrite: it scans the geometry to
+build the sort order, then re-reads the source through a bounded decode
+cache to write the output. Peak memory follows the row count (56 bytes a
+row for the sort index, more when H3, an admin join or partitioning add
+derived columns) rather than the file size, so there is no size cap — a
+rewrite is refused only when the row count alone would not fit.
 
 ## Exploring the map
 
@@ -470,8 +474,9 @@ quality gate and display policy).
 
 ## Roadmap
 
-- Streaming optimize beyond the 8 GB in-memory cap; multi-file
-  optimize.
+- Multi-file optimize: the streaming rewrite takes one source file at a
+  time, so a directory or multi-part dataset still has to be merged
+  first.
 - Label rendering.
 
 Remote hive datasets over `https://` shipped once the manifest they
