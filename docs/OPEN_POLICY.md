@@ -41,9 +41,12 @@ recommendation is covered on both sides: the repository browser
 consumes STAC catalogs, and the publish flow uploads a STAC Collection
 (`collection.json`, on by default) beside its output — extent read from
 the parquet footers and transformed to WGS84, one
-`application/vnd.apache.parquet` asset per part. Collection only for
-now; per-part STAC Items for partitioned datasets would be a
-compatible extension.
+`application/vnd.apache.parquet` asset per part, each with its own
+WGS84 bbox. That document is also the discovery manifest on the way
+back in: an `https://` prefix has no object listing, so it opens by
+resolving the collection's assets, which is what makes a published
+dataset reopenable from its own URL. Collection only for now; per-part
+STAC Items for partitioned datasets would be a compatible extension.
 
 ## 1. Problem
 

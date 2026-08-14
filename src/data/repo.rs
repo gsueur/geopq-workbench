@@ -648,7 +648,7 @@ fn write_collections_cache(cache: &std::collections::HashMap<String, StacCollect
 }
 
 fn parse_stac_collection(col: &Value) -> StacCollection {
-    let parts = col
+    let items = col
         .get("links")
         .and_then(Value::as_array)
         .map(|ls| {
@@ -656,7 +656,17 @@ fn parse_stac_collection(col: &Value) -> StacCollection {
                 .filter(|l| l.get("rel").and_then(Value::as_str) == Some("item"))
                 .count()
         })
-        .unwrap_or(0) as u64;
+        .unwrap_or(0);
+    // A collection-only document (no Items) carries its parts as assets,
+    // and counting only item links reported such a dataset as empty.
+    let parts = if items > 0 {
+        items
+    } else {
+        col.get("assets")
+            .and_then(Value::as_object)
+            .map(|a| a.values().filter(|v| is_parquet_asset(v)).count())
+            .unwrap_or(0)
+    } as u64;
     // Rights holders first: a "processor" that merely reformatted the data
     // is not who the licence asks you to credit.
     let mut providers: Vec<String> = Vec::new();
@@ -760,33 +770,132 @@ pub struct StacPart {
     /// Item bbox (WGS84 lon/lat), for part-level viewport pruning.
     pub bbox: Option<[f64; 4]>,
     pub rows: u64,
+    /// Path of the part below the collection, when it lives under it —
+    /// the only place hive `key=value` segments can come from over plain
+    /// HTTPS, where there is no listing to derive a prefix from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rel: Option<String>,
+}
+
+/// Resolve an href against the document that carries it, over the subset
+/// of RFC 3986 these catalogs use: an absolute http(s) href stands on its
+/// own, `./x` and `x` hang off the document's directory, `/x` off the
+/// origin.
+///
+/// `..` is refused rather than resolved: a collection describes the data
+/// published under it, and an href climbing out of that prefix is either
+/// broken or aimed somewhere it has no claim to.
+fn join_href(doc_url: &str, href: &str) -> Result<String, String> {
+    let href = href.trim();
+    if href.is_empty() {
+        return Err(format!("{doc_url}: an asset has an empty href"));
+    }
+    if href.starts_with("http://") || href.starts_with("https://") {
+        return Ok(href.to_string());
+    }
+    if href.contains("://") {
+        return Err(format!("{href}: not an http(s) href"));
+    }
+    if href.split('/').any(|s| s == "..") {
+        return Err(format!("{href}: href escapes the collection's prefix"));
+    }
+    if href.starts_with('/') {
+        // Root-relative: everything after the host is replaced.
+        let origin = doc_url
+            .split_once("://")
+            .map(|(scheme, rest)| {
+                let host = rest.split('/').next().unwrap_or(rest);
+                format!("{scheme}://{host}")
+            })
+            .ok_or_else(|| format!("{doc_url}: not an http(s) URL"))?;
+        return Ok(format!("{origin}{href}"));
+    }
+    let dir = doc_url.rsplit_once('/').map(|(d, _)| d).unwrap_or(doc_url);
+    Ok(format!("{dir}/{}", href.trim_start_matches("./")))
+}
+
+/// A resolved part URL's path below the collection, or None when the
+/// part lives outside it (another host, another prefix) and a path
+/// fragment would describe nothing.
+fn href_below(collection_url: &str, url: &str) -> Option<String> {
+    let dir = collection_url
+        .rsplit_once('/')
+        .map(|(d, _)| d)
+        .unwrap_or(collection_url);
+    url.strip_prefix(&format!("{dir}/"))
+        .filter(|rel| !rel.is_empty())
+        .map(str::to_string)
+}
+
+/// Whether an asset is a parquet part: the media type when it is
+/// declared, else the extension — third-party collections often publish
+/// `.parquet` hrefs with no type at all.
+fn is_parquet_asset(a: &Value) -> bool {
+    a.get("type").and_then(Value::as_str) == Some("application/vnd.apache.parquet")
+        || a.get("href")
+            .and_then(Value::as_str)
+            .is_some_and(|h| h.to_ascii_lowercase().ends_with(".parquet"))
 }
 
 /// The parquet asset of a STAC item: prefer the `aws` asset, else the
-/// first https parquet one.
-fn stac_item_asset(item: &Value) -> Option<String> {
+/// first http(s) parquet one. Relative hrefs resolve against the item.
+fn stac_item_asset(item: &Value, item_url: &str) -> Option<String> {
     let assets = item.get("assets").and_then(Value::as_object)?;
+    // A non-http(s) scheme (Overture publishes `s3://` alongside) is
+    // skipped, not an error: another asset of the same item may serve
+    // the same part over a protocol this reader speaks.
     let href = |a: &Value| {
         a.get("href")
             .and_then(Value::as_str)
-            .filter(|h| h.starts_with("http://") || h.starts_with("https://"))
-            .map(String::from)
+            .and_then(|h| join_href(item_url, h).ok())
     };
     if let Some(a) = assets.get("aws").and_then(href) {
         return Some(a);
     }
-    assets.values().find_map(|a| {
-        let is_parquet = a.get("type").and_then(Value::as_str)
-            == Some("application/vnd.apache.parquet")
-            || a.get("href")
-                .and_then(Value::as_str)
-                .is_some_and(|h| h.ends_with(".parquet"));
-        if is_parquet {
-            href(a)
-        } else {
-            None
-        }
-    })
+    assets
+        .values()
+        .find_map(|a| if is_parquet_asset(a) { href(a) } else { None })
+}
+
+/// The parts a collection lists in its own `assets` map, in key order.
+///
+/// This is the whole manifest for a dataset published without per-part
+/// Items — what this workbench's own publish flow writes, and what makes
+/// an https prefix openable at all: HTTP cannot list a directory, so the
+/// collection document is the listing.
+fn stac_asset_parts(col: &Value, collection_url: &str) -> Result<Vec<StacPart>, String> {
+    // A collection-only document says nothing per part, so every part
+    // inherits the dataset extent: pruning then keeps or drops them all,
+    // which is correct if coarse. Writers that state a per-asset bbox
+    // (ours does) get real pruning.
+    let extent = col
+        .get("extent")
+        .and_then(|e| e.get("spatial"))
+        .and_then(|s| s.get("bbox"))
+        .and_then(Value::as_array)
+        .and_then(|b| b.first())
+        .and_then(stac_bbox_2d);
+    let Some(assets) = col.get("assets").and_then(Value::as_object) else {
+        return Ok(Vec::new());
+    };
+    let mut entries: Vec<(&String, &Value)> =
+        assets.iter().filter(|(_, a)| is_parquet_asset(a)).collect();
+    // By key: the JSON object's order is not guaranteed to survive a
+    // parse, and part order decides fragment order in the layer.
+    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    entries
+        .into_iter()
+        .map(|(key, a)| {
+            let href = a.get("href").and_then(Value::as_str).unwrap_or(key);
+            let url = join_href(collection_url, href)?;
+            Ok(StacPart {
+                bbox: a.get("bbox").and_then(stac_bbox_2d).or(extent),
+                rows: a.get("rows").and_then(Value::as_u64).unwrap_or(0),
+                rel: href_below(collection_url, &url),
+                url,
+            })
+        })
+        .collect()
 }
 
 /// STAC bbox → 2D: 6 elements is [xmin, ymin, zmin, xmax, ymax, zmax].
@@ -840,12 +949,44 @@ pub fn clear_cached_stac_parts(base: &str) {
     }
 }
 
+/// Whether a collection URL belongs to a configured STAC repository, as
+/// opposed to one a user typed or dropped on the app.
+fn is_repository_collection(url: &str) -> bool {
+    load_repos()
+        .iter()
+        .any(|r| r.kind == RepoKind::Stac && url.starts_with(&r.url))
+}
+
+/// Collection URLs whose part list has been read live in this session.
+fn proven_parts() -> &'static Mutex<std::collections::HashSet<String>> {
+    static PROVEN: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    PROVEN.get_or_init(Mutex::default)
+}
+
+/// Whether the on-disk part list may answer for this collection.
+///
+/// The cache assumes immutability, which holds for the dated release
+/// prefixes a repository publishes but not for a prefix a user publishes
+/// to: republishing rewrites the collection in place, and a stale entry
+/// would open yesterday's parts with no sign that it did. So a
+/// collection outside the configured repositories is proven live once
+/// per session and cached from then on — panning re-reads the part list
+/// on every pass and must not pay for a round trip each time.
+fn parts_cache_may_answer(collection_url: &str) -> bool {
+    is_repository_collection(collection_url)
+        || proven_parts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(collection_url)
+}
+
 /// All parts of a type collection, served from the on-disk cache when
 /// present (release prefixes are immutable), else from its item documents
-/// (parallel fetch on dedicated threads; any failure aborts — a silently
-/// partial part list would silently drop data).
+/// or its own assets (parallel fetch on dedicated threads; any failure
+/// aborts — a silently partial part list would silently drop data).
 pub fn fetch_stac_parts(collection_url: &str) -> Result<Vec<StacPart>, String> {
-    {
+    if parts_cache_may_answer(collection_url) {
         let _g = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(parts) = read_parts_cache().remove(collection_url) {
             return Ok(parts);
@@ -854,6 +995,12 @@ pub fn fetch_stac_parts(collection_url: &str) -> Result<Vec<StacPart>, String> {
     // Fetch outside the lock: item documents can take a while, and the
     // lock only has to make the read-modify-write below atomic.
     let parts = fetch_stac_parts_live(collection_url)?;
+    // Proven only now: a failed fetch must leave the next attempt going
+    // live too, not fall back on the entry it just refused to trust.
+    proven_parts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(collection_url.to_string());
     let _g = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut cache = read_parts_cache();
     cache.insert(collection_url.to_string(), parts.clone());
@@ -861,8 +1008,23 @@ pub fn fetch_stac_parts(collection_url: &str) -> Result<Vec<StacPart>, String> {
     Ok(parts)
 }
 
+/// A collection document that is not there. For a URL the user pointed
+/// at, "not found" alone teaches nothing: no part of an https prefix
+/// says that it is opened through a manifest, or where that manifest is
+/// supposed to come from.
+fn no_collection(collection_url: &str) -> String {
+    if is_repository_collection(collection_url) {
+        return format!("{collection_url}: not found");
+    }
+    format!(
+        "{collection_url}: not found. Plain HTTPS cannot list a directory, so a \
+         prefix opens through a STAC collection.json sitting at it — the one this \
+         workbench's Publish to S3 / R2 writes beside every dataset it uploads."
+    )
+}
+
 fn fetch_stac_parts_live(collection_url: &str) -> Result<Vec<StacPart>, String> {
-    let col = get_json(collection_url)?.ok_or_else(|| format!("{collection_url}: not found"))?;
+    let col = get_json(collection_url)?.ok_or_else(|| no_collection(collection_url))?;
     // The document is in hand and carries the licence and part count, so
     // record them: a layer opened from a pasted URL never went through the
     // browser, and its credit would otherwise cost a second fetch.
@@ -873,10 +1035,6 @@ fn fetch_stac_parts_live(collection_url: &str) -> Result<Vec<StacPart>, String> 
         cache.insert(collection_url.to_string(), parsed);
         write_collections_cache(&cache);
     }
-    let dir = collection_url
-        .rsplit_once('/')
-        .map(|(d, _)| d)
-        .unwrap_or(collection_url);
     let item_urls: Vec<String> = col
         .get("links")
         .and_then(Value::as_array)
@@ -884,10 +1042,18 @@ fn fetch_stac_parts_live(collection_url: &str) -> Result<Vec<StacPart>, String> 
         .flatten()
         .filter(|l| l.get("rel").and_then(Value::as_str) == Some("item"))
         .filter_map(|l| l.get("href").and_then(Value::as_str))
-        .map(|h| format!("{dir}/{}", h.trim_start_matches("./")))
-        .collect();
+        .map(|h| join_href(collection_url, h))
+        .collect::<Result<_, _>>()?;
     if item_urls.is_empty() {
-        return Err(format!("{collection_url}: no items listed"));
+        // No Items: the parts are the collection's own assets.
+        let parts = stac_asset_parts(&col, collection_url)?;
+        if parts.is_empty() {
+            return Err(format!(
+                "{collection_url}: this STAC collection lists no parquet parts \
+                 (neither item links nor application/vnd.apache.parquet assets)"
+            ));
+        }
+        return Ok(parts);
     }
 
     let next = AtomicUsize::new(0);
@@ -912,7 +1078,7 @@ fn fetch_stac_parts_live(collection_url: &str) -> Result<Vec<StacPart>, String> 
                         continue;
                     }
                 };
-                let Some(asset) = stac_item_asset(&item) else {
+                let Some(asset) = stac_item_asset(&item, url) else {
                     first_err
                         .lock()
                         .unwrap()
@@ -927,6 +1093,9 @@ fn fetch_stac_parts_live(collection_url: &str) -> Result<Vec<StacPart>, String> 
                         .and_then(|p| p.get("num_rows"))
                         .and_then(Value::as_u64)
                         .unwrap_or(0),
+                    // An Item's asset URL is its own address, not a path
+                    // under the collection: no hive segments to read.
+                    rel: None,
                 });
             });
         }
@@ -1399,6 +1568,216 @@ mod tests {
         // Generic parquet asset accepted; 6-element bbox collapsed to 2D.
         assert_eq!(parts[1].url, "https://other.example/p1.parquet");
         assert_eq!(parts[1].bbox, Some([5.0, 40.0, 10.0, 45.0]));
+    }
+
+    #[test]
+    /// Hrefs are resolved against the document that carries them, and a
+    /// href climbing out of the collection's prefix is refused by name —
+    /// silently dropping it would open a short dataset that looks whole.
+    fn hrefs_resolve_against_the_document_and_refuse_escapes() {
+        let col = "https://host.example/data/roads/collection.json";
+        // Absolute passes through untouched, whatever host it names.
+        assert_eq!(
+            join_href(col, "https://other.example/p.parquet").unwrap(),
+            "https://other.example/p.parquet"
+        );
+        // `./x`, bare `x` and a nested path all hang off the directory.
+        for href in ["./part-0.parquet", "part-0.parquet"] {
+            assert_eq!(
+                join_href(col, href).unwrap(),
+                "https://host.example/data/roads/part-0.parquet",
+                "{href}"
+            );
+        }
+        assert_eq!(
+            join_href(col, "./dep=31/part-0.parquet").unwrap(),
+            "https://host.example/data/roads/dep=31/part-0.parquet"
+        );
+        // Root-relative replaces the whole path, not the last segment.
+        assert_eq!(
+            join_href(col, "/other/p.parquet").unwrap(),
+            "https://host.example/other/p.parquet"
+        );
+        for bad in ["../secrets/p.parquet", "./a/../../p.parquet"] {
+            let e = join_href(col, bad).unwrap_err();
+            assert!(e.contains(bad) && e.contains("escapes"), "{e}");
+        }
+        // A scheme the range reader cannot speak is refused, not joined.
+        assert!(join_href(col, "s3://bucket/p.parquet").is_err());
+        assert!(join_href(col, "  ").is_err());
+    }
+
+    #[test]
+    /// A collection that lists its parts as assets (no Items) is the
+    /// whole manifest of a dataset published over plain HTTPS.
+    fn collection_assets_are_parts_in_key_order() {
+        use serde_json::json;
+        let url = "https://host.example/data/roads/collection.json";
+        let col = json!({
+            "type": "Collection",
+            "extent": {"spatial": {"bbox": [[-10.0, 40.0, 10.0, 50.0]]}},
+            "links": [],
+            "assets": {
+                "dep=75/part-0.parquet": {
+                    "href": "./dep=75/part-0.parquet",
+                    "type": "application/vnd.apache.parquet",
+                    "bbox": [1.0, 48.0, 3.0, 49.0],
+                    "rows": 7,
+                },
+                // Media type absent: third-party collections often skip
+                // it, and the extension is then all there is to go on.
+                "dep=31/part-0.parquet": {"href": "./dep=31/part-0.parquet"},
+                "thumbnail": {"href": "./preview.png", "type": "image/png"},
+                "metadata": {"href": "./stats.json", "type": "application/json"},
+            },
+        });
+        let parts = stac_asset_parts(&col, url).unwrap();
+        // Sorted by asset key, so the layer's fragment order does not
+        // depend on how the JSON object happened to be parsed.
+        assert_eq!(parts.len(), 2, "only the parquet assets: {parts:?}");
+        assert_eq!(
+            parts.iter().map(|p| p.url.as_str()).collect::<Vec<_>>(),
+            vec![
+                "https://host.example/data/roads/dep=31/part-0.parquet",
+                "https://host.example/data/roads/dep=75/part-0.parquet",
+            ]
+        );
+        // Hive segments come from the path below the collection.
+        assert_eq!(parts[0].rel.as_deref(), Some("dep=31/part-0.parquet"));
+        // No stated bbox: the collection extent, which prunes nothing —
+        // a per-asset bbox is what makes viewport pruning real.
+        assert_eq!(parts[0].bbox, Some([-10.0, 40.0, 10.0, 50.0]));
+        assert_eq!(parts[0].rows, 0);
+        assert_eq!(parts[1].bbox, Some([1.0, 48.0, 3.0, 49.0]));
+        assert_eq!(parts[1].rows, 7);
+
+        // A part hosted elsewhere has no path under the collection, so
+        // no hive segments to invent.
+        let col = json!({"assets": {"a": {"href": "https://cdn.example/p.parquet"}}});
+        let parts = stac_asset_parts(&col, url).unwrap();
+        assert_eq!(parts[0].url, "https://cdn.example/p.parquet");
+        assert_eq!(parts[0].rel, None);
+        assert_eq!(parts[0].bbox, None, "no extent to fall back on");
+
+        // Nothing parquet-shaped at all: an empty list, for the caller to
+        // report as such.
+        let col = json!({"assets": {"thumbnail": {"href": "./preview.png"}}});
+        assert!(stac_asset_parts(&col, url).unwrap().is_empty());
+    }
+
+    #[test]
+    /// Over plain HTTPS the collection document is the listing, so both
+    /// ways of missing it have to say what was expected and where.
+    fn a_prefix_without_a_collection_teaches_the_convention() {
+        let base = spawn_files(&[("collection.json", r#"{"type":"Collection","assets":{}}"#)]);
+        // Present but empty: not a network problem, a content one.
+        let err = fetch_stac_parts(&format!("{base}/collection.json")).unwrap_err();
+        assert!(err.contains("no parquet parts"), "{err}");
+
+        let base = spawn_files(&[("other.json", "{}")]);
+        let err = fetch_stac_parts(&format!("{base}/collection.json")).unwrap_err();
+        assert!(err.contains("collection.json"), "{err}");
+        assert!(err.contains("cannot list a directory"), "{err}");
+        assert!(err.contains("Publish"), "the app writes one itself: {err}");
+        // A configured repository's own 404 stays terse: its browser
+        // never asked the user to know about manifests.
+        let repo_url = "https://stac.overturemaps.org/2026-06/x/collection.json";
+        assert!(is_repository_collection(repo_url));
+        assert_eq!(no_collection(repo_url), format!("{repo_url}: not found"));
+    }
+
+    #[test]
+    /// A dated release prefix is immutable; a prefix a user publishes to
+    /// is not, and a cached part list there would silently open the
+    /// dataset as it was before the last publish.
+    fn a_user_collection_is_proven_live_once_per_session() {
+        let base = spawn_files(&[(
+            "collection.json",
+            r#"{"assets": {"a.parquet": {"href": "./a.parquet"}}}"#,
+        )]);
+        let url = format!("{base}/collection.json");
+        // Seed the disk cache with a part list that is not what the
+        // server says: only a live fetch can disagree with it.
+        {
+            let _g = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = read_parts_cache();
+            cache.insert(
+                url.clone(),
+                vec![StacPart {
+                    url: "https://stale.example/old.parquet".into(),
+                    bbox: None,
+                    rows: 0,
+                    rel: None,
+                }],
+            );
+            write_parts_cache(&cache);
+        }
+        let parts = fetch_stac_parts(&url).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].url, format!("{base}/a.parquet"), "stale entry ignored");
+
+        // Proven once: panning re-reads the list on every pass and must
+        // not pay a round trip each time, so the cache answers from here.
+        {
+            let _g = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = read_parts_cache();
+            cache.insert(
+                url.clone(),
+                vec![
+                    StacPart {
+                        url: "https://cached.example/0.parquet".into(),
+                        bbox: None,
+                        rows: 0,
+                        rel: None,
+                    };
+                    2
+                ],
+            );
+            write_parts_cache(&cache);
+        }
+        let parts = fetch_stac_parts(&url).unwrap();
+        assert_eq!(parts.len(), 2, "second call comes from the cache");
+
+        // A repository collection keeps the immutability assumption from
+        // its very first fetch, network or not.
+        let repo_url = "https://stac.overturemaps.org/2026-06/b/building/collection.json";
+        {
+            let _g = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = read_parts_cache();
+            cache.insert(
+                repo_url.to_string(),
+                vec![StacPart {
+                    url: "https://aws.example/p.parquet".into(),
+                    bbox: None,
+                    rows: 9,
+                    rel: None,
+                }],
+            );
+            write_parts_cache(&cache);
+        }
+        let parts = fetch_stac_parts(repo_url).expect("answered without a network call");
+        assert_eq!(parts[0].rows, 9);
+
+        // A collection that could not be read proves nothing: the next
+        // attempt goes live again rather than settling for the entry it
+        // has just declined to trust.
+        let gone = format!("{}/collection.json", spawn_files(&[("other.json", "{}")]));
+        {
+            let _g = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = read_parts_cache();
+            cache.insert(
+                gone.clone(),
+                vec![StacPart {
+                    url: "https://stale.example/old.parquet".into(),
+                    bbox: None,
+                    rows: 0,
+                    rel: None,
+                }],
+            );
+            write_parts_cache(&cache);
+        }
+        assert!(fetch_stac_parts(&gone).is_err());
+        assert!(fetch_stac_parts(&gone).is_err(), "still no collection to read");
     }
 
     #[test]

@@ -27,26 +27,10 @@ fn app_icon() -> egui::IconData {
 
 fn main() -> eframe::Result {
     env_logger::init();
-    // Args: local paths or http(s) URLs.
+    // Args: local paths, directories, http(s) URLs or s3:// URIs.
     let files: Vec<data::source::Source> = std::env::args()
         .skip(1)
-        .map(|a| {
-            if a.starts_with("http://") || a.starts_with("https://") {
-                data::source::Source::Remote { url: a, len: 0 }
-            } else if a.starts_with("s3://") {
-                data::source::Source::S3 {
-                    uri: a,
-                    profile: std::env::var("AWS_PROFILE").ok(),
-                    endpoint: None,
-                    url: String::new(),
-                    len: 0,
-                }
-            } else if std::path::Path::new(&a).is_dir() {
-                data::source::Source::Dir(a.into())
-            } else {
-                data::source::Source::Local(a.into())
-            }
-        })
+        .map(|a| data::source::route_uri(&a, std::env::var("AWS_PROFILE").ok(), None))
         .collect();
 
     let native_options = eframe::NativeOptions {

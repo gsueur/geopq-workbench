@@ -233,6 +233,64 @@ impl Source {
     }
 }
 
+/// What a URI or path typed at the app (Open URL dialog, CLI argument)
+/// opens as. `profile`/`endpoint` only apply to `s3://`.
+///
+/// The https branch carries the whole difference between the two remote
+/// protocols: S3 lists objects, so a prefix is self-describing, while
+/// HTTP lists nothing and a prefix is a dataset only because a STAC
+/// `collection.json` sits at it. So an https URL that ends in `/` is
+/// routed to that document, and one that already names it is taken as
+/// given — whether either exists is the fetch's answer, not this one's.
+pub fn route_uri(text: &str, profile: Option<String>, endpoint: Option<String>) -> Source {
+    let text = text.trim();
+    if text.starts_with("s3://") {
+        return Source::S3 {
+            uri: text.to_string(),
+            profile,
+            endpoint,
+            url: String::new(),
+            len: 0,
+        };
+    }
+    if text.starts_with("http://") || text.starts_with("https://") {
+        let collection = if text.ends_with("/collection.json") {
+            Some(text.to_string())
+        } else {
+            text.ends_with('/').then(|| format!("{text}collection.json"))
+        };
+        return match collection {
+            Some(url) => Source::Stac {
+                name: collection_name(&url),
+                url,
+            },
+            None => Source::Remote {
+                url: text.to_string(),
+                len: 0,
+            },
+        };
+    }
+    let path = PathBuf::from(text);
+    if path.is_dir() {
+        Source::Dir(path)
+    } else {
+        Source::Local(path)
+    }
+}
+
+/// Layer name for a collection URL: the directory the collection
+/// describes, which is what the user pointed at.
+fn collection_name(collection_url: &str) -> String {
+    collection_url
+        .trim_end_matches("collection.json")
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("collection")
+        .to_string()
+}
+
 /// Keep signed query parameters out of error strings: replace each
 /// presigned query string with `?<presigned>` while preserving the rest of
 /// the message — errors are formatted "{url}: {cause}", and the cause
@@ -1583,6 +1641,56 @@ pub(crate) mod testserver {
             }
         });
         format!("http://127.0.0.1:{port}")
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    /// Every entry point (dialog, CLI) routes through this, so the
+    /// distinctions have to hold here rather than at each caller.
+    fn a_uri_routes_to_what_it_names() {
+        // A file is a file, prefix rules or not.
+        let s = route_uri("https://host/data.parquet", None, None);
+        assert!(matches!(&s, Source::Remote { url, .. } if url == "https://host/data.parquet"));
+
+        // A prefix means the collection published at it.
+        for text in ["https://host/dataset/", "http://host/dataset/"] {
+            let s = route_uri(text, None, None);
+            let Source::Stac { url, name } = &s else { panic!("{text} -> {s:?}") };
+            assert_eq!(url, &format!("{text}collection.json"));
+            assert_eq!(name, "dataset", "the layer is named after the prefix");
+        }
+        // Naming it explicitly is the same open.
+        let s = route_uri("https://host/a/dataset/collection.json", None, None);
+        let Source::Stac { url, name } = &s else { panic!("{s:?}") };
+        assert_eq!(url, "https://host/a/dataset/collection.json");
+        assert_eq!(name, "dataset");
+        // Surrounding whitespace comes with pasted URLs.
+        assert!(matches!(
+            route_uri("  https://host/d/  ", None, None),
+            Source::Stac { .. }
+        ));
+
+        // s3:// keeps its own listing-based prefix rules, credentials
+        // and endpoint.
+        let s = route_uri("s3://bucket/d/", Some("prod".into()), Some("minio:9000".into()));
+        assert!(s.is_s3_prefix());
+        let Source::S3 { profile, endpoint, .. } = &s else { panic!("{s:?}") };
+        assert_eq!(profile.as_deref(), Some("prod"));
+        assert_eq!(endpoint.as_deref(), Some("minio:9000"));
+        // A collection.json is not an S3 concept: the s3 branch wins.
+        assert!(matches!(
+            route_uri("s3://bucket/d/collection.json", None, None),
+            Source::S3 { .. }
+        ));
+
+        // Local paths still sort themselves into file and directory.
+        let dir = std::env::temp_dir();
+        assert!(matches!(route_uri(&dir.to_string_lossy(), None, None), Source::Dir(_)));
+        assert!(matches!(route_uri("/nowhere/x.parquet", None, None), Source::Local(_)));
     }
 }
 

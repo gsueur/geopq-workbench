@@ -157,12 +157,23 @@ geopq-workbench file.parquet dataset_dir/ https://host/data.parquet
 | Local GeoParquet | drag & drop, File → Open…, or CLI argument |
 | Multi-file / hive-partitioned dataset | File → Open folder… — the directory loads as a single layer; `key=value` path segments become queryable columns |
 | HTTPS | File → Open URL… — needs range-request support on the server |
+| HTTPS hive dataset (`https://host/prefix/`) | File → Open URL… — the parts listed by the STAC `collection.json` at the prefix load as one layer; `key=value` path segments become queryable columns |
 | S3 (`s3://bucket/key`) | File → Open URL… — profiles from `~/.aws`, custom endpoints (MinIO etc.), anonymous access to public buckets |
 | S3 hive dataset (`s3://bucket/prefix/` or a `*` glob) | File → Open URL… — every matching parquet part loads as one layer (`s3://bucket/d/state=*/roads.parquet` picks one theme across partitions); `key=value` path segments become queryable columns |
 | Catalogs (Overture Maps, Parquetry, your own) | File → Repositories… — browse snapshots, check layers, they load with sensible names and stacking order. Parquetry repos can load a theme across every state of a country as one layer, with `country`/`state` as columns. A STAC collection opens the parts covering most of the current view and adds the others as you pan into them |
 | Attribute table (parquet or CSV, no geometry) | File → Open attribute table…, or drag & drop a `.csv`. An import dialog proposes a separator, a name and a type per column, with the sampled values and what each type choice would cost. Columns become a SQL table to query and to join a layer against. No map presence |
 | CSV or parquet with coordinate columns | the same dialog: pick the X and Y columns and their CRS, and it is written as GeoParquet and opened as a layer instead |
 | GeoPackage / Shapefile / GeoJSON | drag & drop or File → Import vector file… — pure-Rust conversion to GeoParquet (no GDAL), with a covering bbox column and byte-sized row groups so the result is readable by viewport from the first open, then opens normally |
+
+The two remote prefixes differ in how they are discovered, not in how
+they are read. S3 lists objects, so `s3://bucket/prefix/` finds its own
+parts; plain HTTPS lists nothing, so `https://host/prefix/` is opened
+through the STAC `collection.json` published at it — the parts are its
+`application/vnd.apache.parquet` assets, and each one's stated bbox
+prunes it against the current view. Publishing writes that document
+itself, so anything this workbench uploads reopens from its https URL;
+third-party collections following the same convention open the same
+way, and a `collection.json` URL can also be pasted directly.
 
 Format-wise, anything in the GeoParquet family works: 1.0, 1.1 with WKB
 or GeoArrow coordinate arrays, 2.0 with native GEOMETRY/GEOGRAPHY
@@ -453,11 +464,14 @@ quality gate and display policy).
   document rather than into another dataset.
 - Streaming optimize beyond the 8 GB in-memory cap; multi-file
   optimize.
-- Remote hive datasets over `https://` (the `s3://` side shipped in
-  0.3.2). Blocked on discovery rather than on reading: `s3://prefix/`
-  works because S3 lists objects, while plain HTTPS has no equivalent,
-  so this needs a manifest convention first.
 - Label rendering.
+
+Remote hive datasets over `https://` shipped once the manifest they
+were waiting on existed: the publish flow writes a STAC
+`collection.json`, so an https prefix is opened by resolving that
+document's parquet assets instead of by a directory listing HTTP does
+not have. Reading is unchanged — every part is the same range-read
+remote file it always was.
 
 Line styling shipped as planned: dash patterns and caps on the layer
 row, and the classification dialog can drive stroke width across its

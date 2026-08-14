@@ -136,14 +136,20 @@ fn collection_doc(title: &str, files: &[(String, PathBuf)], crs: &Crs) -> Value 
             });
         }
         let key = href.trim_start_matches("./").to_string();
-        assets.insert(
-            key,
-            json!({
-                "href": href,
-                "type": "application/vnd.apache.parquet",
-                "roles": ["data"],
-            }),
-        );
+        let mut asset = json!({
+            "href": href,
+            "type": "application/vnd.apache.parquet",
+            "roles": ["data"],
+        });
+        // Per-asset extent, same [w,s,e,n] convention as the collection's
+        // (an extra asset field is valid STAC). Without it a reader can
+        // only prune a partitioned dataset by the extent of the whole,
+        // which is to say not at all: every part would claim every view.
+        if let Some(wgs) = b.and_then(|b| wgs84_bbox(b, crs)) {
+            asset["bbox"] = json!(wgs);
+        }
+        asset["rows"] = json!(r);
+        assets.insert(key, asset);
     }
     // Unknown extent is written as the world, never invented tighter.
     let bbox = data_bbox
@@ -286,6 +292,7 @@ mod tests {
         let a = &assets["dep=31/part-0.parquet"];
         assert_eq!(a["href"], "./dep=31/part-0.parquet");
         assert_eq!(a["type"], "application/vnd.apache.parquet");
+        assert_eq!(a["rows"], 10);
         // The union of the parts, in lon/lat: metric Lambert values would
         // be the symptom of a skipped transform.
         let b = doc["extent"]["spatial"]["bbox"][0].as_array().unwrap();
@@ -294,6 +301,22 @@ mod tests {
         assert!(b[1] > 42.0 && b[3] < 50.0, "lat range around France: {b:?}");
         assert!(b[2] > b[0] && b[3] > b[1]);
         assert_eq!(doc["extent"]["temporal"]["interval"][0], json!([null, null]));
+
+        // Each asset states its own extent, or a reader can only prune by
+        // the whole: dep=31 is Toulouse, dep=75 is Paris, and neither may
+        // come back as the union above.
+        let bbox = |k: &str| -> Vec<f64> {
+            assets[k]["bbox"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{k} has no bbox"))
+                .iter()
+                .map(|v| v.as_f64().unwrap())
+                .collect()
+        };
+        let (t, p) = (bbox("dep=31/part-0.parquet"), bbox("dep=75/part-0.parquet"));
+        assert!(t[3] < p[1], "Toulouse is south of Paris: {t:?} {p:?}");
+        assert!(t[0] >= b[0] && p[2] <= b[2], "parts sit inside the extent");
+        assert!(t[2] - t[0] < b[2] - b[0], "a part is narrower than the union");
     }
 
     #[test]
@@ -310,6 +333,9 @@ mod tests {
         let b = doc["extent"]["spatial"]["bbox"][0].as_array().unwrap();
         assert_eq!(b[0].as_f64().unwrap(), -1.0);
         assert_eq!(b[3].as_f64().unwrap(), 48.0);
+        // The single asset covers the whole of it.
+        assert_eq!(doc["assets"]["roads.parquet"]["bbox"], json!([-1.0, 46.0, 2.0, 48.0]));
+        assert_eq!(doc["assets"]["roads.parquet"]["rows"], 3);
     }
 
     #[test]

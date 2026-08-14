@@ -1169,6 +1169,11 @@ fn parts_to_add(
     scored.into_iter().map(|(_, p)| p).collect()
 }
 
+/// A part opened for append: where it reads from, its short label, its
+/// parsed footer, and the hive `key=value` segments of its path under
+/// the collection (empty for a part addressed by its own Item).
+type AppendPart = (Source, String, FileOpen, Vec<(String, Option<String>)>);
+
 /// Open the part files of a STAC collection that the viewport wants and
 /// the layer does not have yet, then build their geometry.
 ///
@@ -1229,17 +1234,15 @@ pub fn spawn_part_append(
         }
 
         // Resolve and read footers in parallel: each part is a round trip.
-        let opened: Vec<(Source, String, FileOpen)> = {
+        let opened: Vec<AppendPart> = {
             use rayon::prelude::*;
             let r: Result<Vec<_>, String> = wanted
                 .par_iter()
                 .map(|p| {
                     let short = p
-                        .url
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(p.url.as_str())
-                        .to_string();
+                        .rel
+                        .clone()
+                        .unwrap_or_else(|| p.url.rsplit('/').next().unwrap_or(&p.url).to_string());
                     let src = Source::Remote {
                         url: p.url.clone(),
                         len: 0,
@@ -1247,7 +1250,12 @@ pub fn spawn_part_append(
                     .resolve()
                     .map_err(|e| format!("{short}: {e}"))?;
                     let f = open_file(&src).map_err(|e| format!("{short}: {e}"))?;
-                    Ok((src, short, f))
+                    let hive = p
+                        .rel
+                        .as_deref()
+                        .map(|rel| super::store::hive_segments(std::path::Path::new(rel)))
+                        .unwrap_or_default();
+                    Ok((src, short, f, hive))
                 })
                 .collect();
             match r {
@@ -1263,7 +1271,7 @@ pub fn spawn_part_append(
         let mut added_boxes: Vec<[f64; 4]> = Vec::new();
         let mut names: Vec<String> = Vec::new();
         let mut boxes_ok = true;
-        for (src, short, f) in opened {
+        for (src, short, f, hive) in opened {
             if !f.crs.same_as(&crs) || f.encoding != base.encoding || f.geom_col != base.geom_col {
                 log::warn!("{short}: does not match the collection's schema; skipped");
                 continue;
@@ -1273,11 +1281,23 @@ pub fn spawn_part_append(
                 (None, Some(b)) => added_boxes.extend(std::iter::repeat_n(b, f.rg_rows.len())),
                 (None, None) => boxes_ok = false,
             }
+            // Partition values of a part panned into, keyed by the
+            // columns the layer already has: leaving them null would make
+            // the hive column lie about the parts that arrived last.
+            let part_values: Vec<Option<String>> = base
+                .part_cols
+                .iter()
+                .map(|c| {
+                    hive.iter()
+                        .find(|(k, _)| k == c)
+                        .and_then(|(_, v)| v.clone())
+                })
+                .collect();
             frags.push((
                 super::store::Fragment {
                     source: src,
                     meta: f.meta.clone(),
-                    part_values: vec![None; base.part_cols.len()],
+                    part_values,
                     rg_offset: 0,
                     row_offset: 0,
                 },
@@ -2098,13 +2118,16 @@ fn open_s3_prefix_store(source: &Source) -> Result<StoreOpen, String> {
     open_multi_store(source, files, hive)
 }
 
-/// Open a STAC type collection as one multi-fragment remote store: fetch
-/// the item list, keep the parts whose bbox intersects the viewport, cap.
+/// Open a STAC collection as one multi-fragment remote store: resolve
+/// its parts (Items, or the collection's own parquet assets), keep the
+/// ones whose bbox intersects the viewport, cap.
 fn open_stac_store(
     source: &Source,
     collection_url: &str,
     rect: Option<[f64; 4]>,
 ) -> Result<StoreOpen, String> {
+    use super::store::hive_segments;
+
     let parts = crate::data::repo::fetch_stac_parts(collection_url)?;
     let total = parts.len();
     let keep: Vec<_> = parts
@@ -2145,17 +2168,28 @@ fn open_stac_store(
             keep.len()
         );
     }
+    // Hive `key=value` segments of the parts that live under the
+    // collection — a dataset published as one collection.json over a
+    // partitioned tree is the https twin of `open_s3_prefix_store`, and
+    // its partition columns have to survive the trip. Parts addressed by
+    // their own Items carry no such path (`rel` is None) and keep the
+    // empty segments they always had.
+    let hive: Vec<Vec<(String, Option<String>)>> = keep
+        .iter()
+        .map(|p| match &p.rel {
+            Some(rel) => hive_segments(std::path::Path::new(rel)),
+            None => Vec::new(),
+        })
+        .collect();
     // Resolve (length probe) every part in parallel.
     let files: Vec<(Source, String)> = {
         use rayon::prelude::*;
         keep.into_par_iter()
             .map(|p| {
                 let short = p
-                    .url
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(p.url.as_str())
-                    .to_string();
+                    .rel
+                    .clone()
+                    .unwrap_or_else(|| p.url.rsplit('/').next().unwrap_or(&p.url).to_string());
                 Source::Remote { url: p.url, len: 0 }
                     .resolve()
                     .map(|src| (src, short.clone()))
@@ -2163,7 +2197,6 @@ fn open_stac_store(
             })
             .collect::<Result<_, _>>()?
     };
-    let hive = vec![Vec::new(); files.len()];
     let mut opened = open_multi_store(source, files, hive)?;
     // The parts are plain object-store URLs, so the info built from the
     // first one looked for a credit beside a parquet file in a bucket and
@@ -5290,6 +5323,7 @@ mod pruning_tests {
             url: url.into(),
             bbox,
             rows: 1,
+            rel: None,
         }
     }
 
@@ -6799,6 +6833,75 @@ mod stac_tests {
             panic!("disjoint viewport must not open a store");
         };
         assert!(err.contains("no parts"), "{err}");
+    }
+
+    /// End-to-end over https: a hive-partitioned dataset published with
+    /// this app's own `collection.json` opens from its prefix URL as one
+    /// layer, partition columns and viewport pruning included.
+    #[test]
+    fn an_https_prefix_opens_through_its_collection() {
+        let root = std::env::temp_dir().join(format!("geopq_stac_https_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // Toulouse and Paris: far enough apart that a viewport over one
+        // cannot be read as covering the other.
+        write_part(&root.join("dep=31/part-0.parquet"), 200, 1.4, 43.6);
+        write_part(&root.join("dep=75/part-0.parquet"), 300, 2.35, 48.85);
+        let written =
+            crate::data::stac::write_for_output(&root, "Parcelles", &Crs::wgs84()).unwrap();
+        assert_eq!(written, root.join("collection.json"));
+        let base = crate::data::source::testserver::spawn_dir(root.clone());
+
+        // A prefix routes to the collection sitting at it; HTTP has no
+        // listing, so this document is the only way in.
+        let source = crate::data::source::route_uri(&format!("{base}/"), None, None);
+        let Source::Stac { url, .. } = &source else {
+            panic!("a prefix must open as a collection, not {source:?}");
+        };
+        assert_eq!(url, &format!("{base}/collection.json"));
+
+        let (store, crs, info, rg_meta) = open_store_with_view(&source, None).unwrap();
+        assert!(crs.is_latlong);
+        assert_eq!(store.fragments.len(), 2);
+        assert_eq!(store.total_rows(), 500);
+        assert_eq!(info.files, 2);
+        let (_, boxes) = rg_meta.expect("file-level geo bboxes back pruning");
+        assert_eq!(boxes.len(), store.rg_starts().len() - 1);
+        // The hive segments of the asset hrefs are a queryable column,
+        // exactly as the s3:// prefix path produces.
+        assert_eq!(store.part_cols, vec!["dep".to_string()]);
+        let values: Vec<_> = store
+            .fragments
+            .iter()
+            .map(|f| f.part_values[0].clone())
+            .collect();
+        assert_eq!(values, vec![Some("31".into()), Some("75".into())]);
+
+        // Per-asset bboxes make pruning real: opening both parts here
+        // would also be the symptom of a reader handing every part the
+        // collection's own extent.
+        let (paris, _, info, _) =
+            open_store_with_view(&source, Some([2.0, 48.5, 2.7, 49.1])).unwrap();
+        assert_eq!(paris.fragments.len(), 1);
+        assert_eq!(paris.total_rows(), 300);
+        assert_eq!(info.files, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A prefix with parquet in it but no manifest: the failure has to
+    /// name the convention, since nothing else will.
+    #[test]
+    fn an_https_prefix_without_a_collection_explains_itself() {
+        let root = std::env::temp_dir().join(format!("geopq_stac_bare_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_part(&root.join("part-0.parquet"), 10, 0.0, 0.0);
+        let base = crate::data::source::testserver::spawn_dir(root.clone());
+        let source = crate::data::source::route_uri(&format!("{base}/"), None, None);
+        let Err(err) = open_store_with_view(&source, None) else {
+            panic!("a prefix with no manifest must not open");
+        };
+        assert!(err.contains("cannot list a directory"), "{err}");
+        assert!(err.contains("collection.json"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Live probe against the public Overture STAC catalog (network):

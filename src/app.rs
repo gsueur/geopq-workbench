@@ -6273,12 +6273,16 @@ impl ViewerApp {
                 ui.label(
                     "GeoParquet over HTTP(S) (needs range requests) or s3://bucket/key. \
                      An s3:// prefix ending in /, or a * glob, opens every matching \
-                     parquet part as one layer (hive key=value segments become columns):",
+                     parquet part as one layer (hive key=value segments become columns). \
+                     An https:// prefix does the same through the STAC collection.json \
+                     published at it — HTTP cannot list a directory, so that document is \
+                     the listing:",
                 );
                 let edit = ui.add(
                     egui::TextEdit::singleline(url)
                         .hint_text(
-                            "https://host/data.parquet · s3://bucket/dataset/state=MA/ · \
+                            "https://host/data.parquet · https://host/dataset/ · \
+                             s3://bucket/dataset/state=MA/ · \
                              s3://bucket/dataset/state=*/roads.parquet",
                         )
                         .desired_width(f32::INFINITY),
@@ -6331,24 +6335,20 @@ impl ViewerApp {
                 if ui.add_enabled(valid, egui::Button::new("Open")).clicked()
                     || (enter && valid)
                 {
-                    let text = url.trim().to_string();
-                    submit = Some(if is_s3 {
-                        let ep = endpoint.trim();
-                        Source::S3 {
-                            uri: text,
-                            profile: profile.clone(),
-                            endpoint: (!ep.is_empty()).then(|| ep.to_string()),
-                            url: String::new(),
-                            len: 0,
-                        }
-                    } else {
-                        Source::Remote { url: text, len: 0 }
-                    });
+                    let ep = endpoint.trim();
+                    submit = Some(crate::data::source::route_uri(
+                        url,
+                        profile.clone(),
+                        (!ep.is_empty()).then(|| ep.to_string()),
+                    ));
                 }
             });
         self.url_as_table = as_table;
         if let Some(src) = submit {
-            if as_table || crate::data::attrs::is_tabular(&src) {
+            // A collection is a set of part files, which the attribute
+            // reader has no way to open; the checkbox cannot make it one.
+            let multi = matches!(src, Source::Stac { .. });
+            if !multi && (as_table || crate::data::attrs::is_tabular(&src)) {
                 // A CSV has no geometry to draw wherever it lives; a
                 // parquet goes here when asked to.
                 self.open_attr_table(src);
