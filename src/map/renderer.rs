@@ -53,14 +53,14 @@ impl Default for DrawStyle {
 }
 
 impl DrawStyle {
-    fn bin_hidden(&self, bin: u8) -> bool {
+    pub(crate) fn bin_hidden(&self, bin: u8) -> bool {
         self.bin_colors.is_some() && self.hidden_bins & (1u64 << bin) != 0
     }
 }
 
 impl DrawStyle {
     /// Fill/point RGB for a chunk (uniform color when unstyled).
-    fn rgb_for(&self, bin: u8, base: [f32; 4]) -> [f32; 3] {
+    pub(crate) fn rgb_for(&self, bin: u8, base: [f32; 4]) -> [f32; 3] {
         match &self.bin_colors {
             Some(lut) => lut[bin as usize % lut.len()],
             None => [base[0], base[1], base[2]],
@@ -69,7 +69,7 @@ impl DrawStyle {
 
     /// Line half-width for a chunk: the width ramp's bin value under
     /// data styling, the layer-wide width otherwise.
-    fn half_width_for(&self, bin: u8) -> f32 {
+    pub(crate) fn half_width_for(&self, bin: u8) -> f32 {
         match &self.bin_half_widths {
             Some(lut) => lut[bin as usize % lut.len()],
             None => self.line_half_width_px,
@@ -78,7 +78,7 @@ impl DrawStyle {
 
     /// Outline / marker border color for a chunk. Under data styling the
     /// border follows the bin, darkened so it reads against its own fill.
-    fn edge_for(&self, bin: u8) -> [f32; 4] {
+    pub(crate) fn edge_for(&self, bin: u8) -> [f32; 4] {
         match &self.bin_colors {
             Some(lut) => {
                 let c = lut[bin as usize % lut.len()];

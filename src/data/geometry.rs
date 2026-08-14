@@ -295,7 +295,7 @@ fn expand(a: &mut [f64; 4], b: [f64; 4]) {
 /// parcels/buildings sit far below it, km-scale aggregates far above.
 const UNDERLAY_SPAN: f64 = CHUNK_WORLD * 0.5;
 
-fn spans_underlay(bbox: [f64; 4]) -> bool {
+pub(crate) fn spans_underlay(bbox: [f64; 4]) -> bool {
     (bbox[2] - bbox[0]).max(bbox[3] - bbox[1]) > UNDERLAY_SPAN
 }
 

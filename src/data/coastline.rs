@@ -45,24 +45,27 @@ fn parse_nec1(b: &[u8]) -> Option<Vec<Vec<(f64, f64)>>> {
     Some(lines)
 }
 
-/// Project WGS84 polylines into world space under `display` and build
-/// render chunks. Vertices that fail to project split the polyline.
-pub fn project_overlay_lines<'a>(
+/// Project WGS84 polylines into world space under `display`. Vertices
+/// that fail to project split the polyline: joining across the gap would
+/// draw a segment through a region the projection does not cover.
+///
+/// The map takes these as meshes and the SVG export takes them as
+/// polylines, so the splitting rule lives here and both get the same
+/// lines.
+pub fn project_overlay_polylines<'a>(
     display: &DisplayCrs,
     lines: impl Iterator<Item = &'a [(f64, f64)]>,
-) -> Arc<Vec<ChunkMesh>> {
+) -> Vec<geo_types::LineString<f64>> {
     let wgs = Crs::wgs84();
     let tr = BulkTransformer::new(&wgs, display);
-    let mut mb = MeshBuilder::default();
+    let mut out: Vec<geo_types::LineString<f64>> = Vec::new();
     let mut coords: Vec<geo_types::Coord<f64>> = Vec::new();
     for line in lines {
         coords.clear();
-        let flush = |coords: &mut Vec<geo_types::Coord<f64>>, mb: &mut MeshBuilder| {
+        let flush = |coords: &mut Vec<geo_types::Coord<f64>>,
+                     out: &mut Vec<geo_types::LineString<f64>>| {
             if coords.len() >= 2 {
-                mb.add(
-                    &geo_types::Geometry::LineString(geo_types::LineString(coords.clone())),
-                    FeatureRef::INVALID,
-                );
+                out.push(geo_types::LineString(std::mem::take(coords)));
             }
             coords.clear();
         };
@@ -70,17 +73,29 @@ pub fn project_overlay_lines<'a>(
             let (mut x, mut y) = (lon, lat);
             let ok = tr.apply(&mut x, &mut y);
             if !ok {
-                flush(&mut coords, &mut mb);
+                flush(&mut coords, &mut out);
                 continue;
             }
             let w = display.world_from_projected(x, y);
             if w[0].is_finite() && w[1].is_finite() {
                 coords.push(geo_types::Coord { x: w[0], y: w[1] });
             } else {
-                flush(&mut coords, &mut mb);
+                flush(&mut coords, &mut out);
             }
         }
-        flush(&mut coords, &mut mb);
+        flush(&mut coords, &mut out);
+    }
+    out
+}
+
+/// The same polylines, built into render chunks.
+pub fn project_overlay_lines<'a>(
+    display: &DisplayCrs,
+    lines: impl Iterator<Item = &'a [(f64, f64)]>,
+) -> Arc<Vec<ChunkMesh>> {
+    let mut mb = MeshBuilder::default();
+    for ls in project_overlay_polylines(display, lines) {
+        mb.add(&geo_types::Geometry::LineString(ls), FeatureRef::INVALID);
     }
     Arc::new(mb.finish())
 }

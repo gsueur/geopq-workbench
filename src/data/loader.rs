@@ -3325,7 +3325,7 @@ pub(crate) fn norm_bin(v: f64, area: f64, breaks: &[f64]) -> u8 {
 }
 
 /// Raw numeric per row (NaN for nulls / uncastable columns).
-fn batch_values(arr: &arrow::array::ArrayRef) -> Vec<f64> {
+pub(crate) fn batch_values(arr: &arrow::array::ArrayRef) -> Vec<f64> {
     let n = arr.len();
     let vals = arrow::compute::cast(arr, &DataType::Float64).ok();
     let vals = vals
@@ -3340,7 +3340,7 @@ fn batch_values(arr: &arrow::array::ArrayRef) -> Vec<f64> {
 }
 
 /// Per-row style bins for one batch's value column.
-fn batch_bins(arr: &arrow::array::ArrayRef, binning: &Binning) -> Vec<u8> {
+pub(crate) fn batch_bins(arr: &arrow::array::ArrayRef, binning: &Binning) -> Vec<u8> {
     use crate::data::layer::STYLE_BINS;
     let n = arr.len();
     match binning {

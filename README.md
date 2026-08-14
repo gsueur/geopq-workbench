@@ -345,6 +345,16 @@ larger files are on the roadmap.
 - **Attributes on click**, fetched lazily from the file; a floating
   window that never resizes the map. Works identically on remote files
   (each click is a small ranged read, off the UI thread).
+- **Export the view** (File menu): as a PNG, or as an SVG of the same
+  frame in real vector paths — polygon fills and outlines, lines with
+  their dash pattern and cap, point markers in their symbol, all in the
+  colours, class widths and opacities the map is drawing, plus the
+  graticule and coastline when they are on and any layer credit in the
+  corner. The raster basemap is not in it: tiles are images, and a note
+  in the file's `<desc>` says so. Nor is anything the viewer chose not
+  to draw — a hidden legend class, a layer still showing a decimated
+  preview (also noted in the file). It is the figure on screen, not a
+  second copy of the dataset.
 - **Session contexts**: File → Save context… stores layers (including
   remote URLs and S3 sources), styles, order, camera and projection as a
   JSON file; Load context… restores the whole session.
@@ -451,7 +461,7 @@ inside an egui shell. No GDAL, no web view, no server process.
 | `data/gpkg.rs`, `data/shp.rs`, `data/geojson.rs` | vector imports (bundled SQLite, pure-Rust shapefile, serde_json) over shared machinery in `data/import.rs` |
 | `data/crs.rs` | PROJJSON → EPSG → proj4rs, projection selection |
 | `data/grid.rs` | grid summaries: square/H3/A5 aggregation, areal apportionment, smoothing and focal operators, marching-squares contours |
-| `map/` | wgpu pipelines, tiles, chunked f64-origin geometry for jitter-free deep zoom |
+| `map/` | wgpu pipelines, tiles, chunked f64-origin geometry for jitter-free deep zoom, SVG export of the frame |
 | `sql/` | DataFusion integration, ST_* UDFs, spatial pushdown, console UI |
 | `app.rs` | the egui application |
 
@@ -460,8 +470,6 @@ quality gate and display policy).
 
 ## Roadmap
 
-- Export the current view to SVG, for a figure that goes into a
-  document rather than into another dataset.
 - Streaming optimize beyond the 8 GB in-memory cap; multi-file
   optimize.
 - Label rendering.
@@ -476,6 +484,12 @@ remote file it always was.
 Line styling shipped as planned: dash patterns and caps on the layer
 row, and the classification dialog can drive stroke width across its
 classes (a min-to-max ramp in px) the way colour already is.
+
+SVG export shipped as planned: File → Export view to SVG… writes the
+current view as real vector paths, styled as the map draws them. It is
+a picture of the frame rather than a re-export of the data — what is
+loaded and visible goes in the file, and what the viewer decided not
+to draw stays out.
 
 Polygon set operations, spatial aggregates, attribute tables and joins
 all shipped together: `st_union/intersection/difference/symdifference`

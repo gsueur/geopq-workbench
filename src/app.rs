@@ -362,6 +362,9 @@ pub struct ViewerApp {
     /// Files the user answered "load all" for (key: label|size), so the
     /// gate never re-asks. Persisted to disk.
     direct_files: HashSet<String>,
+    /// SVG export collecting on a worker; the answer is the finished
+    /// document, which then travels through the save dialog.
+    svg_export: Option<Receiver<SvgExport>>,
     /// Last camera pose + when it last changed (for refinement debounce).
     last_cam: Option<([f64; 2], f64)>,
     cam_changed_at: f64,
@@ -542,6 +545,10 @@ enum PickFor {
     /// The frame was captured before the dialog opened, so it travels with
     /// the request.
     Screenshot(Box<egui::ColorImage>),
+    /// Same reason as the screenshot: the document is built from the
+    /// camera of the frame the export was asked for, and the camera can
+    /// move while the panel is up.
+    ExportSvg(String),
 }
 
 /// A join being set up between an attribute table and a layer.
@@ -964,6 +971,7 @@ impl ViewerApp {
             map_rect: egui::Rect::ZERO,
             quality_gates: Vec::new(),
             direct_files: load_direct_files(),
+            svg_export: None,
             last_cam: None,
             cam_changed_at: 0.0,
             last_view_world: [-10.0, -10.0, 10.0, 10.0],
@@ -2232,6 +2240,11 @@ impl ViewerApp {
                 self.start_optimize(first.join(format!("{stem}_partitioned")), ctx);
             }
             PickFor::Screenshot(img) => self.write_screenshot(&img, &first),
+            PickFor::ExportSvg(doc) => {
+                if let Err(e) = std::fs::write(&first, doc.as_bytes()) {
+                    self.push_error(format!("could not save {}: {e}", first.display()));
+                }
+            }
         }
     }
 
@@ -2899,6 +2912,20 @@ impl ViewerApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
                         egui::UserData::default(),
                     ));
+                }
+                if ui
+                    .add_enabled(
+                        self.svg_export.is_none(),
+                        egui::Button::new(format!("{} Export view to SVG…", ph::PEN_NIB)),
+                    )
+                    .on_hover_text(
+                        "Save the current map view as vector paths, for a figure \
+                         that goes into a document. The basemap is raster and is \
+                         left out; everything else is exported as it is drawn",
+                    )
+                    .clicked()
+                {
+                    self.begin_svg_export(&ctx);
                 }
                 ui.separator();
                 let quit_shortcut = if cfg!(target_os = "macos") { "⌘Q" } else { "Ctrl+Q" };
@@ -8722,6 +8749,111 @@ impl ViewerApp {
         }
     }
 
+    /// File → Export view to SVG…: snapshot the frame, then collect the
+    /// geometry on a worker.
+    ///
+    /// The collection reads original geometries out of the stores, which
+    /// on a remote layer is a series of ranged HTTP requests — the frame
+    /// cannot wait for that. The camera of *this* frame travels with the
+    /// job, so panning while the work runs cannot produce a document of a
+    /// view nobody asked for.
+    fn begin_svg_export(&mut self, ctx: &egui::Context) {
+        if self.svg_export.is_some() {
+            return;
+        }
+        let ppp = ctx.pixels_per_point() as f64;
+        let viewport_px = [
+            (self.map_rect.width() as f64 * ppp) as f32,
+            (self.map_rect.height() as f64 * ppp) as f32,
+        ];
+        if viewport_px[0] < 1.0 || viewport_px[1] < 1.0 {
+            self.push_error("the map panel has no area to export".into());
+            return;
+        }
+        let layers: Vec<SvgLayerJob> = self
+            .layers
+            .iter()
+            // A rebuilding layer is off the map (its mesh is in the old
+            // projection); a consolidating one stays, as in the frame.
+            .filter(|l| {
+                l.style.visible
+                    && (!self.rebuilding.contains(&l.id)
+                        || self.consolidating.contains(&l.id))
+            })
+            .map(|l| SvgLayerJob {
+                name: l.name.clone(),
+                style: resolve_style(&l.style),
+                style_by: l.style.style_by.clone(),
+                sections: l
+                    .sections
+                    .iter()
+                    .map(|s| (Arc::clone(&s.chunks), Arc::clone(&s.rtree)))
+                    .collect(),
+                store: Arc::clone(&l.store),
+                crs: l.crs.clone(),
+                loaded: l.loaded.clone(),
+                decimated: l
+                    .loaded
+                    .iter()
+                    .any(|g| matches!(g, crate::data::layer::GroupLoad::Preview { .. })),
+                attribution: l.info.attribution.as_ref().map(|a| a.credit.clone()),
+            })
+            .collect();
+        let dark = ctx.theme() == egui::Theme::Dark;
+        let job = SvgJob {
+            layers,
+            display: self.display.clone(),
+            camera: self.camera,
+            viewport_px,
+            pixels_per_point: ppp,
+            view_world: self.last_view_world,
+            dark,
+            graticule: self.show_graticule,
+            coastline: self.show_coastline.then_some(self.coast_level),
+        };
+        let (tx, rx) = channel();
+        let egui_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(build_svg(job));
+            egui_ctx.request_repaint();
+        });
+        self.svg_export = Some(rx);
+    }
+
+    /// A collected SVG document goes on to the save dialog.
+    fn poll_svg_export(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.svg_export else { return };
+        // Only one file panel at a time: leave the document in the channel
+        // rather than taking it and having `spawn_pick` drop it on the
+        // floor, which would lose a collection that may have taken
+        // seconds of network reads.
+        if self.pick_dialog.is_some() {
+            return;
+        }
+        let out = match rx.try_recv() {
+            Ok(v) => v,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            // The worker died: reopen the slot or the menu entry stays
+            // disabled for the rest of the session.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.svg_export = None;
+                return;
+            }
+        };
+        self.svg_export = None;
+        for w in out.warnings {
+            self.push_error(w);
+        }
+        let name = out.name;
+        self.spawn_pick(PickFor::ExportSvg(out.doc), ctx, move |d| {
+            awaited_path(
+                d.set_file_name(name)
+                    .add_filter("SVG image", &["svg"])
+                    .save_file(),
+            )
+        });
+    }
+
     /// Quality-gate dialog (docs/OPEN_POLICY.md): a non-indexable file too
     /// big for a full build waits here for Optimize / Load all / Cancel.
     fn quality_gate_window(&mut self, ctx: &egui::Context) {
@@ -9391,6 +9523,10 @@ impl ViewerApp {
                     ui.spinner();
                     ui.label(RichText::new(what).weak());
                 }
+                if self.svg_export.is_some() {
+                    ui.spinner();
+                    ui.label(RichText::new("collecting the view for SVG").weak());
+                }
                 for job in self.loading.values_mut() {
                     if ui
                         .small_button("✖")
@@ -9514,11 +9650,7 @@ impl ViewerApp {
 
         // --- background ---
         let dark = ui.visuals().dark_mode;
-        let bg = if dark {
-            Color32::from_rgb(24, 24, 28)
-        } else {
-            Color32::from_rgb(244, 243, 240)
-        };
+        let bg = map_background(dark);
         ui.painter().rect_filled(rect, 0.0, bg);
 
         // --- build draw call ---
@@ -9549,45 +9681,19 @@ impl ViewerApp {
 
         let mut draws: Vec<LayerDraw> = Vec::new();
         if self.show_graticule && !self.graticule_chunks.is_empty() {
-            let g = if dark { 0.42 } else { 0.55 };
             draws.push(LayerDraw {
                 key: (GRATICULE_KEY, self.graticule_generation),
                 composite_group: GRATICULE_KEY,
                 chunks: self.graticule_chunks.clone(),
-                style: DrawStyle {
-                    fill_color: [0.0; 4],
-                    line_color: [g, g, g, 0.45],
-                    point_color: [0.0; 4],
-                    line_half_width_px: 0.4,
-                    point_radius_px: 0.0,
-                    point_shape: crate::data::layer::PointShape::Circle,
-                    bin_colors: None,
-                    hidden_bins: 0,
-                    ..Default::default()
-                },
+                style: graticule_style(dark),
             });
         }
         if self.show_coastline && !self.coastline_chunks.is_empty() {
-            let c = if dark {
-                [0.62, 0.66, 0.70]
-            } else {
-                [0.35, 0.38, 0.42]
-            };
             draws.push(LayerDraw {
                 key: (COASTLINE_KEY, self.graticule_generation),
                 composite_group: COASTLINE_KEY,
                 chunks: self.coastline_chunks.clone(),
-                style: DrawStyle {
-                    fill_color: [0.0; 4],
-                    line_color: [c[0], c[1], c[2], 0.85],
-                    point_color: [0.0; 4],
-                    line_half_width_px: 0.5,
-                    point_radius_px: 0.0,
-                    point_shape: crate::data::layer::PointShape::Circle,
-                    bin_colors: None,
-                    hidden_bins: 0,
-                    ..Default::default()
-                },
+                style: coastline_style(dark),
             });
         }
         for l in &self.layers {
@@ -9786,12 +9892,57 @@ fn credit_colors(dark: bool) -> (Color32, Color32) {
     }
 }
 
+/// Overlay stroke styles. Named here rather than inlined in the frame
+/// because the SVG export draws the same overlays and has to agree with
+/// the map on what they look like.
+fn graticule_style(dark: bool) -> DrawStyle {
+    let g = if dark { 0.42 } else { 0.55 };
+    DrawStyle {
+        fill_color: [0.0; 4],
+        line_color: [g, g, g, 0.45],
+        point_color: [0.0; 4],
+        line_half_width_px: 0.4,
+        point_radius_px: 0.0,
+        point_shape: crate::data::layer::PointShape::Circle,
+        bin_colors: None,
+        hidden_bins: 0,
+        ..Default::default()
+    }
+}
+
+fn coastline_style(dark: bool) -> DrawStyle {
+    let c = if dark {
+        [0.62, 0.66, 0.70]
+    } else {
+        [0.35, 0.38, 0.42]
+    };
+    DrawStyle {
+        fill_color: [0.0; 4],
+        line_color: [c[0], c[1], c[2], 0.85],
+        point_color: [0.0; 4],
+        line_half_width_px: 0.5,
+        point_radius_px: 0.0,
+        point_shape: crate::data::layer::PointShape::Circle,
+        bin_colors: None,
+        hidden_bins: 0,
+        ..Default::default()
+    }
+}
+
+/// The map's background, which is also the SVG's.
+fn map_background(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_rgb(24, 24, 28)
+    } else {
+        Color32::from_rgb(244, 243, 240)
+    }
+}
+
 /// Build graticule line meshes (meridians/parallels every 15°) for the given
 /// display projection. Cheap: a few thousand densified vertices.
 fn build_graticule(display: &DisplayCrs) -> Arc<Vec<crate::data::geometry::ChunkMesh>> {
     let wgs = Crs::wgs84();
     let tr = BulkTransformer::new(&wgs, display);
-    let max_lat: f64 = if display.is_mercator() { 85.0 } else { 90.0 };
     let mut mb = MeshBuilder::default();
 
     let mut add_line = |pts: &[(f64, f64)]| {
@@ -9815,27 +9966,392 @@ fn build_graticule(display: &DisplayCrs) -> Arc<Vec<crate::data::geometry::Chunk
         }
     };
 
-    let mut pts: Vec<(f64, f64)> = Vec::new();
+    for line in graticule_latlon(display) {
+        add_line(&line);
+    }
+    drop(add_line);
+    Arc::new(mb.finish())
+}
+
+/// The graticule as WGS84 polylines: meridians and parallels every 15°,
+/// densified every 2° so they stay curves through any projection.
+/// Mercator's ±85° cut applies to the meridians (past it the projection
+/// runs to infinity).
+fn graticule_latlon(display: &DisplayCrs) -> Vec<Vec<(f64, f64)>> {
+    let max_lat: f64 = if display.is_mercator() { 85.0 } else { 90.0 };
+    let mut out: Vec<Vec<(f64, f64)>> = Vec::new();
     for lon_i in (-180..=180).step_by(15) {
-        pts.clear();
+        let mut pts: Vec<(f64, f64)> = Vec::new();
         let mut lat = -max_lat;
         while lat <= max_lat + 1e-9 {
             pts.push((lon_i as f64, lat));
             lat += 2.0;
         }
-        add_line(&pts);
+        out.push(pts);
     }
     for lat_i in (-75..=75).step_by(15) {
-        pts.clear();
+        let mut pts: Vec<(f64, f64)> = Vec::new();
         let mut lon = -180.0;
         while lon <= 180.0 + 1e-9 {
             pts.push((lon, lat_i as f64));
             lon += 2.0;
         }
-        add_line(&pts);
+        out.push(pts);
     }
-    drop(add_line);
-    Arc::new(mb.finish())
+    out
+}
+
+// ----------------------------------------------------------------------
+// SVG export: frame snapshot → collected scene
+// ----------------------------------------------------------------------
+
+/// A layer section as the export sees it: the meshes for point
+/// instances, the R-tree for everything else.
+type SvgSection = (
+    Arc<Vec<crate::data::geometry::ChunkMesh>>,
+    Arc<rstar::RTree<crate::data::layer::PickItem>>,
+);
+
+/// Everything the export reads off one layer, cloned on the frame thread
+/// (all of it `Arc`s or small values) so the collection can run on a
+/// worker — `fetch_geoms` on a remote layer is network I/O.
+struct SvgLayerJob {
+    name: String,
+    style: DrawStyle,
+    style_by: Option<crate::data::layer::StyleBy>,
+    sections: Vec<SvgSection>,
+    store: Arc<crate::data::store::FeatureStore>,
+    crs: Crs,
+    /// Decode state per row group: groups drawn from covering boxes must
+    /// export as boxes, because boxes are what the screen shows.
+    loaded: Vec<crate::data::layer::GroupLoad>,
+    /// Some group is on screen as a stride preview.
+    decimated: bool,
+    attribution: Option<String>,
+}
+
+/// One export request, complete: the frame's camera and view settings
+/// travel with it so a pan while it runs cannot change the result.
+struct SvgJob {
+    layers: Vec<SvgLayerJob>,
+    display: DisplayCrs,
+    camera: Camera,
+    viewport_px: [f32; 2],
+    pixels_per_point: f64,
+    view_world: [f64; 4],
+    dark: bool,
+    graticule: bool,
+    /// Coastline level when the overlay is on.
+    coastline: Option<crate::data::coastline::CoastLevel>,
+}
+
+/// A finished document on its way back to the frame.
+struct SvgExport {
+    doc: String,
+    /// Default file name, from the first visible layer.
+    name: String,
+    /// Layers whose geometry could not be read. Reported to the user
+    /// rather than swallowed: a missing layer in a figure is worse than
+    /// an error dialog.
+    warnings: Vec<String>,
+}
+
+/// Collect the visible scene and render it. Blocking — worker only.
+fn build_svg(job: SvgJob) -> SvgExport {
+    use crate::map::svg::{SvgLayer, SvgScene};
+
+    let mut notes = vec![
+        "The raster basemap is not part of this file: tiles are images, \
+         not vectors."
+            .to_string(),
+    ];
+    let mut warnings: Vec<String> = Vec::new();
+    let mut layers: Vec<SvgLayer> = Vec::new();
+
+    // Overlays are rebuilt from their sources rather than read back out
+    // of the render chunks: the chunks hold LOD-simplified segments, and
+    // the polylines are what the map draws at full detail.
+    if job.graticule {
+        let lines = graticule_latlon(&job.display);
+        let mut l = SvgLayer::new("graticule", graticule_style(job.dark));
+        l.features = polyline_features(crate::data::coastline::project_overlay_polylines(
+            &job.display,
+            lines.iter().map(|p| p.as_slice()),
+        ));
+        layers.push(l);
+    }
+    if let Some(level) = job.coastline {
+        use crate::data::coastline::{detailed_lines, project_overlay_polylines, CoastLevel};
+        let detail = (level == CoastLevel::Detailed).then(detailed_lines).flatten();
+        let projected = match &detail {
+            Some(lines) => {
+                project_overlay_polylines(&job.display, lines.iter().map(|l| l.as_slice()))
+            }
+            None => project_overlay_polylines(
+                &job.display,
+                crate::data::coastline::coastline_lines()
+                    .iter()
+                    .map(|l| l.as_slice()),
+            ),
+        };
+        let mut l = SvgLayer::new("coastline", coastline_style(job.dark));
+        l.features = polyline_features(projected);
+        layers.push(l);
+    }
+
+    let mut credits: Vec<String> = Vec::new();
+    let name = job
+        .layers
+        .first()
+        .map(|l| svg_file_name(&l.name))
+        .unwrap_or_else(|| "geopq-map.svg".to_string());
+    for layer in &job.layers {
+        if let Some(a) = &layer.attribution
+            && !credits.contains(a)
+        {
+            credits.push(a.clone());
+        }
+        if layer.decimated {
+            notes.push(format!(
+                "Layer \"{}\" was drawn from a decimated preview on screen; \
+                 the export carries the same rows, not the whole dataset.",
+                layer.name
+            ));
+        }
+        match collect_svg_layer(layer, &job) {
+            Ok(l) => layers.push(l),
+            Err(e) => {
+                warnings.push(format!("SVG export, layer {}: {e}", layer.name));
+                notes.push(format!(
+                    "Layer \"{}\" is missing from this file: {e}",
+                    layer.name
+                ));
+            }
+        }
+    }
+
+    let scene = SvgScene {
+        camera: job.camera,
+        viewport_px: job.viewport_px,
+        pixels_per_point: job.pixels_per_point,
+        background: map_background(job.dark),
+        credit_colors: credit_colors(job.dark),
+        layers,
+        credits,
+        notes,
+    };
+    SvgExport {
+        doc: crate::map::svg::render(&scene),
+        name,
+        warnings,
+    }
+}
+
+/// A layer name turned into a file name: the stem, plus `.svg`.
+fn svg_file_name(layer: &str) -> String {
+    let stem: String = layer
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(layer)
+        .trim_end_matches(".parquet")
+        .chars()
+        .map(|c| if c.is_alphanumeric() || "-_.".contains(c) { c } else { '_' })
+        .collect();
+    let stem = stem.trim_matches('_');
+    if stem.is_empty() {
+        "geopq-map.svg".to_string()
+    } else {
+        format!("{stem}.svg")
+    }
+}
+
+fn polyline_features(
+    lines: Vec<geo_types::LineString<f64>>,
+) -> Vec<crate::map::svg::SvgFeature> {
+    lines
+        .into_iter()
+        .map(|ls| crate::map::svg::SvgFeature {
+            geom: geo_types::Geometry::LineString(ls),
+            bin: 0,
+            underlay: false,
+        })
+        .collect()
+}
+
+/// Collect one layer's visible content, following the pick path: the
+/// R-tree says which features are in view, the store hands back their
+/// original geometry, and the bins are recomputed with the same rules the
+/// build used. The tessellated meshes are never touched — they are
+/// triangles, and this is a vector export.
+fn collect_svg_layer(
+    job: &SvgLayerJob,
+    ctx: &SvgJob,
+) -> Result<crate::map::svg::SvgLayer, String> {
+    use crate::data::geometry::spans_underlay;
+    use crate::map::svg::{SvgFeature, SvgLayer};
+
+    let v = ctx.view_world;
+    let view = [v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])];
+    let env = rstar::AABB::from_corners([view[0], view[1]], [view[2], view[3]]);
+
+    let mut items: Vec<(u32, [f64; 4])> = job
+        .sections
+        .iter()
+        .flat_map(|(_, rtree)| {
+            rtree
+                .locate_in_envelope_intersecting(env)
+                .map(|i| (i.feature.index, i.bbox))
+        })
+        .collect();
+    items.sort_by_key(|(i, _)| *i);
+    items.dedup_by_key(|(i, _)| *i);
+
+    // Groups drawn from covering boxes: their features are on screen as
+    // rectangles, so that is what goes in the file. The box is the
+    // R-tree entry's own bbox, already in world coordinates.
+    let starts = job.store.rg_starts();
+    let boxed: Vec<bool> = items
+        .iter()
+        .map(|(row, _)| {
+            let g = starts.partition_point(|s| *s <= *row as u64).saturating_sub(1);
+            matches!(
+                job.loaded.get(g),
+                Some(crate::data::layer::GroupLoad::Boxes { .. })
+            )
+        })
+        .collect();
+
+    let rows: Vec<u32> = items.iter().map(|(r, _)| *r).collect();
+    let geom_rows: Vec<u32> = rows
+        .iter()
+        .zip(&boxed)
+        .filter(|(_, b)| !**b)
+        .map(|(r, _)| *r)
+        .collect();
+    let mut geoms: HashMap<u32, geo_types::Geometry<f64>> = HashMap::new();
+    if !geom_rows.is_empty() {
+        for (row, g) in job.store.fetch_geoms(&geom_rows)? {
+            if let Some(g) = g {
+                geoms.insert(row, g);
+            }
+        }
+    }
+
+    let mut features: Vec<SvgFeature> = Vec::with_capacity(items.len());
+    let bins = svg_bins(job, &rows, &geoms)?;
+    for (i, (row, bbox)) in items.iter().enumerate() {
+        let bin = bins.as_ref().map(|b| b[i]).unwrap_or(0);
+        let geom = if boxed[i] {
+            geo_types::Geometry::Rect(geo_types::Rect::new(
+                geo_types::Coord { x: bbox[0], y: bbox[1] },
+                geo_types::Coord { x: bbox[2], y: bbox[3] },
+            ))
+        } else {
+            match geoms.remove(row) {
+                Some(g) => picking::to_world_geom(g, &job.crs, &ctx.display),
+                None => continue,
+            }
+        };
+        features.push(SvgFeature {
+            geom,
+            bin,
+            underlay: spans_underlay(*bbox),
+        });
+    }
+
+    // Points carry no R-tree entries: they live in the chunk instance
+    // buffers, which is also where the marker pass reads them. The
+    // renderer's per-chunk decimation is deliberately not reproduced —
+    // it exists to keep a frame cheap, and a file has no frame budget.
+    let mut points: Vec<([f64; 2], u8)> = Vec::new();
+    let reach = job.style.point_shape.reach() as f64;
+    let margin = job.style.point_radius_px as f64 * reach / ctx.camera.scale();
+    for (chunks, _) in &job.sections {
+        for chunk in chunks.iter() {
+            if chunk.point_instances.is_empty() {
+                continue;
+            }
+            let (o, b) = (chunk.origin, chunk.bounds_local);
+            if o[0] + b[2] as f64 + margin < view[0]
+                || o[0] + b[0] as f64 - margin > view[2]
+                || o[1] + b[3] as f64 + margin < view[1]
+                || o[1] + b[1] as f64 - margin > view[3]
+            {
+                continue;
+            }
+            for p in &chunk.point_instances {
+                let w = [o[0] + p[0] as f64, o[1] + p[1] as f64];
+                if w[0] + margin >= view[0]
+                    && w[0] - margin <= view[2]
+                    && w[1] + margin >= view[1]
+                    && w[1] - margin <= view[3]
+                {
+                    points.push((w, chunk.bin));
+                }
+            }
+        }
+    }
+
+    Ok(SvgLayer {
+        name: job.name.clone(),
+        style: job.style.clone(),
+        features,
+        points,
+    })
+}
+
+/// Style bins for the exported rows, recomputed with the build's rules
+/// (`batch_bins` / `norm_bin`) rather than read back off the chunks: a
+/// chunk's bin covers all its features, and this needs one per feature.
+/// None when the layer is not data-styled.
+fn svg_bins(
+    job: &SvgLayerJob,
+    rows: &[u32],
+    geoms: &HashMap<u32, geo_types::Geometry<f64>>,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(sb) = &job.style_by else {
+        return Ok(None);
+    };
+    let Some(sel) = loader::resolve_style(&job.store, sb) else {
+        return Ok(None);
+    };
+    if rows.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let batches = job.store.fetch(rows, Some(&[sel.col]))?;
+    let mut out: Vec<u8> = Vec::with_capacity(rows.len());
+    match (&sel.binning, sel.per_area) {
+        (loader::Binning::Breaks(breaks), true) => {
+            let mut it = rows.iter();
+            for batch in &batches {
+                let vals = loader::batch_values(batch.column(0));
+                for v in vals {
+                    let row = it.next().ok_or("row/batch count mismatch")?;
+                    // A feature whose geometry never arrived (a covering
+                    // box, an undecodable row) has no area; norm_bin
+                    // sends a zero area to bin 0, as the build does.
+                    let area = geoms
+                        .get(row)
+                        .map(|g| loader::ground_area(g, job.crs.is_latlong))
+                        .unwrap_or(0.0);
+                    out.push(loader::norm_bin(v, area, breaks));
+                }
+            }
+        }
+        (binning, _) => {
+            for batch in &batches {
+                out.extend(loader::batch_bins(batch.column(0), binning));
+            }
+        }
+    }
+    if out.len() != rows.len() {
+        return Err(format!(
+            "style column returned {} values for {} rows",
+            out.len(),
+            rows.len()
+        ));
+    }
+    Ok(Some(out))
 }
 
 /// Stable renderer key for a layer section.
@@ -10818,6 +11334,7 @@ impl eframe::App for ViewerApp {
         let cookbook_area = self.floating_area(&ctx);
         crate::cookbook::window(&ctx, &mut self.cookbook_open, cookbook_area);
         self.save_screenshot(&ctx);
+        self.poll_svg_export(&ctx);
         // Desktop-standard shortcuts: Cmd/Ctrl+O opens files, Ctrl+Q quits
         // (macOS handles ⌘Q natively).
         let open_files = ctx.input_mut(|i| {
@@ -10849,6 +11366,7 @@ impl eframe::App for ViewerApp {
             || self.sql.is_running()
             || !self.filter_pending.is_empty()
             || self.filter_dialog.as_ref().is_some_and(|d| d.testing)
+            || self.svg_export.is_some()
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -11127,5 +11645,308 @@ mod legend_fmt_tests {
         // …while genuinely equal breaks (quantile dupes) may share one.
         let l = fmt_break_labels(&[0.0, 0.0, 3200.0]);
         assert_eq!(l[0], l[1]);
+    }
+}
+
+#[cfg(test)]
+mod svg_export_tests {
+    use super::*;
+    use crate::data::layer::{GroupLoad, Ramp, StyleBy, StyleMode};
+    use arrow::array::{ArrayRef, BinaryArray, Float64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use std::fs::File;
+
+    /// Four unit squares in a row at lon 0..8, each carrying a value that
+    /// puts it in its own class, plus one point beside each of them.
+    fn write_squares(path: &std::path::Path) {
+        let geo = serde_json::json!({
+            "version": "1.0.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {
+                "encoding": "WKB",
+                "geometry_types": ["Polygon", "Point"],
+                "bbox": [0.0, 0.0, 10.0, 2.0],
+            }},
+        });
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let mut wkbs: Vec<Vec<u8>> = Vec::new();
+        let mut values: Vec<f64> = Vec::new();
+        for i in 0..4 {
+            let x = i as f64 * 2.0;
+            let ring = geo_types::LineString::from(vec![
+                (x, 0.0),
+                (x + 1.0, 0.0),
+                (x + 1.0, 1.0),
+                (x, 1.0),
+                (x, 0.0),
+            ]);
+            let poly = geo_types::Geometry::Polygon(geo_types::Polygon::new(ring, vec![]));
+            wkbs.push(crate::data::import::to_wkb(&poly).unwrap());
+            values.push(i as f64 * 10.0);
+        }
+        for i in 0..4 {
+            let p = geo_types::Geometry::Point(geo_types::Point::new(i as f64 * 2.0 + 0.5, 1.5));
+            wkbs.push(crate::data::import::to_wkb(&p).unwrap());
+            values.push(i as f64 * 10.0);
+        }
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(BinaryArray::from_iter_values(wkbs.iter())),
+            Arc::new(Float64Array::from(values)),
+        ];
+        let batch = RecordBatch::try_new(schema.clone(), cols).unwrap();
+        let mut w = ArrowWriter::try_new(File::create(path).unwrap(), schema, None).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    fn styled_by_value() -> StyleBy {
+        StyleBy {
+            column: "value".into(),
+            mode: StyleMode::Graduated {
+                breaks: vec![5.0, 15.0, 25.0],
+                method: crate::data::layer::ClassMethod::EqualInterval,
+            },
+            ramp: Ramp::Viridis,
+            per_area: false,
+            hidden_bins: 0,
+            classified_rows: None,
+            width_px: None,
+        }
+    }
+
+    /// The class colours as hex, straight from the ramp: what the map
+    /// paints, so what the file must carry.
+    fn class_colors() -> Vec<String> {
+        let lut = styled_by_value().bin_colors();
+        (0..4)
+            .map(|i| {
+                let c = lut[i];
+                let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                format!("#{:02x}{:02x}{:02x}", b(c[0]), b(c[1]), b(c[2]))
+            })
+            .collect()
+    }
+
+    /// The collector end to end: a real parquet through the R-tree, the
+    /// store and the binning, out as a document that is parsed back.
+    fn export(hidden_bins: u64) -> String {
+        // One file per call: these tests run concurrently and the store
+        // keeps the file open for the whole export.
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "geopq_svg_export_{}_{seq}.parquet",
+            std::process::id()
+        ));
+        write_squares(&path);
+        let (store, crs, _info, _rg) =
+            loader::open_source_for_test(&Source::Local(path.clone())).unwrap();
+        let store = Arc::new(store);
+        let display = DisplayCrs::new(Crs::wgs84());
+        let mut sb = styled_by_value();
+        sb.hidden_bins = hidden_bins;
+        let sel = loader::resolve_style(&store, &sb).expect("style column");
+        let geometry = loader::build_geometry_styled_for_test(&store, &crs, &display, &sel)
+            .unwrap()
+            .0;
+
+        let mut style = crate::data::layer::LayerStyle::new(Color32::from_rgb(200, 80, 40));
+        style.style_by = Some(sb.clone());
+        style.point_radius_px = 4.0;
+        let camera = Camera { center: display.world_from_projected(4.0, 1.0), zoom: 5.0 };
+        let viewport_px = [800.0, 600.0];
+        let tl = camera.screen_to_world([0.0, 0.0], viewport_px);
+        let br = camera.screen_to_world(viewport_px, viewport_px);
+        let view_world = [tl[0], tl[1], br[0], br[1]];
+        let job = SvgJob {
+            layers: vec![SvgLayerJob {
+                name: "squares".into(),
+                style: resolve_style(&style),
+                style_by: Some(sb),
+                sections: vec![(Arc::clone(&geometry.chunks), Arc::clone(&geometry.rtree))],
+                store: Arc::clone(&store),
+                crs,
+                loaded: vec![GroupLoad::Full],
+                decimated: false,
+                attribution: Some("© a publisher".into()),
+            }],
+            // Framed on the middle of the row of squares, with the whole
+            // extent inside the viewport. The view rect is derived from
+            // the camera the way the frame derives it.
+            camera,
+            display,
+            viewport_px,
+            pixels_per_point: 1.0,
+            view_world,
+            dark: true,
+            graticule: false,
+            coastline: None,
+        };
+        let out = build_svg(job);
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert_eq!(out.name, "squares.svg");
+        let _ = std::fs::remove_file(&path);
+        out.doc
+    }
+
+    #[test]
+    fn a_real_layer_exports_every_feature_with_its_own_class() {
+        let svg = export(0);
+        // Four polygons: four opaque fills in the composite group, four
+        // stroked outlines, four markers. A count alone would also pass
+        // on an exporter that emitted one feature eight times, so the
+        // colours below pin which feature each element is.
+        assert_eq!(svg.matches(r#"fill-rule="evenodd""#).count(), 4, "{svg}");
+        assert_eq!(svg.matches(r#"fill="none""#).count(), 4);
+        assert_eq!(svg.matches("<circle").count(), 4);
+        // Values 0/10/20/30 against breaks 5/15/25: one polygon and one
+        // marker per class, both painted in the class colour as the map
+        // paints them.
+        for c in &class_colors() {
+            assert_eq!(
+                svg.matches(&format!(r#"fill="{c}""#)).count(),
+                2,
+                "class colour {c}: one fill, one marker"
+            );
+        }
+        // Every ring closes with four corners, and no path is a fragment.
+        for d in svg.split(r#" d=""#).skip(1) {
+            let d = d.split('"').next().unwrap();
+            assert!(d.starts_with('M'), "{d}");
+            assert!(d.ends_with('Z'), "{d}");
+            assert_eq!(d.matches('L').count(), 3, "square ring: {d}");
+        }
+        // The publisher's credit is reproduced: the licence asks for it
+        // where the data is seen.
+        assert!(svg.contains("© a publisher") && svg.contains("<text"));
+        assert!(svg.contains("raster basemap is not part of this file"));
+        // Geometry came from the store, not from the tessellated mesh:
+        // eight paths, one ring each. A triangulated square would arrive
+        // as two triangles.
+        assert_eq!(svg.matches(r#" d=""#).count(), 8, "4 fills + 4 outlines");
+    }
+
+    #[test]
+    fn a_hidden_class_leaves_the_document_and_comes_back() {
+        let all = export(0);
+        let hidden = export(1 << 2);
+        // Class 2 gone: one fill, one outline and one marker fewer.
+        assert_eq!(hidden.matches(r#"fill-rule="evenodd""#).count(), 3);
+        assert_eq!(hidden.matches(r#"fill="none""#).count(), 3);
+        assert_eq!(hidden.matches("<circle").count(), 3);
+        let gone = format!(r#"fill="{}""#, class_colors()[2]);
+        assert!(all.contains(&gone));
+        assert!(!hidden.contains(&gone), "hidden class still drawn");
+    }
+
+
+    /// The built-in overlays are rebuilt from their sources, so they carry
+    /// full-detail polylines rather than the LOD-simplified segments the
+    /// chunks hold — and they draw under the data layers, as on the map.
+    #[test]
+    fn overlays_export_as_full_detail_polylines_below_the_layers() {
+        let display = DisplayCrs::hobo_dyer();
+        let camera = Camera { center: [0.5, 0.5], zoom: 1.0 };
+        let viewport_px = [1200.0, 800.0];
+        let tl = camera.screen_to_world([0.0, 0.0], viewport_px);
+        let br = camera.screen_to_world(viewport_px, viewport_px);
+        let job = SvgJob {
+            layers: Vec::new(),
+            display,
+            camera,
+            viewport_px,
+            pixels_per_point: 1.0,
+            view_world: [tl[0], tl[1], br[0], br[1]],
+            dark: true,
+            graticule: true,
+            coastline: Some(crate::data::coastline::CoastLevel::Embedded),
+        };
+        let out = build_svg(job);
+        let svg = out.doc;
+        assert!(svg.contains("<title>graticule</title>"));
+        assert!(svg.contains("<title>coastline</title>"));
+        // Graticule before coastline, matching the map's draw order.
+        assert!(
+            svg.find("<title>graticule</title>") < svg.find("<title>coastline</title>"),
+            "overlay order"
+        );
+        // 25 meridians + 11 parallels, none of which fails to project in
+        // Hobo–Dyer, so none splits.
+        let grat = &svg[svg.find(r#"<g id="layer-0">"#).unwrap()
+            ..svg.find(r#"<g id="layer-1">"#).unwrap()];
+        assert_eq!(grat.matches("<path").count(), 36, "meridians + parallels");
+        // The overlay styles are the map's own, not re-invented here.
+        let g = graticule_style(true);
+        assert!(grat.contains(&format!(
+            r#"stroke-width="{}""#,
+            g.line_half_width_px * 2.0
+        )));
+        // The coastline keeps 1:50m detail: an LOD-simplified read-back
+        // would land in the low thousands of vertices.
+        let coast = &svg[svg.find(r#"<g id="layer-1">"#).unwrap()..];
+        assert!(coast.matches(" L").count() > 50_000, "{}", coast.matches(" L").count());
+        assert!(coast.matches("<path").count() > 1_000);
+        // Lines only: an overlay has no fills and no markers.
+        assert_eq!(coast.matches("<g opacity=").count(), 0);
+        assert_eq!(coast.matches("<circle").count(), 0);
+    }
+
+    /// Nothing in view: still a document, still a background.
+    #[test]
+    fn an_empty_viewport_still_writes_a_valid_document() {
+        let path = std::env::temp_dir()
+            .join(format!("geopq_svg_empty_{}.parquet", std::process::id()));
+        write_squares(&path);
+        let (store, crs, _info, _rg) =
+            loader::open_source_for_test(&Source::Local(path.clone())).unwrap();
+        let store = Arc::new(store);
+        let display = DisplayCrs::new(Crs::wgs84());
+        let geometry = loader::build_geometry_for_test(&store, &crs, &display).unwrap().0;
+        // Half a world away from the data, zoomed right in.
+        let camera = Camera { center: display.world_from_projected(-170.0, -60.0), zoom: 12.0 };
+        let viewport_px = [640.0, 480.0];
+        let tl = camera.screen_to_world([0.0, 0.0], viewport_px);
+        let br = camera.screen_to_world(viewport_px, viewport_px);
+        let view_world = [tl[0], tl[1], br[0], br[1]];
+        let job = SvgJob {
+            layers: vec![SvgLayerJob {
+                name: "squares".into(),
+                style: resolve_style(&crate::data::layer::LayerStyle::new(Color32::RED)),
+                style_by: None,
+                sections: vec![(Arc::clone(&geometry.chunks), Arc::clone(&geometry.rtree))],
+                store: Arc::clone(&store),
+                crs,
+                loaded: vec![GroupLoad::Full],
+                decimated: true,
+                attribution: None,
+            }],
+            camera,
+            display,
+            viewport_px,
+            pixels_per_point: 1.0,
+            view_world,
+            dark: false,
+            graticule: true,
+            coastline: None,
+        };
+        let out = build_svg(job);
+        let _ = std::fs::remove_file(&path);
+        assert!(out.doc.contains(r#"viewBox="0 0 640 480""#));
+        assert!(out.doc.contains(r##"fill="#f4f3f0""##), "background rect");
+        assert_eq!(out.doc.matches(r#"fill-rule="evenodd""#).count(), 0);
+        assert_eq!(out.doc.matches("<circle").count(), 0);
+        // A decimated layer says so in the document rather than passing
+        // itself off as the whole dataset.
+        assert!(out.doc.contains("decimated preview"));
+        assert!(out.doc.trim_end().ends_with("</svg>"));
     }
 }
