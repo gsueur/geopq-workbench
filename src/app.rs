@@ -503,6 +503,9 @@ struct CatalogBrowser {
     dcat_checked: std::collections::HashSet<usize>,
     /// Search over the dataset list.
     filter: String,
+    /// Hide datasets whose only openable format is CSV: an attribute
+    /// table, not a layer. A session-wide preference, not per catalog.
+    geo_only: bool,
     /// Drops stale fetch results after a selection switch.
     generation: u64,
 }
@@ -517,19 +520,25 @@ impl CatalogBrowser {
     }
 
     /// Move session entry `i` to the saved list, stamped with today as
-    /// its added-on date, and keep the selection pointing at it.
+    /// its added-on date, and keep the selection pointing at it. The
+    /// saved list stays alphabetical, as the next load would make it.
     fn save_for_good(&mut self, i: usize) {
         let mut c = self.session.remove(i);
         c.added_on = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .ok();
+        let url = c.url.clone();
         self.saved.push(c);
+        crate::data::repo::sort_catalogs(&mut self.saved);
         if let Err(e) = crate::data::repo::save_catalogs(&self.saved) {
             log::warn!("saving catalogs: {e}");
         }
         match self.sel {
-            Some((false, j)) if j == i => self.sel = Some((true, self.saved.len() - 1)),
+            Some((false, j)) if j == i => {
+                self.sel =
+                    self.saved.iter().position(|c| c.url == url).map(|k| (true, k));
+            }
             Some((false, j)) if j > i => self.sel = Some((false, j - 1)),
             _ => {}
         }
@@ -4494,6 +4503,7 @@ impl ViewerApp {
             dcat: None,
             dcat_checked: Default::default(),
             filter: String::new(),
+            geo_only: false,
             generation: 0,
         });
     }
@@ -10541,17 +10551,29 @@ fn dcat_pane(ui: &mut egui::Ui, b: &mut CatalogBrowser, open: &mut Vec<usize>) {
         )));
         return;
     }
-    ui.add(
-        egui::TextEdit::singleline(&mut b.filter)
-            .hint_text("search titles, keywords and descriptions…")
-            .desired_width(ui.available_width()),
-    );
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut b.filter)
+                .hint_text("search titles, keywords and descriptions…")
+                .desired_width((ui.available_width() - 110.0).max(120.0)),
+        );
+        ui.checkbox(&mut b.geo_only, "geo formats").on_hover_text(
+            "Only datasets that open as a layer — GeoParquet, GeoPackage or \
+             GeoJSON. A CSV-only dataset is an attribute table, not a map.",
+        );
+    });
     let needle = b.filter.to_lowercase();
+    let geo_only = b.geo_only;
     let matches = |d: &crate::data::repo::DcatDataset| {
-        needle.is_empty()
+        let text = needle.is_empty()
             || d.title.to_lowercase().contains(&needle)
             || d.description.to_lowercase().contains(&needle)
-            || d.keywords.iter().any(|k| k.to_lowercase().contains(&needle))
+            || d.keywords.iter().any(|k| k.to_lowercase().contains(&needle));
+        let geo = !geo_only
+            || d.distributions
+                .iter()
+                .any(|x| x.format != crate::data::repo::DcatFormat::Csv);
+        text && geo
     };
     let mut shown = 0usize;
     egui::ScrollArea::vertical()

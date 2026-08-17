@@ -244,22 +244,28 @@ pub fn default_catalogs() -> Vec<Catalog> {
         added_on: None,
     };
     vec![
-        c("New York City Open Data", "https://data.cityofnewyork.us"),
-        c("Los Angeles GeoHub", "https://geohub.lacity.org"),
-        c("Chicago Data Portal", "https://data.cityofchicago.org"),
-        c("Houston Open Data", "https://houston-mycity.opendata.arcgis.com"),
-        c("Phoenix Open Data", "https://www.phoenixopendata.com"),
-        c("OpenDataPhilly", "https://opendataphilly.org"),
-        c("San Antonio Open Data", "https://data.sanantonio.gov"),
-        c("Dallas Open Data", "https://www.dallasopendata.com"),
-        c("Austin Open Data", "https://data.austintexas.gov"),
-        c("DataSF (San Francisco)", "https://data.sfgov.org"),
-        c("Seattle Open Data", "https://data.seattle.gov"),
-        c("Denver Geospatial Open Data", "https://opendata-geospatialdenver.hub.arcgis.com"),
-        c("Open Data DC", "https://opendata.dc.gov"),
         c("Analyze Boston", "https://data.boston.gov"),
+        c("Austin Open Data", "https://data.austintexas.gov"),
+        c("Chicago Data Portal", "https://data.cityofchicago.org"),
         c("City of Sacramento Open Data", "https://data.cityofsacramento.org"),
+        c("Dallas Open Data", "https://www.dallasopendata.com"),
+        c("DataSF (San Francisco)", "https://data.sfgov.org"),
+        c("Denver Geospatial Open Data", "https://opendata-geospatialdenver.hub.arcgis.com"),
+        c("Houston Open Data", "https://houston-mycity.opendata.arcgis.com"),
+        c("Los Angeles GeoHub", "https://geohub.lacity.org"),
+        c("New York City Open Data", "https://data.cityofnewyork.us"),
+        c("Open Data DC", "https://opendata.dc.gov"),
+        c("OpenDataPhilly", "https://opendataphilly.org"),
+        c("Phoenix Open Data", "https://www.phoenixopendata.com"),
+        c("San Antonio Open Data", "https://data.sanantonio.gov"),
+        c("Seattle Open Data", "https://data.seattle.gov"),
     ]
+}
+
+/// Alphabetical by name, which is the one order a mixed list of saved
+/// and built-in portals can share.
+pub fn sort_catalogs(list: &mut [Catalog]) {
+    list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 }
 
 /// `catalogs.json`: the user's saved portals plus which built-ins they
@@ -275,8 +281,8 @@ struct CatalogsFile {
     catalogs: Vec<Catalog>,
 }
 
-/// The saved portals: what the file holds, then every built-in the user
-/// has neither saved a version of nor removed.
+/// The saved portals: what the file holds plus every built-in the user
+/// has neither saved a version of nor removed, alphabetically.
 pub fn load_catalogs() -> Vec<Catalog> {
     let text = config_path("catalogs.json").and_then(|p| std::fs::read_to_string(p).ok());
     let file = match text {
@@ -299,6 +305,7 @@ fn merge_catalogs(file: CatalogsFile) -> Vec<Catalog> {
             list.push(d);
         }
     }
+    sort_catalogs(&mut list);
     list
 }
 
@@ -2974,8 +2981,10 @@ mod tests {
             removed: Vec::new(),
             catalogs: vec![mine.clone()],
         });
-        assert_eq!(full[0], mine);
+        assert!(full.contains(&mine));
         assert_eq!(full.len(), 1 + default_catalogs().len());
+        let names: Vec<String> = full.iter().map(|c| c.name.to_lowercase()).collect();
+        assert!(names.is_sorted(), "saved and built-in sort together: {names:?}");
         save_catalogs(&full).unwrap();
         assert_eq!(load_catalogs(), full);
 
