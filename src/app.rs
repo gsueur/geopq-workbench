@@ -626,11 +626,25 @@ impl ImportState {
     }
 }
 
-/// `dst` exists and is not older than `src`. Equal mtimes count as
-/// current: converting right after downloading lands in the same second.
+/// `dst` exists, is not older than `src`, and ends with the parquet
+/// magic. Equal mtimes count as current: converting right after
+/// downloading lands in the same second. The magic check keeps a
+/// truncated file — left by a conversion killed before the rename-into-
+/// place era — from turning one crash into a persistent open failure.
 fn up_to_date(dst: &std::path::Path, src: &std::path::Path) -> bool {
     let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    matches!((modified(dst), modified(src)), (Some(d), Some(s)) if d >= s)
+    if !matches!((modified(dst), modified(src)), (Some(d), Some(s)) if d >= s) {
+        return false;
+    }
+    std::fs::File::open(dst)
+        .and_then(|mut f| {
+            use std::io::{Read, Seek, SeekFrom};
+            f.seek(SeekFrom::End(-4))?;
+            let mut magic = [0u8; 4];
+            f.read_exact(&mut magic)?;
+            Ok(magic == *b"PAR1")
+        })
+        .unwrap_or(false)
 }
 
 enum ImportMsg {
