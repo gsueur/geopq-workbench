@@ -137,6 +137,14 @@ pub fn convert(src: &Path, dst: &Path, progress: &dyn Fn(f32)) -> Result<u64, St
                     geom_b.append_null();
                     bbox_b.push(None);
                 }
+                // RFC 7946 §3.1: an empty "coordinates" array is an empty
+                // geometry, which a processor may treat as null. ArcGIS
+                // Hub exports a feature with no location exactly this
+                // way, and one unplaced row must not refuse the file.
+                Some(g) if is_empty_geometry(g) => {
+                    geom_b.append_null();
+                    bbox_b.push(None);
+                }
                 Some(g) => {
                     let g = parse_geometry(g, 0)?;
                     bbox_b.push(stats.add(&g));
@@ -173,6 +181,14 @@ pub fn convert(src: &Path, dst: &Path, progress: &dyn Fn(f32)) -> Result<u64, St
     ));
     writer.close().map_err(|e| format!("finalize failed: {e}"))?;
     Ok(written)
+}
+
+/// An empty geometry: `"coordinates": []` on any coordinates-bearing
+/// type, or a GeometryCollection whose `"geometries"` list is empty. A
+/// missing member is still an error, not an empty geometry.
+fn is_empty_geometry(v: &Value) -> bool {
+    let empty = |key: &str| v.get(key).and_then(Value::as_array).is_some_and(Vec::is_empty);
+    empty("coordinates") || empty("geometries")
 }
 
 fn coord(v: &Value) -> Result<geo_types::Coord<f64>, String> {
@@ -297,5 +313,53 @@ mod tests {
         let sc = batch.schema();
         assert_eq!(sc.field_with_name("pop").unwrap().data_type(), &DataType::Float64);
         assert_eq!(sc.field_with_name("tags").unwrap().data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    /// ArcGIS Hub exports a feature with no location as an empty
+    /// geometry ({"type": "Point", "coordinates": []}), which RFC 7946
+    /// lets a processor treat as null. Boston's parking-meters file
+    /// carries exactly one such row at the end, and it must not refuse
+    /// the 6,954 placed meters before it. A missing "coordinates"
+    /// member stays an error: that is malformed, not empty.
+    fn an_empty_geometry_is_a_null_row_not_a_refusal() {
+        let dir = std::env::temp_dir().join("geopq_geojson_empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("meters.geojson");
+        let dst = dir.join("meters.parquet");
+
+        let gj = json!({
+            "type": "FeatureCollection",
+            "features": [
+                {"type": "Feature",
+                 "geometry": {"type": "Point", "coordinates": [-71.07, 42.35]},
+                 "properties": {"METER_ID": 450001}},
+                {"type": "Feature",
+                 "geometry": {"type": "Point", "coordinates": []},
+                 "properties": {"METER_ID": null}},
+                {"type": "Feature",
+                 "geometry": {"type": "GeometryCollection", "geometries": []},
+                 "properties": {"METER_ID": null}}
+            ]
+        });
+        std::fs::write(&src, gj.to_string()).unwrap();
+        assert_eq!(convert(&src, &dst, &|_| {}).unwrap(), 3);
+
+        let (store, _crs, _info, _rg) =
+            crate::data::loader::open_store_for_test(&dst).unwrap();
+        let geoms = store.fetch_geoms(&[0, 1, 2]).unwrap();
+        assert!(matches!(geoms[0].1, Some(geo_types::Geometry::Point(_))));
+        assert!(geoms[1].1.is_none());
+        assert!(geoms[2].1.is_none());
+
+        std::fs::write(
+            &src,
+            json!({"type": "Feature", "geometry": {"type": "Point"},
+                   "properties": {}})
+            .to_string(),
+        )
+        .unwrap();
+        let err = convert(&src, &dst, &|_| {}).unwrap_err();
+        assert!(err.contains("without coordinates"), "{err}");
     }
 }
