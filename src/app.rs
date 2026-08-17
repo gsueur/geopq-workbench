@@ -607,6 +607,32 @@ struct ImportState {
     rx: Option<std::sync::mpsc::Receiver<ImportMsg>>,
 }
 
+impl ImportState {
+    /// Where the conversion lands: beside the source, named after it
+    /// (and the chosen table, for a GeoPackage).
+    fn dst_for(&self, table: Option<&crate::data::gpkg::GpkgTable>) -> PathBuf {
+        match table {
+            Some(t) => {
+                let stem = self
+                    .src
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                self.src.with_file_name(format!("{stem}.{}.parquet", t.name))
+            }
+            None => self.src.with_extension("parquet"),
+        }
+    }
+}
+
+/// `dst` exists and is not older than `src`. Equal mtimes count as
+/// current: converting right after downloading lands in the same second.
+fn up_to_date(dst: &std::path::Path, src: &std::path::Path) -> bool {
+    let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    matches!((modified(dst), modified(src)), (Some(d), Some(s)) if d >= s)
+}
+
 enum ImportMsg {
     Progress(f32),
     Done(PathBuf),
@@ -2324,7 +2350,7 @@ impl ViewerApp {
             PickFor::OpenFolder => {
                 self.enqueue_load(Source::Dir(first), ctx);
             }
-            PickFor::ImportVector => self.begin_import(first),
+            PickFor::ImportVector => self.begin_import(first, ctx),
             PickFor::AttributeTable => {
                 for p in paths {
                     self.open_attr_table(Source::Local(p));
@@ -4693,7 +4719,7 @@ impl ViewerApp {
         }
     }
 
-    fn poll_downloads(&mut self) {
+    fn poll_downloads(&mut self, ctx: &egui::Context) {
         let mut ready: Vec<PathBuf> = Vec::new();
         while let Ok(msg) = self.dl_rx.try_recv() {
             match msg {
@@ -4721,7 +4747,7 @@ impl ViewerApp {
             }
         }
         for p in ready {
-            self.begin_import(p);
+            self.begin_import(p, ctx);
         }
     }
 
@@ -4765,7 +4791,7 @@ impl ViewerApp {
         if dst.exists() {
             // Downloaded in an earlier session: the local copy is the
             // point of keeping it outside the temp directory.
-            self.begin_import(dst);
+            self.begin_import(dst, ctx);
             return;
         }
         let id = self.dl_next;
@@ -6911,7 +6937,13 @@ impl ViewerApp {
 
     /// Open the vector-import dialog for a GPKG / SHP / GeoJSON path
     /// (from the File menu or a drag & drop).
-    fn begin_import(&mut self, path: PathBuf) {
+    /// Start importing a vector file. There is no confirmation step: the
+    /// destination is derived from the source, converting is what opening
+    /// the file means, and the dialog exists to pick a table when a
+    /// GeoPackage has several, to show progress, and to surface errors.
+    /// A conversion that already exists and is newer than its source
+    /// opens as is — re-opening a portal dataset costs nothing.
+    fn begin_import(&mut self, path: PathBuf, ctx: &egui::Context) {
         use crate::data::import::ImportFormat;
         if self.gpkg_import.is_some() {
             // One dialog at a time: queue the rest, imported as each closes.
@@ -6921,13 +6953,16 @@ impl ViewerApp {
         let format = ImportFormat::from_path(&path);
         let (tables, error) = match format {
             Some(ImportFormat::Gpkg) => match crate::data::gpkg::list_tables(&path) {
+                Ok(t) if t.is_empty() => {
+                    (Vec::new(), Some("no feature tables in this GeoPackage".into()))
+                }
                 Ok(t) => (t, None),
                 Err(e) => (Vec::new(), Some(e)),
             },
             Some(_) => (Vec::new(), None),
             None => (Vec::new(), Some("unsupported file type".into())),
         };
-        self.gpkg_import = Some(ImportState {
+        let st = ImportState {
             format: format.unwrap_or(ImportFormat::Gpkg),
             src: path,
             tables,
@@ -6936,6 +6971,82 @@ impl ViewerApp {
             progress: 0.0,
             error,
             rx: None,
+        };
+        // The dialog pauses for input only when there is input to give:
+        // an error to read, or several tables to choose between.
+        let ambiguous = st.error.is_some() || st.tables.len() > 1;
+        let table = st.tables.first().cloned();
+        let dst = st.dst_for(table.as_ref());
+        let src = st.src.clone();
+        self.gpkg_import = Some(st);
+        if ambiguous {
+            return;
+        }
+        if up_to_date(&dst, &src) {
+            // Converted earlier and the source unchanged: the output is
+            // derived, so there is nothing to redo.
+            self.gpkg_import = None;
+            self.enqueue_load(Source::Local(dst), ctx);
+            if !self.import_queue.is_empty() {
+                let next = self.import_queue.remove(0);
+                self.begin_import(next, ctx);
+            }
+            return;
+        }
+        self.start_convert(table, dst, ctx);
+    }
+
+    /// Kick off the conversion on a worker thread. It writes a `.part`
+    /// renamed into place on success, so an interrupted run never leaves
+    /// something that looks like a finished conversion — which is what
+    /// lets `begin_import` trust an output it finds already there.
+    fn start_convert(
+        &mut self,
+        table: Option<crate::data::gpkg::GpkgTable>,
+        dst: PathBuf,
+        ctx: &egui::Context,
+    ) {
+        use crate::data::import::ImportFormat;
+        let Some(st) = self.gpkg_import.as_mut() else { return };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let format = st.format;
+        let src = st.src.clone();
+        st.rx = Some(rx);
+        st.running = true;
+        st.progress = 0.0;
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let tx_prog = tx.clone();
+            let prog = move |f: f32| {
+                let _ = tx_prog.send(ImportMsg::Progress(f));
+            };
+            let part = dst.with_file_name(format!(
+                "{}.part",
+                dst.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            let res = match (format, &table) {
+                (ImportFormat::Gpkg, Some(t)) => {
+                    crate::data::gpkg::convert(&src, t, &part, &prog)
+                }
+                (ImportFormat::Shapefile, _) => crate::data::shp::convert(&src, &part, &prog),
+                (ImportFormat::GeoJson, _) => {
+                    crate::data::geojson::convert(&src, &part, &prog)
+                }
+                (ImportFormat::Gpkg, None) => Err("no table selected".into()),
+            };
+            let res = res.and_then(|n| {
+                std::fs::rename(&part, &dst)
+                    .map(|_| n)
+                    .map_err(|e| format!("cannot finish {}: {e}", dst.display()))
+            });
+            if res.is_err() {
+                let _ = std::fs::remove_file(&part);
+            }
+            let _ = tx.send(match res {
+                Ok(_) => ImportMsg::Done(dst),
+                Err(e) => ImportMsg::Failed(e),
+            });
+            ctx2.request_repaint();
         });
     }
 
@@ -6969,14 +7080,14 @@ impl ViewerApp {
             self.enqueue_load(Source::Local(p), ctx);
             if !self.import_queue.is_empty() {
                 let next = self.import_queue.remove(0);
-                self.begin_import(next);
+                self.begin_import(next, ctx);
             }
             return;
         }
 
         use crate::data::import::ImportFormat;
         let mut open = true;
-        let mut start: Option<(PathBuf, Option<crate::data::gpkg::GpkgTable>, PathBuf)> = None;
+        let mut start: Option<(Option<crate::data::gpkg::GpkgTable>, PathBuf)> = None;
         let queued = self.import_queue.len();
         let st = self.gpkg_import.as_mut().unwrap();
         let title = if queued > 0 {
@@ -7017,14 +7128,7 @@ impl ViewerApp {
                 } else {
                     None
                 };
-                let dst = match &table {
-                    Some(t) => {
-                        let stem =
-                            st.src.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                        st.src.with_file_name(format!("{stem}.{}.parquet", t.name))
-                    }
-                    None => st.src.with_extension("parquet"),
-                };
+                let dst = st.dst_for(table.as_ref());
                 ui.label(RichText::new(format!("→ {}", dst.display())).weak().small())
                     .on_hover_text(
                         "Converted to plain WKB GeoParquet (raw import: the quality \
@@ -7035,46 +7139,20 @@ impl ViewerApp {
                     ui.add(egui::ProgressBar::new(st.progress).show_percentage());
                     ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 } else if ui.button("Import").clicked() {
-                    start = Some((st.src.clone(), table, dst));
+                    // Reached only when there was something to decide (a
+                    // table among several) or to retry after a failure;
+                    // the unambiguous case never waits for this click.
+                    start = Some((table, dst));
                 }
             });
-        if let Some((src, table, dst)) = start {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let st = self.gpkg_import.as_mut().unwrap();
-            let format = st.format;
-            st.rx = Some(rx);
-            st.running = true;
-            st.progress = 0.0;
-            let ctx2 = ctx.clone();
-            std::thread::spawn(move || {
-                let tx_prog = tx.clone();
-                let prog = move |f: f32| {
-                    let _ = tx_prog.send(ImportMsg::Progress(f));
-                };
-                let res = match (format, &table) {
-                    (ImportFormat::Gpkg, Some(t)) => {
-                        crate::data::gpkg::convert(&src, t, &dst, &prog)
-                    }
-                    (ImportFormat::Shapefile, _) => {
-                        crate::data::shp::convert(&src, &dst, &prog)
-                    }
-                    (ImportFormat::GeoJson, _) => {
-                        crate::data::geojson::convert(&src, &dst, &prog)
-                    }
-                    (ImportFormat::Gpkg, None) => Err("no table selected".into()),
-                };
-                let _ = tx.send(match res {
-                    Ok(_) => ImportMsg::Done(dst),
-                    Err(e) => ImportMsg::Failed(e),
-                });
-                ctx2.request_repaint();
-            });
+        if let Some((table, dst)) = start {
+            self.start_convert(table, dst, ctx);
         }
         if !open && !self.gpkg_import.as_ref().is_some_and(|s| s.running) {
             self.gpkg_import = None;
             if !self.import_queue.is_empty() {
                 let next = self.import_queue.remove(0);
-                self.begin_import(next);
+                self.begin_import(next, ctx);
             }
         }
     }
@@ -11917,7 +11995,7 @@ impl eframe::App for ViewerApp {
         self.poll_picks();
         self.poll_repo();
         self.poll_catalog();
-        self.poll_downloads();
+        self.poll_downloads(&ctx);
         self.poll_categories();
         self.poll_classes();
         self.poll_viewport_reclass(&ctx);
@@ -11940,7 +12018,7 @@ impl eframe::App for ViewerApp {
             let tabular =
                 !p.is_dir() && crate::data::attrs::is_tabular(&Source::Local(p.clone()));
             if !p.is_dir() && importable {
-                self.begin_import(p);
+                self.begin_import(p, &ctx);
             } else if tabular {
                 self.open_attr_table(Source::Local(p));
             } else {
