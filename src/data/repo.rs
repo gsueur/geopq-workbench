@@ -226,7 +226,7 @@ fn repos_from_json(s: &str) -> Option<Vec<Repository>> {
 }
 
 pub fn save_repos(repos: &[Repository]) -> Result<(), String> {
-    save_config("repositories.json", repos)
+    save_config("repositories.json", &repos)
 }
 
 /// Built-in portals: the major US cities whose DCAT catalog was probed
@@ -262,23 +262,62 @@ pub fn default_catalogs() -> Vec<Catalog> {
     ]
 }
 
-/// The saved portals, oldest first; the built-in city list until the
-/// user has saved a list of their own.
+/// `catalogs.json`: the user's saved portals plus which built-ins they
+/// removed. The wrapper (rather than a bare list) is what lets the
+/// built-ins merge in for a user who saved a catalog of their own
+/// before the list existed — and lets a removed built-in stay removed.
+#[derive(Default, Serialize, Deserialize)]
+struct CatalogsFile {
+    /// URLs of built-ins the user removed.
+    #[serde(default)]
+    removed: Vec<String>,
+    #[serde(default)]
+    catalogs: Vec<Catalog>,
+}
+
+/// The saved portals: what the file holds, then every built-in the user
+/// has neither saved a version of nor removed.
 pub fn load_catalogs() -> Vec<Catalog> {
-    let list: Option<Vec<Catalog>> = config_path("catalogs.json")
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok());
-    match list {
-        Some(l) if !l.is_empty() => l,
-        _ => default_catalogs(),
+    let text = config_path("catalogs.json").and_then(|p| std::fs::read_to_string(p).ok());
+    let file = match text {
+        None => CatalogsFile::default(),
+        Some(s) => serde_json::from_str(&s)
+            // The first releases wrote a bare list.
+            .or_else(|_| {
+                serde_json::from_str::<Vec<Catalog>>(&s)
+                    .map(|catalogs| CatalogsFile { removed: Vec::new(), catalogs })
+            })
+            .unwrap_or_default(),
+    };
+    merge_catalogs(file)
+}
+
+fn merge_catalogs(file: CatalogsFile) -> Vec<Catalog> {
+    let mut list = file.catalogs;
+    for d in default_catalogs() {
+        if !file.removed.contains(&d.url) && !list.iter().any(|c| c.url == d.url) {
+            list.push(d);
+        }
     }
+    list
 }
 
+/// Persist the dialog's list. The callers always pass the full merged
+/// list, so a built-in absent from it was removed by the user — that is
+/// the tombstone set, recomputed rather than carried as state.
 pub fn save_catalogs(catalogs: &[Catalog]) -> Result<(), String> {
-    save_config("catalogs.json", catalogs)
+    let removed: Vec<String> = default_catalogs()
+        .into_iter()
+        .filter(|d| !catalogs.iter().any(|c| c.url == d.url))
+        .map(|d| d.url)
+        .collect();
+    save_config(
+        "catalogs.json",
+        &CatalogsFile { removed, catalogs: catalogs.to_vec() },
+    )
 }
 
-fn save_config<T: Serialize>(name: &str, value: &[T]) -> Result<(), String> {
+fn save_config<T: Serialize>(name: &str, value: &T) -> Result<(), String> {
     let path = config_path(name).ok_or("no home directory")?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -2922,24 +2961,44 @@ mod tests {
     }
 
     #[test]
-    /// Saved catalogs round-trip through their own config file, and an
-    /// entry written before the `added_on` field existed still loads.
+    /// Saved catalogs round-trip with their added-on date, built-ins
+    /// merge back in, and a built-in dropped from a saved list stays
+    /// removed — absence from the full list is the tombstone.
     fn catalogs_persist_with_their_added_date() {
-        let saved = vec![
-            Catalog {
-                name: "City of Sacramento".into(),
-                url: "https://data.cityofsacramento.org".into(),
-                added_on: Some(1_776_297_600),
-            },
-            Catalog { name: "data.gov".into(), url: "https://data.gov".into(), added_on: None },
-        ];
-        save_catalogs(&saved).unwrap();
-        let back = load_catalogs();
-        assert_eq!(back, saved);
+        let mine = Catalog {
+            name: "data.gouv.example".into(),
+            url: "https://data.gouv.example".into(),
+            added_on: Some(1_776_297_600),
+        };
+        let full = merge_catalogs(CatalogsFile {
+            removed: Vec::new(),
+            catalogs: vec![mine.clone()],
+        });
+        assert_eq!(full[0], mine);
+        assert_eq!(full.len(), 1 + default_catalogs().len());
+        save_catalogs(&full).unwrap();
+        assert_eq!(load_catalogs(), full);
 
-        let old: Vec<Catalog> =
-            serde_json::from_str(r#"[{"name": "n", "url": "https://u.example"}]"#).unwrap();
-        assert_eq!(old[0].added_on, None);
+        let nyc = "https://data.cityofnewyork.us";
+        let trimmed: Vec<Catalog> =
+            full.iter().filter(|c| c.url != nyc).cloned().collect();
+        save_catalogs(&trimmed).unwrap();
+        assert_eq!(load_catalogs(), trimmed, "removing a built-in sticks");
+
+        // The first releases wrote a bare list, before the wrapper with
+        // its removed set existed: it still loads, and the built-ins
+        // join it — the exact situation of a user who saved a portal
+        // before the city list shipped.
+        std::fs::write(
+            config_path("catalogs.json").unwrap(),
+            r#"[{"name": "Analyze Boston", "url": "https://data.boston.gov"}]"#,
+        )
+        .unwrap();
+        let back = load_catalogs();
+        assert_eq!(back[0].name, "Analyze Boston");
+        assert_eq!(back[0].added_on, None);
+        assert_eq!(back.len(), default_catalogs().len(), "boston not duplicated");
+        assert!(back.iter().any(|c| c.url == nyc));
     }
 
     #[test]
