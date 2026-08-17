@@ -246,6 +246,7 @@ pub fn default_catalogs() -> Vec<Catalog> {
     vec![
         c("Analyze Boston", "https://data.boston.gov"),
         c("Austin Open Data", "https://data.austintexas.gov"),
+        c("Baltimore Open Data", "https://data.baltimorecity.gov"),
         c("Chicago Data Portal", "https://data.cityofchicago.org"),
         c("City of Sacramento Open Data", "https://data.cityofsacramento.org"),
         c("Dallas Open Data", "https://www.dallasopendata.com"),
@@ -253,6 +254,10 @@ pub fn default_catalogs() -> Vec<Catalog> {
         c("Denver Geospatial Open Data", "https://opendata-geospatialdenver.hub.arcgis.com"),
         c("Houston Open Data", "https://houston-mycity.opendata.arcgis.com"),
         c("Los Angeles GeoHub", "https://geohub.lacity.org"),
+        // Its hub cuts the feed off mid-stream (a generator bug on the
+        // portal's side); the salvage path in fetch_dcat is what makes
+        // the catalog usable at all.
+        c("Miami-Dade County Open Data", "https://gis-mdc.opendata.arcgis.com"),
         c("New York City Open Data", "https://data.cityofnewyork.us"),
         c("Open Data DC", "https://opendata.dc.gov"),
         c("OpenDataPhilly", "https://opendataphilly.org"),
@@ -1386,6 +1391,10 @@ pub struct DcatCatalog {
     /// rather than hidden: a portal whose datasets are all FeatureServer
     /// endpoints has to say so, or the browser looks broken.
     pub hidden: usize,
+    /// The portal cut its feed off mid-stream and this is what could be
+    /// salvaged before the cut. Shown in the browser: an incomplete list
+    /// that says so is trustworthy, one that does not is a lie.
+    pub truncated: bool,
 }
 
 /// Catalog URL of a portal: a `/data.json` a user pasted is used as it
@@ -1405,12 +1414,92 @@ pub fn dcat_url(base: &str) -> String {
 /// place, so yesterday's copy would list datasets that have moved.
 pub fn fetch_dcat(base: &str) -> Result<DcatCatalog, String> {
     let url = dcat_url(base);
-    let v = get_json(&url)?
-        .ok_or_else(|| format!("{url}: not found — no DCAT catalog is published there"))?;
+    let fetch = || {
+        http_agent()
+            .get(&url)
+            .header("User-Agent", USER_AGENT)
+            .call()
+    };
+    // The flakier hubs 500 on one request and answer the next
+    // (Miami-Dade does): one retry is the difference between a portal
+    // and an error message.
+    let res = match fetch() {
+        Ok(r) if r.status().as_u16() >= 500 => {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            fetch()
+        }
+        Err(_) => {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            fetch()
+        }
+        ok => ok,
+    }
+    .map_err(|e| format!("cannot reach {url}: {e}"))?;
+    let body = match res.status().as_u16() {
+        200 => res
+            .into_body()
+            .read_to_string()
+            .map_err(|e| format!("read {url}: {e}"))?,
+        404 => {
+            return Err(format!("{url}: not found — no DCAT catalog is published there"))
+        }
+        s => return Err(format!("{url}: HTTP {s}")),
+    };
+    let (v, truncated) = match serde_json::from_str::<Value>(&body) {
+        Ok(v) => (v, false),
+        // Some portals cut their feed off mid-stream: Miami-Dade's hub
+        // ends its data.json with its generator's crash message instead
+        // of the closing brackets, every time. Everything before the cut
+        // is real; refusing it all over the portal's bug serves nobody.
+        Err(e) => match salvage_truncated_catalog(&body) {
+            Some(v) => (v, true),
+            None => return Err(format!("{url}: invalid JSON: {e}")),
+        },
+    };
     if v.get("dataset").and_then(Value::as_array).is_none() {
         return Err(format!("{url}: no `dataset` array — this is not a DCAT catalog"));
     }
-    Ok(parse_dcat(&v))
+    let mut cat = parse_dcat(&v);
+    cat.truncated = truncated;
+    Ok(cat)
+}
+
+/// Close a mid-stream-truncated catalog document after its last complete
+/// dataset entry, dropping whatever trailed the cut. A brace/bracket
+/// scan that respects strings: a complete entry is a `}` that returns to
+/// depth one inside the top-level array. None when nothing complete
+/// precedes the cut, or what precedes it still does not parse.
+fn salvage_truncated_catalog(text: &str) -> Option<Value> {
+    let (mut curly, mut square) = (0i64, 0i64);
+    let (mut in_str, mut escape) = (false, false);
+    let mut last_end = None;
+    for (i, b) in text.bytes().enumerate() {
+        if in_str {
+            match b {
+                _ if escape => escape = false,
+                b'\\' => escape = true,
+                b'"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => curly += 1,
+            b'[' => square += 1,
+            b']' => square -= 1,
+            b'}' => {
+                curly -= 1;
+                if curly == 1 && square == 1 {
+                    last_end = Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut doc = text.get(..last_end?)?.to_string();
+    doc.push_str("]}");
+    serde_json::from_str(&doc).ok()
 }
 
 /// Parse a DCAT-US catalog document. Defensive throughout: an entry that
@@ -1476,6 +1565,7 @@ pub fn parse_dcat(v: &Value) -> DcatCatalog {
             .map(str::to_string),
         datasets,
         hidden,
+        truncated: false,
     }
 }
 
@@ -3079,6 +3169,29 @@ mod tests {
             assert!(c.added_on.is_none(), "{}", c.url);
             assert!(urls.insert(&c.url), "duplicate {}", c.url);
         }
+    }
+
+    #[test]
+    /// A feed the portal cut off mid-entry (Miami-Dade ends its with the
+    /// generator's crash message) salvages down to the last complete
+    /// dataset and says so; text with no complete entry stays an error.
+    fn a_truncated_catalog_feed_salvages_to_the_last_complete_dataset() {
+        let text = r#"{"conformsTo": "https://project-open-data.cio.gov/v1.1/schema",
+          "dataset": [
+            {"title": "Parcels", "distribution": [
+              {"format": "GeoJSON", "accessURL": "https://p.example/parcels.geojson"}]},
+            {"title": "Streets \"main\" {escaped}", "distribution": [
+              {"format": "GPKG", "accessURL": "https://p.example/streets.gpkg"}]},
+            {"title": "Cut mid-entry", "distribution": [
+              {"format": "GeoJ
+        Cannot read properties of undefined (reading 'toLowerCase')"#;
+        let v = salvage_truncated_catalog(text).expect("two complete entries");
+        let cat = parse_dcat(&v);
+        assert_eq!(cat.datasets.len(), 2);
+        assert_eq!(cat.datasets[1].title, "Streets \"main\" {escaped}");
+
+        assert!(salvage_truncated_catalog("{\"dataset\": [{\"title\": \"cut").is_none());
+        assert!(salvage_truncated_catalog("not json at all").is_none());
     }
 
     /// Live probe of every built-in catalog, opt-in:

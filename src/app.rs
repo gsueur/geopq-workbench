@@ -10564,6 +10564,16 @@ fn dcat_pane(ui: &mut egui::Ui, b: &mut CatalogBrowser, open: &mut Vec<usize>) {
         )));
         return;
     }
+    if cat.truncated {
+        ui.label(
+            RichText::new(
+                "the portal cuts its catalog feed off mid-stream — only the \
+                 datasets before the cut are listed",
+            )
+            .color(Color32::from_rgb(200, 140, 40))
+            .small(),
+        );
+    }
     ui.horizontal(|ui| {
         ui.add(
             egui::TextEdit::singleline(&mut b.filter)
