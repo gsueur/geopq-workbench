@@ -2801,7 +2801,7 @@ dependencies = [
 
 [[package]]
 name = "geopq-workbench"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "a5",
  "arrow",
