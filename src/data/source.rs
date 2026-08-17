@@ -1602,10 +1602,17 @@ pub(crate) mod testserver {
                     }
                     let text = String::from_utf8_lossy(&buf);
                     let is_head = text.starts_with("HEAD");
+                    // Query strings are dropped, not 404'd: portal
+                    // download URLs carry them (`…/geojson?layers=0`) and
+                    // a fixture that had to strip them would not be the
+                    // URL the parser was handed.
                     let path = text
                         .split_whitespace()
                         .nth(1)
                         .unwrap_or("/")
+                        .split('?')
+                        .next()
+                        .unwrap_or("")
                         .trim_start_matches('/')
                         .to_string();
                     // Fixture paths are test-authored; no traversal guard.

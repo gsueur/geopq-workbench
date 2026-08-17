@@ -426,6 +426,13 @@ pub struct ViewerApp {
     repo_browser: Option<RepoBrowser>,
     repo_tx: Sender<RepoMsg>,
     repo_rx: Receiver<RepoMsg>,
+    /// Portal downloads in flight. They outlive the browser window: the
+    /// import dialog is what the user waits for, not the dialog they
+    /// started from.
+    downloads: Vec<Download>,
+    dl_tx: Sender<DlMsg>,
+    dl_rx: Receiver<DlMsg>,
+    dl_next: u64,
     /// Names to give layers when their load finishes (keyed by job id) —
     /// repository themes would otherwise all be called "buildings".
     pending_names: HashMap<u64, String>,
@@ -462,6 +469,16 @@ struct RepoBrowser {
     cache_age: Option<u64>,
     /// Add-repository row (name, base URL).
     add: (String, String),
+    /// Portal catalog of the selected repository, when it is a DCAT one
+    /// (None = fetch in flight). Session state only: a portal rewrites
+    /// its data.json in place, so there is nothing here worth caching.
+    dcat: Option<Result<crate::data::repo::DcatCatalog, String>>,
+    /// Portal datasets ticked for opening, by index into the catalog.
+    dcat_checked: std::collections::HashSet<usize>,
+    /// A portal added this session and not yet written to the config: it
+    /// is saved once its catalog answers, so a URL that turns out not to
+    /// be a portal never becomes a permanent entry.
+    unsaved: Option<usize>,
     /// Drops stale async results after repo/snapshot switches.
     generation: u64,
 }
@@ -493,6 +510,30 @@ enum RepoMsg {
     /// country code, themes). The code pins the result like Manifest's
     /// index does.
     CountryThemes(u64, String, CountryThemesResult),
+    /// A DCAT portal's whole catalog, which is one document.
+    Dcat(u64, Result<crate::data::repo::DcatCatalog, String>),
+}
+
+/// A portal file being fetched before it enters the import path.
+///
+/// GeoPackage and GeoJSON readers take a path, so these formats are the
+/// only ones that touch the disk on the way in; parquet and CSV open
+/// over HTTPS directly and never appear here.
+struct Download {
+    id: u64,
+    /// Dataset title, for the status bar.
+    label: String,
+    got: u64,
+    /// Only when the server states a Content-Length: portal endpoints
+    /// that generate the export on the fly do not.
+    total: Option<u64>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+enum DlMsg {
+    Progress(u64, u64, Option<u64>),
+    Done(u64, PathBuf),
+    Failed(u64, String),
 }
 
 /// Cap on attribute columns fetched for the feature info panel. Wide
@@ -881,6 +922,7 @@ impl ViewerApp {
         let (test_tx, test_rx) = channel();
         let (pick_tx, pick_rx) = channel();
         let (repo_tx, repo_rx) = channel();
+        let (dl_tx, dl_rx) = channel();
         let (join_tx, join_rx) = channel();
         let (attr_tx, attr_rx) = channel();
         let (cat_tx, cat_rx) = channel();
@@ -1006,6 +1048,10 @@ impl ViewerApp {
             repo_browser: None,
             repo_tx,
             repo_rx,
+            downloads: Vec::new(),
+            dl_tx,
+            dl_rx,
+            dl_next: 0,
             pending_names: HashMap::new(),
             temp_outputs: Vec::new(),
             display_gen: 0,
@@ -4327,8 +4373,52 @@ impl ViewerApp {
             country_themes: None,
             cache_age: None,
             add: (String::new(), String::new()),
+            dcat: None,
+            dcat_checked: Default::default(),
+            unsaved: None,
             generation: 0,
         });
+        self.repo_refetch(ctx, false);
+    }
+
+    /// Show the browser on a DCAT portal, adding it if it is new.
+    ///
+    /// A `/data.json` is a catalog, not a file, so it never reaches
+    /// `route_uri`: routing it would hand a JSON document to the parquet
+    /// reader. The entry is not persisted until the catalog answers.
+    fn open_portal(&mut self, url: &str, ctx: &egui::Context) {
+        use crate::data::repo::{self, RepoKind};
+        let trimmed = url.trim().trim_end_matches('/');
+        let base = trimmed.strip_suffix("/data.json").unwrap_or(trimmed).to_string();
+        if self.repo_browser.is_none() {
+            self.open_repo_browser(ctx);
+        }
+        let Some(b) = &mut self.repo_browser else { return };
+        match b
+            .repos
+            .iter()
+            .position(|r| r.kind == RepoKind::Dcat && r.url == base)
+        {
+            Some(i) => {
+                b.sel_repo = i;
+                b.unsaved = None;
+            }
+            None => {
+                b.repos.push(repo::Repository {
+                    // Provisional: the catalog's own title replaces it
+                    // when the fetch lands.
+                    name: base.trim_start_matches("https://").trim_start_matches("http://").to_string(),
+                    url: base,
+                    kind: RepoKind::Dcat,
+                    attribution: None,
+                    attribution_by_license: Default::default(),
+                });
+                b.sel_repo = b.repos.len() - 1;
+                b.unsaved = Some(b.sel_repo);
+            }
+        }
+        b.snapshots = vec![repo::Snapshot::latest()];
+        b.sel_snapshot = 0;
         self.repo_refetch(ctx, false);
     }
 
@@ -4342,6 +4432,8 @@ impl ViewerApp {
         b.selected = None;
         b.checked.clear();
         b.cache_age = None;
+        b.dcat = None;
+        b.dcat_checked.clear();
         let generation = b.generation;
         let base = b.repos[b.sel_repo].url.trim_end_matches('/').to_string();
         let kind = b.repos[b.sel_repo].kind;
@@ -4350,11 +4442,23 @@ impl ViewerApp {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             use crate::data::repo::{self, RepoKind};
+            if kind == RepoKind::Dcat {
+                // A portal has one live catalog: no snapshots to pick
+                // between, and one document instead of a discovery pass.
+                let _ = tx.send(RepoMsg::Snapshots(
+                    generation,
+                    Ok(vec![repo::Snapshot::latest()]),
+                ));
+                let _ = tx.send(RepoMsg::Dcat(generation, repo::fetch_dcat(&base)));
+                ctx.request_repaint();
+                return;
+            }
             let _ = tx.send(RepoMsg::Snapshots(
                 generation,
                 match kind {
                     RepoKind::Parquetry => repo::fetch_snapshots(&base),
                     RepoKind::Stac => repo::fetch_snapshots_stac(&base),
+                    RepoKind::Dcat => unreachable!("handled above"),
                 },
             ));
             if force {
@@ -4370,6 +4474,7 @@ impl ViewerApp {
             let res = match kind {
                 RepoKind::Parquetry => repo::discover_datasets(&base, &snapshot),
                 RepoKind::Stac => repo::discover_datasets_stac(&base, &snapshot),
+                RepoKind::Dcat => unreachable!("handled above"),
             };
             if let Ok(ds) = &res {
                 repo::store_datasets(&base, &snapshot, ds);
@@ -4399,6 +4504,9 @@ impl ViewerApp {
                 match kind {
                     RepoKind::Parquetry => repo::fetch_manifest(&base, &snapshot, &path),
                     RepoKind::Stac => repo::fetch_stac_manifest(&base, &snapshot, &path),
+                    // A portal dataset is opened from the list, not
+                    // expanded into a theme panel.
+                    RepoKind::Dcat => Err("no manifest for a portal dataset".into()),
                 },
             ));
             ctx.request_repaint();
@@ -4493,9 +4601,129 @@ impl ViewerApp {
                         *slot = Some(res);
                     }
                 }
+                RepoMsg::Dcat(g, res) if g == b.generation => {
+                    // The catalog answering is what proves the URL is a
+                    // portal, so this is where a pending entry earns its
+                    // place in the config — and its name.
+                    if let (Ok(cat), Some(i)) = (&res, b.unsaved) {
+                        if let (Some(t), Some(r)) = (&cat.title, b.repos.get_mut(i)) {
+                            r.name = t.clone();
+                        }
+                        if let Err(e) = crate::data::repo::save_repos(&b.repos) {
+                            log::warn!("saving repositories: {e}");
+                        }
+                        b.unsaved = None;
+                    }
+                    b.dcat = Some(res);
+                    b.dcat_checked.clear();
+                }
                 _ => {} // stale generation
             }
         }
+    }
+
+    fn poll_downloads(&mut self) {
+        let mut ready: Vec<PathBuf> = Vec::new();
+        while let Ok(msg) = self.dl_rx.try_recv() {
+            match msg {
+                DlMsg::Progress(id, got, total) => {
+                    if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
+                        d.got = got;
+                        d.total = total;
+                    }
+                }
+                DlMsg::Done(id, path) => {
+                    self.downloads.retain(|d| d.id != id);
+                    ready.push(path);
+                }
+                DlMsg::Failed(id, e) => {
+                    // A download the user stopped is not a failure to
+                    // report back to them.
+                    let cancelled = self.downloads.iter().any(|d| {
+                        d.id == id && d.cancel.load(std::sync::atomic::Ordering::Relaxed)
+                    });
+                    self.downloads.retain(|d| d.id != id);
+                    if !cancelled {
+                        self.push_error(e);
+                    }
+                }
+            }
+        }
+        for p in ready {
+            self.begin_import(p);
+        }
+    }
+
+    /// Open one portal dataset through the path its format already has:
+    /// parquet range-reads in place, a CSV goes to the import dialog over
+    /// HTTPS, and the two filesystem-only formats download first and then
+    /// enter `begin_import` exactly as a dropped file would.
+    fn open_portal_dataset(&mut self, idx: usize, ctx: &egui::Context) {
+        use crate::data::repo::{self, DcatFormat};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let Some(b) = &self.repo_browser else { return };
+        let portal = b.repos[b.sel_repo].url.trim_end_matches('/').to_string();
+        let Some(Ok(cat)) = &b.dcat else { return };
+        let Some(ds) = cat.datasets.get(idx).cloned() else { return };
+        let Some(dist) = ds.distributions.first().cloned() else { return };
+        if !dist.format.needs_download() {
+            match dist.format {
+                DcatFormat::Csv => {
+                    self.open_attr_table_named(
+                        Source::Remote { url: dist.url, len: 0 },
+                        ds.title.clone(),
+                    );
+                }
+                _ => {
+                    let job = self.enqueue_load(Source::Remote { url: dist.url, len: 0 }, ctx);
+                    self.pending_names.insert(job, ds.title.clone());
+                }
+            }
+            return;
+        }
+        let Some(dir) = repo::portal_dir(&portal, &ds.slug()) else {
+            self.push_error("no config directory to download portal datasets into".into());
+            return;
+        };
+        // Before the file opens, not after: the sidecar lookup memoizes
+        // its misses per directory, so a notice written later is unread.
+        if let Err(e) = repo::write_dcat_attribution(&dir, &ds, &portal) {
+            log::warn!("{}: {e}", ds.title);
+        }
+        let dst = dir.join(format!("{}.{}", ds.slug(), dist.format.ext()));
+        if dst.exists() {
+            // Downloaded in an earlier session: the local copy is the
+            // point of keeping it outside the temp directory.
+            self.begin_import(dst);
+            return;
+        }
+        let id = self.dl_next;
+        self.dl_next += 1;
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        self.downloads.push(Download {
+            id,
+            label: ds.title.clone(),
+            got: 0,
+            total: None,
+            cancel: cancel.clone(),
+        });
+        let tx = self.dl_tx.clone();
+        let (ctx_prog, ctx_done) = (ctx.clone(), ctx.clone());
+        let url = dist.url.clone();
+        std::thread::spawn(move || {
+            let tx_prog = tx.clone();
+            let progress = move |got: u64, total: Option<u64>| {
+                let _ = tx_prog.send(DlMsg::Progress(id, got, total));
+                ctx_prog.request_repaint();
+                !cancel.load(Ordering::Relaxed)
+            };
+            let res = repo::download_to(&url, &dst, &progress);
+            let _ = tx.send(match res {
+                Ok(()) => DlMsg::Done(id, dst),
+                Err(e) => DlMsg::Failed(id, e),
+            });
+            ctx_done.request_repaint();
+        });
     }
 
     fn repo_window(&mut self, ctx: &egui::Context) {
@@ -4509,6 +4737,7 @@ impl ViewerApp {
         let mut fetch_manifest: Option<usize> = None;
         let mut fetch_country: Option<String> = None;
         let mut load: Vec<(Source, String)> = Vec::new(); // (source, layer name)
+        let mut open_datasets: Vec<usize> = Vec::new(); // portal catalog indices
 
         {
             let b = self.repo_browser.as_mut().unwrap();
@@ -4535,17 +4764,21 @@ impl ViewerApp {
                             b.sel_snapshot = 0;
                             refetch = true;
                         }
-                        ui.label("snapshot:");
-                        let before = b.sel_snapshot;
-                        egui::ComboBox::from_id_salt("repo_snap")
-                            .selected_text(&b.snapshots[b.sel_snapshot].label)
-                            .show_ui(ui, |ui| {
-                                for (i, s) in b.snapshots.iter().enumerate() {
-                                    ui.selectable_value(&mut b.sel_snapshot, i, &s.label);
-                                }
-                            });
-                        if b.sel_snapshot != before {
-                            refetch = true;
+                        // A portal publishes one live catalog: there is
+                        // nothing for a snapshot picker to pick between.
+                        if kind != crate::data::repo::RepoKind::Dcat {
+                            ui.label("snapshot:");
+                            let before = b.sel_snapshot;
+                            egui::ComboBox::from_id_salt("repo_snap")
+                                .selected_text(&b.snapshots[b.sel_snapshot].label)
+                                .show_ui(ui, |ui| {
+                                    for (i, s) in b.snapshots.iter().enumerate() {
+                                        ui.selectable_value(&mut b.sel_snapshot, i, &s.label);
+                                    }
+                                });
+                            if b.sel_snapshot != before {
+                                refetch = true;
+                            }
                         }
                         if ui
                             .button(ph::ARROWS_CLOCKWISE)
@@ -4566,6 +4799,13 @@ impl ViewerApp {
                         }
                     });
                     ui.separator();
+
+                    if kind == crate::data::repo::RepoKind::Dcat {
+                        dcat_pane(ui, b, &mut open_datasets);
+                        ui.separator();
+                        add_repo_row(ui, b, &mut refetch);
+                        return;
+                    }
 
                     // --- datasets (left) + themes (right) ---
                     // Owned views of the async state, so the widgets below
@@ -4826,6 +5066,9 @@ impl ViewerApp {
                                                             },
                                                             theme.clone(),
                                                         ),
+                                                        // Portals never
+                                                        // reach this pane.
+                                                        RepoKind::Dcat => continue,
                                                     });
                                                 }
                                                 b.checked.clear();
@@ -5055,61 +5298,8 @@ impl ViewerApp {
                         });
                     });
 
-                    // --- add repository ---
                     ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut b.add.0)
-                                .hint_text("name")
-                                .desired_width(140.0),
-                        );
-                        ui.add(
-                            egui::TextEdit::singleline(&mut b.add.1)
-                                .hint_text("https://repo.example.com")
-                                .desired_width(240.0),
-                        );
-                        let valid = !b.add.0.trim().is_empty()
-                            && b.add.1.trim().starts_with("https://");
-                        if ui
-                            .add_enabled(valid, egui::Button::new("Add repository"))
-                            .clicked()
-                        {
-                            // A URL pasted with its catalog.json marks a
-                            // STAC repository; the base is its directory.
-                            let url = b.add.1.trim().trim_end_matches('/');
-                            let (url, kind) = match url.strip_suffix("/catalog.json") {
-                                Some(base) => (base, crate::data::repo::RepoKind::Stac),
-                                None => (url, crate::data::repo::RepoKind::Parquetry),
-                            };
-                            b.repos.push(crate::data::repo::Repository {
-                                name: b.add.0.trim().to_string(),
-                                url: url.to_string(),
-                                kind,
-                                // A user-added repository credits itself
-                                // from its own data, if at all.
-                                attribution: None,
-                                attribution_by_license: Default::default(),
-                            });
-                            b.add = (String::new(), String::new());
-                            b.sel_repo = b.repos.len() - 1;
-                            if let Err(e) = crate::data::repo::save_repos(&b.repos) {
-                                log::warn!("saving repositories: {e}");
-                            }
-                            b.snapshots = vec![crate::data::repo::Snapshot::latest()];
-                            b.sel_snapshot = 0;
-                            refetch = true;
-                        }
-                        if b.repos.len() > 1 && ui.button("Remove current").clicked() {
-                            b.repos.remove(b.sel_repo);
-                            b.sel_repo = 0;
-                            if let Err(e) = crate::data::repo::save_repos(&b.repos) {
-                                log::warn!("saving repositories: {e}");
-                            }
-                            b.snapshots = vec![crate::data::repo::Snapshot::latest()];
-                            b.sel_snapshot = 0;
-                            refetch = true;
-                        }
-                    });
+                    add_repo_row(ui, b, &mut refetch);
                 });
         }
 
@@ -5125,6 +5315,9 @@ impl ViewerApp {
         for (source, name) in load {
             let job = self.enqueue_load(source, ctx);
             self.pending_names.insert(job, name);
+        }
+        for i in open_datasets {
+            self.open_portal_dataset(i, ctx);
         }
         if !open {
             self.repo_browser = None;
@@ -6295,6 +6488,7 @@ impl ViewerApp {
         let Some((url, profile, profiles, endpoint)) = &mut self.url_input else { return };
         let mut open = true;
         let mut submit: Option<Source> = None;
+        let mut portal: Option<String> = None;
         let mut as_table = self.url_as_table;
         egui::Window::new("Open URL")
             .id(egui::Id::new("open_url"))
@@ -6366,15 +6560,27 @@ impl ViewerApp {
                 if ui.add_enabled(valid, egui::Button::new("Open")).clicked()
                     || (enter && valid)
                 {
-                    let ep = endpoint.trim();
-                    submit = Some(crate::data::source::route_uri(
-                        url,
-                        profile.clone(),
-                        (!ep.is_empty()).then(|| ep.to_string()),
-                    ));
+                    // A DCAT catalog is a list of datasets, not a file:
+                    // it belongs in the browser, and handing it to the
+                    // parquet reader would only produce a puzzling error.
+                    if url.trim().trim_end_matches('/').ends_with("/data.json") {
+                        portal = Some(url.trim().to_string());
+                    } else {
+                        let ep = endpoint.trim();
+                        submit = Some(crate::data::source::route_uri(
+                            url,
+                            profile.clone(),
+                            (!ep.is_empty()).then(|| ep.to_string()),
+                        ));
+                    }
                 }
             });
         self.url_as_table = as_table;
+        if let Some(p) = portal {
+            self.url_input = None;
+            self.open_portal(&p, ctx);
+            return;
+        }
         if let Some(src) = submit {
             // A collection is a set of part files, which the attribute
             // reader has no way to open; the checkbox cannot make it one.
@@ -9532,6 +9738,29 @@ impl ViewerApp {
                     ui.spinner();
                     ui.label(RichText::new("collecting the view for SVG").weak());
                 }
+                use crate::data::info::fmt_bytes;
+                for d in &self.downloads {
+                    if ui
+                        .small_button("✖")
+                        .on_hover_text("Stop this download")
+                        .clicked()
+                    {
+                        d.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // An export endpoint that builds the file on the fly
+                    // states no length, so there is a count but no bar to
+                    // fill: a fraction of an unknown total would be a lie.
+                    let (frac, text) = match d.total {
+                        Some(t) => (
+                            d.got as f32 / t as f32,
+                            format!("{} — {} / {}", d.label, fmt_bytes(d.got), fmt_bytes(t)),
+                        ),
+                        None => (0.0, format!("{} — {}", d.label, fmt_bytes(d.got))),
+                    };
+                    ui.add(
+                        egui::ProgressBar::new(frac).desired_width(220.0).text(text),
+                    );
+                }
                 for job in self.loading.values_mut() {
                     if ui
                         .small_button("✖")
@@ -9878,6 +10107,259 @@ impl ViewerApp {
             }
         }
     }
+}
+
+/// The add-repository / add-portal row, shared by every repository kind
+/// (a portal browser still has to be able to reach the others).
+fn add_repo_row(ui: &mut egui::Ui, b: &mut RepoBrowser, refetch: &mut bool) {
+    use crate::data::repo::{self, RepoKind};
+    fn added(
+        b: &mut RepoBrowser,
+        refetch: &mut bool,
+        kind: RepoKind,
+        url: String,
+        name: String,
+    ) {
+        b.repos.push(repo::Repository {
+            name,
+            url,
+            kind,
+            // A user-added repository credits itself from its own data,
+            // if at all. A portal's credit comes per dataset, from the
+            // publisher its catalog names.
+            attribution: None,
+            attribution_by_license: Default::default(),
+        });
+        b.add = (String::new(), String::new());
+        b.sel_repo = b.repos.len() - 1;
+        // Any earlier portal still waiting for its catalog gives up its
+        // claim here: the index it holds is about to name someone else.
+        b.unsaved = None;
+        b.snapshots = vec![repo::Snapshot::latest()];
+        b.sel_snapshot = 0;
+        *refetch = true;
+    }
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut b.add.0)
+                .hint_text("name")
+                .desired_width(140.0),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut b.add.1)
+                .hint_text("https://repo.example.com · https://data.city.gov/data.json")
+                .desired_width(240.0),
+        );
+        let url = b.add.1.trim().trim_end_matches('/').to_string();
+        let http = url.starts_with("https://") || url.starts_with("http://");
+        if ui
+            .add_enabled(
+                http && !b.add.0.trim().is_empty(),
+                egui::Button::new("Add repository"),
+            )
+            .clicked()
+        {
+            // A URL pasted with its catalog.json marks a STAC
+            // repository; the base is its directory.
+            let (url, kind) = match url.strip_suffix("/catalog.json") {
+                Some(base) => (base.to_string(), RepoKind::Stac),
+                None => (url.clone(), RepoKind::Parquetry),
+            };
+            let name = b.add.0.trim().to_string();
+            added(b, refetch, kind, url, name);
+            if let Err(e) = repo::save_repos(&b.repos) {
+                log::warn!("saving repositories: {e}");
+            }
+        }
+        if ui
+            .add_enabled(http, egui::Button::new("Add portal"))
+            .on_hover_text(
+                "An open-data portal publishing a DCAT catalog at /data.json — \
+                 ArcGIS Hub, Socrata and CKAN all do. Paste the catalog URL or \
+                 just the site: the portal names itself from its catalog, and it \
+                 is only remembered once that catalog answers.",
+            )
+            .clicked()
+        {
+            let base = url.strip_suffix("/data.json").unwrap_or(&url).to_string();
+            let name = base
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .to_string();
+            added(b, refetch, RepoKind::Dcat, base, name);
+            b.unsaved = Some(b.sel_repo);
+        }
+        if b.repos.len() > 1 && ui.button("Remove current").clicked() {
+            b.repos.remove(b.sel_repo);
+            b.sel_repo = 0;
+            b.unsaved = None;
+            if let Err(e) = repo::save_repos(&b.repos) {
+                log::warn!("saving repositories: {e}");
+            }
+            b.snapshots = vec![repo::Snapshot::latest()];
+            b.sel_snapshot = 0;
+            *refetch = true;
+        }
+    });
+}
+
+/// The dataset list of a DCAT portal: a search box over what the catalog
+/// says in words, one row per dataset with the formats it publishes, and
+/// the count of entries no format here can open.
+///
+/// Flat and full width, unlike the two-pane repository view: a portal
+/// dataset has nothing below it to expand into — the row is the dataset.
+fn dcat_pane(ui: &mut egui::Ui, b: &mut RepoBrowser, open: &mut Vec<usize>) {
+    let cat = match &b.dcat {
+        None => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("reading the portal catalog…").weak());
+            });
+            return;
+        }
+        Some(Err(e)) => {
+            ui.label(RichText::new(e).color(Color32::from_rgb(220, 60, 60)));
+            return;
+        }
+        Some(Ok(c)) => c,
+    };
+    if cat.datasets.is_empty() {
+        ui.label(RichText::new(format!(
+            "none of this catalog's {} datasets publish a format this app can \
+             open — GeoParquet, GeoPackage, GeoJSON or CSV. Map services and \
+             web pages are all it offers.",
+            cat.hidden
+        )));
+        return;
+    }
+    ui.add(
+        egui::TextEdit::singleline(&mut b.filter)
+            .hint_text("search titles, keywords and descriptions…")
+            .desired_width(ui.available_width()),
+    );
+    let needle = b.filter.to_lowercase();
+    let matches = |d: &crate::data::repo::DcatDataset| {
+        needle.is_empty()
+            || d.title.to_lowercase().contains(&needle)
+            || d.description.to_lowercase().contains(&needle)
+            || d.keywords.iter().any(|k| k.to_lowercase().contains(&needle))
+    };
+    let mut shown = 0usize;
+    egui::ScrollArea::vertical()
+        .id_salt("dcat_datasets")
+        .max_height(340.0)
+        .show(ui, |ui| {
+            for (i, d) in cat.datasets.iter().enumerate() {
+                if !matches(d) {
+                    continue;
+                }
+                shown += 1;
+                ui.horizontal(|ui| {
+                    let mut on = b.dcat_checked.contains(&i);
+                    if ui.checkbox(&mut on, &d.title).changed() {
+                        if on {
+                            b.dcat_checked.insert(i);
+                        } else {
+                            b.dcat_checked.remove(&i);
+                        }
+                    }
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if let Some(m) = &d.modified {
+                                ui.label(RichText::new(m).weak().small());
+                            }
+                            let badges: Vec<&str> =
+                                d.distributions.iter().map(|x| x.format.label()).collect();
+                            ui.label(RichText::new(badges.join(" · ")).weak().small())
+                                .on_hover_text(format!(
+                                    "opens as {} — {}",
+                                    d.distributions[0].format.label(),
+                                    d.distributions[0].url,
+                                ));
+                        },
+                    );
+                })
+                .response
+                .on_hover_text(dcat_hover(d));
+            }
+        });
+    if shown == 0 {
+        ui.label(RichText::new("no dataset matches the search").weak());
+    }
+    ui.horizontal(|ui| {
+        let n = b.dcat_checked.len();
+        if ui
+            .add_enabled(
+                n > 0,
+                egui::Button::new(format!(
+                    "Open {n} dataset{}",
+                    if n == 1 { "" } else { "s" }
+                )),
+            )
+            .clicked()
+        {
+            let mut picked: Vec<usize> = b.dcat_checked.iter().copied().collect();
+            picked.sort_unstable();
+            open.extend(picked);
+            b.dcat_checked.clear();
+        }
+        if ui.small_button("none").clicked() {
+            b.dcat_checked.clear();
+        }
+        ui.label(
+            RichText::new(
+                "each opens as its best format: GeoPackage and GeoJSON are \
+                 downloaded and imported, parquet and CSV are read where they are",
+            )
+            .weak()
+            .small(),
+        );
+    });
+    if cat.hidden > 0 {
+        ui.label(
+            RichText::new(format!(
+                "{} more without an openable format",
+                cat.hidden
+            ))
+            .weak()
+            .small(),
+        )
+        .on_hover_text(
+            "Datasets published only as a map service, a web page, a KML or a \
+             zipped shapefile. Nothing in this app extracts archives yet.",
+        );
+    }
+}
+
+/// Everything a portal dataset says about itself, for the row's tooltip.
+fn dcat_hover(d: &crate::data::repo::DcatDataset) -> String {
+    let mut out = String::new();
+    if !d.description.is_empty() {
+        let desc: String = d.description.chars().take(400).collect();
+        out.push_str(&desc);
+        if d.description.chars().count() > 400 {
+            out.push('…');
+        }
+        out.push_str("\n\n");
+    }
+    if let Some(p) = &d.publisher {
+        out.push_str(&format!("Publisher: {p}\n"));
+    }
+    if let Some(l) = &d.license {
+        out.push_str(&format!("License: {l}\n"));
+    }
+    if let Some(b) = &d.bbox {
+        out.push_str(&format!(
+            "Extent: {:.4}, {:.4} → {:.4}, {:.4}\n",
+            b[0], b[1], b[2], b[3]
+        ));
+    }
+    if !d.keywords.is_empty() {
+        out.push_str(&format!("Keywords: {}\n", d.keywords.join(", ")));
+    }
+    out.trim_end().to_string()
 }
 
 /// Text and plate colours for the credit strip, as `(text, plate)`.
@@ -11213,6 +11695,7 @@ impl eframe::App for ViewerApp {
         self.update_coastline_detail(&ctx);
         self.poll_picks();
         self.poll_repo();
+        self.poll_downloads();
         self.poll_categories();
         self.poll_classes();
         self.poll_viewport_reclass(&ctx);

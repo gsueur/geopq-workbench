@@ -13,6 +13,17 @@
 //! "country=US/state=US-AR", "name": "Arkansas"}]}`) when the repository
 //! publishes one; otherwise a built-in ISO 3166-2 table (US/CA/MX) is
 //! probed concurrently for `_manifest.json` files.
+//!
+//! Two other protocols live here because the browser treats them as the
+//! same thing — a list of datasets behind a base URL: a static STAC
+//! catalog (Overture's layout), and a DCAT-US `data.json`, which is what
+//! every ArcGIS Hub, Socrata and CKAN open-data portal publishes. A DCAT
+//! dataset names its files by absolute URL and format rather than by
+//! path, so it gets its own types below rather than being forced into
+//! `Dataset`/`Manifest`. Only formats this workbench reads are offered:
+//! GeoParquet, GeoPackage, GeoJSON and CSV. Shapefiles and file
+//! geodatabases are published as ZIPs, and nothing in the tree extracts
+//! archives yet — the day it does, they belong here too.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -39,6 +50,9 @@ pub enum RepoKind {
     /// A static STAC catalog: releases → themes → type collections whose
     /// items are the parquet part files (Overture layout).
     Stac,
+    /// An open-data portal publishing a DCAT-US 1.1 `data.json`: one
+    /// document listing every dataset with its download URLs.
+    Dcat,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1106,6 +1120,467 @@ fn fetch_stac_parts_live(collection_url: &str) -> Result<Vec<StacPart>, String> 
     Ok(parts.into_inner().unwrap().into_iter().flatten().collect())
 }
 
+// ---------------------------------------------------------------------
+// DCAT-US catalogs (open-data portals)
+// ---------------------------------------------------------------------
+//
+// {portal}/data.json — the whole catalog in one document: a `dataset`
+// array, each entry carrying its metadata and a `distribution` array of
+// (format, URL) pairs. Nothing is versioned and nothing is immutable, so
+// unlike the STAC parts this is never written to the disk caches.
+
+/// A distribution format this workbench can open, best first.
+///
+/// The order is what a dataset gets opened as when it publishes several:
+/// parquet is read where it lies, GPKG carries real types and a CRS,
+/// GeoJSON is always lon/lat and loses types, and CSV has no geometry
+/// until the user names its coordinate columns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum DcatFormat {
+    Parquet,
+    Gpkg,
+    GeoJson,
+    Csv,
+}
+
+impl DcatFormat {
+    fn rank(self) -> u8 {
+        match self {
+            Self::Parquet => 0,
+            Self::Gpkg => 1,
+            Self::GeoJson => 2,
+            Self::Csv => 3,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Parquet => "Parquet",
+            Self::Gpkg => "GPKG",
+            Self::GeoJson => "GeoJSON",
+            Self::Csv => "CSV",
+        }
+    }
+
+    /// Extension for the local copy. Portal download URLs end in an API
+    /// verb (`…/items/{id}/geoPackage`), so the name comes from here.
+    pub fn ext(self) -> &'static str {
+        match self {
+            Self::Parquet => "parquet",
+            Self::Gpkg => "gpkg",
+            Self::GeoJson => "geojson",
+            Self::Csv => "csv",
+        }
+    }
+
+    /// Whether opening it costs a download first. Parquet range-reads and
+    /// the CSV importer streams, but the GeoPackage reader opens a SQLite
+    /// file and the GeoJSON one reads a path — both filesystem-only.
+    pub fn needs_download(self) -> bool {
+        matches!(self, Self::Gpkg | Self::GeoJson)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DcatDistribution {
+    pub format: DcatFormat,
+    pub url: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct DcatDataset {
+    pub title: String,
+    /// Plain text: portals put HTML in this field, and it is searched.
+    pub description: String,
+    pub keywords: Vec<String>,
+    /// `modified`, as published (ISO 8601, or a bare date).
+    pub modified: Option<String>,
+    pub publisher: Option<String>,
+    /// The `license` field when it actually is one — see `dcat_license`.
+    pub license: Option<String>,
+    pub landing_page: Option<String>,
+    /// `spatial` parsed as W,S,E,N.
+    pub bbox: Option<[f64; 4]>,
+    /// Openable distributions, best first, one per format.
+    pub distributions: Vec<DcatDistribution>,
+}
+
+impl DcatDataset {
+    /// Directory name for the local copy: the title reduced to the
+    /// characters every filesystem accepts.
+    pub fn slug(&self) -> String {
+        let mut out = String::new();
+        for c in self.title.chars() {
+            if c.is_ascii_alphanumeric() {
+                out.push(c.to_ascii_lowercase());
+            } else if !out.ends_with('-') {
+                out.push('-');
+            }
+        }
+        // Every pushed byte is ASCII, so the cut cannot split a char.
+        let s = out.trim_matches('-');
+        let s = s[..s.len().min(60)].trim_end_matches('-');
+        if s.is_empty() {
+            "dataset".to_string()
+        } else {
+            s.to_string()
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct DcatCatalog {
+    /// The catalog's own title, which names the portal entry.
+    pub title: Option<String>,
+    /// Datasets with at least one openable distribution, catalog order.
+    pub datasets: Vec<DcatDataset>,
+    /// Entries dropped for publishing no format this app reads. Counted
+    /// rather than hidden: a portal whose datasets are all FeatureServer
+    /// endpoints has to say so, or the browser looks broken.
+    pub hidden: usize,
+}
+
+/// Catalog URL of a portal: a `/data.json` a user pasted is used as it
+/// is, anything else is the site the document hangs off.
+pub fn dcat_url(base: &str) -> String {
+    let b = base.trim().trim_end_matches('/');
+    if b.ends_with("/data.json") {
+        b.to_string()
+    } else {
+        format!("{b}/data.json")
+    }
+}
+
+/// Fetch and parse a portal's catalog (~600 KB for a mid-sized city).
+///
+/// Deliberately not cached anywhere: a portal rewrites data.json in
+/// place, so yesterday's copy would list datasets that have moved.
+pub fn fetch_dcat(base: &str) -> Result<DcatCatalog, String> {
+    let url = dcat_url(base);
+    let v = get_json(&url)?
+        .ok_or_else(|| format!("{url}: not found — no DCAT catalog is published there"))?;
+    if v.get("dataset").and_then(Value::as_array).is_none() {
+        return Err(format!("{url}: no `dataset` array — this is not a DCAT catalog"));
+    }
+    Ok(parse_dcat(&v))
+}
+
+/// Parse a DCAT-US catalog document. Defensive throughout: an entry that
+/// makes no sense is skipped, never fatal — data.gov aggregates hundreds
+/// of publishers and some of them do get their JSON wrong.
+pub fn parse_dcat(v: &Value) -> DcatCatalog {
+    let mut datasets = Vec::new();
+    let mut hidden = 0usize;
+    for d in v.get("dataset").and_then(Value::as_array).into_iter().flatten() {
+        let Some(title) = d.get("title").and_then(Value::as_str) else {
+            continue;
+        };
+        let title = title.trim();
+        if title.is_empty() {
+            continue;
+        }
+        let distributions = dcat_distributions(d);
+        if distributions.is_empty() {
+            hidden += 1;
+            continue;
+        }
+        datasets.push(DcatDataset {
+            title: title.to_string(),
+            description: strip_tags(
+                d.get("description").and_then(Value::as_str).unwrap_or(""),
+            ),
+            keywords: d
+                .get("keyword")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            modified: d
+                .get("modified")
+                .and_then(Value::as_str)
+                .map(|m| m.split('T').next().unwrap_or(m).to_string())
+                .filter(|m| !m.is_empty()),
+            publisher: d
+                .get("publisher")
+                .and_then(|p| p.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string),
+            license: dcat_license(d.get("license").and_then(Value::as_str)),
+            landing_page: d
+                .get("landingPage")
+                .and_then(Value::as_str)
+                .filter(|u| u.starts_with("http"))
+                .map(str::to_string),
+            bbox: d.get("spatial").and_then(Value::as_str).and_then(dcat_bbox),
+            distributions,
+        });
+    }
+    DcatCatalog {
+        title: v
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string),
+        datasets,
+        hidden,
+    }
+}
+
+/// The openable distributions of one dataset, best format first and one
+/// entry per format.
+fn dcat_distributions(ds: &Value) -> Vec<DcatDistribution> {
+    let mut out: Vec<DcatDistribution> = Vec::new();
+    for d in ds.get("distribution").and_then(Value::as_array).into_iter().flatten() {
+        let Some(format) = dcat_format(d) else { continue };
+        // `downloadURL` is the file when it is stated; ArcGIS Hub states
+        // only `accessURL`, and for its file exports that is the file.
+        let url = d
+            .get("downloadURL")
+            .or_else(|| d.get("accessURL"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|u| u.starts_with("http://") || u.starts_with("https://"));
+        let Some(url) = url else { continue };
+        out.push(DcatDistribution {
+            format,
+            url: url.to_string(),
+        });
+    }
+    // Stable, so catalog order breaks ties and two runs of the browser
+    // offer the same URL for the same dataset.
+    out.sort_by_key(|d| d.format.rank());
+    out.dedup_by(|a, b| a.format == b.format);
+    out
+}
+
+/// Which openable format a distribution is.
+///
+/// The `format` label decides whenever there is one: ArcGIS Hub gives its
+/// "SQLite Geodatabase" export the GeoPackage media type, and a .gdb is
+/// not a .gpkg. The media type only answers for entries with no label.
+fn dcat_format(dist: &Value) -> Option<DcatFormat> {
+    let label = dist.get("format").and_then(Value::as_str).unwrap_or("").trim();
+    if !label.is_empty() {
+        return match label.to_ascii_uppercase().as_str() {
+            "GEOPARQUET" | "PARQUET" => Some(DcatFormat::Parquet),
+            "GPKG" | "GEOPACKAGE" => Some(DcatFormat::Gpkg),
+            "GEOJSON" => Some(DcatFormat::GeoJson),
+            "CSV" => Some(DcatFormat::Csv),
+            // ZIP (shapefile, file geodatabase), KML, XLSX, TXT, the REST
+            // endpoint and the landing page: nothing here opens them.
+            _ => None,
+        };
+    }
+    let media = dist
+        .get("mediaType")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if media.contains("parquet") {
+        Some(DcatFormat::Parquet)
+    } else if media.contains("geopackage") {
+        Some(DcatFormat::Gpkg)
+    } else if media.contains("geo+json") || media.contains("geojson") {
+        Some(DcatFormat::GeoJson)
+    } else if media == "text/csv" {
+        Some(DcatFormat::Csv)
+    } else {
+        None
+    }
+}
+
+/// The `license` field when it is one.
+///
+/// ArcGIS Hub portals put a whole HTML disclaimer in it ("<DIV STYLE=…All
+/// information compiled on this website is provided as a public
+/// service…"). That is a notice, not a licence, and pasting it into a
+/// credit line would be both false and unreadable — a `<` means absent.
+fn dcat_license(v: Option<&str>) -> Option<String> {
+    let l = v?.trim();
+    (!l.is_empty() && !l.contains('<')).then(|| l.to_string())
+}
+
+/// DCAT `spatial` as a bounding box. The field is a "W,S,E,N" string when
+/// it is a box at all; portals also put place names and empty strings
+/// there, and those are simply no extent.
+fn dcat_bbox(s: &str) -> Option<[f64; 4]> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let mut b = [0f64; 4];
+    for (i, p) in parts.iter().enumerate() {
+        b[i] = p.trim().parse::<f64>().ok()?;
+    }
+    (b.iter().all(|v| v.is_finite()) && b[0] <= b[2] && b[1] <= b[3]).then_some(b)
+}
+
+/// Drop HTML markup from a description: portals paste rendered prose into
+/// the field, and the browser searches and shows it as text.
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut depth = 0usize;
+    for c in s.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace('\u{a0}', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `~/.config/geopq-workbench/portals/<host>/<slug>/` — the local copy of
+/// one portal dataset, and where the import writes its GeoParquet beside
+/// it. Not the temp directory: these survive the session on purpose, so
+/// re-opening a dataset costs nothing and the `ATTRIBUTION.txt` written
+/// here still credits the file months later.
+pub fn portal_dir(portal_url: &str, slug: &str) -> Option<PathBuf> {
+    let host = url_host(portal_url)?;
+    Some(config_file()?.with_file_name("portals").join(host).join(slug))
+}
+
+/// Host of a URL, with the `:` of any port replaced — Windows refuses it
+/// in a path component.
+fn url_host(url: &str) -> Option<String> {
+    let host = url.split_once("://")?.1.split('/').next()?;
+    (!host.is_empty()).then(|| host.replace(':', "_"))
+}
+
+/// The `ATTRIBUTION.txt` a portal dataset needs, in the `Key: value`
+/// shape the sidecar reader parses.
+///
+/// DCAT states a publisher and (sometimes) a licence, and the imported
+/// GeoParquet carries neither: the sidecar is the only channel an import
+/// has, and it keeps working when the file is reopened later from disk.
+pub fn dcat_attribution(ds: &DcatDataset, portal_url: &str) -> Option<String> {
+    let publisher = ds.publisher.as_deref()?;
+    let mut text = format!("Attribution: {publisher}\n");
+    if let Some(l) = &ds.license {
+        text.push_str(&format!("License: {l}\n"));
+    }
+    text.push_str(&format!(
+        "Source: {}\n",
+        ds.landing_page.as_deref().unwrap_or(portal_url)
+    ));
+    Some(text)
+}
+
+/// Write the notice into the dataset's directory. Must happen before the
+/// layer opens: the sidecar lookup memoizes its misses per directory, so
+/// a notice that lands afterwards is never read.
+pub fn write_dcat_attribution(
+    dir: &Path,
+    ds: &DcatDataset,
+    portal_url: &str,
+) -> Result<(), String> {
+    let Some(text) = dcat_attribution(ds, portal_url) else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let path = dir.join("ATTRIBUTION.txt");
+    write_atomic(&path, &text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// Stream `url` into `dst`, calling `progress(bytes so far, total)` as it
+/// goes — `total` only when the server states a Content-Length, which
+/// portal export endpoints generating a file on the fly do not.
+///
+/// Returning `false` from `progress` aborts the download. The bytes go
+/// into `<dst>.part` and are renamed into place on success, so an
+/// interrupted fetch never leaves something that looks like a complete
+/// file: the caller's "already downloaded?" check is `dst.exists()`.
+pub fn download_to(
+    url: &str,
+    dst: &Path,
+    progress: &dyn Fn(u64, Option<u64>) -> bool,
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+    if let Some(dir) = dst.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    let res = http_agent()
+        .get(url)
+        .header("User-Agent", USER_AGENT)
+        .call()
+        .map_err(|e| format!("cannot reach {url}: {e}"))?;
+    if res.status() != 200 {
+        return Err(format!("{url}: HTTP {}", res.status()));
+    }
+    let total = res
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0);
+    let mut part = dst.as_os_str().to_os_string();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    let mut file =
+        std::fs::File::create(&part).map_err(|e| format!("cannot write {}: {e}", part.display()))?;
+    let mut body = res.into_body().into_reader();
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut done = 0u64;
+    let outcome = loop {
+        let n = match body.read(&mut buf) {
+            Ok(0) => break Ok(done),
+            Ok(n) => n,
+            Err(e) => break Err(format!("{url}: {e}")),
+        };
+        if let Err(e) = file.write_all(&buf[..n]) {
+            break Err(format!("cannot write {}: {e}", part.display()));
+        }
+        done += n as u64;
+        if !progress(done, total) {
+            break Err("download cancelled".to_string());
+        }
+    };
+    let outcome = outcome.and_then(|n| {
+        file.flush()
+            .map_err(|e| format!("cannot write {}: {e}", part.display()))
+            .map(|()| n)
+    });
+    drop(file);
+    // A dropped connection ends the body stream the same way completion
+    // does; when the server stated a length, anything short of it is a
+    // truncated file that must never get the real name.
+    let outcome = outcome.and_then(|n| match total {
+        Some(t) if n != t => Err(format!(
+            "{url}: connection closed at {n} of {t} bytes"
+        )),
+        _ => Ok(n),
+    });
+    match outcome {
+        Ok(n) => {
+            std::fs::rename(&part, dst).map_err(|e| {
+                let _ = std::fs::remove_file(&part);
+                format!("cannot rename into {}: {e}", dst.display())
+            })?;
+            // The coastline fetch forgot this and its megabytes never
+            // appeared in the network readout; a dataset download is far
+            // more of it, and it is the app's traffic either way.
+            super::net::record(super::net::Channel::Data, url, n);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            Err(e)
+        }
+    }
+}
+
 /// ISO 3166-2 regions probed when a repository has no index.json.
 /// 404s drop out, so over-listing is harmless.
 const REGIONS: &[(&str, &str, &str)] = &[
@@ -1889,6 +2364,486 @@ mod tests {
         assert_eq!(ds[0].path, "");
         assert_eq!(ds[0].code, "");
         assert_eq!(ds[0].name, "geoBoundaries CGAZ (global)");
+    }
+
+    // -----------------------------------------------------------------
+    // DCAT portals
+    // -----------------------------------------------------------------
+
+    /// Three datasets captured from https://data.cityofsacramento.org/
+    /// data.json (descriptions trimmed, everything else verbatim): one
+    /// with a GeoPackage, one whose best format is GeoJSON, and one that
+    /// publishes nothing but a web page and a FeatureServer. The messy
+    /// bits are the point — the HTML "license", the GeoPackage media type
+    /// on a SQLite geodatabase, and the `?layers=0` on every URL.
+    const SACRAMENTO: &str = r##"{
+  "@type": "dcat:Catalog",
+  "title": "City of Sacramento Open Data",
+  "dataset": [
+    {
+      "@type": "dcat:Dataset",
+      "landingPage": "https://data.cityofsacramento.org/datasets/SacCity::city-maintained-trees",
+      "title": "City Maintained Trees",
+      "description": "<p>City Maintained Trees. Trees or tree site locations maintained by the <a href='x'>Urban Forestry section</a>.</p><p>&nbsp;</p>",
+      "keyword": ["Open Data", "Urban Forestry", "Locations & Mapping", "Trees"],
+      "modified": "2026-08-16T11:33:19.805Z",
+      "publisher": {"name": "City of Sacramento"},
+      "accessLevel": "public",
+      "spatial": "-121.5577,38.4386,-120.1158,38.8031",
+      "license": "<DIV STYLE=\"text-align:Left;font-size:12pt\"><P><SPAN>All information compiled on this website is provided as a public service.</SPAN></P></DIV>",
+      "distribution": [
+        {"title": "ArcGIS Hub Dataset", "format": "Web Page", "mediaType": "text/html",
+         "accessURL": "https://data.cityofsacramento.org/datasets/SacCity::city-maintained-trees"},
+        {"title": "ArcGIS GeoService", "format": "ArcGIS GeoServices REST API", "mediaType": "application/json",
+         "accessURL": "https://services5.arcgis.com/x/arcgis/rest/services/City_Maintained_Trees/FeatureServer/0"},
+        {"title": "CSV", "format": "CSV", "mediaType": "text/csv",
+         "accessURL": "https://data.cityofsacramento.org/api/download/v1/items/b9b7/csv?layers=0"},
+        {"title": "Shapefile", "format": "ZIP", "mediaType": "application/zip",
+         "accessURL": "https://data.cityofsacramento.org/api/download/v1/items/b9b7/shapefile?layers=0"},
+        {"title": "GeoJSON", "format": "GeoJSON", "mediaType": "application/vnd.geo+json",
+         "accessURL": "https://data.cityofsacramento.org/api/download/v1/items/b9b7/geojson?layers=0"},
+        {"title": "KML", "format": "KML", "mediaType": "application/vnd.google-earth.kml+xml",
+         "accessURL": "https://data.cityofsacramento.org/api/download/v1/items/b9b7/kml?layers=0"},
+        {"title": "Excel", "format": "XLSX", "mediaType": "application/vnd.ms-excel",
+         "accessURL": "https://data.cityofsacramento.org/api/download/v1/items/b9b7/excel?layers=0"},
+        {"title": "GeoPackage", "format": "GPKG", "mediaType": "application/geopackage+sqlite3",
+         "accessURL": "https://data.cityofsacramento.org/api/download/v1/items/b9b7/geoPackage?layers=0"},
+        {"title": "SQLite Geodatabase", "format": "GDB", "mediaType": "application/geopackage+sqlite3",
+         "accessURL": "https://data.cityofsacramento.org/api/download/v1/items/b9b7/sqlite?layers=0"}
+      ]
+    },
+    {
+      "@type": "dcat:Dataset",
+      "landingPage": "https://data.cityofsacramento.org/datasets/SacCity::street-lights",
+      "title": "Street Lights",
+      "description": "City of Sacramento streetlight locations.",
+      "keyword": ["Transportation & Infrastructure", "Streetlights"],
+      "modified": "2026-08-17T11:33:51.299Z",
+      "publisher": {"name": "City of Sacramento"},
+      "spatial": "-121.5591,38.4385,-121.3663,38.6848",
+      "license": "",
+      "distribution": [
+        {"title": "ArcGIS Hub Dataset", "format": "Web Page", "mediaType": "text/html",
+         "accessURL": "https://data.cityofsacramento.org/datasets/SacCity::street-lights"},
+        {"title": "CSV", "format": "CSV", "mediaType": "text/csv",
+         "accessURL": "https://data.cityofsacramento.org/api/download/v1/items/3dca/csv?layers=0"},
+        {"title": "Shapefile", "format": "ZIP", "mediaType": "application/zip",
+         "accessURL": "https://data.cityofsacramento.org/api/download/v1/items/3dca/shapefile?layers=0"},
+        {"title": "GeoJSON", "format": "GeoJSON", "mediaType": "application/vnd.geo+json",
+         "accessURL": "https://data.cityofsacramento.org/api/download/v1/items/3dca/geojson?layers=0"},
+        {"title": "KML", "format": "KML", "mediaType": "application/vnd.google-earth.kml+xml",
+         "accessURL": "https://data.cityofsacramento.org/api/download/v1/items/3dca/kml?layers=0"}
+      ]
+    },
+    {
+      "@type": "dcat:Dataset",
+      "landingPage": "https://data.cityofsacramento.org/apps/SacCity::2021-2029-housing-element-hub",
+      "title": "2021-2029 Housing Element Hub",
+      "description": "<p>Housing Element Data Hub</p>",
+      "keyword": [],
+      "modified": "2026-08-06T23:07:43.000Z",
+      "publisher": {"name": "City of Sacramento"},
+      "spatial": "",
+      "license": "",
+      "distribution": [
+        {"title": "ArcGIS Hub Dataset", "format": "Web Page", "mediaType": "text/html",
+         "accessURL": "https://data.cityofsacramento.org/apps/SacCity::2021-2029-housing-element-hub"},
+        {"title": "ArcGIS GeoService", "format": "ArcGIS GeoServices REST API", "mediaType": "application/json",
+         "accessURL": "https://experience.arcgis.com/experience/9cda"}
+      ],
+      "theme": ""
+    }
+  ]
+}"##;
+
+    fn sacramento() -> DcatCatalog {
+        parse_dcat(&serde_json::from_str(SACRAMENTO).unwrap())
+    }
+
+    #[test]
+    /// A dataset whose only distributions are a map service and a web
+    /// page cannot be opened, and dropping it silently would leave the
+    /// browser looking like it had lost datasets.
+    fn dcat_lists_only_what_can_be_opened_and_counts_the_rest() {
+        let cat = sacramento();
+        assert_eq!(cat.title.as_deref(), Some("City of Sacramento Open Data"));
+        assert_eq!(
+            cat.datasets.iter().map(|d| d.title.as_str()).collect::<Vec<_>>(),
+            vec!["City Maintained Trees", "Street Lights"],
+            "catalog order preserved",
+        );
+        assert_eq!(cat.hidden, 1, "the Housing Element hub has no openable format");
+        // Parsing twice must produce the same list in the same order:
+        // the rows are addressed by index when the user opens them.
+        let again = sacramento();
+        assert_eq!(
+            again.datasets.iter().map(|d| d.title.clone()).collect::<Vec<_>>(),
+            cat.datasets.iter().map(|d| d.title.clone()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    /// Preference decides what a click opens, and the loser formats stay
+    /// listed as badges. Equal-length lists would also be the symptom of
+    /// a parser that kept every distribution in catalog order.
+    fn dcat_ranks_formats_and_refuses_the_lookalikes() {
+        let cat = sacramento();
+        let trees = &cat.datasets[0];
+        assert_eq!(
+            trees.distributions.iter().map(|d| d.format).collect::<Vec<_>>(),
+            vec![DcatFormat::Gpkg, DcatFormat::GeoJson, DcatFormat::Csv],
+            "GPKG first; the ZIP, KML, XLSX, web page and REST entries are gone",
+        );
+        assert!(
+            trees.distributions[0].url.ends_with("/geoPackage?layers=0"),
+            "{:?}",
+            trees.distributions[0].url,
+        );
+        // The SQLite geodatabase declares the GeoPackage media type. Its
+        // format label is what stops it being opened as one.
+        assert!(
+            !trees.distributions.iter().any(|d| d.url.contains("/sqlite")),
+            "a .gdb is not a .gpkg: {:?}",
+            trees.distributions,
+        );
+        // No GeoPackage published: GeoJSON is the best that is left.
+        let lights = &cat.datasets[1];
+        assert_eq!(
+            lights.distributions.iter().map(|d| d.format).collect::<Vec<_>>(),
+            vec![DcatFormat::GeoJson, DcatFormat::Csv],
+        );
+        // Only the two filesystem-only readers cost a download.
+        assert!(DcatFormat::Gpkg.needs_download() && DcatFormat::GeoJson.needs_download());
+        assert!(!DcatFormat::Parquet.needs_download() && !DcatFormat::Csv.needs_download());
+    }
+
+    #[test]
+    /// A GeoParquet distribution outranks everything and needs no local
+    /// copy; a distribution with no format label falls back to its media
+    /// type, which is all some CKAN portals publish.
+    fn dcat_reads_parquet_and_unlabelled_distributions() {
+        let v = serde_json::json!({"dataset": [{
+            "title": "Parcels",
+            "distribution": [
+                {"format": "CSV", "accessURL": "https://h.example/p.csv"},
+                {"mediaType": "application/vnd.apache.parquet",
+                 "downloadURL": "https://h.example/p.parquet"},
+                {"mediaType": "application/geo+json", "accessURL": "https://h.example/p.geojson"},
+                {"format": "GeoJSON", "accessURL": "ftp://h.example/p.geojson"}
+            ]
+        }]});
+        let cat = parse_dcat(&v);
+        let d = &cat.datasets[0];
+        assert_eq!(d.distributions[0].format, DcatFormat::Parquet);
+        assert_eq!(d.distributions[0].url, "https://h.example/p.parquet");
+        // downloadURL wins over accessURL, one entry per format survives,
+        // and a scheme no reader speaks is not a distribution at all.
+        assert_eq!(
+            d.distributions.iter().map(|x| x.format).collect::<Vec<_>>(),
+            vec![DcatFormat::Parquet, DcatFormat::GeoJson, DcatFormat::Csv],
+        );
+        assert!(d.distributions.iter().all(|x| x.url.starts_with("https://")));
+    }
+
+    #[test]
+    /// ArcGIS Hub puts a rendered HTML disclaimer in `license`. Printing
+    /// that in a credit line would be false as well as unreadable.
+    fn dcat_html_license_blob_is_not_a_licence() {
+        let cat = sacramento();
+        let trees = &cat.datasets[0];
+        assert_eq!(trees.publisher.as_deref(), Some("City of Sacramento"));
+        assert_eq!(trees.license, None, "the <DIV> blob is a notice, not a licence");
+        assert_eq!(cat.datasets[1].license, None, "an empty string is absent too");
+        // A real licence — a URL or an identifier — is kept.
+        assert_eq!(
+            dcat_license(Some("https://creativecommons.org/licenses/by/4.0/")).as_deref(),
+            Some("https://creativecommons.org/licenses/by/4.0/"),
+        );
+        assert_eq!(dcat_license(Some("CC-BY-4.0")).as_deref(), Some("CC-BY-4.0"));
+        assert_eq!(dcat_license(Some("  ")), None);
+        assert_eq!(dcat_license(None), None);
+    }
+
+    #[test]
+    /// The credit an imported portal layer gets, in the shape the sidecar
+    /// reader parses back.
+    fn dcat_attribution_is_the_sidecar_the_reader_expects() {
+        let mut trees = sacramento().datasets.remove(0);
+        let text =
+            dcat_attribution(&trees, "https://data.cityofsacramento.org").expect("publisher");
+        let a = crate::data::attribution::parse(&text).expect("parses back");
+        assert_eq!(a.credit, "City of Sacramento");
+        assert!(!text.contains("License:"), "no licence to state: {text}");
+        assert!(
+            text.contains("Source: https://data.cityofsacramento.org/datasets/SacCity::city-maintained-trees"),
+            "the landing page, not the portal root: {text}",
+        );
+        // A real licence joins the notice.
+        trees.license = Some("CC-BY-4.0".into());
+        let text = dcat_attribution(&trees, "https://p.example").unwrap();
+        assert!(text.contains("License: CC-BY-4.0"), "{text}");
+        // Nobody to credit: no notice rather than an invented one.
+        trees.publisher = None;
+        assert_eq!(dcat_attribution(&trees, "https://p.example"), None);
+    }
+
+    #[test]
+    fn dcat_spatial_and_descriptions_are_parsed_tolerantly() {
+        let cat = sacramento();
+        assert_eq!(
+            cat.datasets[0].bbox,
+            Some([-121.5577, 38.4386, -120.1158, 38.8031]),
+        );
+        // Markup is dropped so the search box matches prose, not tags.
+        assert!(!cat.datasets[0].description.contains('<'));
+        assert!(
+            cat.datasets[0].description.starts_with("City Maintained Trees."),
+            "{}",
+            cat.datasets[0].description,
+        );
+        assert!(cat.datasets[0].description.contains("Urban Forestry section."));
+        // The modified stamp is shown as a date.
+        assert_eq!(cat.datasets[0].modified.as_deref(), Some("2026-08-16"));
+        // Everything a portal actually puts in `spatial` that is not a box.
+        for s in ["", "Sacramento, CA", "-121,38,-120", "a,b,c,d", "-1,2,-3,4"] {
+            assert_eq!(dcat_bbox(s), None, "{s:?}");
+        }
+        assert_eq!(dcat_bbox(" -180 , -90 , 180 , 90 "), Some([-180.0, -90.0, 180.0, 90.0]));
+    }
+
+    #[test]
+    fn dcat_url_probes_the_site_and_takes_a_catalog_as_given() {
+        assert_eq!(dcat_url("https://p.example"), "https://p.example/data.json");
+        assert_eq!(dcat_url("https://p.example/"), "https://p.example/data.json");
+        assert_eq!(dcat_url(" https://p.example/data.json "), "https://p.example/data.json");
+        assert_eq!(
+            dcat_url("https://p.example/data.json/"),
+            "https://p.example/data.json",
+        );
+    }
+
+    #[test]
+    /// A URL that is not a portal has to say which document was asked
+    /// for: "not found" alone teaches nothing about the convention.
+    fn a_portal_probe_names_what_it_looked_for() {
+        let base = spawn_files(&[("other.json", "{}")]);
+        let err = fetch_dcat(&base).unwrap_err();
+        assert!(err.contains(&format!("{base}/data.json")), "{err}");
+        assert!(err.contains("not found"), "{err}");
+
+        // Present but not a catalog: a content problem, not a network one.
+        let base = spawn_files(&[("data.json", r#"{"title":"Something else"}"#)]);
+        let err = fetch_dcat(&base).unwrap_err();
+        assert!(err.contains("not a DCAT catalog"), "{err}");
+
+        // A catalog whose every dataset is a map service parses fine and
+        // says so through the count, rather than failing.
+        let cat = parse_dcat(&serde_json::json!({"dataset": [
+            {"title": "A service", "distribution": [{"format": "Web Page",
+             "accessURL": "https://h.example/a"}]},
+            {"title": "No distribution key at all"},
+            {"no title": true},
+        ]}));
+        assert!(cat.datasets.is_empty());
+        assert_eq!(cat.hidden, 2, "the untitled entry is not a dataset to count");
+    }
+
+    #[test]
+    fn a_slug_is_a_directory_name_on_every_filesystem() {
+        let ds = |title: &str| DcatDataset {
+            title: title.into(),
+            description: String::new(),
+            keywords: Vec::new(),
+            modified: None,
+            publisher: None,
+            license: None,
+            landing_page: None,
+            bbox: None,
+            distributions: Vec::new(),
+        };
+        assert_eq!(ds("City Maintained Trees").slug(), "city-maintained-trees");
+        assert_eq!(ds("2021-2029 Housing Element Hub").slug(), "2021-2029-housing-element-hub");
+        assert_eq!(ds("Parcels / Lots (2026)").slug(), "parcels-lots-2026");
+        assert_eq!(ds("Réseau d'eau").slug(), "r-seau-d-eau");
+        assert_eq!(ds("...").slug(), "dataset");
+        let long = ds(&"x".repeat(200)).slug();
+        assert_eq!(long.len(), 60, "capped, and never on a trailing dash");
+        assert!(!long.ends_with('-'));
+    }
+
+    #[test]
+    /// A download that stops halfway must not leave something the next
+    /// open would mistake for the whole file: the `.part` is the whole
+    /// point, and the bytes are the app's traffic like any other.
+    fn a_download_lands_whole_or_not_at_all() {
+        let body = "x".repeat(700_000);
+        let base = spawn_files(&[("big.geojson", body.as_str())]);
+        let dir = std::env::temp_dir().join(format!("geopq_dl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dst = dir.join("sub").join("big.geojson");
+
+        let seen = Mutex::new(Vec::<(u64, Option<u64>)>::new());
+        download_to(&format!("{base}/big.geojson"), &dst, &|got, total| {
+            seen.lock().unwrap().push((got, total));
+            true
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&dst).unwrap().len(), body.len());
+        let seen = seen.into_inner().unwrap();
+        assert!(seen.len() > 1, "progress arrives in chunks: {seen:?}");
+        assert_eq!(seen.last().unwrap().0, body.len() as u64);
+        assert_eq!(
+            seen[0].1,
+            Some(body.len() as u64),
+            "the server states a Content-Length, so the total is known up front",
+        );
+        // A dataset download is the largest thing this app fetches; the
+        // coastline fetch forgot to declare its bytes and they never
+        // showed up anywhere.
+        assert_eq!(
+            crate::data::net::for_source(&format!("{base}/big.geojson")),
+            Some((body.len() as u64, 1)),
+            "counted against the data channel, under its own URL",
+        );
+
+        // Cancelled at the first chunk: no file, no leftover part.
+        let dst2 = dir.join("sub").join("cancelled.geojson");
+        let err = download_to(&format!("{base}/big.geojson"), &dst2, &|_, _| false)
+            .unwrap_err();
+        assert!(err.contains("cancelled"), "{err}");
+        assert!(!dst2.exists());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.join("sub"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".part"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        // A missing object is an error, not an empty file.
+        let dst3 = dir.join("sub").join("absent.geojson");
+        assert!(download_to(&format!("{base}/nope.geojson"), &dst3, &|_, _| true).is_err());
+        assert!(!dst3.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// The whole chain over loopback: a portal catalog whose GeoPackage
+    /// distribution is served by the same server, opened the way the
+    /// browser opens one — pick the best distribution, download it into
+    /// the portal directory, write the notice, import it, and read the
+    /// layer and its credit back off the converted GeoParquet.
+    ///
+    /// Asserting only that a file arrived would pass on a truncated
+    /// download; the row count and the geometry come from the parquet.
+    fn a_portal_dataset_downloads_imports_and_carries_its_credit() {
+        let root = std::env::temp_dir().join(format!("geopq_portal_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // The dataset the portal serves: a real GeoPackage, 41 rows.
+        crate::data::gpkg::tests::make_gpkg(&root.join("trees.gpkg"), 40);
+        let base = crate::data::source::testserver::spawn_dir(root.clone());
+        // The catalog points back at this server, and its export URLs
+        // carry the query string a real ArcGIS Hub one has.
+        std::fs::write(
+            root.join("data.json"),
+            format!(
+                r#"{{"title": "Loopback Open Data", "dataset": [
+                {{"title": "City Maintained Trees",
+                  "landingPage": "{base}/datasets/trees",
+                  "publisher": {{"name": "City of Sacramento"}},
+                  "license": "<DIV>a disclaimer, not a licence</DIV>",
+                  "spatial": "-121.5577,38.4386,-120.1158,38.8031",
+                  "modified": "2026-08-16T11:33:19.805Z",
+                  "distribution": [
+                    {{"format": "Web Page", "accessURL": "{base}/datasets/trees"}},
+                    {{"format": "CSV", "accessURL": "{base}/trees.csv?layers=0"}},
+                    {{"format": "GPKG", "accessURL": "{base}/trees.gpkg?layers=0"}}
+                  ]}}
+            ]}}"#
+            ),
+        )
+        .unwrap();
+
+        // 1. Add the portal: a bare site URL probes <url>/data.json.
+        let cat = fetch_dcat(&base).expect("the catalog is where a portal keeps it");
+        assert_eq!(cat.title.as_deref(), Some("Loopback Open Data"));
+        assert_eq!(cat.datasets.len(), 1);
+        let ds = &cat.datasets[0];
+
+        // 2. Open it: the GeoPackage outranks the CSV, and only it is
+        //    fetched to disk.
+        let dist = &ds.distributions[0];
+        assert_eq!(dist.format, DcatFormat::Gpkg);
+        assert!(dist.format.needs_download());
+        let dir = portal_dir(&base, &ds.slug()).expect("a config directory");
+        let dst = dir.join(format!("{}.{}", ds.slug(), dist.format.ext()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_dcat_attribution(&dir, ds, &base).unwrap();
+        download_to(&dist.url, &dst, &|_, _| true).expect("the query string does not 404");
+        assert_eq!(
+            std::fs::metadata(&dst).unwrap().len(),
+            std::fs::metadata(root.join("trees.gpkg")).unwrap().len(),
+            "the whole GeoPackage arrived",
+        );
+
+        // 3. Import it exactly as a dropped file would be.
+        let table = crate::data::gpkg::list_tables(&dst).unwrap().remove(0);
+        let parquet = dst.with_file_name(format!("{}.{}.parquet", ds.slug(), table.name));
+        assert_eq!(
+            crate::data::gpkg::convert(&dst, &table, &parquet, &|_| {}).unwrap(),
+            41,
+        );
+
+        // 4. The layer, read back from the converted file.
+        let (store, crs, _info, _rg) =
+            crate::data::loader::open_store_for_test(&parquet).unwrap();
+        assert_eq!(store.total_rows(), 41);
+        assert_eq!(crs.epsg, Some(2154), "the GeoPackage's CRS survived the import");
+
+        // 5. The credit: the sidecar sits beside both the download and
+        //    the parquet, and names the publisher the catalog stated.
+        let a = crate::data::attribution::find(
+            &crate::data::source::Source::Local(parquet.clone()),
+            &[],
+        )
+        .expect("ATTRIBUTION.txt beside the import");
+        assert_eq!(a.credit, "City of Sacramento");
+        assert!(a.text.contains(&format!("Source: {base}/datasets/trees")), "{}", a.text);
+        assert!(
+            !a.text.contains("disclaimer"),
+            "the HTML license blob must not reach the notice: {}",
+            a.text,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Live portal probe, opt-in:
+    /// cargo test dcat_live -- --ignored --nocapture
+    #[test]
+    #[ignore = "hits the network: a live open-data portal"]
+    fn dcat_live() {
+        let cat = fetch_dcat("https://data.cityofsacramento.org").unwrap();
+        eprintln!(
+            "{:?}: {} openable, {} without a format",
+            cat.title,
+            cat.datasets.len(),
+            cat.hidden,
+        );
+        assert!(cat.datasets.len() > 100);
+        let by_format = |f: DcatFormat| {
+            cat.datasets.iter().filter(|d| d.distributions[0].format == f).count()
+        };
+        eprintln!(
+            "best format: {} gpkg, {} geojson, {} csv",
+            by_format(DcatFormat::Gpkg),
+            by_format(DcatFormat::GeoJson),
+            by_format(DcatFormat::Csv),
+        );
+        assert!(cat.datasets.iter().all(|d| d.publisher.is_some()));
+        // Every entry the browser lists must be openable by something.
+        assert!(cat.datasets.iter().all(|d| !d.distributions.is_empty()));
     }
 
     /// Live repository probe, opt-in:

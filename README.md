@@ -41,7 +41,9 @@ so it doubles as a hands-on guide to GeoParquet best practices.
   groups under your viewport are downloaded.
 - **Catalog browser**: Overture Maps and Geomermaids Parquetry are
   preconfigured; check the layers you want and they load straight onto
-  the map.
+  the map. Paste the URL of any open-data portal and its whole catalog
+  joins them: ArcGIS Hub, Socrata and CKAN all publish one, which is
+  most municipal and federal portals in North America.
 - **SQL console**: DataFusion with 28 spatial functions (including
   `st_transform` reprojection and polygon set operations) and 3 spatial
   aggregates over every loaded layer, local or remote, with spatial
@@ -161,6 +163,7 @@ geopq-workbench file.parquet dataset_dir/ https://host/data.parquet
 | S3 (`s3://bucket/key`) | File → Open URL… — profiles from `~/.aws`, custom endpoints (MinIO etc.), anonymous access to public buckets |
 | S3 hive dataset (`s3://bucket/prefix/` or a `*` glob) | File → Open URL… — every matching parquet part loads as one layer (`s3://bucket/d/state=*/roads.parquet` picks one theme across partitions); `key=value` path segments become queryable columns |
 | Catalogs (Overture Maps, Parquetry, your own) | File → Repositories… — browse snapshots, check layers, they load with sensible names and stacking order. Parquetry repos can load a theme across every state of a country as one layer, with `country`/`state` as columns. A STAC collection opens the parts covering most of the current view and adds the others as you pan into them |
+| Open-data portals (`https://data.city.gov/data.json`) | File → Repositories… → **Add portal**, or paste the catalog URL into File → Open URL… — the portal's datasets are listed with the formats it publishes, searchable by title, keywords and description |
 | Attribute table (parquet or CSV, no geometry) | File → Open attribute table…, or drag & drop a `.csv`. An import dialog proposes a separator, a name and a type per column, with the sampled values and what each type choice would cost. Columns become a SQL table to query and to join a layer against. No map presence |
 | CSV or parquet with coordinate columns | the same dialog: pick the X and Y columns and their CRS, and it is written as GeoParquet and opened as a layer instead |
 | GeoPackage / Shapefile / GeoJSON | drag & drop or File → Import vector file… — pure-Rust conversion to GeoParquet (no GDAL), with a covering bbox column and byte-sized row groups so the result is readable by viewport from the first open, then opens normally |
@@ -174,6 +177,20 @@ prunes it against the current view. Publishing writes that document
 itself, so anything this workbench uploads reopens from its https URL;
 third-party collections following the same convention open the same
 way, and a `collection.json` URL can also be pasted directly.
+
+An open-data portal is the third kind of catalog, and the cheapest to
+reach: nearly all of them publish a DCAT `data.json` at their root, so
+pasting the site URL is enough. The browser lists only the datasets it
+can actually open and says how many it left out, and a click takes the
+best format the dataset offers — GeoParquet read in place, otherwise
+GeoPackage, GeoJSON or CSV, downloaded into
+`~/.config/geopq-workbench/portals/` and imported through the same
+dialogs a dropped file goes through. The publisher and licence the
+catalog states are written beside the import as an `ATTRIBUTION.txt`,
+so the layer is credited on the map and stays credited when the file is
+reopened months later. Portal catalogs are fetched fresh each session
+and never cached: unlike a dated release prefix, a portal rewrites its
+catalog in place.
 
 Format-wise, anything in the GeoParquet family works: 1.0, 1.1 with WKB
 or GeoArrow coordinate arrays, 2.0 with native GEOMETRY/GEOGRAPHY

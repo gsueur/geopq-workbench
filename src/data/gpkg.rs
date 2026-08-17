@@ -350,11 +350,13 @@ fn cell(v: ValueRef<'_>) -> Cell<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Minimal spec-shaped GeoPackage with one point table in EPSG:2154.
-    fn make_gpkg(path: &Path, rows: usize) {
+    /// Shared with repo.rs, whose portal end-to-end test needs a real
+    /// GeoPackage on the far end of a download.
+    pub(crate) fn make_gpkg(path: &Path, rows: usize) {
         make_gpkg_srs(path, rows, "EPSG", 2154, "RGF93 / Lambert-93", "undefined");
     }
 
