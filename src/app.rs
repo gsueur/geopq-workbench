@@ -426,6 +426,14 @@ pub struct ViewerApp {
     repo_browser: Option<RepoBrowser>,
     repo_tx: Sender<RepoMsg>,
     repo_rx: Receiver<RepoMsg>,
+    /// Open-data catalog browser dialog (Some = open).
+    catalog_browser: Option<CatalogBrowser>,
+    /// Catalogs added this session and not saved for good. They survive
+    /// the dialog closing — "for the session" means the app run — and
+    /// die with it, which is the point.
+    session_catalogs: Vec<crate::data::repo::Catalog>,
+    dcat_tx: Sender<CatMsg>,
+    dcat_rx: Receiver<CatMsg>,
     /// Portal downloads in flight. They outlive the browser window: the
     /// import dialog is what the user waits for, not the dialog they
     /// started from.
@@ -469,18 +477,63 @@ struct RepoBrowser {
     cache_age: Option<u64>,
     /// Add-repository row (name, base URL).
     add: (String, String),
-    /// Portal catalog of the selected repository, when it is a DCAT one
-    /// (None = fetch in flight). Session state only: a portal rewrites
-    /// its data.json in place, so there is nothing here worth caching.
+    /// Drops stale async results after repo/snapshot switches.
+    generation: u64,
+}
+
+/// Browser over open-data portals (DCAT `data.json` catalogs): the saved
+/// list, the session-only list, and the dataset pane of whichever one is
+/// selected. Its own dialog, not a repository kind — a portal lists
+/// datasets to fetch, it serves nothing this app reads in place.
+struct CatalogBrowser {
+    /// Catalogs saved for good (`catalogs.json`), in saved order.
+    saved: Vec<crate::data::repo::Catalog>,
+    /// Catalogs added this session only; mirrored to the app when the
+    /// dialog closes so they outlive it.
+    session: Vec<crate::data::repo::Catalog>,
+    /// Selected catalog: (in the saved list?, index). None = just the lists.
+    sel: Option<(bool, usize)>,
+    /// Add-catalog row (base or `/data.json` URL).
+    add_url: String,
+    /// The selected portal's catalog (None = fetch in flight). Session
+    /// state only: a portal rewrites its data.json in place, so there is
+    /// nothing here worth caching on disk.
     dcat: Option<Result<crate::data::repo::DcatCatalog, String>>,
     /// Portal datasets ticked for opening, by index into the catalog.
     dcat_checked: std::collections::HashSet<usize>,
-    /// A portal added this session and not yet written to the config: it
-    /// is saved once its catalog answers, so a URL that turns out not to
-    /// be a portal never becomes a permanent entry.
-    unsaved: Option<usize>,
-    /// Drops stale async results after repo/snapshot switches.
+    /// Search over the dataset list.
+    filter: String,
+    /// Drops stale fetch results after a selection switch.
     generation: u64,
+}
+
+/// A portal's whole catalog answering, which is one document.
+type CatMsg = (u64, Result<crate::data::repo::DcatCatalog, String>);
+
+impl CatalogBrowser {
+    fn selected_catalog(&self) -> Option<&crate::data::repo::Catalog> {
+        let (saved, i) = self.sel?;
+        if saved { self.saved.get(i) } else { self.session.get(i) }
+    }
+
+    /// Move session entry `i` to the saved list, stamped with today as
+    /// its added-on date, and keep the selection pointing at it.
+    fn save_for_good(&mut self, i: usize) {
+        let mut c = self.session.remove(i);
+        c.added_on = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .ok();
+        self.saved.push(c);
+        if let Err(e) = crate::data::repo::save_catalogs(&self.saved) {
+            log::warn!("saving catalogs: {e}");
+        }
+        match self.sel {
+            Some((false, j)) if j == i => self.sel = Some((true, self.saved.len() - 1)),
+            Some((false, j)) if j > i => self.sel = Some((false, j - 1)),
+            _ => {}
+        }
+    }
 }
 
 /// One theme aggregated across a country: total features and the
@@ -510,8 +563,6 @@ enum RepoMsg {
     /// country code, themes). The code pins the result like Manifest's
     /// index does.
     CountryThemes(u64, String, CountryThemesResult),
-    /// A DCAT portal's whole catalog, which is one document.
-    Dcat(u64, Result<crate::data::repo::DcatCatalog, String>),
 }
 
 /// A portal file being fetched before it enters the import path.
@@ -922,6 +973,7 @@ impl ViewerApp {
         let (test_tx, test_rx) = channel();
         let (pick_tx, pick_rx) = channel();
         let (repo_tx, repo_rx) = channel();
+        let (dcat_tx, dcat_rx) = channel();
         let (dl_tx, dl_rx) = channel();
         let (join_tx, join_rx) = channel();
         let (attr_tx, attr_rx) = channel();
@@ -1048,6 +1100,10 @@ impl ViewerApp {
             repo_browser: None,
             repo_tx,
             repo_rx,
+            catalog_browser: None,
+            session_catalogs: Vec::new(),
+            dcat_tx,
+            dcat_rx,
             downloads: Vec::new(),
             dl_tx,
             dl_rx,
@@ -2893,6 +2949,17 @@ impl ViewerApp {
                     self.open_repo_browser(&ctx);
                 }
                 if ui
+                    .button(format!("{} Data catalogs…", ph::BOOKS))
+                    .on_hover_text(
+                        "Browse open-data portals through their DCAT catalog \
+                         (ArcGIS Hub, Socrata, CKAN) and open their datasets",
+                    )
+                    .clicked()
+                    && self.catalog_browser.is_none()
+                {
+                    self.open_catalog_browser();
+                }
+                if ui
                     .button(format!("{} Import vector file…", ph::TRAY_ARROW_DOWN))
                     .on_hover_text(
                         "Convert a GeoPackage, Shapefile or GeoJSON file to \
@@ -4373,53 +4440,91 @@ impl ViewerApp {
             country_themes: None,
             cache_age: None,
             add: (String::new(), String::new()),
-            dcat: None,
-            dcat_checked: Default::default(),
-            unsaved: None,
             generation: 0,
         });
         self.repo_refetch(ctx, false);
     }
 
-    /// Show the browser on a DCAT portal, adding it if it is new.
+    fn open_catalog_browser(&mut self) {
+        self.catalog_browser = Some(CatalogBrowser {
+            saved: crate::data::repo::load_catalogs(),
+            session: self.session_catalogs.clone(),
+            sel: None,
+            add_url: String::new(),
+            dcat: None,
+            dcat_checked: Default::default(),
+            filter: String::new(),
+            generation: 0,
+        });
+    }
+
+    /// Show the catalog browser on a portal, adding it for the session if
+    /// it is new. Saving it for good stays the user's call, made in the
+    /// dialog once the catalog has answered.
     ///
     /// A `/data.json` is a catalog, not a file, so it never reaches
     /// `route_uri`: routing it would hand a JSON document to the parquet
-    /// reader. The entry is not persisted until the catalog answers.
+    /// reader.
     fn open_portal(&mut self, url: &str, ctx: &egui::Context) {
-        use crate::data::repo::{self, RepoKind};
         let trimmed = url.trim().trim_end_matches('/');
-        let base = trimmed.strip_suffix("/data.json").unwrap_or(trimmed).to_string();
-        if self.repo_browser.is_none() {
-            self.open_repo_browser(ctx);
+        let base = trimmed.strip_suffix("/data.json").unwrap_or(trimmed).trim_end_matches('/');
+        if self.catalog_browser.is_none() {
+            self.open_catalog_browser();
         }
-        let Some(b) = &mut self.repo_browser else { return };
-        match b
-            .repos
-            .iter()
-            .position(|r| r.kind == RepoKind::Dcat && r.url == base)
-        {
-            Some(i) => {
-                b.sel_repo = i;
-                b.unsaved = None;
+        let b = self.catalog_browser.as_mut().unwrap();
+        b.sel = if let Some(i) = b.saved.iter().position(|c| c.url == base) {
+            Some((true, i))
+        } else if let Some(i) = b.session.iter().position(|c| c.url == base) {
+            Some((false, i))
+        } else {
+            b.session.push(crate::data::repo::Catalog {
+                // Provisional: the catalog's own title replaces it when
+                // the fetch lands.
+                name: base
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .to_string(),
+                url: base.to_string(),
+                added_on: None,
+            });
+            Some((false, b.session.len() - 1))
+        };
+        self.catalog_fetch(ctx);
+    }
+
+    /// Fetch the selected portal's catalog, dropping any stale in-flight
+    /// result. One live document per portal: nothing here is cached.
+    fn catalog_fetch(&mut self, ctx: &egui::Context) {
+        let Some(b) = &mut self.catalog_browser else { return };
+        b.generation += 1;
+        b.dcat = None;
+        b.dcat_checked.clear();
+        let Some(url) = b.selected_catalog().map(|c| c.url.clone()) else { return };
+        let generation = b.generation;
+        let tx = self.dcat_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((generation, crate::data::repo::fetch_dcat(&url)));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_catalog(&mut self) {
+        while let Ok((g, res)) = self.dcat_rx.try_recv() {
+            let Some(b) = &mut self.catalog_browser else { continue };
+            if g != b.generation {
+                continue; // stale
             }
-            None => {
-                b.repos.push(repo::Repository {
-                    // Provisional: the catalog's own title replaces it
-                    // when the fetch lands.
-                    name: base.trim_start_matches("https://").trim_start_matches("http://").to_string(),
-                    url: base,
-                    kind: RepoKind::Dcat,
-                    attribution: None,
-                    attribution_by_license: Default::default(),
-                });
-                b.sel_repo = b.repos.len() - 1;
-                b.unsaved = Some(b.sel_repo);
+            // The catalog knows its own name; a session entry adopts it.
+            // A saved entry keeps the name it was saved under.
+            if let (Ok(cat), Some((false, i))) = (&res, b.sel) {
+                if let (Some(t), Some(c)) = (&cat.title, b.session.get_mut(i)) {
+                    c.name = t.clone();
+                }
             }
+            b.dcat = Some(res);
+            b.dcat_checked.clear();
         }
-        b.snapshots = vec![repo::Snapshot::latest()];
-        b.sel_snapshot = 0;
-        self.repo_refetch(ctx, false);
     }
 
     /// (Re)fetch snapshots + datasets for the browser's current repository
@@ -4432,8 +4537,6 @@ impl ViewerApp {
         b.selected = None;
         b.checked.clear();
         b.cache_age = None;
-        b.dcat = None;
-        b.dcat_checked.clear();
         let generation = b.generation;
         let base = b.repos[b.sel_repo].url.trim_end_matches('/').to_string();
         let kind = b.repos[b.sel_repo].kind;
@@ -4442,23 +4545,11 @@ impl ViewerApp {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             use crate::data::repo::{self, RepoKind};
-            if kind == RepoKind::Dcat {
-                // A portal has one live catalog: no snapshots to pick
-                // between, and one document instead of a discovery pass.
-                let _ = tx.send(RepoMsg::Snapshots(
-                    generation,
-                    Ok(vec![repo::Snapshot::latest()]),
-                ));
-                let _ = tx.send(RepoMsg::Dcat(generation, repo::fetch_dcat(&base)));
-                ctx.request_repaint();
-                return;
-            }
             let _ = tx.send(RepoMsg::Snapshots(
                 generation,
                 match kind {
                     RepoKind::Parquetry => repo::fetch_snapshots(&base),
                     RepoKind::Stac => repo::fetch_snapshots_stac(&base),
-                    RepoKind::Dcat => unreachable!("handled above"),
                 },
             ));
             if force {
@@ -4474,7 +4565,6 @@ impl ViewerApp {
             let res = match kind {
                 RepoKind::Parquetry => repo::discover_datasets(&base, &snapshot),
                 RepoKind::Stac => repo::discover_datasets_stac(&base, &snapshot),
-                RepoKind::Dcat => unreachable!("handled above"),
             };
             if let Ok(ds) = &res {
                 repo::store_datasets(&base, &snapshot, ds);
@@ -4504,9 +4594,6 @@ impl ViewerApp {
                 match kind {
                     RepoKind::Parquetry => repo::fetch_manifest(&base, &snapshot, &path),
                     RepoKind::Stac => repo::fetch_stac_manifest(&base, &snapshot, &path),
-                    // A portal dataset is opened from the list, not
-                    // expanded into a theme panel.
-                    RepoKind::Dcat => Err("no manifest for a portal dataset".into()),
                 },
             ));
             ctx.request_repaint();
@@ -4601,22 +4688,6 @@ impl ViewerApp {
                         *slot = Some(res);
                     }
                 }
-                RepoMsg::Dcat(g, res) if g == b.generation => {
-                    // The catalog answering is what proves the URL is a
-                    // portal, so this is where a pending entry earns its
-                    // place in the config — and its name.
-                    if let (Ok(cat), Some(i)) = (&res, b.unsaved) {
-                        if let (Some(t), Some(r)) = (&cat.title, b.repos.get_mut(i)) {
-                            r.name = t.clone();
-                        }
-                        if let Err(e) = crate::data::repo::save_repos(&b.repos) {
-                            log::warn!("saving repositories: {e}");
-                        }
-                        b.unsaved = None;
-                    }
-                    b.dcat = Some(res);
-                    b.dcat_checked.clear();
-                }
                 _ => {} // stale generation
             }
         }
@@ -4661,8 +4732,8 @@ impl ViewerApp {
     fn open_portal_dataset(&mut self, idx: usize, ctx: &egui::Context) {
         use crate::data::repo::{self, DcatFormat};
         use std::sync::atomic::{AtomicBool, Ordering};
-        let Some(b) = &self.repo_browser else { return };
-        let portal = b.repos[b.sel_repo].url.trim_end_matches('/').to_string();
+        let Some(b) = &self.catalog_browser else { return };
+        let Some(portal) = b.selected_catalog().map(|c| c.url.clone()) else { return };
         let Some(Ok(cat)) = &b.dcat else { return };
         let Some(ds) = cat.datasets.get(idx).cloned() else { return };
         let Some(dist) = ds.distributions.first().cloned() else { return };
@@ -4737,7 +4808,6 @@ impl ViewerApp {
         let mut fetch_manifest: Option<usize> = None;
         let mut fetch_country: Option<String> = None;
         let mut load: Vec<(Source, String)> = Vec::new(); // (source, layer name)
-        let mut open_datasets: Vec<usize> = Vec::new(); // portal catalog indices
 
         {
             let b = self.repo_browser.as_mut().unwrap();
@@ -4764,21 +4834,17 @@ impl ViewerApp {
                             b.sel_snapshot = 0;
                             refetch = true;
                         }
-                        // A portal publishes one live catalog: there is
-                        // nothing for a snapshot picker to pick between.
-                        if kind != crate::data::repo::RepoKind::Dcat {
-                            ui.label("snapshot:");
-                            let before = b.sel_snapshot;
-                            egui::ComboBox::from_id_salt("repo_snap")
-                                .selected_text(&b.snapshots[b.sel_snapshot].label)
-                                .show_ui(ui, |ui| {
-                                    for (i, s) in b.snapshots.iter().enumerate() {
-                                        ui.selectable_value(&mut b.sel_snapshot, i, &s.label);
-                                    }
-                                });
-                            if b.sel_snapshot != before {
-                                refetch = true;
-                            }
+                        ui.label("snapshot:");
+                        let before = b.sel_snapshot;
+                        egui::ComboBox::from_id_salt("repo_snap")
+                            .selected_text(&b.snapshots[b.sel_snapshot].label)
+                            .show_ui(ui, |ui| {
+                                for (i, s) in b.snapshots.iter().enumerate() {
+                                    ui.selectable_value(&mut b.sel_snapshot, i, &s.label);
+                                }
+                            });
+                        if b.sel_snapshot != before {
+                            refetch = true;
                         }
                         if ui
                             .button(ph::ARROWS_CLOCKWISE)
@@ -4799,13 +4865,6 @@ impl ViewerApp {
                         }
                     });
                     ui.separator();
-
-                    if kind == crate::data::repo::RepoKind::Dcat {
-                        dcat_pane(ui, b, &mut open_datasets);
-                        ui.separator();
-                        add_repo_row(ui, b, &mut refetch);
-                        return;
-                    }
 
                     // --- datasets (left) + themes (right) ---
                     // Owned views of the async state, so the widgets below
@@ -5066,9 +5125,6 @@ impl ViewerApp {
                                                             },
                                                             theme.clone(),
                                                         ),
-                                                        // Portals never
-                                                        // reach this pane.
-                                                        RepoKind::Dcat => continue,
                                                     });
                                                 }
                                                 b.checked.clear();
@@ -5316,11 +5372,209 @@ impl ViewerApp {
             let job = self.enqueue_load(source, ctx);
             self.pending_names.insert(job, name);
         }
+        if !open {
+            self.repo_browser = None;
+        }
+    }
+
+    /// The open-data catalog dialog: saved catalogs with their added-on
+    /// date, this session's catalogs with the offer to save them for
+    /// good, an add row, and the dataset pane of the selected portal.
+    fn catalog_window(&mut self, ctx: &egui::Context) {
+        use crate::data::repo;
+        let floating_area = self.floating_area(ctx);
+        if self.catalog_browser.is_none() {
+            return;
+        }
+        let mut open = true;
+        let mut fetch = false;
+        let mut add_url: Option<String> = None;
+        let mut open_datasets: Vec<usize> = Vec::new(); // catalog indices
+
+        {
+            let b = self.catalog_browser.as_mut().unwrap();
+            egui::Window::new("Open-data catalogs")
+                .id(egui::Id::new("catalog_browser"))
+                .open(&mut open)
+                .default_width(560.0)
+                .constrain_to(floating_area)
+                .show(ctx, |ui| {
+                    if b.saved.is_empty() && b.session.is_empty() {
+                        ui.label(
+                            RichText::new(
+                                "No catalogs yet. Paste an open-data portal below — \
+                                 ArcGIS Hub, Socrata and CKAN sites all publish a \
+                                 DCAT catalog at /data.json.",
+                            )
+                            .weak(),
+                        );
+                    }
+                    // Row actions, applied after the loops: the lists
+                    // cannot be edited while they are being drawn.
+                    let mut select: Option<(bool, usize)> = None;
+                    let mut forget: Option<(bool, usize)> = None; // (saved list?, index)
+                    let mut keep: Option<usize> = None; // session index
+                    for (i, c) in b.saved.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let on = b.sel == Some((true, i));
+                            if ui.selectable_label(on, &c.name).on_hover_text(&c.url).clicked()
+                                && !on
+                            {
+                                select = Some((true, i));
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .small_button(ph::TRASH)
+                                        .on_hover_text("Forget this catalog")
+                                        .clicked()
+                                    {
+                                        forget = Some((true, i));
+                                    }
+                                    if let Some(at) = c.added_on {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "added {}",
+                                                repo::date_label(at)
+                                            ))
+                                            .weak()
+                                            .small(),
+                                        );
+                                    }
+                                },
+                            );
+                        });
+                    }
+                    for (i, c) in b.session.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let on = b.sel == Some((false, i));
+                            if ui.selectable_label(on, &c.name).on_hover_text(&c.url).clicked()
+                                && !on
+                            {
+                                select = Some((false, i));
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .small_button(ph::TRASH)
+                                        .on_hover_text("Drop this session entry")
+                                        .clicked()
+                                    {
+                                        forget = Some((false, i));
+                                    }
+                                    if ui
+                                        .small_button("Save")
+                                        .on_hover_text(
+                                            "Keep this catalog for future sessions",
+                                        )
+                                        .clicked()
+                                    {
+                                        keep = Some(i);
+                                    }
+                                    ui.label(
+                                        RichText::new("this session only").weak().small(),
+                                    );
+                                },
+                            );
+                        });
+                    }
+                    if let Some((in_saved, i)) = forget {
+                        if in_saved {
+                            b.saved.remove(i);
+                            if let Err(e) = repo::save_catalogs(&b.saved) {
+                                log::warn!("saving catalogs: {e}");
+                            }
+                        } else {
+                            b.session.remove(i);
+                        }
+                        match b.sel {
+                            Some((s, j)) if s == in_saved && j == i => {
+                                b.sel = None;
+                                b.dcat = None;
+                            }
+                            Some((s, j)) if s == in_saved && j > i => {
+                                b.sel = Some((s, j - 1));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(i) = keep {
+                        b.save_for_good(i);
+                    }
+                    if let Some(s) = select {
+                        b.sel = Some(s);
+                        b.filter.clear();
+                        fetch = true;
+                    }
+                    // --- add row ---
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut b.add_url)
+                                .hint_text("https://data.city.gov · https://data.city.gov/data.json")
+                                .desired_width(300.0),
+                        );
+                        let url = b.add_url.trim().to_string();
+                        let http = url.starts_with("https://") || url.starts_with("http://");
+                        if ui
+                            .add_enabled(http, egui::Button::new("Add catalog"))
+                            .on_hover_text(
+                                "Added for this session; whether it is kept for good \
+                                 is asked once its catalog answers. The portal names \
+                                 itself from the catalog.",
+                            )
+                            .clicked()
+                        {
+                            add_url = Some(url);
+                            b.add_url.clear();
+                        }
+                    });
+                    // --- dataset pane of the selected catalog ---
+                    if b.sel.is_some() {
+                        ui.separator();
+                        if let Some((false, i)) = b.sel
+                            && matches!(b.dcat, Some(Ok(_)))
+                        {
+                            // The ask. Answering "no" costs nothing: a
+                            // session entry simply dies with the app.
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(
+                                        "This catalog is kept for this session only.",
+                                    )
+                                    .weak(),
+                                );
+                                if ui
+                                    .button("Save it for good")
+                                    .on_hover_text(
+                                        "Remember this catalog across sessions, with \
+                                         today as its added-on date",
+                                    )
+                                    .clicked()
+                                {
+                                    b.save_for_good(i);
+                                }
+                            });
+                        }
+                        dcat_pane(ui, b, &mut open_datasets);
+                    }
+                });
+        }
+
+        if let Some(url) = add_url {
+            self.open_portal(&url, ctx);
+        } else if fetch {
+            self.catalog_fetch(ctx);
+        }
         for i in open_datasets {
             self.open_portal_dataset(i, ctx);
         }
         if !open {
-            self.repo_browser = None;
+            // "For the session" means the app run, not the dialog's
+            // lifetime: the session list survives the window closing.
+            let b = self.catalog_browser.take().unwrap();
+            self.session_catalogs = b.session;
         }
     }
 
@@ -10109,36 +10363,10 @@ impl ViewerApp {
     }
 }
 
-/// The add-repository / add-portal row, shared by every repository kind
-/// (a portal browser still has to be able to reach the others).
+/// The add-repository row. Open-data portals are not added here: they
+/// have their own dialog, File → Data catalogs.
 fn add_repo_row(ui: &mut egui::Ui, b: &mut RepoBrowser, refetch: &mut bool) {
     use crate::data::repo::{self, RepoKind};
-    fn added(
-        b: &mut RepoBrowser,
-        refetch: &mut bool,
-        kind: RepoKind,
-        url: String,
-        name: String,
-    ) {
-        b.repos.push(repo::Repository {
-            name,
-            url,
-            kind,
-            // A user-added repository credits itself from its own data,
-            // if at all. A portal's credit comes per dataset, from the
-            // publisher its catalog names.
-            attribution: None,
-            attribution_by_license: Default::default(),
-        });
-        b.add = (String::new(), String::new());
-        b.sel_repo = b.repos.len() - 1;
-        // Any earlier portal still waiting for its catalog gives up its
-        // claim here: the index it holds is about to name someone else.
-        b.unsaved = None;
-        b.snapshots = vec![repo::Snapshot::latest()];
-        b.sel_snapshot = 0;
-        *refetch = true;
-    }
     ui.horizontal(|ui| {
         ui.add(
             egui::TextEdit::singleline(&mut b.add.0)
@@ -10147,7 +10375,7 @@ fn add_repo_row(ui: &mut egui::Ui, b: &mut RepoBrowser, refetch: &mut bool) {
         );
         ui.add(
             egui::TextEdit::singleline(&mut b.add.1)
-                .hint_text("https://repo.example.com · https://data.city.gov/data.json")
+                .hint_text("https://repo.example.com")
                 .desired_width(240.0),
         );
         let url = b.add.1.trim().trim_end_matches('/').to_string();
@@ -10165,34 +10393,27 @@ fn add_repo_row(ui: &mut egui::Ui, b: &mut RepoBrowser, refetch: &mut bool) {
                 Some(base) => (base.to_string(), RepoKind::Stac),
                 None => (url.clone(), RepoKind::Parquetry),
             };
-            let name = b.add.0.trim().to_string();
-            added(b, refetch, kind, url, name);
+            b.repos.push(repo::Repository {
+                name: b.add.0.trim().to_string(),
+                url,
+                kind,
+                // A user-added repository credits itself from its own
+                // data, if at all.
+                attribution: None,
+                attribution_by_license: Default::default(),
+            });
+            b.add = (String::new(), String::new());
+            b.sel_repo = b.repos.len() - 1;
+            b.snapshots = vec![repo::Snapshot::latest()];
+            b.sel_snapshot = 0;
+            *refetch = true;
             if let Err(e) = repo::save_repos(&b.repos) {
                 log::warn!("saving repositories: {e}");
             }
         }
-        if ui
-            .add_enabled(http, egui::Button::new("Add portal"))
-            .on_hover_text(
-                "An open-data portal publishing a DCAT catalog at /data.json — \
-                 ArcGIS Hub, Socrata and CKAN all do. Paste the catalog URL or \
-                 just the site: the portal names itself from its catalog, and it \
-                 is only remembered once that catalog answers.",
-            )
-            .clicked()
-        {
-            let base = url.strip_suffix("/data.json").unwrap_or(&url).to_string();
-            let name = base
-                .trim_start_matches("https://")
-                .trim_start_matches("http://")
-                .to_string();
-            added(b, refetch, RepoKind::Dcat, base, name);
-            b.unsaved = Some(b.sel_repo);
-        }
         if b.repos.len() > 1 && ui.button("Remove current").clicked() {
             b.repos.remove(b.sel_repo);
             b.sel_repo = 0;
-            b.unsaved = None;
             if let Err(e) = repo::save_repos(&b.repos) {
                 log::warn!("saving repositories: {e}");
             }
@@ -10209,7 +10430,7 @@ fn add_repo_row(ui: &mut egui::Ui, b: &mut RepoBrowser, refetch: &mut bool) {
 ///
 /// Flat and full width, unlike the two-pane repository view: a portal
 /// dataset has nothing below it to expand into — the row is the dataset.
-fn dcat_pane(ui: &mut egui::Ui, b: &mut RepoBrowser, open: &mut Vec<usize>) {
+fn dcat_pane(ui: &mut egui::Ui, b: &mut CatalogBrowser, open: &mut Vec<usize>) {
     let cat = match &b.dcat {
         None => {
             ui.horizontal(|ui| {
@@ -11695,6 +11916,7 @@ impl eframe::App for ViewerApp {
         self.update_coastline_detail(&ctx);
         self.poll_picks();
         self.poll_repo();
+        self.poll_catalog();
         self.poll_downloads();
         self.poll_categories();
         self.poll_classes();
@@ -11841,6 +12063,7 @@ impl eframe::App for ViewerApp {
         self.grid_window(&ctx);
         self.url_window(&ctx);
         self.repo_window(&ctx);
+        self.catalog_window(&ctx);
         self.style_window(&ctx);
         self.poll_filters(&ctx);
         self.filter_window(&ctx);

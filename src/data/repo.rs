@@ -50,9 +50,22 @@ pub enum RepoKind {
     /// A static STAC catalog: releases → themes → type collections whose
     /// items are the parquet part files (Overture layout).
     Stac,
-    /// An open-data portal publishing a DCAT-US 1.1 `data.json`: one
-    /// document listing every dataset with its download URLs.
-    Dcat,
+}
+
+/// One saved open-data portal (a DCAT `data.json` publisher). Portals
+/// are not repositories: a repository serves parquet this app reads in
+/// place, a portal lists datasets to fetch — so they live in their own
+/// `catalogs.json`, not among `Repository` entries.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Catalog {
+    /// The catalog's own title, once it has answered; the host until then.
+    pub name: String,
+    /// Base URL, no trailing slash, no `/data.json`.
+    pub url: String,
+    /// Unix seconds the user saved it for good. `None` while the entry
+    /// only lives for the session.
+    #[serde(default)]
+    pub added_on: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -157,16 +170,16 @@ pub fn default_repos() -> Vec<Repository> {
     ]
 }
 
-/// `~/.config/geopq-viewer/repositories.json`. Tests read and write a
+/// `~/.config/geopq-workbench/<name>`. Tests read and write a
 /// per-process temp directory instead — cache tests must never touch (or
 /// depend on) the developer's real config.
-fn config_file() -> Option<PathBuf> {
+fn config_path(name: &str) -> Option<PathBuf> {
     #[cfg(test)]
     {
         return Some(
             std::env::temp_dir()
                 .join(format!("geopq_test_config_{}", std::process::id()))
-                .join("repositories.json"),
+                .join(name),
         );
     }
     #[cfg(not(test))]
@@ -180,27 +193,80 @@ fn config_file() -> Option<PathBuf> {
             if !dir.exists() && old.exists() {
                 let _ = std::fs::rename(&old, &dir);
             }
-            dir.join("repositories.json")
+            dir.join(name)
         })
 }
 
+fn config_file() -> Option<PathBuf> {
+    config_path("repositories.json")
+}
+
 pub fn load_repos() -> Vec<Repository> {
-    let list: Option<Vec<Repository>> = config_file()
+    let list = config_file()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok());
+        .and_then(|s| repos_from_json(&s));
     match list {
         Some(l) if !l.is_empty() => l,
         _ => default_repos(),
     }
 }
 
+/// Entry by entry, not the list at once: one unreadable entry (say a
+/// kind this build no longer knows, like the pre-0.7.1 "Dcat" moved out
+/// to catalogs.json) must drop that entry, not silently reset every
+/// user-added repository to the defaults.
+fn repos_from_json(s: &str) -> Option<Vec<Repository>> {
+    let entries: Vec<Value> = serde_json::from_str(s).ok()?;
+    Some(
+        entries
+            .into_iter()
+            .filter_map(|v| serde_json::from_value(v).ok())
+            .collect(),
+    )
+}
+
 pub fn save_repos(repos: &[Repository]) -> Result<(), String> {
-    let path = config_file().ok_or("no home directory")?;
+    save_config("repositories.json", repos)
+}
+
+/// The saved portals, oldest first. Unlike repositories there are no
+/// defaults to fall back to: an empty list is simply empty.
+pub fn load_catalogs() -> Vec<Catalog> {
+    config_path("catalogs.json")
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_catalogs(catalogs: &[Catalog]) -> Result<(), String> {
+    save_config("catalogs.json", catalogs)
+}
+
+fn save_config<T: Serialize>(name: &str, value: &[T]) -> Result<(), String> {
+    let path = config_path(name).ok_or("no home directory")?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
-    let json = serde_json::to_string_pretty(repos).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
     write_atomic(&path, &json).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// Unix seconds as `2026-08-17`, for the "added on" column. Proleptic
+/// Gregorian, days-from-epoch arithmetic (Howard Hinnant's civil_from_days),
+/// so no date dependency for one label.
+pub fn date_label(unix: u64) -> String {
+    let days = (unix / 86_400) as i64;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// Truncate-then-write can leave an empty or partial file if the process
@@ -2817,6 +2883,52 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    /// Saved catalogs round-trip through their own config file, and an
+    /// entry written before the `added_on` field existed still loads.
+    fn catalogs_persist_with_their_added_date() {
+        let saved = vec![
+            Catalog {
+                name: "City of Sacramento".into(),
+                url: "https://data.cityofsacramento.org".into(),
+                added_on: Some(1_776_297_600),
+            },
+            Catalog { name: "data.gov".into(), url: "https://data.gov".into(), added_on: None },
+        ];
+        save_catalogs(&saved).unwrap();
+        let back = load_catalogs();
+        assert_eq!(back, saved);
+
+        let old: Vec<Catalog> =
+            serde_json::from_str(r#"[{"name": "n", "url": "https://u.example"}]"#).unwrap();
+        assert_eq!(old[0].added_on, None);
+    }
+
+    #[test]
+    /// A repositories.json holding an entry this build cannot read (the
+    /// pre-0.7.1 "Dcat" kind, moved out to catalogs.json) loses that
+    /// entry alone — never the user's other repositories.
+    fn an_unknown_repository_kind_drops_the_entry_not_the_config() {
+        let mixed = r#"[
+            {"name": "Mine", "url": "https://repo.example", "kind": "Parquetry"},
+            {"name": "A portal", "url": "https://p.example", "kind": "Dcat"}
+        ]"#;
+        let back = repos_from_json(mixed).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].name, "Mine");
+        // A file that is not a list at all still falls through to the
+        // defaults, rather than becoming an empty repository list.
+        assert!(repos_from_json("not json").is_none());
+    }
+
+    #[test]
+    fn a_date_label_is_the_civil_date_of_the_unix_second() {
+        assert_eq!(date_label(0), "1970-01-01");
+        assert_eq!(date_label(951_782_400), "2000-02-29");
+        // 2026-08-17 12:00:00 UTC: the time of day is dropped, not rounded.
+        assert_eq!(date_label(1_786_968_000), "2026-08-17");
     }
 
     /// Live portal probe, opt-in:
