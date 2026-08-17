@@ -171,6 +171,12 @@ struct OptimizeState {
     /// Publish a STAC `collection.json` beside the data, as the
     /// distributing-geoparquet best practices recommend.
     stac: bool,
+    /// Overwrite a dataset already published at the destination prefix.
+    /// A partitioned publish that finds a foreign `collection.json`
+    /// there refuses unless this is ticked: that prefix is somebody's
+    /// dataset, and a wrong prefix is likelier than an intended replace.
+    /// (Single-file publishes never need it — they merge instead.)
+    replace_remote: bool,
     /// Finished as-is publish: destination and bytes uploaded.
     report_as_is: Option<(S3Dest, u64)>,
 }
@@ -182,6 +188,34 @@ struct S3Dest {
     uri: String,
     profile: Option<String>,
     endpoint: Option<String>,
+}
+
+/// Upload `local` (our freshly written collection.json) to the sibling
+/// key of `data_uri`, merging it into whatever collection is already
+/// published there — publishing a file into a prefix that has one means
+/// adding a part to that dataset, not replacing it. Fetch trouble other
+/// than a clean 404 aborts: not being able to look must never turn into
+/// a blind overwrite.
+fn upload_collection_merged(
+    local: &std::path::Path,
+    data_uri: &str,
+    profile: Option<&str>,
+    endpoint: Option<&str>,
+) -> Result<(), String> {
+    use crate::data::{source::aws, stac};
+    let sibling = stac::sibling_uri(data_uri).ok_or("no prefix for collection.json")?;
+    let existing = aws::fetch_small(&sibling, profile, endpoint)
+        .map_err(|e| format!("cannot check for an existing collection.json: {e}"))?;
+    if let Some(text) = existing {
+        let ours: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(local).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        let merged = crate::data::stac::merge_into(&text, &ours)?;
+        let pretty = serde_json::to_string_pretty(&merged).map_err(|e| e.to_string())?;
+        std::fs::write(local, pretty).map_err(|e| e.to_string())?;
+    }
+    aws::upload_file(local, &sibling, profile, endpoint, &|_, _| {})
+        .map_err(|e| format!("collection.json upload failed: {e}"))
 }
 
 pub struct ViewerApp {
@@ -4263,6 +4297,7 @@ impl ViewerApp {
                         recommended,
                         dest_s3: false,
                         stac: true,
+                        replace_remote: false,
                         s3_uri: String::new(),
                         s3_endpoint: String::new(),
                         s3_profile: None,
@@ -7273,20 +7308,17 @@ impl ViewerApp {
             // beside the user's source file), uploaded after the data.
             let publish_stac = || -> Result<(), String> {
                 let Some((crs, title)) = &stac else { return Ok(()) };
-                let sibling = crate::data::stac::sibling_uri(&dest.uri)
-                    .ok_or("no prefix for collection.json")?;
                 let json = std::env::temp_dir()
                     .join(format!("geopq_stac_{}.json", std::process::id()));
                 crate::data::stac::write_for_file_at(&src_path, &json, title, crs)?;
-                let r = crate::data::source::aws::upload_file(
+                let r = upload_collection_merged(
                     &json,
-                    &sibling,
+                    &dest.uri,
                     dest.profile.as_deref(),
                     dest.endpoint.as_deref(),
-                    &|_, _| {},
                 );
                 let _ = std::fs::remove_file(&json);
-                r.map_err(|e| format!("data uploaded, but collection.json failed: {e}"))
+                r.map_err(|e| format!("data uploaded, but {e}"))
             };
             let msg = match crate::data::source::aws::upload_file(
                 &src_path,
@@ -7357,6 +7389,7 @@ impl ViewerApp {
         // STAC sidecar for publishes: needs the CRS (extent goes to
         // WGS84) and a human title.
         let stac = (o.dest_s3 && o.stac).then(|| (o.crs.clone(), o.layer_name.clone()));
+        let replace_remote = o.replace_remote;
         let admin: Option<AdminJoinSpec> = admin_sel
             .0
             .and_then(|id| self.layers.iter().find(|l| l.id == id))
@@ -7468,6 +7501,33 @@ impl ViewerApp {
                         };
                         let uploaded = stac_json.and_then(|stac_json| {
                             if dst.is_dir() {
+                                // A dataset tree replaces the prefix
+                                // wholesale, so a collection already
+                                // published there is a decision, not a
+                                // merge: likelier a wrong prefix than an
+                                // intended replace.
+                                let sibling = format!(
+                                    "{}/collection.json",
+                                    d.uri.trim_end_matches('/')
+                                );
+                                if !replace_remote
+                                    && aws::fetch_small(
+                                        &sibling,
+                                        d.profile.as_deref(),
+                                        d.endpoint.as_deref(),
+                                    )
+                                    .map_err(|e| {
+                                        format!("cannot check the destination: {e}")
+                                    })?
+                                    .is_some()
+                                {
+                                    return Err(format!(
+                                        "{sibling} already exists — the destination \
+                                         publishes a dataset. Tick \"Replace the \
+                                         dataset at the destination\" to overwrite \
+                                         it, or publish to another prefix."
+                                    ));
+                                }
                                 // collection.json sits inside: one tree upload.
                                 aws::upload_tree(
                                     &dst,
@@ -7490,19 +7550,14 @@ impl ViewerApp {
                                     &|s, t| up(s, t, &name),
                                 )?;
                                 if let Some(json) = &stac_json {
-                                    let sibling = crate::data::stac::sibling_uri(&d.uri)
-                                        .ok_or("no prefix for collection.json")?;
                                     progress(1.0, "uploading collection.json");
-                                    aws::upload_file(
+                                    upload_collection_merged(
                                         json,
-                                        &sibling,
+                                        &d.uri,
                                         d.profile.as_deref(),
                                         d.endpoint.as_deref(),
-                                        &|_, _| {},
                                     )
-                                    .map_err(|e| {
-                                        format!("data uploaded, but collection.json failed: {e}")
-                                    })?;
+                                    .map_err(|e| format!("data uploaded, but {e}"))?;
                                     let _ = std::fs::remove_file(json);
                                 }
                                 Ok(())
@@ -8201,8 +8256,22 @@ impl ViewerApp {
                                  STAC Collection uploaded beside it, with the \
                                  extent read from the parquet footers. The \
                                  distributing-geoparquet best practices \
-                                 recommend one for any published dataset.",
+                                 recommend one for any published dataset. \
+                                 Publishing a file where a collection already \
+                                 exists adds it to that collection.",
                             );
+                        ui.checkbox(
+                            &mut o.replace_remote,
+                            "Replace the dataset at the destination",
+                        )
+                        .on_hover_text(
+                            "A partitioned publish that finds a collection.json \
+                             already at the destination prefix refuses unless \
+                             this is ticked: that prefix is somebody's dataset, \
+                             and a wrong prefix is likelier than an intended \
+                             replace. Single-file publishes never need it — \
+                             they merge into the existing collection instead.",
+                        );
                         if let Source::Local(p) = &o.src {
                             let mut reasons: Vec<&str> = Vec::new();
                             if !o.merge_with.is_empty() {
@@ -9586,6 +9655,7 @@ impl ViewerApp {
                         recommended,
                         dest_s3: false,
                         stac: true,
+                        replace_remote: false,
                         s3_uri: String::new(),
                         s3_endpoint: String::new(),
                         s3_profile: None,

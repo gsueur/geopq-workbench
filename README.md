@@ -178,6 +178,10 @@ prunes it against the current view. Publishing writes that document
 itself, so anything this workbench uploads reopens from its https URL;
 third-party collections following the same convention open the same
 way, and a `collection.json` URL can also be pasted directly.
+Publishing a file into a prefix that already has a collection merges
+into it — an added part, not a replaced dataset — while a partitioned
+publish that finds one refuses unless told to replace, since a wrong
+prefix is likelier than an intended overwrite.
 
 Open-data portals have their own dialog, File → Data catalogs, and are
 the cheapest catalogs to reach: nearly all of them publish a DCAT

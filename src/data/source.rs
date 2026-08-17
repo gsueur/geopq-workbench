@@ -702,6 +702,32 @@ pub mod aws {
         Ok(out)
     }
 
+    /// GET one small object as text; Ok(None) when the key does not
+    /// exist. For the pre-publish look at a destination's
+    /// `collection.json` — any answer other than the document or a clean
+    /// 404 is an error, because "could not check" must never read as
+    /// "nothing there" when overwriting is what hangs on it.
+    pub fn fetch_small(
+        uri: &str,
+        profile: Option<&str>,
+        endpoint: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let url = presign(uri, profile, endpoint)?;
+        let res = super::http_agent()
+            .get(&url)
+            .call()
+            .map_err(|e| super::redact_presign(&format!("cannot reach {uri}: {e}")))?;
+        match res.status().as_u16() {
+            200 => res
+                .into_body()
+                .read_to_string()
+                .map(Some)
+                .map_err(|e| format!("read {uri}: {e}")),
+            404 => Ok(None),
+            s => Err(format!("{uri}: HTTP {s}")),
+        }
+    }
+
     /// Multipart part size, and the single-PUT threshold. S3's minimum
     /// part is 5 MB; 64 MB keeps a 5 GB file under 80 parts.
     const UPLOAD_PART_SIZE: usize = 64 * 1024 * 1024;

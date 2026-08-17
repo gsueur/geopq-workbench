@@ -231,6 +231,65 @@ fn write_doc(out: &Path, title: &str, files: &[(String, PathBuf)], crs: &Crs) ->
     std::fs::write(out, text).map_err(|e| format!("write {}: {e}", out.display()))
 }
 
+/// Merge our just-built collection into the one already published at
+/// the destination: publishing a file into a prefix that has a
+/// collection means adding a part to that dataset, not replacing it.
+///
+/// The existing document keeps its identity — id, title, description,
+/// license, links — while our assets upsert by key and the spatial
+/// extent becomes the union. Anything that is not a STAC Collection
+/// with assets is refused: the sidecar found there is someone's file,
+/// and overwriting a stranger's document is exactly what this exists
+/// to stop.
+pub fn merge_into(existing: &str, ours: &Value) -> Result<Value, String> {
+    let mut base: Value = serde_json::from_str(existing).map_err(|_| {
+        "the destination's collection.json is not JSON — not overwriting it".to_string()
+    })?;
+    if base.get("type").and_then(Value::as_str) != Some("Collection")
+        || !base.get("assets").is_some_and(Value::is_object)
+    {
+        return Err(
+            "the destination's collection.json is not a STAC Collection with assets — \
+             not overwriting it"
+                .into(),
+        );
+    }
+    let bbox_of = |v: &Value| -> Option<[f64; 4]> {
+        let b = v.pointer("/extent/spatial/bbox/0")?.as_array()?;
+        let mut out = [0f64; 4];
+        for (i, x) in b.iter().take(4).enumerate() {
+            out[i] = x.as_f64()?;
+        }
+        (b.len() >= 4).then_some(out)
+    };
+    let union = match (bbox_of(&base), bbox_of(ours)) {
+        (Some(a), Some(b)) => {
+            Some([a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])])
+        }
+        (a, b) => a.or(b),
+    };
+    match (union, base.pointer_mut("/extent/spatial/bbox/0")) {
+        (Some(u), Some(slot)) => *slot = json!(u),
+        (Some(_), None) => {
+            // The existing document has no extent to widen: take ours
+            // wholesale rather than leaving the merged set undescribed.
+            if let Some(e) = ours.get("extent") {
+                base["extent"] = e.clone();
+            }
+        }
+        _ => {}
+    }
+    if let (Some(dst), Some(src)) = (
+        base.get_mut("assets").and_then(Value::as_object_mut),
+        ours.get("assets").and_then(Value::as_object),
+    ) {
+        for (k, v) in src {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
+    Ok(base)
+}
+
 /// The sibling `collection.json` object key of an `s3://…/file.parquet`
 /// upload uri. None when the uri has no parent path to hang it on.
 pub fn sibling_uri(uri: &str) -> Option<String> {
@@ -354,5 +413,91 @@ mod tests {
             Some("s3://bucket/collection.json")
         );
         assert_eq!(sibling_uri("s3://bucket/"), None);
+    }
+
+    #[test]
+    /// Publishing a file into a prefix that already has a collection
+    /// adds a part to that dataset: assets upsert by key, the extent
+    /// widens to the union, and the existing document keeps its
+    /// identity. Publishing the same href again replaces that asset.
+    fn a_second_publish_merges_into_the_existing_collection() {
+        let existing = json!({
+            "type": "Collection",
+            "stac_version": "1.1.0",
+            "id": "parcels",
+            "title": "Parcels",
+            "license": "CC-BY-4.0",
+            "extent": {
+                "spatial": {"bbox": [[-2.0, 46.0, 0.0, 47.0]]},
+                "temporal": {"interval": [[null, null]]},
+            },
+            "links": [],
+            "assets": {
+                "parcels.parquet": {"href": "./parcels.parquet", "rows": 10},
+            },
+        })
+        .to_string();
+        let ours = json!({
+            "type": "Collection",
+            "id": "roads",
+            "title": "Roads",
+            "extent": {"spatial": {"bbox": [[1.0, 45.0, 3.0, 46.5]]}},
+            "assets": {
+                "roads.parquet": {"href": "./roads.parquet", "rows": 3},
+            },
+        });
+        let merged = merge_into(&existing, &ours).unwrap();
+        assert_eq!(merged["title"], "Parcels", "their identity survives");
+        assert_eq!(merged["license"], "CC-BY-4.0");
+        assert_eq!(merged["assets"].as_object().unwrap().len(), 2);
+        assert_eq!(merged["assets"]["roads.parquet"]["rows"], 3);
+        assert_eq!(
+            merged["extent"]["spatial"]["bbox"][0],
+            json!([-2.0, 45.0, 3.0, 47.0]),
+            "the union of both extents",
+        );
+
+        // Same href again: the asset is replaced, nothing duplicates.
+        let again = json!({
+            "type": "Collection",
+            "extent": {"spatial": {"bbox": [[1.0, 45.0, 3.0, 46.5]]}},
+            "assets": {
+                "roads.parquet": {"href": "./roads.parquet", "rows": 5},
+            },
+        });
+        let twice = merge_into(&serde_json::to_string(&merged).unwrap(), &again).unwrap();
+        assert_eq!(twice["assets"].as_object().unwrap().len(), 2);
+        assert_eq!(twice["assets"]["roads.parquet"]["rows"], 5);
+    }
+
+    #[test]
+    /// A document that is not a STAC Collection is somebody's file, and
+    /// the merge refuses to replace it rather than guessing.
+    fn a_foreign_collection_json_is_not_overwritten() {
+        let ours = json!({"type": "Collection", "assets": {}});
+        for foreign in [
+            "not json at all",
+            r#"{"hello": "world"}"#,
+            r#"{"type": "Feature", "assets": {}}"#,
+            r#"{"type": "Collection", "assets": "not an object"}"#,
+        ] {
+            let err = merge_into(foreign, &ours).unwrap_err();
+            assert!(err.contains("not overwriting"), "{foreign}: {err}");
+        }
+    }
+
+    #[test]
+    /// An existing collection with no spatial extent takes ours rather
+    /// than leaving the merged dataset undescribed.
+    fn a_merge_supplies_the_extent_the_existing_document_lacks() {
+        let existing = json!({"type": "Collection", "assets": {}}).to_string();
+        let ours = json!({
+            "type": "Collection",
+            "extent": {"spatial": {"bbox": [[1.0, 45.0, 3.0, 46.5]]}},
+            "assets": {"a.parquet": {"href": "./a.parquet"}},
+        });
+        let merged = merge_into(&existing, &ours).unwrap();
+        assert_eq!(merged["extent"]["spatial"]["bbox"][0], json!([1.0, 45.0, 3.0, 46.5]));
+        assert_eq!(merged["assets"].as_object().unwrap().len(), 1);
     }
 }
