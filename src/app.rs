@@ -5447,6 +5447,12 @@ impl ViewerApp {
                 .id(egui::Id::new("catalog_browser"))
                 .open(&mut open)
                 .default_width(560.0)
+                // Bounded, not auto-sized: with fifteen catalogs above a
+                // dataset list, auto-height runs past the screen and the
+                // Open button ends up under the window border. Bounding
+                // the window is what makes the panes' available_height
+                // real, so they can share what actually fits.
+                .max_height((floating_area.height() - 24.0).max(240.0))
                 .constrain_to(floating_area)
                 .show(ctx, |ui| {
                     if b.saved.is_empty() && b.session.is_empty() {
@@ -5464,6 +5470,12 @@ impl ViewerApp {
                     let mut select: Option<(bool, usize)> = None;
                     let mut forget: Option<(bool, usize)> = None; // (saved list?, index)
                     let mut keep: Option<usize> = None; // session index
+                    // The catalog rows scroll in their own strip so a
+                    // long list leaves the dataset pane its share.
+                    egui::ScrollArea::vertical()
+                        .id_salt("catalog_rows")
+                        .max_height(if b.sel.is_some() { 160.0 } else { 400.0 })
+                        .show(ui, |ui| {
                     for (i, c) in b.saved.iter().enumerate() {
                         ui.horizontal(|ui| {
                             let on = b.sel == Some((true, i));
@@ -5525,6 +5537,7 @@ impl ViewerApp {
                             );
                         });
                     }
+                    });
                     if let Some((in_saved, i)) = forget {
                         if in_saved {
                             b.saved.remove(i);
@@ -10576,9 +10589,12 @@ fn dcat_pane(ui: &mut egui::Ui, b: &mut CatalogBrowser, open: &mut Vec<usize>) {
         text && geo
     };
     let mut shown = 0usize;
+    // Whatever height is left, minus room for the Open row and the
+    // hidden-count line below: they must never slip under the border.
+    let list_height = (ui.available_height() - 84.0).clamp(140.0, 340.0);
     egui::ScrollArea::vertical()
         .id_salt("dcat_datasets")
-        .max_height(340.0)
+        .max_height(list_height)
         .show(ui, |ui| {
             for (i, d) in cat.datasets.iter().enumerate() {
                 if !matches(d) {
