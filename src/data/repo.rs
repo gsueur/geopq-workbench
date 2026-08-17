@@ -229,13 +229,49 @@ pub fn save_repos(repos: &[Repository]) -> Result<(), String> {
     save_config("repositories.json", repos)
 }
 
-/// The saved portals, oldest first. Unlike repositories there are no
-/// defaults to fall back to: an empty list is simply empty.
+/// Built-in portals: the major US cities whose DCAT catalog was probed
+/// and found rich in openable datasets (2026-08). No `added_on`: these
+/// were not added by the user, and the dialog labels them built-in.
+/// Like `default_repos`, they seed the saved list and become the user's
+/// own on first save — removing one removes it for good.
+///
+/// Deliberately absent: San Diego (no DCAT feed found) and Atlanta
+/// (its hub serves a mismatched TLS certificate).
+pub fn default_catalogs() -> Vec<Catalog> {
+    let c = |name: &str, url: &str| Catalog {
+        name: name.into(),
+        url: url.into(),
+        added_on: None,
+    };
+    vec![
+        c("New York City Open Data", "https://data.cityofnewyork.us"),
+        c("Los Angeles GeoHub", "https://geohub.lacity.org"),
+        c("Chicago Data Portal", "https://data.cityofchicago.org"),
+        c("Houston Open Data", "https://houston-mycity.opendata.arcgis.com"),
+        c("Phoenix Open Data", "https://www.phoenixopendata.com"),
+        c("OpenDataPhilly", "https://opendataphilly.org"),
+        c("San Antonio Open Data", "https://data.sanantonio.gov"),
+        c("Dallas Open Data", "https://www.dallasopendata.com"),
+        c("Austin Open Data", "https://data.austintexas.gov"),
+        c("DataSF (San Francisco)", "https://data.sfgov.org"),
+        c("Seattle Open Data", "https://data.seattle.gov"),
+        c("Denver Geospatial Open Data", "https://opendata-geospatialdenver.hub.arcgis.com"),
+        c("Open Data DC", "https://opendata.dc.gov"),
+        c("Analyze Boston", "https://data.boston.gov"),
+        c("City of Sacramento Open Data", "https://data.cityofsacramento.org"),
+    ]
+}
+
+/// The saved portals, oldest first; the built-in city list until the
+/// user has saved a list of their own.
 pub fn load_catalogs() -> Vec<Catalog> {
-    config_path("catalogs.json")
+    let list: Option<Vec<Catalog>> = config_path("catalogs.json")
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    match list {
+        Some(l) if !l.is_empty() => l,
+        _ => default_catalogs(),
+    }
 }
 
 pub fn save_catalogs(catalogs: &[Catalog]) -> Result<(), String> {
@@ -2956,6 +2992,48 @@ mod tests {
         assert!(cat.datasets.iter().all(|d| d.publisher.is_some()));
         // Every entry the browser lists must be openable by something.
         assert!(cat.datasets.iter().all(|d| !d.distributions.is_empty()));
+    }
+
+    #[test]
+    /// The built-in city list is well-formed: https URLs with no
+    /// trailing slash and no `/data.json` (the probe appends it), no
+    /// duplicates, and no `added_on` — the dialog shows them as
+    /// built-in, not as dated additions.
+    fn default_catalogs_are_well_formed() {
+        let defaults = default_catalogs();
+        assert!(defaults.len() >= 10);
+        let mut urls = std::collections::HashSet::new();
+        for c in &defaults {
+            assert!(!c.name.trim().is_empty());
+            assert!(c.url.starts_with("https://"), "{}", c.url);
+            assert!(!c.url.ends_with('/'), "{}", c.url);
+            assert!(!c.url.ends_with("/data.json"), "{}", c.url);
+            assert!(c.added_on.is_none(), "{}", c.url);
+            assert!(urls.insert(&c.url), "duplicate {}", c.url);
+        }
+    }
+
+    /// Live probe of every built-in catalog, opt-in:
+    /// cargo test --release default_catalogs_live -- --ignored --nocapture
+    ///
+    /// Run it when touching the list: a portal that moved or emptied
+    /// should be dropped, not shipped.
+    #[test]
+    #[ignore = "hits the network: every built-in open-data portal"]
+    fn default_catalogs_live() {
+        let mut failures = Vec::new();
+        for c in default_catalogs() {
+            match fetch_dcat(&c.url) {
+                Ok(cat) => {
+                    eprintln!("{}: {} openable, {} hidden", c.name, cat.datasets.len(), cat.hidden);
+                    if cat.datasets.is_empty() {
+                        failures.push(format!("{}: nothing openable", c.name));
+                    }
+                }
+                Err(e) => failures.push(format!("{}: {e}", c.name)),
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     /// Live repository probe, opt-in:

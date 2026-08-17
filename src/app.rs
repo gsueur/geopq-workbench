@@ -5472,16 +5472,11 @@ impl ViewerApp {
                                     {
                                         forget = Some((true, i));
                                     }
-                                    if let Some(at) = c.added_on {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "added {}",
-                                                repo::date_label(at)
-                                            ))
-                                            .weak()
-                                            .small(),
-                                        );
-                                    }
+                                    let when = match c.added_on {
+                                        Some(at) => format!("added {}", repo::date_label(at)),
+                                        None => "built-in".into(),
+                                    };
+                                    ui.label(RichText::new(when).weak().small());
                                 },
                             );
                         });

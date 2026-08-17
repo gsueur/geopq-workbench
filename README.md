@@ -181,10 +181,12 @@ way, and a `collection.json` URL can also be pasted directly.
 
 Open-data portals have their own dialog, File → Data catalogs, and are
 the cheapest catalogs to reach: nearly all of them publish a DCAT
-`data.json` at their root, so pasting the site URL is enough. A pasted
-portal lives for the session; once its catalog answers, one click saves
-it for good, and the dialog lists the saved ones with the date each was
-added. The browser lists only the datasets it can actually open and
+`data.json` at their root, so pasting the site URL is enough. The
+dialog comes preloaded with the major US city portals — New York,
+Los Angeles, Chicago, Houston and eleven more, each verified to serve
+openable datasets. A pasted portal lives for the session; once its
+catalog answers, one click saves it for good, and the dialog lists the
+saved ones with the date each was added. The browser lists only the datasets it can actually open and
 says how many it left out, and a click takes the best format the
 dataset offers — GeoParquet read in place, otherwise GeoPackage,
 GeoJSON or CSV, downloaded into `~/.config/geopq-workbench/portals/`
