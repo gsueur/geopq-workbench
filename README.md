@@ -60,8 +60,9 @@ so it doubles as a hands-on guide to GeoParquet best practices.
   choice per dataset, ~30 official national grids, data-driven styling
   with six ramps, seven classification methods and an interactive
   legend, basemaps.
-- **Grid summaries**: aggregate any numeric column onto square, H3 or A5
-  cells with proper areal apportionment, smooth it, run focal operators
+- **Grid summaries**: aggregate any column onto square, H3 or A5
+  cells with proper areal apportionment — numeric statistics, or the
+  majority/minority category of a text column — smooth it, run focal operators
   (std, open/close, hillshade) over it, and get the cells or contour
   lines back as a new GeoParquet layer. 2.56M parcels to a 1 km grid in
   ~0.7 s.
@@ -424,7 +425,7 @@ a regular layer (whole result or checked rows).
 
 ## Summarizing onto a grid
 
-Layer ⋮ → **Grid summary…** aggregates a numeric column onto a regular
+Layer ⋮ → **Grid summary…** aggregates a column onto a regular
 cell system and writes the result as a new GeoParquet layer, ready to
 style, query or export like any other. Useful when the geometry gets in
 the way of the pattern: parcels, buildings and admin units come in wildly
@@ -443,6 +444,13 @@ different sizes, and a choropleth of them mostly maps polygon size.
   one to reach for on mixed-size polygons: the apportionment weights
   cancel out in mean and median, so under those a giant parcel still
   paints its own value across every cell it touches.
+- **Text columns** take **majority** and **minority**: each cell gets
+  the category that dominates it (or the rarest one present) — which
+  species rules each block of a street-tree inventory, which land use
+  each hectare. Points count 1 apiece, polygons their covered-area
+  share; the cell value is the text itself, so the output layer styles
+  by category. The numeric-surface tools (smoothing, focal, contours)
+  don't apply and say so.
 - **Smoothing**: any number of passes of a 3×3 box or Gaussian kernel
   (ring mean on H3/A5). Each pass averages present neighbors only, so
   nothing bleeds past the edge of the data.

@@ -956,8 +956,11 @@ fn fetch_pick_attrs(
 struct GridState {
     layer_id: u64,
     layer_name: String,
-    /// Numeric columns of the source layer.
+    /// Aggregable columns of the source layer, numeric and text alike.
     columns: Vec<String>,
+    /// The text ones among them: they take majority/minority and turn
+    /// the numeric-surface controls off.
+    text_cols: std::collections::HashSet<String>,
     column: String,
     /// 0 = square grid, 1 = H3, 2 = A5.
     system: usize,
@@ -5701,20 +5704,29 @@ impl ViewerApp {
 
     fn open_grid_dialog(&mut self, layer_id: u64) {
         let Some(l) = self.layers.iter().find(|l| l.id == layer_id) else { return };
-        let columns: Vec<String> = Self::style_columns(&l.store)
-            .into_iter()
-            .filter(|(_, numeric)| *numeric)
-            .map(|(n, _)| n)
+        let all = Self::style_columns(&l.store);
+        let text_cols: std::collections::HashSet<String> = all
+            .iter()
+            .filter(|(_, numeric)| !numeric)
+            .map(|(n, _)| n.clone())
             .collect();
+        let columns: Vec<String> = all.into_iter().map(|(n, _)| n).collect();
         if columns.is_empty() {
-            self.push_error(format!("{}: no numeric columns to aggregate", l.name));
+            self.push_error(format!("{}: no columns to aggregate", l.name));
             return;
         }
-        let column = columns[0].clone();
+        // A numeric column first when there is one: the numeric
+        // statistics are the common case.
+        let column = columns
+            .iter()
+            .find(|c| !text_cols.contains(*c))
+            .unwrap_or(&columns[0])
+            .clone();
         self.grid_dialog = Some(GridState {
             layer_id,
             layer_name: l.name.clone(),
             columns,
+            text_cols,
             column,
             system: 0,
             size: 1000.0,
@@ -5808,14 +5820,55 @@ impl ViewerApp {
                             .selected_text(&st.column)
                             .show_ui(ui, |ui| {
                                 for c in &st.columns {
-                                    ui.selectable_value(&mut st.column, c.clone(), c);
+                                    let label = if st.text_cols.contains(c) {
+                                        format!("{c} (text)")
+                                    } else {
+                                        c.clone()
+                                    };
+                                    ui.selectable_value(&mut st.column, c.clone(), label);
                                 }
                             });
+                        // A text column takes the categorical statistics
+                        // and nothing numeric; switching back restores a
+                        // numeric default. The surface controls below
+                        // (smoothing, focal, contours) have no meaning
+                        // over categories and are cleared with it.
+                        let is_text = st.text_cols.contains(&st.column);
+                        if is_text && !st.stat.text() {
+                            st.stat = GridStat::Majority;
+                            st.passes = 0;
+                            st.post = 0;
+                            st.contours = false;
+                        } else if !is_text && st.stat.text() {
+                            st.stat = GridStat::Mean;
+                        }
                         ui.label("statistic:");
                         egui::ComboBox::from_id_salt("grid_stat")
                             .width(90.0)
                             .selected_text(st.stat.label())
                             .show_ui(ui, |ui| {
+                                if is_text {
+                                    ui.selectable_value(
+                                        &mut st.stat,
+                                        GridStat::Majority,
+                                        "majority",
+                                    )
+                                    .on_hover_text(
+                                        "The value that dominates the cell — points \
+                                         count 1 apiece, polygons their covered-area \
+                                         share",
+                                    );
+                                    ui.selectable_value(
+                                        &mut st.stat,
+                                        GridStat::Minority,
+                                        "minority",
+                                    )
+                                    .on_hover_text(
+                                        "The rarest value present in the cell — the \
+                                         one oak in the pine stand",
+                                    );
+                                    return;
+                                }
                                 ui.label(
                                     RichText::new("rates (per-m² prices, years, ratios)")
                                         .weak()
@@ -5835,13 +5888,17 @@ impl ViewerApp {
                                 }
                             })
                             .response
-                            .on_hover_text(
+                            .on_hover_text(if is_text {
+                                "A text column: each cell gets its majority (or \
+                                 minority) value, and the layer styles by category"
+                            } else {
                                 "Pick by column type: totals grow with polygon size \
                                  (use sum / count / density — a giant polygon's mean \
                                  equals its full value in every covered cell); rates \
-                                 don't (use mean / median)",
-                            );
+                                 don't (use mean / median)"
+                            });
                     });
+                    let is_text = st.text_cols.contains(&st.column);
                     ui.horizontal(|ui| {
                         ui.label("cells:");
                         ui.selectable_value(&mut st.system, 0, "square");
@@ -5884,6 +5941,7 @@ impl ViewerApp {
                             }
                         }
                     });
+                    ui.add_enabled_ui(!is_text, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("smoothing:");
                         ui.add(egui::DragValue::new(&mut st.passes).range(0..=5))
@@ -6005,6 +6063,7 @@ impl ViewerApp {
                                     );
                                 });
                         }
+                    });
                     });
                     ui.label(
                         RichText::new(

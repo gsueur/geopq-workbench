@@ -1,7 +1,9 @@
-//! Grid summary: aggregate a numeric column into cells — square grid in
+//! Grid summary: aggregate a column into cells — square grid in
 //! data-CRS units, H3, or A5 — with optional kernel smoothing, and
 //! materialize the result as a GeoParquet layer (which then inherits
 //! styling, classification, export and publish like any other layer).
+//! Numeric columns take the numeric statistics; a text column takes
+//! majority/minority, and the cell value is the winning category.
 //!
 //! Cell assignment is area-apportioned: features contained in one cell
 //! (the vast majority — a pure columnar scan when the file carries a
@@ -46,6 +48,15 @@ pub enum GridStat {
     /// value in every cell it covers (the weights cancel), while its
     /// density spreads honestly.
     Density,
+    /// The value with the largest weight in the cell — for a text
+    /// column (species, land use, owner): each cell gets the category
+    /// that dominates it. Point features count 1 apiece; polygons count
+    /// their covered-area share, so a big parcel's category carries the
+    /// cells it actually covers. The output column is text.
+    Majority,
+    /// The rarest value present in the cell — where the odd one out is
+    /// the question (the one oak in a pine stand).
+    Minority,
 }
 
 impl GridStat {
@@ -56,7 +67,16 @@ impl GridStat {
             GridStat::Sum => "sum",
             GridStat::Count => "count",
             GridStat::Density => "density",
+            GridStat::Majority => "majority",
+            GridStat::Minority => "minority",
         }
+    }
+
+    /// Whether this statistic reads the column as text and produces a
+    /// text cell value (which no smoothing, contour or focal operation
+    /// can apply to).
+    pub fn text(&self) -> bool {
+        matches!(self, GridStat::Majority | GridStat::Minority)
     }
 }
 
@@ -161,6 +181,9 @@ struct Acc {
     wsum: f64,
     /// (value, weight) pairs, kept only for the median.
     vals: Option<Vec<(f64, f64)>>,
+    /// Σ w per interned code, kept only for majority/minority — the
+    /// value then travels as a dictionary code cast to f64.
+    cats: Option<HashMap<u32, f64>>,
 }
 
 impl Acc {
@@ -170,6 +193,9 @@ impl Acc {
         if let Some(vals) = &mut self.vals {
             vals.push((v, w));
         }
+        if let Some(cats) = &mut self.cats {
+            *cats.entry(v as u32).or_insert(0.0) += w;
+        }
     }
 
     fn stat(&mut self, stat: GridStat) -> f64 {
@@ -177,6 +203,28 @@ impl Acc {
             GridStat::Mean => self.sum / self.wsum.max(f64::EPSILON),
             GridStat::Sum | GridStat::Density => self.sum,
             GridStat::Count => self.wsum,
+            // Ties break toward the smaller code (first value seen in
+            // the scan), so two runs draw the same map.
+            GridStat::Majority => self
+                .cats
+                .as_ref()
+                .expect("majority keeps counts")
+                .iter()
+                .max_by(|(ka, wa), (kb, wb)| {
+                    wa.partial_cmp(wb).unwrap().then(kb.cmp(ka))
+                })
+                .map(|(k, _)| *k as f64)
+                .unwrap_or(f64::NAN),
+            GridStat::Minority => self
+                .cats
+                .as_ref()
+                .expect("minority keeps counts")
+                .iter()
+                .min_by(|(ka, wa), (kb, wb)| {
+                    wa.partial_cmp(wb).unwrap().then(ka.cmp(kb))
+                })
+                .map(|(k, _)| *k as f64)
+                .unwrap_or(f64::NAN),
             GridStat::Median => {
                 // Weighted median: value where the cumulative weight
                 // crosses half the total.
@@ -208,6 +256,21 @@ pub fn compute(
 ) -> Result<(usize, u64), String> {
     let wgs84 = Crs::wgs84();
     let geographic = !matches!(spec.system, CellSystem::Square { .. });
+    let text = spec.stat.text();
+    if text
+        && (spec.smooth_passes > 0
+            || spec.post != PostOp::None
+            || matches!(spec.output, GridOutput::Contours { .. }))
+    {
+        return Err(format!(
+            "{} produces a category per cell, which has no numeric surface \
+             to smooth, contour or filter",
+            spec.stat.label(),
+        ));
+    }
+    // Dictionary for text statistics: the value travels through the
+    // pipeline as its code, and turns back into the string at the end.
+    let mut dict: Vec<String> = Vec::new();
 
     // ---- pass 1: bbox + value per row -------------------------------
     // Features whose bbox fits in one cell assign wholly (weight 1) with
@@ -217,6 +280,7 @@ pub fn compute(
         sum: 0.0,
         wsum: 0.0,
         vals: keep_vals.then(Vec::new),
+        cats: text.then(HashMap::new),
     };
     let mut sq: HashMap<(i64, i64), Acc> = HashMap::new();
     let mut geo: HashMap<u64, Acc> = HashMap::new();
@@ -235,7 +299,7 @@ pub fn compute(
             CellSystem::Square { .. } => None,
         }
     };
-    scan_bbox_values(store, spec.value_col, &mut |row, b, v, frac| {
+    scan_bbox_values(store, spec.value_col, text.then_some(&mut dict), &mut |row, b, v, frac| {
         progress(frac * 0.55);
         match spec.system {
             CellSystem::Square { size } => {
@@ -433,7 +497,7 @@ pub fn compute(
     }
     let (batch, schema, cells) = match spec.system {
         CellSystem::Square { size } => {
-            materialize(&sq_vals, &value_name, |&(ix, iy)| {
+            materialize(&sq_vals, &value_name, text.then_some(dict.as_slice()), |&(ix, iy)| {
                 let (x0, y0) = (ix as f64 * size, iy as f64 * size);
                 (
                     format!("{ix}:{iy}"),
@@ -447,7 +511,7 @@ pub fn compute(
                 )
             })?
         }
-        CellSystem::H3 { .. } => materialize(&geo_vals, &value_name, |&c| {
+        CellSystem::H3 { .. } => materialize(&geo_vals, &value_name, text.then_some(dict.as_slice()), |&c| {
             let cell = h3o::CellIndex::try_from(c).expect("aggregated cell is valid");
             let mut ring: Vec<(f64, f64)> = cell
                 .boundary()
@@ -460,7 +524,7 @@ pub fn compute(
             }
             (cell.to_string(), ring)
         })?,
-        CellSystem::A5 { .. } => materialize(&geo_vals, &value_name, |&c| {
+        CellSystem::A5 { .. } => materialize(&geo_vals, &value_name, text.then_some(dict.as_slice()), |&c| {
             let b = a5::cell_to_boundary(c, None).unwrap_or_default();
             let mut ring: Vec<(f64, f64)> =
                 b.iter().map(|ll| (ll.longitude(), ll.latitude())).collect();
@@ -903,18 +967,29 @@ fn unwrap_dateline(ring: &mut [(f64, f64)]) {
     }
 }
 
-/// Cells → one arrow batch: WKB polygon, value, count, cell id.
+/// Cells → one arrow batch: WKB polygon, value, count, cell id. With
+/// `dict`, the value is a dictionary code and the column comes out as
+/// the text it stands for.
 #[allow(clippy::type_complexity)]
 fn materialize<K: Hash + Eq + Copy>(
     vals: &HashMap<K, (f64, f64)>,
     value_name: &str,
+    dict: Option<&[String]>,
     cell_geom: impl Fn(&K) -> (String, Vec<(f64, f64)>),
 ) -> Result<(RecordBatch, SchemaRef, usize), String> {
     let mut wkb = BinaryBuilder::new();
     let mut value: Vec<f64> = Vec::with_capacity(vals.len());
+    let mut text = dict.map(|_| StringBuilder::new());
     let mut count: Vec<f64> = Vec::with_capacity(vals.len());
     let mut ids = StringBuilder::new();
     for (k, &(v, c)) in vals {
+        if let (Some(d), Some(_)) = (dict, &text) {
+            // A cell with weight has at least one category, so this only
+            // guards a NaN that a bug upstream would have produced.
+            if !v.is_finite() || v as usize >= d.len() {
+                continue;
+            }
+        }
         let (id, ring) = cell_geom(k);
         if ring.len() < 4 {
             continue;
@@ -926,22 +1001,30 @@ fn materialize<K: Hash + Eq + Copy>(
             vec![],
         ));
         wkb.append_value(crate::data::import::to_wkb(&poly)?);
-        value.push(v);
+        match (&mut text, dict) {
+            (Some(t), Some(d)) => t.append_value(&d[v as usize]),
+            _ => value.push(v),
+        }
         count.push(c);
         ids.append_value(id);
     }
+    let value_type = if dict.is_some() { DataType::Utf8 } else { DataType::Float64 };
     let schema = Arc::new(Schema::new(vec![
         Field::new("geometry", DataType::Binary, false),
-        Field::new(value_name, DataType::Float64, false),
+        Field::new(value_name, value_type, false),
         Field::new("count", DataType::Float64, false),
         Field::new("cell", DataType::Utf8, false),
     ]));
-    let n = value.len();
+    let n = count.len();
+    let value_col: ArrayRef = match &mut text {
+        Some(t) => Arc::new(t.finish()),
+        None => Arc::new(Float64Array::from(value)),
+    };
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
             Arc::new(wkb.finish()) as ArrayRef,
-            Arc::new(Float64Array::from(value)),
+            value_col,
             Arc::new(Float64Array::from(count)),
             Arc::new(ids.finish()),
         ],
@@ -1197,9 +1280,56 @@ fn sample_rings(
 /// usable extent and finite value. Uses the covering bbox column when
 /// present (columnar, no geometry decode); falls back to decoding
 /// geometries otherwise.
+/// The value column of one batch as f64 per row: a numeric cast, or —
+/// when interning — the column cast to text, trimmed and dictionary-
+/// coded, the code travelling as the value. Null, blank and non-finite
+/// slots are None.
+fn batch_values(
+    col: &ArrayRef,
+    interner: &mut Option<(HashMap<String, u32>, &mut Vec<String>)>,
+) -> Result<Vec<Option<f64>>, String> {
+    match interner {
+        None => {
+            let a = arrow::compute::cast(col, &DataType::Float64)
+                .map_err(|e| format!("value cast: {e}"))?;
+            let a = a.as_any().downcast_ref::<Float64Array>().unwrap();
+            Ok((0..a.len())
+                .map(|i| (!a.is_null(i)).then(|| a.value(i)).filter(|v| v.is_finite()))
+                .collect())
+        }
+        Some((map, dict)) => {
+            let a = arrow::compute::cast(col, &DataType::Utf8)
+                .map_err(|e| format!("text cast: {e}"))?;
+            let a = a.as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+            Ok((0..a.len())
+                .map(|i| {
+                    if a.is_null(i) {
+                        return None;
+                    }
+                    let s = a.value(i).trim();
+                    if s.is_empty() {
+                        return None;
+                    }
+                    let code = match map.get(s) {
+                        Some(&c) => c,
+                        None => {
+                            let c = dict.len() as u32;
+                            dict.push(s.to_string());
+                            map.insert(s.to_string(), c);
+                            c
+                        }
+                    };
+                    Some(code as f64)
+                })
+                .collect())
+        }
+    }
+}
+
 fn scan_bbox_values(
     store: &FeatureStore,
     value_col: usize,
+    text_dict: Option<&mut Vec<String>>,
     f: &mut dyn FnMut(u32, [f64; 4], f64, f32),
 ) -> Result<(), String> {
     const CHUNK: u64 = 131_072;
@@ -1207,6 +1337,7 @@ fn scan_bbox_values(
     if total == 0 {
         return Err("layer has no rows".into());
     }
+    let mut interner = text_dict.map(|d| (HashMap::new(), d));
     let covering = store.covering.clone();
     let mut start = 0u64;
     while start < total {
@@ -1236,24 +1367,21 @@ fn scan_bbox_values(
                     };
                     let (xmin, ymin) = (child(&cov.children[0])?, child(&cov.children[1])?);
                     let (xmax, ymax) = (child(&cov.children[2])?, child(&cov.children[3])?);
-                    let vals = arrow::compute::cast(b.column(val_pos), &DataType::Float64)
-                        .map_err(|e| format!("value cast: {e}"))?;
-                    let vals = vals.as_any().downcast_ref::<Float64Array>().unwrap();
+                    let vals = batch_values(b.column(val_pos), &mut interner)?;
                     for i in 0..b.num_rows() {
-                        if vals.is_null(i)
-                            || xmin.is_null(i)
+                        let Some(v) = vals[i] else { continue };
+                        if xmin.is_null(i)
                             || ymin.is_null(i)
                             || xmax.is_null(i)
                             || ymax.is_null(i)
                         {
                             continue;
                         }
-                        let v = vals.value(i);
                         let bb = [xmin.value(i), ymin.value(i), xmax.value(i), ymax.value(i)];
                         // A null Arrow slot reads as 0.0 and NaN floors to
                         // cell 0 rather than erroring, so a corrupt covering
                         // column would quietly pile features onto the origin.
-                        if !v.is_finite() || !bb.iter().all(|c| c.is_finite()) {
+                        if !bb.iter().all(|c| c.is_finite()) {
                             continue;
                         }
                         f(rows[i + row_base], bb, v, frac);
@@ -1266,19 +1394,11 @@ fn scan_bbox_values(
                 let batches = store.fetch(&rows, Some(&[value_col]))?;
                 let mut vals_all: Vec<Option<f64>> = Vec::with_capacity(rows.len());
                 for b in &batches {
-                    let vals = arrow::compute::cast(b.column(0), &DataType::Float64)
-                        .map_err(|e| format!("value cast: {e}"))?;
-                    let vals = vals.as_any().downcast_ref::<Float64Array>().unwrap();
-                    for i in 0..b.num_rows() {
-                        vals_all.push((!vals.is_null(i)).then(|| vals.value(i)));
-                    }
+                    vals_all.extend(batch_values(b.column(0), &mut interner)?);
                 }
                 let geoms = store.fetch_geoms(&rows)?;
                 for (k, ((_, g), v)) in geoms.iter().zip(&vals_all).enumerate() {
                     let (Some(g), Some(v)) = (g, v) else { continue };
-                    if !v.is_finite() {
-                        continue;
-                    }
                     use geo::BoundingRect;
                     if let Some(r) = g.bounding_rect() {
                         f(
@@ -1652,7 +1772,7 @@ mod tests {
 
     #[test]
     fn acc_stats() {
-        let mut a = Acc { sum: 0.0, wsum: 0.0, vals: Some(Vec::new()) };
+        let mut a = Acc { sum: 0.0, wsum: 0.0, vals: Some(Vec::new()), cats: None };
         for v in [1.0, 100.0, 3.0] {
             a.push(v, 1.0);
         }
@@ -1662,7 +1782,7 @@ mod tests {
         assert!((a.stat(GridStat::Mean) - 104.0 / 3.0).abs() < 1e-12);
         // Weighted: a huge value at tiny weight must not dominate the
         // weighted median.
-        let mut a = Acc { sum: 0.0, wsum: 0.0, vals: Some(Vec::new()) };
+        let mut a = Acc { sum: 0.0, wsum: 0.0, vals: Some(Vec::new()), cats: None };
         a.push(1_000_000.0, 0.01);
         a.push(10.0, 1.0);
         a.push(20.0, 1.0);
@@ -1677,7 +1797,7 @@ mod tests {
     fn density_defuses_giant_polygon_hotspots() {
         let giant_value = 1_000_000.0;
         let mk = |stat: GridStat| {
-            let mut a = Acc { sum: 0.0, wsum: 0.0, vals: None };
+            let mut a = Acc { sum: 0.0, wsum: 0.0, vals: None, cats: None };
             a.push(giant_value, 0.5); // half the giant covers this cell
             a.stat(stat)
         };
@@ -1688,7 +1808,7 @@ mod tests {
         assert!((density - 50.0).abs() < 1e-9);
         // A neighboring cell with a small local parcel on top barely
         // differs: no spike between "giant only" and "giant + normal".
-        let mut b = Acc { sum: 0.0, wsum: 0.0, vals: None };
+        let mut b = Acc { sum: 0.0, wsum: 0.0, vals: None, cats: None };
         b.push(giant_value, 0.5);
         b.push(100.0, 1.0);
         let density_b = b.stat(GridStat::Density) / (100.0 * 100.0);
@@ -1759,6 +1879,120 @@ mod tests {
         });
         assert!((got[&(0, 0)] - 4800.0 / 6400.0).abs() < 1e-9, "{got:?}");
         assert!((got[&(1, 0)] - 1600.0 / 6400.0).abs() < 1e-9, "{got:?}");
+    }
+
+    #[test]
+    /// A text column grids by majority/minority — the Cambridge trees
+    /// question: which species dominates each cell. Points count 1
+    /// apiece, blank values drop out, ties break the same way every
+    /// run, and the output column is the text itself.
+    fn a_text_column_grids_by_majority_and_minority() {
+        use arrow::array::StringArray;
+        let dir = std::env::temp_dir().join(format!("geopq_grid_text_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("trees.parquet");
+
+        let mut wkb = BinaryBuilder::new();
+        let mut species = StringBuilder::new();
+        let trees: &[(f64, f64, Option<&str>)] = &[
+            // Cell (0,0): two maples, one birch.
+            (10.0, 10.0, Some("Acer")),
+            (20.0, 20.0, Some("Acer")),
+            (30.0, 30.0, Some("Betula")),
+            // Cell (1,0): three birches, two dogwoods.
+            (150.0, 50.0, Some("Betula")),
+            (160.0, 60.0, Some(" Betula ")), // portals pad values
+            (170.0, 70.0, Some("Cornus")),
+            (180.0, 80.0, Some("Cornus")),
+            (190.0, 90.0, Some("Betula")),
+            // No species recorded: not a category, not a count.
+            (40.0, 40.0, None),
+        ];
+        for &(x, y, s) in trees {
+            let p = geo_types::Geometry::Point(geo_types::Point::new(x, y));
+            wkb.append_value(crate::data::import::to_wkb(&p).unwrap());
+            match s {
+                Some(s) => species.append_value(s),
+                None => species.append_null(),
+            }
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("SPECIES", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(wkb.finish()) as ArrayRef,
+                Arc::new(species.finish()),
+            ],
+        )
+        .unwrap();
+        crate::sql::export::write_result(&src, &schema, &[batch], 0, &Crs::wgs84())
+            .unwrap();
+        let (store, crs, _, _) = crate::data::loader::open_store_for_test(&src).unwrap();
+        let col = store.schema.index_of("SPECIES").unwrap();
+
+        let run = |stat: GridStat| -> HashMap<String, String> {
+            let spec = GridSpec {
+                value_col: col,
+                value_name: "SPECIES".into(),
+                system: CellSystem::Square { size: 100.0 },
+                stat,
+                kernel: Kernel::Box,
+                output: GridOutput::Cells,
+                smooth_passes: 0,
+                post: PostOp::None,
+            };
+            let dst = dir.join(format!("grid_{}.parquet", stat.label()));
+            let (cells, rows) = compute(&store, &crs, &spec, &dst, &|_| {}).unwrap();
+            assert_eq!(rows, 8, "the species-less tree is skipped");
+            assert_eq!(cells, 2);
+            let (gs, _, _, _) = crate::data::loader::open_store_for_test(&dst).unwrap();
+            let mut out = HashMap::new();
+            for b in &gs.fetch(&[0, 1], None).unwrap() {
+                let sc = b.schema();
+                let sp = b
+                    .column(sc.index_of("SPECIES").unwrap())
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("the value column is text")
+                    .clone();
+                let cell = b
+                    .column(sc.index_of("cell").unwrap())
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .clone();
+                for i in 0..b.num_rows() {
+                    out.insert(cell.value(i).to_string(), sp.value(i).to_string());
+                }
+            }
+            out
+        };
+        let maj = run(GridStat::Majority);
+        assert_eq!(maj["0:0"], "Acer");
+        assert_eq!(maj["1:0"], "Betula", "padded values counted with the clean ones");
+        let min = run(GridStat::Minority);
+        assert_eq!(min["0:0"], "Betula");
+        assert_eq!(min["1:0"], "Cornus");
+
+        // The numeric-surface operations refuse a category rather than
+        // averaging dictionary codes into nonsense.
+        let smoothed = GridSpec {
+            value_col: col,
+            value_name: "SPECIES".into(),
+            system: CellSystem::Square { size: 100.0 },
+            stat: GridStat::Majority,
+            kernel: Kernel::Box,
+            output: GridOutput::Cells,
+            smooth_passes: 1,
+            post: PostOp::None,
+        };
+        let err = compute(&store, &crs, &smoothed, &dir.join("x.parquet"), &|_| {})
+            .unwrap_err();
+        assert!(err.contains("smooth"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
