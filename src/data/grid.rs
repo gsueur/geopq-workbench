@@ -28,12 +28,37 @@ use super::store::FeatureStore;
 /// Cell system for the aggregation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CellSystem {
-    /// Square cells of `size` data-CRS units (meters for projected CRS).
-    Square { size: f64 },
+    /// Square-ish cells of `sx` × `sy` data-CRS units. Equal for
+    /// projected CRS (meters); for a layer in degrees the dialog sizes
+    /// them from meters at the data's mid-latitude, so `sx` runs
+    /// 1/cos(lat) wider than `sy` and the cell is locally square on the
+    /// ground.
+    Square { sx: f64, sy: f64 },
     /// H3 hexagons (geographic; centroids are inverse-projected).
     H3 { res: u8 },
     /// A5 pentagons (geographic, equal-area).
     A5 { res: i32 },
+}
+
+impl CellSystem {
+    /// Isotropic square cells, for projected (metric) layers.
+    pub fn square(size: f64) -> Self {
+        CellSystem::Square { sx: size, sy: size }
+    }
+}
+
+/// A square-on-the-ground cell for a layer in degrees: `meters` at
+/// latitude `lat0`, where a degree of longitude is cos(lat0) shorter
+/// than a degree of latitude. Fine at city and state scale; over a
+/// continental span the width drifts with latitude, which is what H3
+/// and A5 are for.
+pub fn square_cell_degrees(meters: f64, lat0: f64) -> (f64, f64) {
+    /// One degree of arc on the sphere, meters.
+    const M_PER_DEG: f64 = 111_195.0;
+    let sy = meters / M_PER_DEG;
+    // Clamped so polar data gets very wide cells rather than infinite.
+    let sx = meters / (M_PER_DEG * lat0.to_radians().cos().max(0.01));
+    (sx, sy)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -302,9 +327,9 @@ pub fn compute(
     scan_bbox_values(store, spec.value_col, text.then_some(&mut dict), &mut |row, b, v, frac| {
         progress(frac * 0.55);
         match spec.system {
-            CellSystem::Square { size } => {
-                let (ix0, iy0) = ((b[0] / size).floor() as i64, (b[1] / size).floor() as i64);
-                let (ix1, iy1) = ((b[2] / size).floor() as i64, (b[3] / size).floor() as i64);
+            CellSystem::Square { sx, sy } => {
+                let (ix0, iy0) = ((b[0] / sx).floor() as i64, (b[1] / sy).floor() as i64);
+                let (ix1, iy1) = ((b[2] / sx).floor() as i64, (b[3] / sy).floor() as i64);
                 if ix0 == ix1 && iy0 == iy1 {
                     sq.entry((ix0, iy0)).or_insert_with(blank).push(v, 1.0);
                     rows_used += 1;
@@ -341,7 +366,7 @@ pub fn compute(
         let n_chunks = chunks.len();
         let done = std::sync::atomic::AtomicUsize::new(0);
         match spec.system {
-            CellSystem::Square { size } => {
+            CellSystem::Square { sx, sy } => {
                 let parts: Result<Vec<Vec<((i64, i64), f64, f64)>>, String> = chunks
                     .par_iter()
                     .map(|chunk| {
@@ -350,7 +375,7 @@ pub fn compute(
                         let mut out = Vec::new();
                         for ((_, g), &(_, v)) in geoms.iter().zip(chunk.iter()) {
                             let Some(g) = g else { continue };
-                            apportion_square(g, size, &mut |k, w| out.push((k, v, w)));
+                            apportion_square(g, sx, sy, &mut |k, w| out.push((k, v, w)));
                         }
                         let d = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         progress(0.55 + 0.15 * d as f32 / n_chunks as f32);
@@ -405,9 +430,9 @@ pub fn compute(
     drop(geo);
     if spec.stat == GridStat::Density {
         match spec.system {
-            CellSystem::Square { size } => {
+            CellSystem::Square { sx, sy } => {
                 for v in sq_vals.values_mut() {
-                    v.0 /= size * size;
+                    v.0 /= sx * sy;
                 }
             }
             CellSystem::H3 { .. } => {
@@ -450,12 +475,12 @@ pub fn compute(
             azimuth_deg,
             altitude_deg,
         } => {
-            let CellSystem::Square { size } = spec.system else {
+            let CellSystem::Square { sx, sy } = spec.system else {
                 return Err("hillshade needs the square grid (it reads the \
                             gradient off the regular lattice)"
                     .into());
             };
-            sq_vals = hillshade(&sq_vals, size, azimuth_deg, altitude_deg);
+            sq_vals = hillshade(&sq_vals, sx, sy, azimuth_deg, altitude_deg);
         }
         op => {
             // Focal std is one pass; open and close are two passes of the
@@ -486,26 +511,26 @@ pub fn compute(
     progress(0.9);
     let out_crs = if geographic { &wgs84 } else { crs };
     if let GridOutput::Contours { levels, spacing } = spec.output {
-        let CellSystem::Square { size } = spec.system else {
+        let CellSystem::Square { sx, sy } = spec.system else {
             return Err("contour lines need the square grid (marching squares)".into());
         };
         let (batch, schema, lines) =
-            contour_lines(&sq_vals, &value_name, size, levels, spacing)?;
+            contour_lines(&sq_vals, &value_name, sx, sy, levels, spacing)?;
         crate::sql::export::write_result(dst, &schema, std::slice::from_ref(&batch), 0, out_crs)?;
         progress(1.0);
         return Ok((lines, rows_used));
     }
     let (batch, schema, cells) = match spec.system {
-        CellSystem::Square { size } => {
+        CellSystem::Square { sx, sy } => {
             materialize(&sq_vals, &value_name, text.then_some(dict.as_slice()), |&(ix, iy)| {
-                let (x0, y0) = (ix as f64 * size, iy as f64 * size);
+                let (x0, y0) = (ix as f64 * sx, iy as f64 * sy);
                 (
                     format!("{ix}:{iy}"),
                     vec![
                         (x0, y0),
-                        (x0 + size, y0),
-                        (x0 + size, y0 + size),
-                        (x0, y0 + size),
+                        (x0 + sx, y0),
+                        (x0 + sx, y0 + sy),
+                        (x0, y0 + sy),
                         (x0, y0),
                     ],
                 )
@@ -596,7 +621,8 @@ fn quantile_sorted(sorted: &[f64], f: f64) -> f64 {
 fn contour_lines(
     vals: &HashMap<(i64, i64), (f64, f64)>,
     value_name: &str,
-    size: f64,
+    sx: f64,
+    sy: f64,
     levels: usize,
     spacing: ContourSpacing,
 ) -> Result<(RecordBatch, SchemaRef, usize), String> {
@@ -632,8 +658,8 @@ fn contour_lines(
     // Cell-center position of grid node (i, j), data CRS.
     let pos = |i: usize, j: usize| -> [f64; 2] {
         [
-            (min_ix + i as i64) as f64 * size + size * 0.5,
-            (min_iy + j as i64) as f64 * size + size * 0.5,
+            (min_ix + i as i64) as f64 * sx + sx * 0.5,
+            (min_iy + j as i64) as f64 * sy + sy * 0.5,
         ]
     };
 
@@ -699,7 +725,7 @@ fn contour_lines(
                 }
             }
         }
-        for line in stitch_segments(segments, size * 1e-6) {
+        for line in stitch_segments(segments, sx.min(sy) * 1e-6) {
             if line.len() < 2 {
                 continue;
             }
@@ -868,7 +894,8 @@ fn focal_pass<K: Hash + Eq + Copy>(
 /// value for it (a flat continuation), which is the standard edge rule.
 fn hillshade(
     vals: &HashMap<(i64, i64), (f64, f64)>,
-    size: f64,
+    sx: f64,
+    sy: f64,
     azimuth_deg: f64,
     altitude_deg: f64,
 ) -> HashMap<(i64, i64), (f64, f64)> {
@@ -878,8 +905,8 @@ fn hillshade(
         let (nw, n, ne) = (at(-1, 1), at(0, 1), at(1, 1));
         let (w, e) = (at(-1, 0), at(1, 0));
         let (sw, s, se) = (at(-1, -1), at(0, -1), at(1, -1));
-        let dzdx = ((ne + 2.0 * e + se) - (nw + 2.0 * w + sw)) / (8.0 * size);
-        let dzdy = ((nw + 2.0 * n + ne) - (sw + 2.0 * s + se)) / (8.0 * size);
+        let dzdx = ((ne + 2.0 * e + se) - (nw + 2.0 * w + sw)) / (8.0 * sx);
+        let dzdy = ((nw + 2.0 * n + ne) - (sw + 2.0 * s + se)) / (8.0 * sy);
         (dzdx, dzdy)
     };
     let grads: HashMap<(i64, i64), (f64, f64)> = vals
@@ -1039,7 +1066,8 @@ fn materialize<K: Hash + Eq + Copy>(
 /// back to their bbox-center cell with weight 1.
 fn apportion_square(
     g: &geo_types::Geometry<f64>,
-    size: f64,
+    sx: f64,
+    sy: f64,
     add: &mut dyn FnMut((i64, i64), f64),
 ) {
     use geo::{Area, BoundingRect};
@@ -1049,7 +1077,7 @@ fn apportion_square(
     let centroid_fallback = |add: &mut dyn FnMut((i64, i64), f64)| {
         if let Some(r) = g.bounding_rect() {
             let (cx, cy) = ((r.min().x + r.max().x) * 0.5, (r.min().y + r.max().y) * 0.5);
-            add(((cx / size).floor() as i64, (cy / size).floor() as i64), 1.0);
+            add(((cx / sx).floor() as i64, (cy / sy).floor() as i64), 1.0);
         }
     };
     if total <= 0.0 {
@@ -1059,15 +1087,15 @@ fn apportion_square(
     let mut covered: HashMap<(i64, i64), f64> = HashMap::new();
     let mut per_poly = |poly: &geo_types::Polygon<f64>| {
         let Some(r) = poly.bounding_rect() else { return };
-        let (ix0, ix1) = ((r.min().x / size).floor() as i64, (r.max().x / size).floor() as i64);
-        let (iy0, iy1) = ((r.min().y / size).floor() as i64, (r.max().y / size).floor() as i64);
+        let (ix0, ix1) = ((r.min().x / sx).floor() as i64, (r.max().x / sx).floor() as i64);
+        let (iy0, iy1) = ((r.min().y / sy).floor() as i64, (r.max().y / sy).floor() as i64);
         for ix in ix0..=ix1 {
             for iy in iy0..=iy1 {
                 let rect = [
-                    ix as f64 * size,
-                    iy as f64 * size,
-                    (ix + 1) as f64 * size,
-                    (iy + 1) as f64 * size,
+                    ix as f64 * sx,
+                    iy as f64 * sy,
+                    (ix + 1) as f64 * sx,
+                    (iy + 1) as f64 * sy,
                 ];
                 let mut a = ring_area_in_rect(&poly.exterior().0, rect);
                 for hole in poly.interiors() {
@@ -1464,7 +1492,7 @@ mod tests {
             vec![],
         ));
         let mut w = 0.0;
-        apportion_square(&bowtie, 100.0, &mut |_, x| w += x);
+        apportion_square(&bowtie, 100.0, 100.0, &mut |_, x| w += x);
         assert!((w - 1.0).abs() < 1e-9, "bowtie weights sum to {w}");
 
         // A thin annulus: no 8×8 sample lands in the 1-unit band and the
@@ -1623,19 +1651,19 @@ mod tests {
             &[0.0, 5.0, 10.0, 5.0, 0.0],
             &[0.0, 5.0, 10.0, 5.0, 0.0],
         ]);
-        let west_sun = hillshade(&ridge, 100.0, 270.0, 45.0);
+        let west_sun = hillshade(&ridge, 100.0, 100.0, 270.0, 45.0);
         let (west_flank, east_flank) = (west_sun[&(1, 1)].0, west_sun[&(3, 1)].0);
         assert!(
             west_flank > east_flank + 20.0,
             "west sun must favour the west flank: {west_flank} vs {east_flank}"
         );
         // Move the sun east and the lighting swaps.
-        let east_sun = hillshade(&ridge, 100.0, 90.0, 45.0);
+        let east_sun = hillshade(&ridge, 100.0, 100.0, 90.0, 45.0);
         assert!(east_sun[&(3, 1)].0 > east_sun[&(1, 1)].0 + 20.0);
 
         // Flat ground everywhere takes the sun's zenith cosine.
         let flat = surface(&[&[4.0, 4.0, 4.0], &[4.0, 4.0, 4.0], &[4.0, 4.0, 4.0]]);
-        let shaded = hillshade(&flat, 100.0, 315.0, 45.0);
+        let shaded = hillshade(&flat, 100.0, 100.0, 315.0, 45.0);
         let expect = (45.0f64).to_radians().cos() * 255.0;
         assert!(shaded.values().all(|&(v, _)| (v - expect).abs() < 1e-6));
         // Values stay inside the 0..255 shading range.
@@ -1692,7 +1720,7 @@ mod tests {
             }
         }
         let (batch, _, n) =
-            contour_lines(&vals, "v", 100.0, 3, ContourSpacing::Equal).unwrap();
+            contour_lines(&vals, "v", 100.0, 100.0, 3, ContourSpacing::Equal).unwrap();
         assert!(n >= 3, "one line per crossed level, got {n}");
         assert_eq!(batch.num_rows(), n);
         // Level column values sit strictly inside the value range.
@@ -1707,7 +1735,7 @@ mod tests {
         // Degenerate surfaces refuse politely.
         let flat: HashMap<(i64, i64), (f64, f64)> =
             (0..9).map(|i| ((i % 3, i / 3), (5.0, 1.0))).collect();
-        assert!(contour_lines(&flat, "v", 100.0, 3, ContourSpacing::Equal).is_err());
+        assert!(contour_lines(&flat, "v", 100.0, 100.0, 3, ContourSpacing::Equal).is_err());
     }
 
     #[test]
@@ -1830,7 +1858,7 @@ mod tests {
             vec![],
         ));
         let mut got: HashMap<(i64, i64), f64> = HashMap::new();
-        apportion_square(&poly, 100.0, &mut |k, w| {
+        apportion_square(&poly, 100.0, 100.0, &mut |k, w| {
             *got.entry(k).or_insert(0.0) += w;
         });
         assert_eq!(got.len(), 4, "{got:?}");
@@ -1849,7 +1877,7 @@ mod tests {
             vec![],
         ));
         let mut got: HashMap<(i64, i64), f64> = HashMap::new();
-        apportion_square(&poly, 100.0, &mut |k, w| {
+        apportion_square(&poly, 100.0, 100.0, &mut |k, w| {
             *got.entry(k).or_insert(0.0) += w;
         });
         assert!((got[&(0, 0)] - 0.8).abs() < 1e-9, "{got:?}");
@@ -1874,7 +1902,7 @@ mod tests {
             ])],
         ));
         let mut got: HashMap<(i64, i64), f64> = HashMap::new();
-        apportion_square(&poly, 100.0, &mut |k, w| {
+        apportion_square(&poly, 100.0, 100.0, &mut |k, w| {
             *got.entry(k).or_insert(0.0) += w;
         });
         assert!((got[&(0, 0)] - 4800.0 / 6400.0).abs() < 1e-9, "{got:?}");
@@ -1937,7 +1965,7 @@ mod tests {
             let spec = GridSpec {
                 value_col: col,
                 value_name: "SPECIES".into(),
-                system: CellSystem::Square { size: 100.0 },
+                system: CellSystem::square(100.0),
                 stat,
                 kernel: Kernel::Box,
                 output: GridOutput::Cells,
@@ -1982,7 +2010,7 @@ mod tests {
         let smoothed = GridSpec {
             value_col: col,
             value_name: "SPECIES".into(),
-            system: CellSystem::Square { size: 100.0 },
+            system: CellSystem::square(100.0),
             stat: GridStat::Majority,
             kernel: Kernel::Box,
             output: GridOutput::Cells,
@@ -1993,6 +2021,21 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("smooth"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// A layer in degrees takes its cell size in meters: converted at
+    /// the data's mid-latitude, wider in longitude by 1/cos(lat) so the
+    /// cell is square on the ground, not on the graticule.
+    fn a_degree_layer_takes_its_cell_size_in_meters() {
+        // Cambridge MA: 1000 m at 42.37°N.
+        let (sx, sy) = square_cell_degrees(1000.0, 42.37);
+        assert!((sy - 0.0089932).abs() < 1e-5, "{sy}");
+        assert!(sx > sy, "longitude degrees are shorter, cells span more of them");
+        assert!((sx * (42.37_f64.to_radians().cos()) - sy).abs() < 1e-12);
+        // On the equator the two agree.
+        let (ex, ey) = square_cell_degrees(1000.0, 0.0);
+        assert!((ex - ey).abs() < 1e-15);
     }
 
     #[test]
@@ -2026,7 +2069,7 @@ mod real_file_tests {
             crate::data::loader::open_store_for_test(&path).unwrap();
         let col = store.schema.index_of("LAND_VAL").unwrap();
         for (system, label) in [
-            (CellSystem::Square { size: 1000.0 }, "square 1km"),
+            (CellSystem::square(1000.0), "square 1km"),
             (CellSystem::H3 { res: 7 }, "h3 r7"),
             (CellSystem::A5 { res: 14 }, "a5 r14"),
         ] {
@@ -2062,7 +2105,7 @@ mod real_file_tests {
         let spec = GridSpec {
             value_col: col,
             value_name: "LAND_VAL".into(),
-            system: CellSystem::Square { size: 1000.0 },
+            system: CellSystem::square(1000.0),
             stat: GridStat::Mean,
             kernel: Kernel::Gaussian,
             output: GridOutput::Contours {
@@ -2091,7 +2134,7 @@ mod real_file_tests {
         let spec = GridSpec {
             value_col: col,
             value_name: "LAND_VAL".into(),
-            system: CellSystem::Square { size: 1000.0 },
+            system: CellSystem::square(1000.0),
             stat: GridStat::Mean,
             kernel: Kernel::Gaussian,
             output: GridOutput::Cells,

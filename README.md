@@ -431,8 +431,11 @@ style, query or export like any other. Useful when the geometry gets in
 the way of the pattern: parcels, buildings and admin units come in wildly
 different sizes, and a choropleth of them mostly maps polygon size.
 
-- **Cell systems**: square cells in the layer's own CRS at the size you
-  choose, or H3 / A5 cells for equal-area coverage of the globe.
+- **Cell systems**: square cells at the size you choose — in the
+  layer's own CRS units when it is projected, and in meters when the
+  layer is in degrees (converted at the data's mid-latitude, so cells
+  stay square on the ground) — or H3 / A5 cells for equal-area
+  coverage of the globe.
 - **Areal apportionment**: a feature spanning several cells gives each
   cell the share of its value that the cell actually covers — exact
   rectangle clipping on square grids, sampling on H3/A5. Assigning by

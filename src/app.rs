@@ -964,8 +964,13 @@ struct GridState {
     column: String,
     /// 0 = square grid, 1 = H3, 2 = A5.
     system: usize,
-    /// Square cell size, data-CRS units.
+    /// Square cell size: meters. For a projected layer that is its CRS
+    /// unit; for a layer in degrees the size converts at `lat0`.
     size: f64,
+    /// The layer is in degrees (lon/lat).
+    latlong: bool,
+    /// Mid-latitude of the data, for the meters→degrees conversion.
+    lat0: f64,
     h3_res: u8,
     a5_res: i32,
     stat: crate::data::grid::GridStat,
@@ -5730,6 +5735,13 @@ impl ViewerApp {
             column,
             system: 0,
             size: 1000.0,
+            latlong: l.crs.is_latlong,
+            lat0: l
+                .info
+                .geo
+                .bbox
+                .map(|b| (b[1] + b[3]) * 0.5)
+                .unwrap_or(0.0),
             h3_res: 7,
             a5_res: 14,
             stat: crate::data::grid::GridStat::Mean,
@@ -5916,13 +5928,18 @@ impl ViewerApp {
                                 ui.add(
                                     egui::DragValue::new(&mut st.size)
                                         .range(1.0..=1e7)
-                                        .speed(50.0),
+                                        .speed(50.0)
+                                        .suffix(if st.latlong { " m" } else { "" }),
                                 )
-                                .on_hover_text(
+                                .on_hover_text(if st.latlong {
+                                    "Cell size in meters. The layer is in degrees, \
+                                     so cells are sized at the data's mid-latitude \
+                                     — square on the ground at city and state \
+                                     scale; for continental spans prefer H3 or A5"
+                                } else {
                                     "Cell size in the layer's CRS units (meters for \
-                                     projected data — avoid degrees, \
-                                     st_transform first)",
-                                );
+                                     projected data)"
+                                });
                             }
                             1 => {
                                 ui.label("res:");
@@ -6099,7 +6116,11 @@ impl ViewerApp {
                 return;
             };
             let system = match st.system {
-                0 => CellSystem::Square { size: st.size },
+                0 if st.latlong => {
+                    let (sx, sy) = crate::data::grid::square_cell_degrees(st.size, st.lat0);
+                    CellSystem::Square { sx, sy }
+                }
+                0 => CellSystem::square(st.size),
                 1 => CellSystem::H3 { res: st.h3_res },
                 _ => CellSystem::A5 { res: st.a5_res },
             };
@@ -6134,9 +6155,10 @@ impl ViewerApp {
                     _ => crate::data::grid::PostOp::None,
                 },
             };
+            let unit = if st.latlong { "m" } else { "u" };
             let cell_label = match st.system {
-                0 if st.contours => format!("{}u contours", st.size),
-                0 => format!("{}u", st.size),
+                0 if st.contours => format!("{}{unit} contours", st.size),
+                0 => format!("{}{unit}", st.size),
                 1 => format!("h3r{}", st.h3_res),
                 _ => format!("a5r{}", st.a5_res),
             };
