@@ -10809,6 +10809,22 @@ fn dcat_pane(ui: &mut egui::Ui, b: &mut CatalogBrowser, open: &mut Vec<usize>) {
                 })
                 .response
                 .on_hover_text(dcat_hover(d));
+                // One line of description under the title; the row's
+                // hover carries the rest. Size stays unshown on purpose:
+                // portals state no byteSize — the export is generated
+                // when asked for — and inventing one would be worse.
+                let desc = d.description.trim();
+                if !desc.is_empty() {
+                    let mut line: String = desc.chars().take(110).collect();
+                    if desc.chars().count() > 110 {
+                        line.push('…');
+                    }
+                    ui.horizontal(|ui| {
+                        ui.add_space(18.0);
+                        ui.label(RichText::new(line).weak().small());
+                    });
+                }
+                ui.add_space(2.0);
             }
         });
     if shown == 0 {

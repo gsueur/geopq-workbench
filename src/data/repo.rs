@@ -1784,6 +1784,29 @@ pub fn write_dcat_attribution(
 /// into `<dst>.part` and are renamed into place on success, so an
 /// interrupted fetch never leaves something that looks like a complete
 /// file: the caller's "already downloaded?" check is `dst.exists()`.
+/// Agent for portal downloads. The shared agent's timeouts fit bounded
+/// range reads; a portal export is the opposite shape. Socrata and
+/// ArcGIS Hub generate the file when it is asked for, so the first byte
+/// routinely takes past the shared 30 s (Dallas's query.geojson read as
+/// "timeout: receive response"), and the body is as large as the
+/// dataset, so the shared 120 s body cap would kill any big download
+/// that did start. Patient headers, an hour's dead-connection backstop
+/// on the body — the progress callback and its cancel supervise the
+/// rest — and the same resolve/connect bounds.
+fn download_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_resolve(Some(std::time::Duration::from_secs(10)))
+            .timeout_connect(Some(std::time::Duration::from_secs(10)))
+            .timeout_recv_response(Some(std::time::Duration::from_secs(300)))
+            .timeout_recv_body(Some(std::time::Duration::from_secs(3600)))
+            .build()
+            .into()
+    })
+}
+
 pub fn download_to(
     url: &str,
     dst: &Path,
@@ -1793,7 +1816,7 @@ pub fn download_to(
     if let Some(dir) = dst.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
-    let res = http_agent()
+    let res = download_agent()
         .get(url)
         .header("User-Agent", USER_AGENT)
         .call()
