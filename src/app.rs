@@ -5511,7 +5511,26 @@ impl ViewerApp {
                         .id_salt("catalog_rows")
                         .max_height(if b.sel.is_some() { 160.0 } else { 400.0 })
                         .show(ui, |ui| {
-                    for (i, c) in b.saved.iter().enumerate() {
+                    // Cities and user-added portals first, then the
+                    // state section under its own heading; each keeps
+                    // the list's alphabetical order.
+                    let is_state: Vec<bool> = b
+                        .saved
+                        .iter()
+                        .map(|c| repo::is_default_state(&c.url))
+                        .collect();
+                    let order: Vec<usize> = (0..b.saved.len())
+                        .filter(|&i| !is_state[i])
+                        .chain((0..b.saved.len()).filter(|&i| is_state[i]))
+                        .collect();
+                    let mut states_started = false;
+                    for i in order {
+                        if is_state[i] && !states_started {
+                            states_started = true;
+                            ui.add_space(4.0);
+                            ui.label(RichText::new("US states").weak().small());
+                        }
+                        let c = &b.saved[i];
                         ui.horizontal(|ui| {
                             let on = b.sel == Some((true, i));
                             if ui.selectable_label(on, &c.name).on_hover_text(&c.url).clicked()

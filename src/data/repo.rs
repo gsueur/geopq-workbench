@@ -229,9 +229,10 @@ pub fn save_repos(repos: &[Repository]) -> Result<(), String> {
     save_config("repositories.json", &repos)
 }
 
-/// Built-in portals: the major US cities whose DCAT catalog was probed
-/// and found rich in openable datasets (2026-08). No `added_on`: these
-/// were not added by the user, and the dialog labels them built-in.
+/// Every built-in portal: the major US cities plus the state portals of
+/// `default_state_catalogs`, each probed and found rich in openable
+/// datasets (2026-08). No `added_on`: these were not added by the user,
+/// and the dialog labels them built-in.
 /// Like `default_repos`, they seed the saved list and become the user's
 /// own on first save — removing one removes it for good.
 ///
@@ -243,7 +244,7 @@ pub fn default_catalogs() -> Vec<Catalog> {
         url: url.into(),
         added_on: None,
     };
-    vec![
+    let mut cities = vec![
         c("Analyze Boston", "https://data.boston.gov"),
         c("Austin Open Data", "https://data.austintexas.gov"),
         c("Baltimore Open Data", "https://data.baltimorecity.gov"),
@@ -264,7 +265,50 @@ pub fn default_catalogs() -> Vec<Catalog> {
         c("Phoenix Open Data", "https://www.phoenixopendata.com"),
         c("San Antonio Open Data", "https://data.sanantonio.gov"),
         c("Seattle Open Data", "https://data.seattle.gov"),
+    ];
+    cities.extend(default_state_catalogs());
+    cities
+}
+
+/// The state-level GIS portals among the built-ins, shown as their own
+/// section in the dialog. Probed like the cities (2026-08); notable
+/// absences and why: Tennessee's hub 500s persistently, Texas's WAF
+/// refuses non-browser clients, and Pennsylvania (PASDA) and Minnesota
+/// (Geospatial Commons) publish no DCAT feed.
+pub fn default_state_catalogs() -> Vec<Catalog> {
+    let c = |name: &str, url: &str| Catalog {
+        name: name.into(),
+        url: url.into(),
+        added_on: None,
+    };
+    vec![
+        c("Alaska Geoportal", "https://gis.data.alaska.gov"),
+        c("Arizona AZGeo", "https://azgeo-open-data-agic.hub.arcgis.com"),
+        c("California State Geoportal", "https://gis.data.ca.gov"),
+        c("Colorado GeoData", "https://geodata.colorado.gov"),
+        c("Connecticut GeoData", "https://geodata.ct.gov"),
+        c("Florida GIO", "https://geodata.floridagio.gov"),
+        c("Hawaii Geoportal", "https://geoportal.hawaii.gov"),
+        c("Iowa Geodata", "https://geodata.iowa.gov"),
+        c("Maryland iMAP", "https://data.imap.maryland.gov"),
+        c("Massachusetts MassGIS", "https://gis.data.mass.gov"),
+        c("Michigan GIS Open Data", "https://gis-michigan.opendata.arcgis.com"),
+        c("New Jersey NJGIN", "https://njogis-newjersey.opendata.arcgis.com"),
+        c("New York State GIS", "https://data.gis.ny.gov"),
+        c("North Carolina OneMap", "https://www.nconemap.gov"),
+        c("Oregon GEOHub", "https://geohub.oregon.gov"),
+        c("Rhode Island RIGIS", "https://rigis-edc.opendata.arcgis.com"),
+        c("Utah SGID", "https://opendata.gis.utah.gov"),
+        c("Vermont Geodata", "https://geodata.vermont.gov"),
+        c("Virginia VGIN", "https://vgin.vdem.virginia.gov"),
+        c("Washington Geospatial Portal", "https://geo.wa.gov"),
     ]
+}
+
+/// Whether `url` is one of the built-in state portals, for the
+/// dialog's section split.
+pub fn is_default_state(url: &str) -> bool {
+    default_state_catalogs().iter().any(|c| c.url == url)
 }
 
 /// Alphabetical by name, which is the one order a mixed list of saved
@@ -3094,8 +3138,9 @@ mod tests {
         )
         .unwrap();
         let back = load_catalogs();
-        assert_eq!(back[0].name, "Analyze Boston");
-        assert_eq!(back[0].added_on, None);
+        let boston = back.iter().find(|c| c.url == "https://data.boston.gov").unwrap();
+        assert_eq!(boston.name, "Analyze Boston");
+        assert_eq!(boston.added_on, None);
         assert_eq!(back.len(), default_catalogs().len(), "boston not duplicated");
         assert!(back.iter().any(|c| c.url == nyc));
     }
