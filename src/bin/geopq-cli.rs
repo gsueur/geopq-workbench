@@ -13,18 +13,18 @@ use geopq_workbench::data::partition::PartitionBy;
 use geopq_workbench::data::source::Source;
 use geopq_workbench::data::{geojson, gpkg, shp};
 
-/// Convert a vector source (File Geodatabase, GeoPackage, Shapefile,
-/// GeoJSON, or an existing GeoParquet file) into an optimized GeoParquet:
-/// spatially sorted, tuned row groups, covering bbox column.
+/// Convert a vector source (GeoPackage, Shapefile, GeoJSON, or an
+/// existing GeoParquet file) into an optimized GeoParquet: spatially
+/// sorted, tuned row groups, covering bbox column.
 #[derive(Parser)]
 #[command(name = "geopq-cli", version, about)]
 struct Cli {
-    /// Source path: a .gdb/.gpkg/.shp/.geojson file, or an existing
+    /// Source path: a .gpkg/.shp/.geojson file, or an existing
     /// .parquet file (skipped straight to the optimize step).
     #[arg(long)]
     input: PathBuf,
 
-    /// Layer/table name, for multi-layer sources (.gdb, .gpkg). Required
+    /// Layer/table name, for multi-layer sources (.gpkg). Required
     /// when the source has more than one; omit otherwise. See --list-layers.
     #[arg(long)]
     layer: Option<String>,
@@ -208,23 +208,6 @@ fn import(fmt: ImportFormat, input: &Path, layer: Option<&str>, dst: &Path) -> R
         }
         ImportFormat::Shapefile => shp::convert(input, dst, &|_| {}).map(|_| ()),
         ImportFormat::GeoJson => geojson::convert(input, dst, &|_| {}).map(|_| ()),
-        ImportFormat::Gdb => {
-            #[cfg(feature = "gdal-import")]
-            {
-                use geopq_workbench::data::gdb;
-                let layers = gdb::list_layers(input)?;
-                let l = pick(&layers, layer, |l| l.name.clone())?;
-                gdb::convert(input, &l, dst, &|_| {})?;
-                Ok(())
-            }
-            #[cfg(not(feature = "gdal-import"))]
-            {
-                let _ = (input, layer, dst);
-                Err("this build has no File Geodatabase support \
-                     (rebuild with --features gdal-import)"
-                    .to_string())
-            }
-        }
     }
 }
 
@@ -236,18 +219,6 @@ fn print_layers(input: &Path) -> Result<(), String> {
             for t in gpkg::list_tables(input)? {
                 println!("{}\t{} rows\t{}", t.name, t.rows, t.srs_name);
             }
-        }
-        ImportFormat::Gdb => {
-            #[cfg(feature = "gdal-import")]
-            {
-                for l in geopq_workbench::data::gdb::list_layers(input)? {
-                    println!("{}\t{} rows\t{}", l.name, l.rows, l.srs_name);
-                }
-            }
-            #[cfg(not(feature = "gdal-import"))]
-            return Err("this build has no File Geodatabase support \
-                         (rebuild with --features gdal-import)"
-                .to_string());
         }
         ImportFormat::Shapefile | ImportFormat::GeoJson => {
             println!("(single layer — no --layer needed)");
