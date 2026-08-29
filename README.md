@@ -281,9 +281,9 @@ Beyond the rewrite itself:
 - **Partitioned output**: hive directories by chosen fields
   (`state=MA/part-0.parquet`) or adaptive H3 cells that split until each
   file is under a row target. Every part keeps the full treatment.
-- **Cloud-optimized levels (COGP)**: order the file coarse to fine so a
-  map reader fetches only the leading row groups its zoom needs. See
-  below.
+- **Ordering**: the usual Hilbert spatial sort, or coarse-to-fine
+  levels (COGP), which order the file so a reader fetches only the
+  leading row groups its zoom needs. See below.
 - **Publish to S3 / R2**: tick "Publish to S3 / R2" in the Export
   dialog and the output uploads to your bucket (multipart for big
   files) instead of staying local; partitioned datasets upload under a
@@ -307,47 +307,56 @@ COGP levels add derived columns — COGP costs 59 bytes a row on top,
 most of it the point-thinning grid) rather than the file size, so there is no size cap — a
 rewrite is refused only when the row count alone would not fit.
 
-### Cloud-optimized levels (COGP)
+### Coarse-to-fine levels (COGP)
 
-The [Cloud Optimized GeoParquet Profile](https://github.com/Kanahiro/cloud-optimized-geoparquet)
-is a layout convention for progressive map rendering: features are
-ordered from coarse to fine detail, every detail level ends on a row
-group boundary, and one file-level metadata key, `cogp`, records where
-those boundaries are. A reader picks the level matching its display
-scale and fetches only the row groups up to it, so a world view costs a
-few range requests instead of the whole file. Nothing is simplified or
-duplicated — every feature appears exactly once, with its geometry
-verbatim — which is why a reader that has never heard of COGP just sees
-an ordinary GeoParquet file and reads all of it.
+The Export dialog's **Ordering** choice is either the usual Hilbert
+spatial sort or coarse-to-fine levels, the
+[Cloud Optimized GeoParquet Profile](https://github.com/Kanahiro/cloud-optimized-geoparquet).
+The levels order features largest first, cut each detail level on a
+row-group boundary and record those boundaries in one file-level
+metadata key, `cogp`, so a reader that knows the profile streams the
+prefix its zoom needs instead of the whole file. Nothing is simplified
+or duplicated — every feature appears exactly once, geometry verbatim —
+so every other reader just sees an ordinary GeoParquet, and within a
+level the Hilbert sort still applies. It is offered on all three
+flavours: the pruning signal is the covering bbox column on 1.1 WKB
+(written whether or not you ticked it), the native geometry statistics
+on 2.0, and the coordinate columns' own statistics on GeoArrow. Only
+partitioned output is incompatible — levels describe one file's row
+groups — and the dialog greys those controls out while they are on.
 
-Tick "Cloud-optimized levels (COGP)" in the Export dialog. Levels come
-from a Web Mercator pyramid by default (`gsd = 40 075 016 / (resolution
-× 2^z)` metres, z 0–16 at resolution 1024), or from a list of ground
-sample distances in metres you type yourself. A feature joins the
-coarsest level at which it is independently renderable: a line once its
-bbox diagonal reaches 2 GSD, a polygon once it reaches 4 — points have
-no extent, so they are thinned on a grid of 4 GSD instead, one survivor
-per cell per level with the rest deferred, and an optional attribute
-column decides which one survives. Whatever never qualifies lands in
-the finest level. The factors and the rank column are all adjustable,
-and the defaults reproduce the profile's reference converter, so files
-this app writes behave like the ones `cogp-rs convert` writes. GSDs are
-always metres on the ground: a layer in degrees converts at each
-feature's own latitude, a projected one is read from its CRS units.
-Within each level the usual Hilbert sort still applies, so row group
-bboxes stay tight and spatial pruning works inside a level as well as
-between them.
+The caveat is coverages. A layer that tiles its area, such as parcels or
+land cover, has no size hierarchy to lead with, so its coarse levels are
+a thin scatter of whatever happens to be biggest and the layer looks
+sparse when zoomed out. COGP pays off on layers that do have one (roads,
+rivers, buildings, admin boundaries) and on files large enough that
+reading all of them to draw a world view is the real cost.
+
+The knobs are not in the dialog. They default to the reference
+converter's values, so files this app writes behave like the ones
+`cogp-rs convert` writes, and a `cogp` object in `~/.geopq-workbench.json`
+(read once at startup, ignored whole if it does not validate) overrides
+them:
+
+```json
+{"cogp": {"minzoom": 0, "maxzoom": 16, "resolution": 1024,
+          "line_factor": 2, "polygon_factor": 4, "point_factor": 4,
+          "rank": null, "rank_order": "desc"}}
+```
+
+The zooms and resolution shape the Web Mercator pyramid the level GSDs
+come from (`gsd = 40 075 016 / (resolution × 2^z)` metres), or
+`"gsds": [10000, 1000, 100]` replaces it with an explicit list of metres,
+coarse to fine. The factors are how many GSDs a feature must span to join
+a level: bbox diagonal for lines and polygons, thinning-grid pitch for
+points, one survivor per cell per level. `rank` names the attribute
+column that decides which point survives a contested cell.
 
 COGP v0.1 specifies GeoParquet 1.1 with a bbox covering column, and the
-export writes that column whether or not you ticked it. The workbench
-also offers the profile on GeoParquet 2.0, where the native GEOMETRY
-type's own row-group statistics are the pruning signal; the `cogp`
-metadata is identical, but that combination is this app's extension and
-the profile's reference tools will not recognise it until the spec
-adopts it. Levels describe one file's row groups, so COGP does not
-combine with partitioned output or with the GeoArrow flavour; the
-dialog greys those out while it is on.
-
+profile's own validator accepts what this app writes in that flavour. It
+does not know the 2.0 and GeoArrow forms: the `cogp` metadata is
+identical, but leaning on those statistics is this app's extension until
+the spec adopts it, which the info panel and quality check C8 both say.
 
 ## Exploring the map
 
