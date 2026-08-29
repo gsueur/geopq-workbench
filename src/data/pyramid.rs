@@ -309,6 +309,12 @@ pub struct PyramidState {
     /// so this is one value, not a set.
     pub active_res: u8,
     levels: Vec<LevelCells>,
+    /// Files the descriptor lists that the root does not hold, from the
+    /// one listing taken at open. A plan never names them, so a gap in
+    /// the tree costs the cells that are missing and nothing else — and
+    /// re-planning the same viewport keeps giving the same answer
+    /// instead of chasing files that will not appear.
+    absent: std::collections::HashSet<String>,
 }
 
 impl PyramidState {
@@ -329,7 +335,28 @@ impl PyramidState {
             })
             .collect::<Result<Vec<_>, String>>()?;
         let active_res = descriptor.leaf.res;
-        Ok(Self { descriptor, root: root.into(), active_res, levels })
+        Ok(Self {
+            descriptor,
+            root: root.into(),
+            active_res,
+            levels,
+            absent: std::collections::HashSet::new(),
+        })
+    }
+
+    /// Record which of the descriptor's files the root does not hold.
+    /// `have` is the root's listing; None means it serves none, in which
+    /// case the descriptor is taken at its word.
+    pub fn mark_absent(&mut self, have: Option<&std::collections::HashSet<String>>) {
+        self.absent = match have {
+            Some(have) => self.all_parts().into_iter().filter(|p| !have.contains(p)).collect(),
+            None => std::collections::HashSet::new(),
+        };
+    }
+
+    /// Files the descriptor lists that are not there.
+    pub fn absent(&self) -> &std::collections::HashSet<String> {
+        &self.absent
     }
 
     /// Resolutions of the levels a `res_for_gsd` answer may name, coarse
@@ -456,6 +483,7 @@ impl PyramidState {
                     .iter()
                     .filter(|c| keep(**c, l.res))
                     .map(|c| part_path(l.res, &c.to_string()))
+                    .filter(|p| !self.absent.contains(p))
                     .collect::<Vec<_>>()
             })
             .collect();

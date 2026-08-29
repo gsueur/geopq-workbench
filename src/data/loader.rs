@@ -87,6 +87,28 @@ pub enum LoadMsg {
     },
     /// A row append ended without a result (error or user cancel).
     AppendEnded { layer_id: u64, error: String },
+    /// A pyramid layer moved to another level: a different set of part
+    /// files, and geometry rebuilt from them.
+    ///
+    /// Levels are never mixed, so unlike `PartsOpened` this replaces
+    /// rather than extends — the store, the row-group boxes, the decode
+    /// state and the sections all change together, and every row-group
+    /// index the layer held stops meaning what it meant.
+    LevelSwitched {
+        layer_id: u64,
+        generation: u64,
+        /// The level now on screen, for the log line.
+        level: u8,
+        store: Arc<FeatureStore>,
+        rg_bboxes: Box<Option<RgBboxes>>,
+        /// Part files the new level opened.
+        files: usize,
+        geometry: LayerGeometry,
+        loaded: Vec<GroupLoad>,
+        rows: usize,
+        bad_geoms: usize,
+        build_ms: u64,
+    },
     /// Extra part files of a multi-part collection were opened and the
     /// layer's store has grown to include them.
     ///
@@ -2099,19 +2121,12 @@ fn open_pyramid_store(
     root: &PyramidRoot,
     state: &PyramidState,
     view: Option<ViewHint>,
-    listing: Option<&std::collections::HashSet<String>>,
 ) -> Result<StoreOpen, String> {
-    let mut plan = state.plan(
+    let plan = state.plan(
         view.and_then(|v| v.gsd()),
         view.map(|v| v.rect),
         pyramid::MAX_LEVEL_PARTS,
     );
-    // The descriptor lists cells, not files. Where the root can be
-    // listed we believe the listing: a cell whose file is missing would
-    // otherwise fail the whole open, and C9 reports the same gap.
-    if let Some(have) = listing {
-        plan.parts.retain(|p| have.contains(p));
-    }
     // The null part draws nothing, so it stays out of viewport plans;
     // SQL and the scorecard still count it (see `leaf_parts`).
     if plan.parts.is_empty() {
@@ -2153,6 +2168,128 @@ fn open_pyramid_store(
     Ok(opened)
 }
 
+/// Re-plan an open pyramid layer for the current viewport and, if it
+/// lands on a different level or different cells, replace what the
+/// layer holds with them.
+///
+/// This is the pyramid's version of the COGP prefix re-plan, one step
+/// further out. A COGP level is a prefix of row groups already in the
+/// store, so refinement only has to filter its candidates; a pyramid
+/// level is a different set of *files*, so the store is rebuilt — and
+/// because levels are never mixed, so is the geometry. Nothing is
+/// appended: the new level replaces the old one whole.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_pyramid_level(
+    handle: LoaderHandle,
+    layer_id: u64,
+    generation: u64,
+    store: Arc<FeatureStore>,
+    crs: Crs,
+    display: DisplayCrs,
+    view_world: [f64; 4],
+    view_px: f64,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    style: Option<crate::data::layer::StyleBy>,
+) {
+    use std::sync::atomic::Ordering;
+    std::thread::spawn(move || {
+        let t0 = Instant::now();
+        let ended = |error: &str| {
+            handle.send(LoadMsg::AppendEnded { layer_id, error: error.into() });
+        };
+        let (Some(state), Some(root)) =
+            (store.pyramid.as_ref(), pyramid_root(&store.source))
+        else {
+            return ended(NOTHING_TO_APPEND);
+        };
+        // The plan is pure: the cell lists and the absent set are
+        // already in hand, so deciding there is nothing to do costs no
+        // IO at all — which matters, because this runs on every camera
+        // settle.
+        let Some(rect) =
+            viewport_to_data_bbox(view_world, &display, crate::data::crs::wgs84_cached())
+        else {
+            return ended(NOTHING_TO_APPEND);
+        };
+        let gsd = view_gsd(rect, view_px, crate::data::crs::wgs84_cached());
+        let plan = state.plan(gsd, Some(rect), pyramid::MAX_LEVEL_PARTS);
+        let have: std::collections::HashSet<String> = (0..store.rg_starts().len() - 1)
+            .filter_map(|g| store.part_value(g, 0).map(str::to_string))
+            .collect();
+        let want: std::collections::HashSet<String> =
+            plan.parts.iter().filter_map(|p| pyramid_hive(p)[0].1.clone()).collect();
+        if plan.res == state.active_res && want == have {
+            return ended(NOTHING_TO_APPEND);
+        }
+        if plan.parts.is_empty() {
+            // Panned off the data. Keeping what is on screen beats
+            // blanking the layer; the next settle over the pyramid
+            // brings it back.
+            return ended(NOTHING_TO_APPEND);
+        }
+        log::info!(
+            "{}: pyramid level r{} -> r{} ({} part files)",
+            store.source.name(),
+            state.active_res,
+            plan.res,
+            plan.parts.len()
+        );
+        if cancel.load(Ordering::Relaxed) {
+            return ended(CANCELLED);
+        }
+        let view = ViewHint { rect, view_px };
+        let (fresh, fresh_crs, info, rg_meta) =
+            match open_pyramid_store(&store.source, &root, state, Some(view)) {
+                Ok(o) => o,
+                Err(e) => return ended(&e),
+            };
+        if !fresh_crs.same_as(&crs) {
+            return ended(&format!(
+                "level r{} is in '{}', the layer is in '{}'",
+                plan.res, fresh_crs.name, crs.name
+            ));
+        }
+        let fresh = Arc::new(fresh);
+        let n_rg = fresh.rg_starts().len().saturating_sub(1);
+        let sel = plan_viewport_selection(
+            &fresh,
+            &fresh.source.label(),
+            rg_meta.as_ref().map(|(_, b)| b.as_slice()),
+            Some(rect),
+            None,
+            "pyramid level switch",
+        );
+        let style_sel = style.as_ref().and_then(|sb| resolve_style(&fresh, sb));
+        match build_geometry(&fresh, &crs, &display, None, sel, Some(&cancel), style_sel.as_ref()) {
+            Ok((geometry, rows, bad, _boxes, resolved)) => {
+                let mut loaded = vec![GroupLoad::None; n_rg];
+                for (g, st) in resolved {
+                    loaded[g as usize] = st;
+                }
+                let rg_rows: Vec<u64> =
+                    fresh.rg_starts().windows(2).map(|w| w[1] - w[0]).collect();
+                let boxes = rg_meta.map(|(source, boxes)| {
+                    RgBboxes::new(source, boxes, fresh.cogp.as_ref().map(|c| c.runs(&rg_rows)).as_deref())
+                });
+                handle.send(LoadMsg::LevelSwitched {
+                    layer_id,
+                    generation,
+                    level: plan.res,
+                    store: fresh,
+                    rg_bboxes: Box::new(boxes),
+                    files: info.files,
+                    geometry,
+                    loaded,
+                    rows,
+                    bad_geoms: bad,
+                    build_ms: t0.elapsed().as_millis() as u64,
+                });
+            }
+            Err(e) => ended(&e),
+        }
+    });
+}
+
 /// C9's facts: what the descriptor says, and whether the files it names
 /// are there.
 fn pyramid_quality(
@@ -2162,14 +2299,11 @@ fn pyramid_quality(
     match found? {
         Err(e) => Some(Err(e.clone())),
         Ok(state) => {
-            let listed = state.all_parts();
-            let missing: Vec<String> = match listing {
-                Some(have) => listed.iter().filter(|p| !have.contains(*p)).cloned().collect(),
-                None => Vec::new(),
-            };
+            let mut missing: Vec<String> = state.absent().iter().cloned().collect();
+            missing.sort();
             Some(Ok(super::quality::PyramidQuality {
                 summary: state.info_line(),
-                listed: listed.len(),
+                listed: state.all_parts().len(),
                 missing,
                 unlisted: listing.is_none(),
             }))
@@ -2205,10 +2339,18 @@ fn open_store_with_view(
         .is_some_and(Result::is_ok)
         .then(|| root.as_ref().and_then(PyramidRoot::list))
         .flatten();
+    // The descriptor lists cells, not files. Where the root can be
+    // listed we take the listing's word for what is there: a cell whose
+    // file is missing would otherwise fail the whole open, and C9
+    // reports the same gap.
+    let found = found.map(|r| {
+        r.map(|mut state| {
+            state.mark_absent(listing.as_ref());
+            state
+        })
+    });
     let mut opened = match (&root, &found) {
-        (Some(r), Some(Ok(state))) => {
-            open_pyramid_store(source, r, state, view, listing.as_ref())?
-        }
+        (Some(r), Some(Ok(state))) => open_pyramid_store(source, r, state, view)?,
         _ => {
             if let Some(Err(e)) = &found {
                 log::warn!("{}: {e}; opening as a plain partitioned dataset", source.label());
@@ -9001,6 +9143,75 @@ pub(crate) mod pyramid_tests {
         let (_s, _c, leaf_info, _) = open_store(&Source::Local(leaf)).unwrap();
         assert!(leaf_info.pyramid_file.is_none());
         assert_eq!(crate::data::pyramid::layer_badge(None, None), None);
+    }
+
+
+    /// Zooming in moves the layer to the level the new scale calls for:
+    /// a different set of files, and geometry rebuilt from them. Staying
+    /// put costs nothing — the re-plan is pure, so a settle that changes
+    /// no level does no IO at all.
+    #[test]
+    fn zooming_in_moves_the_layer_to_the_leaf_level() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let f = fixture("switch");
+        let wide = view_at(f.r5[0], 100.0);
+        let (store, crs, _info, _) = open_store_with_view(&f.source(), Some(wide)).unwrap();
+        assert_eq!(store.pyramid.as_ref().unwrap().active_res, 5);
+        let store = Arc::new(store);
+        let display = crate::data::crs::DisplayCrs::hobo_dyer();
+        let handle = |tx| LoaderHandle { tx, egui_ctx: eframe::egui::Context::default() };
+        let world = |v: ViewHint| data_bbox_to_world(v.rect, &crs, &display).expect("transforms");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let close = view_at(f.r7[0], 0.02);
+        spawn_pyramid_level(
+            handle(tx),
+            7,
+            0,
+            Arc::clone(&store),
+            crs.clone(),
+            display.clone(),
+            world(close),
+            close.view_px,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+        match rx.recv_timeout(Duration::from_secs(60)).expect("a level switch or an ending") {
+            LoadMsg::LevelSwitched { level, store: fresh, rows, loaded, files, .. } => {
+                assert_eq!(level, 7);
+                let p = fresh.pyramid.as_ref().unwrap();
+                assert_eq!(p.active_res, 7);
+                assert_eq!(p.badge(), None, "the leaf level badges nothing");
+                assert_eq!(files, fresh.fragments.len());
+                assert!(rows > 0, "the new level drew something");
+                assert_eq!(loaded.len(), fresh.rg_starts().len() - 1);
+                // One leaf cell and its ring, not the whole level.
+                assert!(fresh.fragments.len() < f.r7.len(), "{} parts", fresh.fragments.len());
+            }
+            LoadMsg::AppendEnded { error, .. } => panic!("{error}"),
+            _ => panic!("unexpected message"),
+        }
+
+        // The same viewport the layer was opened for: nothing to do.
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_pyramid_level(
+            handle(tx),
+            7,
+            0,
+            store,
+            crs.clone(),
+            display.clone(),
+            world(wide),
+            wide.view_px,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+        match rx.recv_timeout(Duration::from_secs(60)).expect("an ending") {
+            LoadMsg::AppendEnded { error, .. } => assert_eq!(error, NOTHING_TO_APPEND),
+            _ => panic!("a settle that changes no level must not rebuild the layer"),
+        }
     }
 
     /// Opened with no viewport at all (the CLI path), a pyramid reads
