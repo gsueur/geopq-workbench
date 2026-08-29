@@ -2407,7 +2407,27 @@ fn open_multi_store(
                         box_source = Some("file-level geo bbox".into());
                     }
                 }
-                (None, None) => boxes = None,
+                // A part that describes no extent at all. Adaptive H3
+                // writes exactly one of these: the
+                // `h3=__HIVE_DEFAULT_PARTITION__` file holding the
+                // null-geometry rows, whose covering column is all
+                // nulls and whose `geo` metadata therefore carries no
+                // bbox. Voiding the whole dataset's row-group boxes
+                // over it costs every other part its pruning: one row
+                // with no shape turns a 700-file H3 tree into a tree
+                // with no spatial index. Its groups get an empty box
+                // instead. They hold nothing drawable, so nothing is
+                // lost by never selecting them, and every other part
+                // keeps its bbox.
+                (None, None) => {
+                    all.extend(std::iter::repeat_n(
+                        [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
+                        f.rg_rows.len(),
+                    ));
+                    if box_source.is_none() {
+                        box_source = Some("mixed (a part describes no extent)".into());
+                    }
+                }
             }
         }
 
