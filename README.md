@@ -281,6 +281,9 @@ Beyond the rewrite itself:
 - **Partitioned output**: hive directories by chosen fields
   (`state=MA/part-0.parquet`) or adaptive H3 cells that split until each
   file is under a row target. Every part keeps the full treatment.
+- **Cloud-optimized levels (COGP)**: order the file coarse to fine so a
+  map reader fetches only the leading row groups its zoom needs. See
+  below.
 - **Publish to S3 / R2**: tick "Publish to S3 / R2" in the Export
   dialog and the output uploads to your bucket (multipart for big
   files) instead of staying local; partitioned datasets upload under a
@@ -299,9 +302,52 @@ Beyond the rewrite itself:
 The optimizer is a two-pass streaming rewrite: it scans the geometry to
 build the sort order, then re-reads the source through a bounded decode
 cache to write the output. Peak memory follows the row count (56 bytes a
-row for the sort index, more when H3, an admin join or partitioning add
-derived columns) rather than the file size, so there is no size cap — a
+row for the sort index, more when H3, an admin join, partitioning or
+COGP levels add derived columns — COGP costs 59 bytes a row on top,
+most of it the point-thinning grid) rather than the file size, so there is no size cap — a
 rewrite is refused only when the row count alone would not fit.
+
+### Cloud-optimized levels (COGP)
+
+The [Cloud Optimized GeoParquet Profile](https://github.com/Kanahiro/cloud-optimized-geoparquet)
+is a layout convention for progressive map rendering: features are
+ordered from coarse to fine detail, every detail level ends on a row
+group boundary, and one file-level metadata key, `cogp`, records where
+those boundaries are. A reader picks the level matching its display
+scale and fetches only the row groups up to it, so a world view costs a
+few range requests instead of the whole file. Nothing is simplified or
+duplicated — every feature appears exactly once, with its geometry
+verbatim — which is why a reader that has never heard of COGP just sees
+an ordinary GeoParquet file and reads all of it.
+
+Tick "Cloud-optimized levels (COGP)" in the Export dialog. Levels come
+from a Web Mercator pyramid by default (`gsd = 40 075 016 / (resolution
+× 2^z)` metres, z 0–16 at resolution 1024), or from a list of ground
+sample distances in metres you type yourself. A feature joins the
+coarsest level at which it is independently renderable: a line once its
+bbox diagonal reaches 2 GSD, a polygon once it reaches 4 — points have
+no extent, so they are thinned on a grid of 4 GSD instead, one survivor
+per cell per level with the rest deferred, and an optional attribute
+column decides which one survives. Whatever never qualifies lands in
+the finest level. The factors and the rank column are all adjustable,
+and the defaults reproduce the profile's reference converter, so files
+this app writes behave like the ones `cogp-rs convert` writes. GSDs are
+always metres on the ground: a layer in degrees converts at each
+feature's own latitude, a projected one is read from its CRS units.
+Within each level the usual Hilbert sort still applies, so row group
+bboxes stay tight and spatial pruning works inside a level as well as
+between them.
+
+COGP v0.1 specifies GeoParquet 1.1 with a bbox covering column, and the
+export writes that column whether or not you ticked it. The workbench
+also offers the profile on GeoParquet 2.0, where the native GEOMETRY
+type's own row-group statistics are the pruning signal; the `cogp`
+metadata is identical, but that combination is this app's extension and
+the profile's reference tools will not recognise it until the spec
+adopts it. Levels describe one file's row groups, so COGP does not
+combine with partitioned output or with the GeoArrow flavour; the
+dialog greys those out while it is on.
+
 
 ## Exploring the map
 
