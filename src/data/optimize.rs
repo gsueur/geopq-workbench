@@ -582,6 +582,126 @@ fn assign_cogp_levels(
     level
 }
 
+/// An H3 pyramid: a leaf level holding the source features partitioned by
+/// H3 cell, plus coarser levels holding features derived from the next
+/// finer one, so a reader picks a level by zoom the way it picks a COG
+/// overview. Layout and descriptor live in `super::pyramid`; design notes
+/// in `_WIKI/concepts/h3-pyramid.md`.
+///
+/// The pyramid owns the output layout end to end, which is why it refuses
+/// to share it with hive partitioning or with COGP levels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PyramidOptions {
+    /// Reference resolution: the coarsest resolution holding source
+    /// features, and the level a reader falls back to for full detail.
+    pub reference_res: u8,
+    /// Replace a reference cell over `target_rows` with its children.
+    pub adaptive: bool,
+    /// Finest resolution adaptive splitting may reach.
+    pub max_res: u8,
+    /// Rows a leaf cell may hold before it is split.
+    pub target_rows: usize,
+    /// Coarsest overview level. `None` writes the leaf level only.
+    pub from_res: Option<u8>,
+    pub method: MethodChoice,
+    /// Douglas-Peucker tolerance as a fraction of the level's ground
+    /// sample distance (`pyramid::gsd_for_res` at 64 px per cell):
+    /// 0.5 means gsd/2, half a pixel at the zoom the level is read at.
+    pub simplify_tolerance_factor: f64,
+    pub prune: PruneOptions,
+    pub dissolve: DissolveOptions,
+}
+
+impl Default for PyramidOptions {
+    fn default() -> Self {
+        Self {
+            reference_res: 8,
+            adaptive: true,
+            max_res: 10,
+            target_rows: 250_000,
+            from_res: None,
+            method: MethodChoice::Auto,
+            simplify_tolerance_factor: 0.5,
+            prune: PruneOptions::default(),
+            dissolve: DissolveOptions::default(),
+        }
+    }
+}
+
+/// How each overview level is derived from the next finer one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MethodChoice {
+    /// Per geometry family: points prune, lines simplify then prune,
+    /// polygons dissolve.
+    Auto,
+    Simplify,
+    Prune,
+    Dissolve,
+}
+
+impl MethodChoice {
+    pub fn label(self) -> &'static str {
+        match self {
+            MethodChoice::Auto => "auto",
+            MethodChoice::Simplify => "simplify",
+            MethodChoice::Prune => "prune",
+            MethodChoice::Dissolve => "dissolve",
+        }
+    }
+
+    /// One line for the dialog, saying what the level will contain.
+    pub fn hint(self) -> &'static str {
+        match self {
+            MethodChoice::Auto => {
+                "points prune, lines simplify then prune, polygons dissolve"
+            }
+            MethodChoice::Simplify => "every feature kept, fewer vertices (Douglas-Peucker)",
+            MethodChoice::Prune => "fewer features: the largest, or one in x",
+            MethodChoice::Dissolve => "polygons unioned per child cell, with count and area",
+        }
+    }
+}
+
+/// Which features a pruned level keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PruneMode {
+    /// The largest by bbox diagonal (or by the rank column when set).
+    Largest,
+    /// Every x-th feature in the level's spatial order. The keep
+    /// fraction is 1/x by construction, so it ignores `keep_fraction`.
+    OneIn(u32),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PruneOptions {
+    pub mode: PruneMode,
+    /// Share of a level's input kept, applied per level (0..1].
+    pub keep_fraction: f64,
+    /// Rank column and direction: the winning end of this column is kept
+    /// instead of the largest bbox. Same plumbing as the COGP rank, read
+    /// back from the level's own files rather than from the key pass, so
+    /// it must be a column the output actually carries.
+    pub rank: Option<(String, RankOrder)>,
+}
+
+impl Default for PruneOptions {
+    fn default() -> Self {
+        Self { mode: PruneMode::Largest, keep_fraction: 0.25, rank: None }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct DissolveOptions {
+    /// Categorical column carried onto the union as `majority:<col>`.
+    pub majority_column: Option<String>,
+}
+
+/// Attribute names a dissolved level writes.
+const DISSOLVE_COUNT: &str = "count";
+const DISSOLVE_AREA: &str = "area_sum";
+/// Prefix of the dissolved majority column (`majority:LU_CODE`).
+const DISSOLVE_MAJORITY: &str = "majority:";
+
 #[derive(Clone)]
 pub struct OptimizeOptions {
     pub version: GpVersion,
@@ -620,6 +740,10 @@ pub struct OptimizeOptions {
     /// on 1.1 WKB, the covering column; cannot combine with partitioning
     /// (levels and hive parts both want to own the file layout).
     pub cogp: Option<CogpOptions>,
+    /// Publish as an H3 pyramid: `r<res>/<cell>.parquet` files plus a
+    /// `h3-pyramid.json` descriptor. Owns the output layout, so it
+    /// combines with neither `partition` nor `cogp`.
+    pub pyramid: Option<PyramidOptions>,
     /// Source has no geometry column: synthesize WKB points from these
     /// coordinate columns (x/lon, y/lat) — materializes x/y layers into
     /// real GeoParquet.
@@ -644,6 +768,7 @@ impl Default for OptimizeOptions {
             h3_resolution: None,
             partition: super::partition::PartitionBy::None,
             cogp: None,
+            pyramid: None,
             xy_geom: None,
         }
     }
@@ -666,6 +791,23 @@ pub struct OptimizeReport {
     pub files: usize,
     /// COGP levels actually written, coarse to fine (empty when off).
     pub cogp_levels: Vec<CogpLevelReport>,
+    /// Pyramid levels written, coarse to fine (empty when off).
+    pub pyramid_levels: Vec<PyramidLevelReport>,
+    /// What the pyramid had to do differently from what was asked (a
+    /// dissolve on a non-polygon layer falling back to prune).
+    pub pyramid_note: Option<String>,
+}
+
+/// One written pyramid level, for the completion summary. Leaf levels
+/// are included (with `method: None`) so the summary can put the
+/// overviews' cost next to what they are overviews of.
+#[derive(Clone, Debug)]
+pub struct PyramidLevelReport {
+    pub res: u8,
+    pub method: Option<super::pyramid::Method>,
+    pub files: usize,
+    pub rows: u64,
+    pub bytes: u64,
 }
 
 /// One written COGP level, for the completion summary.
@@ -687,6 +829,24 @@ impl OptimizeReport {
     pub fn overlap_frac_after(&self) -> f64 {
         self.overlap_after / (self.rg_after.max(2) - 1) as f64
     }
+
+    /// Bytes the overview levels add, as a percentage of the leaf level.
+    /// The number that says whether a pyramid was worth writing.
+    pub fn pyramid_overhead_pct(&self) -> Option<f64> {
+        let leaf: u64 = self
+            .pyramid_levels
+            .iter()
+            .filter(|l| l.method.is_none())
+            .map(|l| l.bytes)
+            .sum();
+        let ov: u64 = self
+            .pyramid_levels
+            .iter()
+            .filter(|l| l.method.is_some())
+            .map(|l| l.bytes)
+            .sum();
+        (leaf > 0).then(|| ov as f64 * 100.0 / leaf as f64)
+    }
 }
 
 /// Bytes of fixed-width side tables the key pass keeps per exported row:
@@ -707,7 +867,10 @@ fn key_pass_bytes_per_row(
 ) -> u64 {
     use super::partition::PartitionBy;
     let mut n = 56;
-    if opts.h3_resolution.is_some() || matches!(opts.partition, PartitionBy::AdaptiveH3 { .. }) {
+    if opts.h3_resolution.is_some()
+        || opts.pyramid.is_some()
+        || matches!(opts.partition, PartitionBy::AdaptiveH3 { .. })
+    {
         n += 24; // lon/lat centroids
     }
     if opts.h3_resolution.is_some() {
@@ -733,6 +896,12 @@ fn key_pass_bytes_per_row(
             // (12) are all live.
             n += 28;
         }
+    }
+    if opts.pyramid.is_some() {
+        // The leaf split is the same descent over the same tables (28),
+        // and the density table the dialog showed keeps a sorted cell per
+        // row of its own while it runs (8).
+        n += 36;
     }
     if let Some(c) = &opts.cogp {
         // Geometry family (1), the visibility floor (1) and the assigned
@@ -965,6 +1134,36 @@ impl StagedOutputs {
         let file = File::create(&path).map_err(|e| format!("cannot create output: {e}"))?;
         self.files.push(path);
         Ok(file)
+    }
+
+    /// The file for one output part whose relative path *is* the file
+    /// name (`r7/872a3066dffffff.parquet`). An H3 pyramid addresses its
+    /// parts by cell id, so a `part-0.parquet` under a directory of that
+    /// name would put a directory exactly where a reader deriving the
+    /// path from a cell expects a file.
+    fn create_at(&mut self, rel: &str) -> Result<(File, PathBuf), String> {
+        let path = self.staging.join(rel);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+        let file = File::create(&path).map_err(|e| format!("cannot create output: {e}"))?;
+        self.files.push(path.clone());
+        Ok((file, path))
+    }
+
+    /// A sidecar published with the dataset (the pyramid descriptor).
+    /// Written through the same staging tree so it is renamed into place
+    /// with everything else, never on its own.
+    fn write_text(&mut self, rel: &str, text: &str) -> Result<(), String> {
+        let path = self.staging.join(rel);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+        std::fs::write(&path, text).map_err(|e| format!("write {}: {e}", path.display()))?;
+        self.files.push(path);
+        Ok(())
     }
 
     /// Flush everything to the device, then publish. Returns the paths the
@@ -1811,9 +2010,63 @@ pub fn optimize(
         PartitionBy::Fields(f) => f.clone(),
         _ => Vec::new(),
     };
-    let partitioned = !matches!(opts.partition, PartitionBy::None);
+    // --- H3 pyramid ---
+    // The pyramid owns the whole output layout: which files exist, what
+    // each is named, and what it holds. Hive parts and COGP levels each
+    // own the same thing, so the three cannot combine — and saying which
+    // one to drop is more use than a generic "cannot partition".
+    let pyramid: Option<PyramidOptions> = match &opts.pyramid {
+        None => None,
+        Some(p) => {
+            if !matches!(opts.partition, PartitionBy::None) {
+                return Err("an H3 pyramid and partitioned output cannot combine: \
+                            the pyramid already writes one file per H3 cell"
+                    .into());
+            }
+            if opts.cogp.is_some() {
+                return Err("an H3 pyramid and COGP levels cannot combine: COGP \
+                            orders the row groups of one file, the pyramid writes \
+                            a file per cell per level"
+                    .into());
+            }
+            let mut p = p.clone();
+            if !p.adaptive {
+                p.max_res = p.reference_res;
+            }
+            if p.reference_res > 15 || p.max_res > 15 {
+                return Err("pyramid: H3 resolutions must lie in 0..=15".into());
+            }
+            if p.max_res < p.reference_res {
+                return Err(format!(
+                    "pyramid: the adaptive maximum r{} is coarser than the reference r{}",
+                    p.max_res, p.reference_res
+                ));
+            }
+            if let Some(from) = p.from_res
+                && from >= p.reference_res
+            {
+                return Err(format!(
+                    "pyramid: overviews would start at r{from}, which is not coarser \
+                     than the reference resolution r{}",
+                    p.reference_res
+                ));
+            }
+            if !(p.simplify_tolerance_factor.is_finite() && p.simplify_tolerance_factor >= 0.0) {
+                return Err("pyramid: the simplify tolerance factor must be finite and \
+                            not negative"
+                    .into());
+            }
+            if !(p.prune.keep_fraction > 0.0 && p.prune.keep_fraction <= 1.0) {
+                return Err("pyramid: the prune keep fraction must lie in 0..1".into());
+            }
+            p.target_rows = p.target_rows.max(1);
+            Some(p)
+        }
+    };
+    let partitioned = pyramid.is_some() || !matches!(opts.partition, PartitionBy::None);
     let h3_name = opts.h3_resolution.map(|r| format!("h3_r{r}"));
     let need_lonlat = opts.h3_resolution.is_some()
+        || pyramid.is_some()
         || matches!(opts.partition, PartitionBy::AdaptiveH3 { .. });
     let data_crs = if need_lonlat || admin.is_some() {
         // A vendor proj4 CRS resolves for centroid math like any other.
@@ -1876,9 +2129,13 @@ pub fn optimize(
     // §5.2 asks producers to cluster spatially within each level; the
     // Hilbert order is what this app has, so COGP simply switches it on.
     let hilbert_sort = opts.hilbert_sort || cogp_on;
-    let cogp_units = cogp_on.then(|| cogp_units(crs_value.as_ref(), vendor_crs.as_ref()));
+    // The pyramid measures in the same units for the same reason: its
+    // simplification tolerances and dissolved areas are metres on the
+    // ground whatever the layer's CRS.
+    let cogp_units = (cogp_on || pyramid.is_some())
+        .then(|| cogp_units(crs_value.as_ref(), vendor_crs.as_ref()));
     if let Some(u) = cogp_units {
-        log::info!("COGP: measuring gsd thresholds in {}", u.label());
+        log::info!("measuring ground distances in {}", u.label());
     }
     // The rank column is read by the key pass like a partition key is.
     let cogp_rank_src: Option<usize> = match opts.cogp.as_ref().and_then(|c| c.rank.as_ref()) {
@@ -2250,6 +2507,7 @@ pub fn optimize(
             true,
         ));
     }
+    let mut aux_name: Option<String> = None;
     if let Some(t) = aux_target {
         let mut name = format!("{primary}_geoarrow");
         let mut k = 0usize;
@@ -2257,6 +2515,7 @@ pub fn optimize(
             k += 1;
             name = format!("{primary}_geoarrow_{k}");
         }
+        aux_name = Some(name.clone());
         let mut f = Field::new(name.as_str(), geoarrow::data_type(t), true);
         f.set_metadata(std::collections::HashMap::from([(
             "ARROW:extension:name".to_string(),
@@ -2279,6 +2538,26 @@ pub fn optimize(
     }
 
     let out_schema = Arc::new(Schema::new(fields));
+    // Pyramid knobs that name a column: the overview levels read them
+    // back out of the level below, so the column has to survive into the
+    // output. Checked here rather than at the first overview, which is
+    // minutes of leaf writing later.
+    if let Some(p) = &pyramid {
+        if let Some((name, _)) = &p.prune.rank
+            && out_schema.index_of(name).is_err()
+        {
+            return Err(format!(
+                "pyramid: prune rank column '{name}' is not in the output"
+            ));
+        }
+        if let Some(name) = &p.dissolve.majority_column
+            && out_schema.index_of(name).is_err()
+        {
+            return Err(format!(
+                "pyramid: dissolve majority column '{name}' is not in the output"
+            ));
+        }
+    }
 
     // --- writer properties (rebuilt per output file) ---
     let mut bloom_columns: Vec<String> = Vec::new();
@@ -2384,10 +2663,27 @@ pub fn optimize(
     };
 
     // --- partition plan ---
-    let parts: Vec<(String, Vec<u32>)> = match &opts.partition {
-        PartitionBy::None => vec![(String::new(), order.clone())],
-        PartitionBy::Fields(_) => partition::split_by_field_codes(&order, &field_codes)?,
-        PartitionBy::AdaptiveH3 { target_rows, max_res } => partition::split_adaptive_h3(
+    // A pyramid's plan is its leaf level: one file per H3 cell, named by
+    // the cell instead of by a hive directory, with the null-geometry
+    // rows in the leaf level's own null part.
+    let leaf_parts: Vec<partition::LeafPart> = match &pyramid {
+        Some(p) => partition::split_pyramid_leaf(
+            &order,
+            lonlat.as_ref().ok_or("internal: pyramid without centroids")?,
+            p.reference_res,
+            p.target_rows,
+            p.max_res,
+        )?,
+        None => Vec::new(),
+    };
+    let parts: Vec<(String, Vec<u32>)> = match (&pyramid, &opts.partition) {
+        (Some(p), _) => leaf_parts
+            .iter()
+            .map(|lp| (lp.path(p.reference_res), lp.rows.clone()))
+            .collect(),
+        (None, PartitionBy::None) => vec![(String::new(), order.clone())],
+        (None, PartitionBy::Fields(_)) => partition::split_by_field_codes(&order, &field_codes)?,
+        (None, PartitionBy::AdaptiveH3 { target_rows, max_res }) => partition::split_adaptive_h3(
             &order,
             lonlat.as_ref().ok_or("internal: adaptive H3 without centroids")?,
             (*target_rows).max(1),
@@ -2463,6 +2759,12 @@ pub fn optimize(
     // dataset that published as each sweep finished would answer a failure
     // in sweep two with a directory of thirty-two valid partitions and
     // eight missing ones, readable and wrong, with nothing saying so.
+    // Overview levels are written after the leaf, so the leaf pass keeps
+    // only part of the bar when there are any.
+    let write_span = match &pyramid {
+        Some(p) if p.from_res.is_some() => 0.40,
+        _ => 0.55,
+    };
     let mut staged = StagedOutputs::new(dst, partitioned)?;
     let mut rg_after_boxes: Vec<[f64; 4]> = Vec::new();
     let mut rg_after = 0usize;
@@ -2476,7 +2778,12 @@ pub fn optimize(
         for (pi, (rel, part_order)) in parts.iter().enumerate().take(hi).skip(lo) {
             let part_bbox =
                 union_bboxes(part_order.iter().filter_map(|&r| row_bboxes[r as usize].as_ref()));
-            let out_file = staged.create(rel)?;
+            // A pyramid part is a file named by its cell; a hive part is
+            // a directory the conventional `part-0.parquet` goes in.
+            let out_file = match &pyramid {
+                Some(_) => staged.create_at(rel)?.0,
+                None => staged.create(rel)?,
+            };
             let mut writer =
                 ArrowWriter::try_new(out_file, out_schema.clone(), Some(make_props()))
                     .map_err(|e| format!("writer init: {e}"))?;
@@ -2601,7 +2908,7 @@ pub fn optimize(
             }
             written += chunk.len();
             fail_point(written)?;
-            progress(0.45 + 0.55 * (written as f32 / rows.max(1) as f32), "writing");
+            progress(0.45 + write_span * (written as f32 / rows.max(1) as f32), "writing");
             if at_level_end && cogp_bounds.is_some() {
                 // COGP never partitions, so there is exactly one writer and
                 // this is its level boundary. The row-group index is read
@@ -2665,6 +2972,190 @@ pub fn optimize(
             }
         }
     }
+    // --- pyramid: overview levels, then the descriptor ---
+    let mut pyramid_levels: Vec<PyramidLevelReport> = Vec::new();
+    let mut pyramid_note: Option<String> = None;
+    if let Some(p) = &pyramid {
+        use super::pyramid as pyr;
+        // Leaf files, in creation order, which is `leaf_parts` order.
+        let leaf_paths: Vec<PathBuf> = staged.files.clone();
+        // Per-resolution leaf totals: cells, rows, bytes, files.
+        let mut leaf_levels: std::collections::BTreeMap<
+            u8,
+            (Vec<h3o::CellIndex>, u64, u64, usize),
+        > = Default::default();
+        let mut null_part = false;
+        let mut sources: Vec<(h3o::CellIndex, PathBuf)> = Vec::new();
+        for (lp, path) in leaf_parts.iter().zip(&leaf_paths) {
+            let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let e = leaf_levels.entry(lp.res(p.reference_res)).or_default();
+            match lp.cell {
+                Some(c) => {
+                    e.0.push(c);
+                    sources.push((c, path.clone()));
+                }
+                None => null_part = true,
+            }
+            e.1 += lp.rows.len() as u64;
+            e.2 += bytes;
+            e.3 += 1;
+        }
+        // The reference resolution is a level even when adaptive
+        // splitting replaced every one of its cells: it is the leaf band
+        // a reader falls back to, and the descriptor must name it.
+        leaf_levels.entry(p.reference_res).or_default();
+
+        let (vertical, note) = Vertical::resolve(p.method, layer_kind(&geom_types));
+        pyramid_note = note;
+        if let Some(n) = &pyramid_note {
+            log::info!("pyramid: {n}");
+        }
+
+        // Schema of a simplified or pruned level: the leaf's, with WKB
+        // geometry (overviews are derived data, written in the most
+        // portable flavour) and no auxiliary GeoArrow twin.
+        let mut ov_fields: Vec<Field> = Vec::new();
+        let mut pass_attrs: Vec<String> = Vec::new();
+        for f in out_schema.fields() {
+            if f.name() == &primary {
+                ov_fields.push(Field::new(&primary, DataType::Binary, true));
+            } else if aux_name.as_deref() == Some(f.name().as_str())
+                || (write_covering && f.name() == &covering_name)
+            {
+                continue; // the covering is rebuilt from the derived geometry
+            } else {
+                pass_attrs.push(f.name().clone());
+                ov_fields.push(f.as_ref().clone());
+            }
+        }
+        if write_covering {
+            ov_fields.push(Field::new(
+                covering_name.as_str(),
+                DataType::Struct(bbox_fields.clone()),
+                true,
+            ));
+        }
+        let pass_schema: SchemaRef = Arc::new(Schema::new(ov_fields));
+
+        // A dissolved level keeps none of the source attributes: one row
+        // per child cell, and summaries of what went into it.
+        let mut dis_fields: Vec<Field> = vec![
+            Field::new(&primary, DataType::Binary, true),
+            Field::new(DISSOLVE_COUNT, DataType::UInt64, false),
+            Field::new(DISSOLVE_AREA, DataType::Float64, false),
+        ];
+        if let Some(c) = &p.dissolve.majority_column {
+            dis_fields.push(Field::new(
+                format!("{DISSOLVE_MAJORITY}{c}"),
+                DataType::Utf8,
+                true,
+            ));
+        }
+        if write_covering {
+            dis_fields.push(Field::new(
+                covering_name.as_str(),
+                DataType::Struct(bbox_fields.clone()),
+                true,
+            ));
+        }
+        let dissolve_schema: SchemaRef = Arc::new(Schema::new(dis_fields));
+
+        let ctx = OverviewCtx {
+            pyr: p,
+            vertical,
+            from_res: p.from_res.unwrap_or(p.reference_res),
+            reference_res: p.reference_res,
+            pass_schema,
+            dissolve_schema,
+            pass_attrs,
+            primary: primary.clone(),
+            covering_name: covering_name.clone(),
+            write_covering,
+            bbox_fields: bbox_fields.clone(),
+            // Overviews are GeoParquet 1.1 WKB with the covering column,
+            // whatever flavour the leaf was written in.
+            geo_opts: OptimizeOptions {
+                version: GpVersion::V1_1,
+                covering: write_covering,
+                ..opts.clone()
+            },
+            crs_value: crs_value.clone(),
+            vendor_crs: vendor_crs.clone(),
+            crs_explicit_null,
+            units: cogp_units.unwrap_or(CogpUnits::Linear(1.0)),
+            props: &make_props,
+        };
+        let overviews = match p.from_res {
+            Some(_) => build_overviews(&mut staged, &ctx, &sources, progress, (0.85, 0.99))?,
+            None => Vec::new(),
+        };
+
+        // Descriptor: overviews coarse to fine, then the leaf band.
+        let mut levels: Vec<pyr::Level> = overviews
+            .iter()
+            .map(|l| pyr::Level {
+                res: l.res,
+                method: Some(l.method),
+                cells: l.cells.iter().map(|c| c.to_string()).collect(),
+                rows: Some(l.rows),
+            })
+            .collect();
+        for (res, (cells, level_rows, _, _)) in &leaf_levels {
+            levels.push(pyr::Level {
+                res: *res,
+                method: None,
+                // Already ascending: the leaf plan sorts by (res, cell).
+                cells: cells.iter().map(|c| c.to_string()).collect(),
+                rows: Some(*level_rows),
+            });
+        }
+        let desc = pyr::Descriptor {
+            version: pyr::VERSION.to_string(),
+            leaf: pyr::Leaf {
+                res: p.reference_res,
+                adaptive_max_res: p.max_res,
+                target_rows: p.target_rows as u64,
+                null_part,
+            },
+            levels,
+            pixels_per_cell: pyr::DEFAULT_PIXELS_PER_CELL,
+            crs: crs_value.clone().unwrap_or(Value::Null),
+            bbox: file_bbox,
+            rows: Some(rows as u64),
+            methods: pyramid_methods_json(p, vertical, pyramid_note.as_deref()),
+        };
+        // Never publish a descriptor the reader would reject: it is the
+        // one file that says what all the others are.
+        desc.validate()?;
+        staged.write_text(pyr::DESCRIPTOR, &desc.to_json())?;
+
+        pyramid_levels = overviews
+            .iter()
+            .map(|l| PyramidLevelReport {
+                res: l.res,
+                method: Some(l.method),
+                files: l.cells.len(),
+                rows: l.rows,
+                bytes: l.bytes,
+            })
+            .collect();
+        pyramid_levels.extend(leaf_levels.iter().map(|(res, (_, level_rows, bytes, files))| {
+            PyramidLevelReport {
+                res: *res,
+                method: None,
+                files: *files,
+                rows: *level_rows,
+                bytes: *bytes,
+            }
+        }));
+        log::info!(
+            "pyramid: leaf r{} ({} files), {} overview levels",
+            p.reference_res,
+            leaf_parts.len(),
+            overviews.len()
+        );
+    }
+
     let out_paths = staged.commit_all()?;
     let size_after: u64 = out_paths
         .iter()
@@ -2723,8 +3214,18 @@ pub fn optimize(
             opts.version.label().into()
         },
         elapsed_ms: t0.elapsed().as_millis() as u64,
-        files: parts.len(),
+        files: match &pyramid {
+            // The pyramid's parquet parts across every level; the
+            // descriptor beside them is not one of them.
+            Some(_) => out_paths
+                .iter()
+                .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+                .count(),
+            None => parts.len(),
+        },
         cogp_levels,
+        pyramid_levels,
+        pyramid_note,
     })
 }
 
@@ -3023,6 +3524,997 @@ fn build_bbox_column(
         vec![get(0), get(1), get(2), get(3)],
         Some(validity),
     ))
+}
+
+// --- H3 pyramid: overview levels ---------------------------------------
+//
+// Built fine to coarse, one target cell at a time: gather that cell's
+// children from the level below (files already closed and staged), derive
+// one file, move on. Peak memory is therefore one overview cell's input,
+// not one level's — which matters most at the first overview, where the
+// input is real source features rather than already-derived ones.
+
+/// Geometry family of a whole layer, for `MethodChoice::Auto`. A layer
+/// whose declared types straddle families takes the line treatment:
+/// simplification is meaningful for anything (points come back
+/// unchanged) and pruning applies to anything, whereas a dissolve would
+/// silently drop everything that is not a polygon.
+fn layer_kind(geom_types: &HashSet<String>) -> CogpKind {
+    let mut kinds = geom_types
+        .iter()
+        .map(|t| CogpKind::from_type_name(t.trim_end_matches(" Z")));
+    let Some(first) = kinds.next() else {
+        return CogpKind::Line;
+    };
+    if kinds.all(|k| k == first) { first } else { CogpKind::Line }
+}
+
+/// What one overview level actually does. `Auto` resolves into this, and
+/// the combination the brief asks for on lines has no single descriptor
+/// `Method` — it declares itself the way a reader most needs to hear it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Vertical {
+    Simplify,
+    Prune,
+    /// Fewer vertices, then fewer features (the `Auto` rule for lines).
+    SimplifyThenPrune,
+    Dissolve,
+}
+
+impl Vertical {
+    /// The descriptor's `method`. `SimplifyThenPrune` declares `prune`:
+    /// of the two, features going missing is the fact a reader has to
+    /// know, and the full recipe is in the descriptor's `methods` block.
+    fn declared(self) -> super::pyramid::Method {
+        use super::pyramid::Method;
+        match self {
+            Vertical::Simplify => Method::Simplify,
+            Vertical::Prune | Vertical::SimplifyThenPrune => Method::Prune,
+            Vertical::Dissolve => Method::Dissolve,
+        }
+    }
+
+    fn simplifies(self) -> bool {
+        matches!(self, Vertical::Simplify | Vertical::SimplifyThenPrune | Vertical::Dissolve)
+    }
+
+    fn prunes(self) -> bool {
+        matches!(self, Vertical::Prune | Vertical::SimplifyThenPrune)
+    }
+
+    /// Resolve the user's choice against the layer's geometry family.
+    /// A dissolve of anything but polygons has nothing to union, so it
+    /// falls back to pruning and says so rather than writing empty files.
+    fn resolve(choice: MethodChoice, kind: CogpKind) -> (Self, Option<String>) {
+        match (choice, kind) {
+            (MethodChoice::Simplify, _) => (Vertical::Simplify, None),
+            (MethodChoice::Prune, _) => (Vertical::Prune, None),
+            (MethodChoice::Dissolve, CogpKind::Polygon) => (Vertical::Dissolve, None),
+            (MethodChoice::Dissolve, _) => (
+                Vertical::Prune,
+                Some(
+                    "dissolve needs polygons; the overview levels were pruned instead"
+                        .to_string(),
+                ),
+            ),
+            (MethodChoice::Auto, CogpKind::Point) => (Vertical::Prune, None),
+            (MethodChoice::Auto, CogpKind::Line) => (Vertical::SimplifyThenPrune, None),
+            (MethodChoice::Auto, CogpKind::Polygon) => (Vertical::Dissolve, None),
+        }
+    }
+}
+
+/// Everything the overview builder needs that the leaf pass already
+/// worked out. Borrowed rather than cloned: the schemas and the CRS are
+/// shared with the writer that produced the leaf.
+struct OverviewCtx<'a> {
+    pyr: &'a PyramidOptions,
+    vertical: Vertical,
+    /// Coarsest overview resolution, and the resolution the leaf starts at.
+    from_res: u8,
+    reference_res: u8,
+    /// Schema of a simplified / pruned level: the leaf schema with WKB
+    /// geometry and no auxiliary GeoArrow column.
+    pass_schema: SchemaRef,
+    /// Schema of a dissolved level.
+    dissolve_schema: SchemaRef,
+    /// Attribute fields of `pass_schema` (everything but the geometry
+    /// and the covering column), in schema order.
+    pass_attrs: Vec<String>,
+    primary: String,
+    covering_name: String,
+    write_covering: bool,
+    bbox_fields: Fields,
+    /// Options `build_geo_meta` is called with: the leaf's, forced to the
+    /// 1.1 WKB flavour the overviews are written in.
+    geo_opts: OptimizeOptions,
+    crs_value: Option<Value>,
+    vendor_crs: Option<Value>,
+    crs_explicit_null: bool,
+    units: CogpUnits,
+    props: &'a dyn Fn() -> WriterProperties,
+}
+
+/// One overview level, as written.
+struct LevelOut {
+    res: u8,
+    method: super::pyramid::Method,
+    cells: Vec<h3o::CellIndex>,
+    rows: u64,
+    bytes: u64,
+}
+
+/// Build every overview level, coarse resolution last. `sources` is the
+/// leaf level: its cells (at the reference resolution or finer, when
+/// adaptive splitting ran) and the staged file each one lives in.
+fn build_overviews(
+    staged: &mut StagedOutputs,
+    ctx: &OverviewCtx,
+    sources: &[(h3o::CellIndex, PathBuf)],
+    progress: &dyn Fn(f32, &str),
+    span: (f32, f32),
+) -> Result<Vec<LevelOut>, String> {
+    use h3o::{CellIndex, Resolution};
+    let mut levels: Vec<LevelOut> = Vec::new();
+    let mut source: Vec<(CellIndex, PathBuf)> = sources.to_vec();
+    let count = (ctx.reference_res - ctx.from_res) as f32;
+    for (step, res) in (ctx.from_res..ctx.reference_res).rev().enumerate() {
+        let r = Resolution::try_from(res).map_err(|e| format!("H3 resolution: {e}"))?;
+        // Group the finer level's files by the cell that will contain
+        // them. A leaf level that split adaptively has files at several
+        // resolutions; `parent` answers for all of them at once, which is
+        // why the source list carries cells rather than resolutions.
+        let mut groups: std::collections::HashMap<CellIndex, Vec<(CellIndex, PathBuf)>> =
+            std::collections::HashMap::new();
+        for (cell, path) in &source {
+            let parent = cell.parent(r).unwrap_or(*cell);
+            groups.entry(parent).or_default().push((*cell, path.clone()));
+        }
+        let mut cells: Vec<CellIndex> = groups.keys().copied().collect();
+        cells.sort_unstable_by_key(|c| u64::from(*c));
+
+        let mut written: Vec<(CellIndex, PathBuf)> = Vec::with_capacity(cells.len());
+        let (mut rows, mut bytes) = (0u64, 0u64);
+        for (i, cell) in cells.iter().enumerate() {
+            let inputs = &groups[cell];
+            let (n, b, path) = write_overview_cell(staged, ctx, *cell, r, inputs)?;
+            rows += n;
+            bytes += b;
+            written.push((*cell, path));
+            let done = (step as f32 + (i + 1) as f32 / cells.len() as f32) / count.max(1.0);
+            progress(
+                span.0 + (span.1 - span.0) * done,
+                &format!("overview r{res}"),
+            );
+        }
+        levels.push(LevelOut {
+            res,
+            method: ctx.vertical.declared(),
+            cells: cells.clone(),
+            rows,
+            bytes,
+        });
+        source = written;
+    }
+    // Coarse to fine, the order the descriptor lists levels in.
+    levels.reverse();
+    Ok(levels)
+}
+
+/// Derive and write `r<res>/<cell>.parquet` from the files under it.
+/// Returns rows, bytes and the staged path (the next level reads it).
+fn write_overview_cell(
+    staged: &mut StagedOutputs,
+    ctx: &OverviewCtx,
+    cell: h3o::CellIndex,
+    res: h3o::Resolution,
+    inputs: &[(h3o::CellIndex, PathBuf)],
+) -> Result<(u64, u64, PathBuf), String> {
+    // Tolerance at the cell's own latitude: a geographic CRS converts
+    // metres to degrees differently at the equator and at 60°N, and an
+    // overview file covers one cell, so there is a right answer here.
+    let centre = h3o::LatLng::from(cell).lat();
+    let tol = level_tolerance(res, ctx.pyr.simplify_tolerance_factor, ctx.units, centre);
+    let (batch, schema) = match ctx.vertical {
+        Vertical::Dissolve => (dissolve_cell(ctx, inputs, res, tol)?, &ctx.dissolve_schema),
+        _ => (derive_cell(ctx, inputs, tol)?, &ctx.pass_schema),
+    };
+
+    let geom_pos = schema
+        .index_of(&ctx.primary)
+        .map_err(|_| "internal: overview schema has no geometry column".to_string())?;
+    let mut types: HashSet<String> = HashSet::new();
+    let mut boxes: Vec<[f64; 4]> = Vec::with_capacity(batch.num_rows());
+    {
+        let col = batch.column(geom_pos);
+        let geoms = GeomCol::new(col.as_ref(), GeomEncoding::Wkb)
+            .ok_or("internal: overview geometry is not WKB")?;
+        for i in 0..batch.num_rows() {
+            if let Some(g) = geoms.geometry(i) {
+                types.insert(geom_type_name(&g).to_string());
+                boxes.extend(bbox_of(&g));
+            }
+        }
+    }
+    let file_bbox = union_bboxes(boxes.iter());
+
+    let rel = super::pyramid::part_path(u8::from(res), &cell.to_string());
+    let (file, path) = staged.create_at(&rel)?;
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some((ctx.props)()))
+        .map_err(|e| format!("writer init: {e}"))?;
+    writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+        "geo".to_string(),
+        build_geo_meta(
+            &ctx.geo_opts,
+            &ctx.primary,
+            ctx.crs_value.as_ref(),
+            ctx.vendor_crs.as_ref(),
+            ctx.crs_explicit_null,
+            &types,
+            GeomEncoding::Wkb,
+            file_bbox,
+            &ctx.covering_name,
+            ctx.write_covering,
+        )
+        .to_string(),
+    ));
+    // An overview file opened on its own must say that it is one.
+    let meta = super::pyramid::FileMeta {
+        res: u8::from(res),
+        method: ctx.vertical.declared(),
+        source_res: u8::from(res) + 1,
+        derived: true,
+    };
+    writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+        super::pyramid::FILE_KEY.to_string(),
+        serde_json::to_string(&meta).map_err(|e| e.to_string())?,
+    ));
+    if batch.num_rows() > 0 {
+        writer.write(&batch).map_err(|e| format!("write failed: {e}"))?;
+    }
+    writer.close().map_err(|e| format!("finalize failed: {e}"))?;
+    let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    Ok((batch.num_rows() as u64, bytes, path))
+}
+
+/// Simplify and/or prune one cell's inputs into the pass-through schema.
+fn derive_cell(
+    ctx: &OverviewCtx,
+    inputs: &[(h3o::CellIndex, PathBuf)],
+    tol: f64,
+) -> Result<RecordBatch, String> {
+    let (mut geoms, attrs) = load_cell_inputs(ctx, inputs)?;
+    if ctx.vertical.simplifies() {
+        for g in geoms.iter_mut() {
+            if let Some(geom) = g.take() {
+                *g = Some(simplify_geom(&geom, tol));
+            }
+        }
+    }
+    let keep = if ctx.vertical.prunes() {
+        prune_rows(ctx, &geoms, &attrs)?
+    } else {
+        (0..geoms.len() as u32).collect()
+    };
+    assemble_pass(ctx, &geoms, &attrs, &keep)
+}
+
+/// One overview cell's loaded inputs: a geometry per row, and the
+/// pass-through attribute columns in the level schema's order.
+type CellInputs = (Vec<Option<geo_types::Geometry<f64>>>, Vec<ArrayRef>);
+
+/// Read one overview cell's inputs: geometries decoded to `geo` types,
+/// and the pass-through attributes concatenated in schema order.
+fn load_cell_inputs(
+    ctx: &OverviewCtx,
+    inputs: &[(h3o::CellIndex, PathBuf)],
+) -> Result<CellInputs, String> {
+    let mut geoms: Vec<Option<geo_types::Geometry<f64>>> = Vec::new();
+    let mut parts: Vec<Vec<ArrayRef>> = vec![Vec::new(); ctx.pass_attrs.len()];
+    for (_, path) in inputs {
+        let part = read_part(path)?;
+        let col = part.column_by(&part.primary)?;
+        let gc = GeomCol::new(col.as_ref(), part.encoding)
+            .ok_or_else(|| format!("{}: geometry does not match its encoding", path.display()))?;
+        for i in 0..part.batch.num_rows() {
+            geoms.push(gc.geometry(i));
+        }
+        for (slot, name) in ctx.pass_attrs.iter().enumerate() {
+            parts[slot].push(part.column_by(name)?);
+        }
+    }
+    let attrs: Vec<ArrayRef> = parts
+        .into_iter()
+        .map(|cols| {
+            let refs: Vec<&dyn Array> = cols.iter().map(|c| c.as_ref()).collect();
+            arrow::compute::concat(&refs).map_err(|e| format!("overview attributes: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok((geoms, attrs))
+}
+
+/// Rows a pruned level keeps, as indices into the loaded inputs.
+fn prune_rows(
+    ctx: &OverviewCtx,
+    geoms: &[Option<geo_types::Geometry<f64>>],
+    attrs: &[ArrayRef],
+) -> Result<Vec<u32>, String> {
+    let n = geoms.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    match ctx.pyr.prune.mode {
+        // One in x is its own keep fraction: the caller asked for a
+        // stride, not for a share, and honouring both would be two
+        // thinnings on top of each other.
+        PruneMode::OneIn(x) => {
+            let x = x.max(1) as usize;
+            Ok((0..n as u32).step_by(x).collect())
+        }
+        PruneMode::Largest => {
+            let keep = ((n as f64 * ctx.pyr.prune.keep_fraction.clamp(0.0, 1.0)).ceil() as usize)
+                .clamp(1, n);
+            // The rank column, when set, replaces the bbox diagonal —
+            // the same idea as the COGP rank, read back from the level's
+            // own files rather than carried from the key pass.
+            let scores: Vec<f64> = match &ctx.pyr.prune.rank {
+                Some((name, order)) => {
+                    let slot = ctx
+                        .pass_attrs
+                        .iter()
+                        .position(|a| a == name)
+                        .ok_or_else(|| format!("prune rank column '{name}' is not in the output"))?;
+                    let col = arrow::compute::cast(&attrs[slot], &DataType::Float64)
+                        .map_err(|e| format!("prune rank column '{name}': {e}"))?;
+                    let col = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                    (0..n)
+                        .map(|i| {
+                            if col.is_null(i) {
+                                f64::NEG_INFINITY
+                            } else if *order == RankOrder::Desc {
+                                col.value(i)
+                            } else {
+                                -col.value(i)
+                            }
+                        })
+                        .collect()
+                }
+                None => geoms
+                    .iter()
+                    .map(|g| {
+                        g.as_ref()
+                            .and_then(bbox_of)
+                            .map(|b| {
+                                let (w, h) = (b[2] - b[0], b[3] - b[1]);
+                                (w * w + h * h).sqrt()
+                            })
+                            .unwrap_or(f64::NEG_INFINITY)
+                    })
+                    .collect(),
+            };
+            let mut idx: Vec<u32> = (0..n as u32).collect();
+            // Descending by score, index breaking ties, so two runs of the
+            // same input keep the same features.
+            idx.sort_by(|&a, &b| {
+                scores[b as usize]
+                    .partial_cmp(&scores[a as usize])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.cmp(&b))
+            });
+            idx.truncate(keep);
+            // Back into the level's spatial order: the file stays
+            // Hilbert-ordered, which is what its row-group bboxes need.
+            idx.sort_unstable();
+            Ok(idx)
+        }
+    }
+}
+
+/// Build the output batch of a simplified / pruned level.
+fn assemble_pass(
+    ctx: &OverviewCtx,
+    geoms: &[Option<geo_types::Geometry<f64>>],
+    attrs: &[ArrayRef],
+    keep: &[u32],
+) -> Result<RecordBatch, String> {
+    let idx = UInt32Array::from(keep.to_vec());
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(ctx.pass_schema.fields().len());
+    let mut attr_slot = 0usize;
+    for f in ctx.pass_schema.fields() {
+        if f.name() == &ctx.primary {
+            cols.push(wkb_array(keep.iter().map(|&r| geoms[r as usize].as_ref()))?);
+        } else if ctx.write_covering && f.name() == &ctx.covering_name {
+            let boxes: Vec<Option<[f64; 4]>> = keep
+                .iter()
+                .map(|&r| geoms[r as usize].as_ref().and_then(bbox_of))
+                .collect();
+            let rows: Vec<u32> = (0..boxes.len() as u32).collect();
+            cols.push(build_bbox_column(&rows, &boxes, &ctx.bbox_fields));
+        } else {
+            let col = attrs
+                .get(attr_slot)
+                .ok_or("internal: overview attribute count mismatch")?;
+            attr_slot += 1;
+            cols.push(
+                arrow::compute::take(col.as_ref(), &idx, None)
+                    .map_err(|e| format!("overview attributes: {e}"))?,
+            );
+        }
+    }
+    RecordBatch::try_new(ctx.pass_schema.clone(), cols)
+        .map_err(|e| format!("overview batch assembly failed: {e}"))
+}
+
+/// Dissolve one cell: union the features by the child cell they belong
+/// to, then simplify at the level's tolerance.
+///
+/// The child cell comes from the *file* a feature is in, not from a
+/// fresh `to_cell` on its centroid. H3 resolutions do not nest
+/// geometrically — hexagons cannot — so a point's own r5 cell is not
+/// always the r5 parent of its r7 cell, and grouping by a fresh lookup
+/// put the same child cell in two different parent files. Truncating the
+/// source file's index is the same centroid assignment the leaf level
+/// made, propagated the one way that stays consistent: `parent` is a
+/// prefix of the index, so every group of this file is a child of this
+/// file's own cell, exactly once.
+fn dissolve_cell(
+    ctx: &OverviewCtx,
+    inputs: &[(h3o::CellIndex, PathBuf)],
+    res: h3o::Resolution,
+    tol: f64,
+) -> Result<RecordBatch, String> {
+    use std::collections::HashMap;
+
+    let child_res = res.succ().unwrap_or(res);
+    /// What one child cell accumulates before it becomes a row.
+    #[derive(Default)]
+    struct Group {
+        polys: Vec<geo_types::MultiPolygon<f64>>,
+        count: u64,
+        area: f64,
+        cats: HashMap<String, f64>,
+    }
+    let mut groups: HashMap<h3o::CellIndex, Group> = HashMap::new();
+
+    for (cell, path) in inputs {
+        let key = cell.parent(child_res).unwrap_or(*cell);
+        // Degrees convert to metres at the child cell's own latitude;
+        // one cell is small enough that a single factor is right for it.
+        let lat = h3o::LatLng::from(key).lat();
+        let part = read_part(path)?;
+        let col = part.column_by(&part.primary)?;
+        let gc = GeomCol::new(col.as_ref(), part.encoding)
+            .ok_or_else(|| format!("{}: geometry does not match its encoding", path.display()))?;
+        // A level below that was itself dissolved carries the running
+        // totals; the leaf level does not, and its rows count one each.
+        let counts = part.opt_u64(DISSOLVE_COUNT)?;
+        let areas = part.opt_f64(DISSOLVE_AREA)?;
+        let cats = match &ctx.pyr.dissolve.majority_column {
+            Some(c) => {
+                let dissolved = part.opt_strings(&format!("{DISSOLVE_MAJORITY}{c}"))?;
+                match dissolved {
+                    Some(v) => Some(v),
+                    None => part.opt_strings(c)?,
+                }
+            }
+            None => None,
+        };
+        let e = groups.entry(key).or_default();
+        for i in 0..part.batch.num_rows() {
+            let Some(g) = gc.geometry(i) else { continue };
+            // Non-polygon rows have nothing to union. The method only
+            // runs on polygon layers, so this is a stray in a mixed one.
+            let Some(mp) = as_multipolygon(&g) else { continue };
+            let n = counts.as_ref().map_or(1, |c| c[i]);
+            e.count += n;
+            e.area += match &areas {
+                Some(a) => a[i],
+                None => geom_area(&mp, ctx.units, lat),
+            };
+            if let Some(vals) = &cats
+                && let Some(v) = &vals[i]
+            {
+                *e.cats.entry(v.clone()).or_insert(0.0) += n as f64;
+            }
+            e.polys.push(mp);
+        }
+    }
+
+    let mut keys: Vec<h3o::CellIndex> = groups.keys().copied().collect();
+    keys.sort_unstable_by_key(|c| u64::from(*c));
+    let mut geoms: Vec<Option<geo_types::Geometry<f64>>> = Vec::with_capacity(keys.len());
+    let mut counts: Vec<u64> = Vec::with_capacity(keys.len());
+    let mut areas: Vec<f64> = Vec::with_capacity(keys.len());
+    let mut majority: Vec<Option<String>> = Vec::with_capacity(keys.len());
+    for k in &keys {
+        let g = &groups[k];
+        if g.polys.is_empty() {
+            continue; // a file of non-polygons contributes no row
+        }
+        let union = dissolve_union(&g.polys, tol);
+        geoms.push(Some(geo_types::Geometry::MultiPolygon(union)));
+        counts.push(g.count);
+        areas.push(g.area);
+        // Ties break on the value itself, so two runs write the same file.
+        majority.push(
+            g.cats
+                .iter()
+                .max_by(|(ka, wa), (kb, wb)| {
+                    wa.partial_cmp(wb).unwrap_or(std::cmp::Ordering::Equal).then(kb.cmp(ka))
+                })
+                .map(|(k, _)| k.clone()),
+        );
+    }
+
+    let mut cols: Vec<ArrayRef> = vec![
+        wkb_array(geoms.iter().map(|g| g.as_ref()))?,
+        Arc::new(arrow::array::UInt64Array::from(counts)),
+        Arc::new(Float64Array::from(areas)),
+    ];
+    if ctx.pyr.dissolve.majority_column.is_some() {
+        cols.push(Arc::new(arrow::array::StringArray::from(majority)));
+    }
+    if ctx.write_covering {
+        let boxes: Vec<Option<[f64; 4]>> =
+            geoms.iter().map(|g| g.as_ref().and_then(bbox_of)).collect();
+        let rows: Vec<u32> = (0..boxes.len() as u32).collect();
+        cols.push(build_bbox_column(&rows, &boxes, &ctx.bbox_fields));
+    }
+    RecordBatch::try_new(ctx.dissolve_schema.clone(), cols)
+        .map_err(|e| format!("dissolve batch assembly failed: {e}"))
+}
+
+/// Features unioned in one pass before the running result is
+/// generalized. Small enough that a batch's own output stays cheap to
+/// extract, large enough that a dense cell is not a thousand passes.
+const DISSOLVE_BATCH: usize = 256;
+
+/// Union many polygons into the level's geometry.
+///
+/// `unary_union` over a whole cell at once did not finish on 2.5M
+/// Massachusetts parcels: i_overlay spends its time in OGC extraction,
+/// which pairs every hole with every shell, and cadastral data unions
+/// into a blob riddled with sliver holes where neighbouring parcels do
+/// not quite meet. The ring count, not the vertex count, is what runs
+/// away.
+///
+/// So the union runs in batches with the running result generalized at
+/// the level's tolerance between them: slivers below the tolerance
+/// disappear instead of accumulating, and every batch unions a few
+/// hundred rings rather than tens of thousands. Sub-tolerance pieces are
+/// dropped rather than kept as boxes the way `simplify_geom` keeps a
+/// collapsed *feature* — here the level's feature is the union, and a
+/// fragment of it is not one.
+fn dissolve_union(polys: &[geo_types::MultiPolygon<f64>], tol: f64) -> geo_types::MultiPolygon<f64> {
+    use geo::algorithm::bool_ops::unary_union;
+    let mut acc = geo_types::MultiPolygon::new(Vec::new());
+    for (i, chunk) in polys.chunks(DISSOLVE_BATCH).enumerate() {
+        let union = if i == 0 {
+            unary_union(chunk.iter())
+        } else {
+            unary_union(chunk.iter().chain(std::iter::once(&acc)))
+        };
+        acc = generalize(union, tol);
+    }
+    acc
+}
+
+/// Simplify a dissolved union and drop what it simplifies away: pieces
+/// that lose their outline, and holes narrower than the tolerance.
+///
+/// Holes are what the extraction cost is quadratic in, and a coverage's
+/// unwanted holes are slivers: a gap where two parcels do not quite
+/// meet is long but hair-thin. So a hole goes when the shorter side of
+/// its bounding box is under the tolerance — under a pixel wide at the
+/// zoom this level is read at, whatever its length. Pieces are held to
+/// the gentler rule of having any area left, because a thin *piece* of
+/// a coverage is still coverage.
+fn generalize(mp: geo_types::MultiPolygon<f64>, tol: f64) -> geo_types::MultiPolygon<f64> {
+    use geo::{Area, BoundingRect, Simplify};
+    if !(tol.is_finite() && tol > 0.0) {
+        return mp;
+    }
+    let thin = |ls: &geo_types::LineString<f64>| match ls.bounding_rect() {
+        Some(r) => r.width().min(r.height()) < tol,
+        None => true,
+    };
+    let keep = |p: &geo_types::Polygon<f64>| -> Option<geo_types::Polygon<f64>> {
+        let out = p.simplify(tol);
+        (out.exterior().0.len() >= 4 && out.unsigned_area() > 0.0).then(|| {
+            let interiors: Vec<_> = out
+                .interiors()
+                .iter()
+                .filter(|r| r.0.len() >= 4 && !thin(r))
+                .cloned()
+                .collect();
+            geo_types::Polygon::new(out.exterior().clone(), interiors)
+        })
+    };
+    geo_types::MultiPolygon::new(mp.0.iter().filter_map(keep).collect())
+}
+
+/// One pyramid part read back for derivation.
+struct Part {
+    batch: RecordBatch,
+    primary: String,
+    encoding: GeomEncoding,
+}
+
+impl Part {
+    fn column_by(&self, name: &str) -> Result<ArrayRef, String> {
+        let i = self
+            .batch
+            .schema()
+            .index_of(name)
+            .map_err(|_| format!("pyramid level file has no column '{name}'"))?;
+        Ok(self.batch.column(i).clone())
+    }
+
+    /// An optional running total from an already-dissolved level.
+    fn opt_u64(&self, name: &str) -> Result<Option<Vec<u64>>, String> {
+        let Ok(i) = self.batch.schema().index_of(name) else { return Ok(None) };
+        let col = arrow::compute::cast(self.batch.column(i), &DataType::UInt64)
+            .map_err(|e| format!("column '{name}': {e}"))?;
+        let col = col.as_any().downcast_ref::<arrow::array::UInt64Array>().unwrap();
+        Ok(Some(
+            (0..col.len()).map(|i| if col.is_null(i) { 0 } else { col.value(i) }).collect(),
+        ))
+    }
+
+    fn opt_f64(&self, name: &str) -> Result<Option<Vec<f64>>, String> {
+        let Ok(i) = self.batch.schema().index_of(name) else { return Ok(None) };
+        let col = arrow::compute::cast(self.batch.column(i), &DataType::Float64)
+            .map_err(|e| format!("column '{name}': {e}"))?;
+        let col = col.as_any().downcast_ref::<Float64Array>().unwrap();
+        Ok(Some(
+            (0..col.len()).map(|i| if col.is_null(i) { 0.0 } else { col.value(i) }).collect(),
+        ))
+    }
+
+    /// A categorical column as display strings, for the majority vote.
+    fn opt_strings(&self, name: &str) -> Result<Option<Vec<Option<String>>>, String> {
+        use arrow::util::display::{ArrayFormatter, FormatOptions};
+        let Ok(i) = self.batch.schema().index_of(name) else { return Ok(None) };
+        let col = self.batch.column(i);
+        let opts = FormatOptions::default().with_display_error(true);
+        let f = ArrayFormatter::try_new(col.as_ref(), &opts)
+            .map_err(|e| format!("column '{name}': {e}"))?;
+        Ok(Some(
+            (0..col.len())
+                .map(|i| (!col.is_null(i)).then(|| f.value(i).to_string()))
+                .collect(),
+        ))
+    }
+}
+
+/// Read a staged pyramid part whole: one batch, plus the geometry column
+/// name and encoding its own `geo` metadata declares (the leaf level may
+/// be GeoArrow or native GEOMETRY; every overview above it is WKB).
+fn read_part(path: &Path) -> Result<Part, String> {
+    let file = File::open(path).map_err(|e| format!("cannot reopen {}: {e}", path.display()))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let schema = builder.schema().clone();
+    let geo: Option<Value> = builder
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .and_then(|kv| kv.iter().find(|k| k.key == "geo"))
+        .and_then(|k| k.value.as_ref())
+        .and_then(|v| serde_json::from_str(v).ok());
+    let primary = geo
+        .as_ref()
+        .and_then(|m| m.get("primary_column")?.as_str())
+        .map(str::to_string)
+        .or_else(|| guess_geom_column(&schema))
+        .ok_or_else(|| format!("{}: no geometry column", path.display()))?;
+    let encoding = geo
+        .as_ref()
+        .and_then(|m| m.get("columns")?.get(&primary)?.get("encoding")?.as_str())
+        .and_then(GeomEncoding::parse)
+        .unwrap_or_default();
+    let reader = builder.build().map_err(|e| format!("{}: {e}", path.display()))?;
+    let batches: Vec<RecordBatch> = reader
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let batch = concat_batches(&schema, &batches)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Part { batch, primary, encoding })
+}
+
+/// WKB column from decoded geometries.
+fn wkb_array<'a>(
+    geoms: impl Iterator<Item = Option<&'a geo_types::Geometry<f64>>>,
+) -> Result<ArrayRef, String> {
+    let opts = wkb::writer::WriteOptions::default();
+    let mut buf: Vec<u8> = Vec::new();
+    let values: Vec<Option<Vec<u8>>> = geoms
+        .map(|g| -> Result<Option<Vec<u8>>, String> {
+            let Some(g) = g else { return Ok(None) };
+            buf.clear();
+            wkb::writer::write_geometry(&mut buf, g, &opts)
+                .map_err(|e| format!("WKB encode: {e}"))?;
+            Ok(Some(buf.clone()))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Arc::new(arrow::array::BinaryArray::from_iter(values)))
+}
+
+fn bbox_of(g: &geo_types::Geometry<f64>) -> Option<[f64; 4]> {
+    use geo::BoundingRect;
+    g.bounding_rect().map(|r| {
+        let (min, max) = (r.min(), r.max());
+        [min.x, min.y, max.x, max.y]
+    })
+}
+
+/// Douglas-Peucker tolerance for one level, in the layer's own units.
+///
+/// The level's ground sample distance is its cell edge over the
+/// descriptor's pixels per cell, and the tolerance is a fraction of that
+/// (half a pixel by default). A projected CRS divides by its linear unit;
+/// a geographic one has two scales, and the conservative choice is the
+/// larger metres-per-degree — a smaller tolerance in degrees
+/// under-simplifies rather than collapsing features along the axis that
+/// converts most tightly.
+fn level_tolerance(res: h3o::Resolution, factor: f64, units: CogpUnits, lat_deg: f64) -> f64 {
+    let metres = super::pyramid::gsd_for_res(res, super::pyramid::DEFAULT_PIXELS_PER_CELL)
+        * factor.max(0.0);
+    match units {
+        CogpUnits::Linear(f) => metres / f.max(f64::MIN_POSITIVE),
+        CogpUnits::Degrees => {
+            let per_deg = M_PER_DEG_LAT.max(M_PER_DEG_LON * lat_deg.to_radians().cos().abs());
+            metres / per_deg
+        }
+    }
+}
+
+/// Area in metres squared, whatever the layer measures in (the same
+/// conversion the COGP thresholds use). Reported in metres rather than in
+/// the projected unit so a dissolved level means the same thing across
+/// CRSs; for the metre-based CRSs this is nearly always run on, the two
+/// readings coincide.
+fn geom_area(g: &geo_types::MultiPolygon<f64>, units: CogpUnits, lat_deg: f64) -> f64 {
+    use geo::Area;
+    let a = g.unsigned_area();
+    match units {
+        CogpUnits::Linear(f) => a * f * f,
+        CogpUnits::Degrees => {
+            a * (M_PER_DEG_LON * lat_deg.to_radians().cos().abs()) * M_PER_DEG_LAT
+        }
+    }
+}
+
+/// The polygons of one feature, or None when it has none.
+fn as_multipolygon(g: &geo_types::Geometry<f64>) -> Option<geo_types::MultiPolygon<f64>> {
+    use geo_types::{Geometry, MultiPolygon};
+    match g {
+        Geometry::Polygon(p) => Some(MultiPolygon::new(vec![p.clone()])),
+        Geometry::MultiPolygon(m) => Some(m.clone()),
+        Geometry::Rect(r) => Some(MultiPolygon::new(vec![r.to_polygon()])),
+        Geometry::Triangle(t) => Some(MultiPolygon::new(vec![t.to_polygon()])),
+        Geometry::GeometryCollection(c) => {
+            let polys: Vec<geo_types::Polygon<f64>> =
+                c.iter().filter_map(as_multipolygon).flat_map(|m| m.0).collect();
+            (!polys.is_empty()).then(|| MultiPolygon::new(polys))
+        }
+        _ => None,
+    }
+}
+
+/// Douglas-Peucker at `tol`, per geometry family. Z is already gone: the
+/// decoder hands out 2D geometry whatever the source stored.
+///
+/// A polygon that simplifies away keeps its bounding box as a rectangle
+/// rather than vanishing from the level (see the guard below).
+fn simplify_geom(g: &geo_types::Geometry<f64>, tol: f64) -> geo_types::Geometry<f64> {
+    use geo::Simplify;
+    use geo_types::{Geometry, MultiPolygon, Polygon};
+    if !(tol.is_finite() && tol > 0.0) {
+        return g.clone();
+    }
+    // geo's Douglas-Peucker floors a ring at four coordinates, so a
+    // polygon simplified past its own outline comes back as a
+    // zero-area sliver rather than as nothing. Either shape is a
+    // feature that vanished from the level, and an overview that
+    // silently loses features is worse than one drawing a sub-pixel
+    // feature as a box — at these zooms the box *is* the feature on
+    // screen. It keeps its bounding box instead.
+    use geo::{Area, BoundingRect};
+    let fix = |p: &Polygon<f64>, out: Polygon<f64>| -> Polygon<f64> {
+        if out.exterior().0.len() >= 4 && out.unsigned_area() > 0.0 {
+            return out;
+        }
+        match p.bounding_rect() {
+            Some(r) => r.to_polygon(),
+            None => out,
+        }
+    };
+    match g {
+        Geometry::LineString(l) => Geometry::LineString(l.simplify(tol)),
+        Geometry::MultiLineString(m) => Geometry::MultiLineString(m.simplify(tol)),
+        Geometry::Polygon(p) => Geometry::Polygon(fix(p, p.simplify(tol))),
+        Geometry::MultiPolygon(m) => Geometry::MultiPolygon(MultiPolygon::new(
+            m.iter().map(|p| fix(p, p.simplify(tol))).collect(),
+        )),
+        // Points and rectangles have no vertices to drop; a collection is
+        // simplified member by member.
+        Geometry::GeometryCollection(c) => Geometry::GeometryCollection(
+            geo_types::GeometryCollection(c.iter().map(|m| simplify_geom(m, tol)).collect()),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Feature centroids in lon/lat, for the density table the pyramid
+/// dialog shows before the user commits to a reference resolution.
+///
+/// Reads the covering bbox column when the file declares one — four
+/// float leaves rather than the geometry, which on a parcels file is the
+/// difference between a second and a minute — and decodes geometry only
+/// when there is none. Either way it is one projected scan: the answer
+/// is per feature, so there is no metadata shortcut.
+pub fn scan_centroids(
+    src: &Source,
+    epsg_hint: Option<u32>,
+) -> Result<Vec<Option<(f64, f64)>>, String> {
+    let reader = src.open()?;
+    let arrow_meta = ArrowReaderMetadata::load(&reader, Default::default())
+        .map_err(|e| format!("not a parquet file: {e}"))?;
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(reader, arrow_meta);
+    let schema = builder.schema().clone();
+    let meta = builder.metadata().clone();
+    let geo: Option<Value> = meta
+        .file_metadata()
+        .key_value_metadata()
+        .and_then(|kv| kv.iter().find(|k| k.key == "geo"))
+        .and_then(|k| k.value.as_ref())
+        .and_then(|v| serde_json::from_str(v).ok());
+    let primary = primary_of(&geo, &schema)?;
+    let col_meta = |k: &str| -> Option<Value> {
+        geo.as_ref()?.get("columns")?.get(&primary)?.get(k).cloned()
+    };
+    let encoding = col_meta("encoding")
+        .and_then(|e| e.as_str().and_then(GeomEncoding::parse))
+        .unwrap_or_default();
+    let crs_value: Option<Value> = col_meta("crs")
+        .filter(|v| !v.is_null())
+        .or_else(|| logical_type_crs(&meta, &primary))
+        .or_else(|| {
+            epsg_hint
+                .filter(|&e| e != 4326)
+                .map(|e| json!({"id": {"authority": "EPSG", "code": e}}))
+        });
+    let vendor_crs: Option<Value> = crs_value.is_none().then(|| col_meta("geopq:crs")).flatten();
+    let data_crs = match vendor_crs.as_ref().and_then(|v| {
+        let p4 = v.get("proj4")?.as_str()?;
+        super::crs::Crs::from_proj4(p4, None, "from .prj").ok()
+    }) {
+        Some(c) => c,
+        None => super::crs::Crs::from_geoparquet_crs(crs_value.as_ref())
+            .map_err(|e| format!("the density table needs a resolvable CRS: {e}"))?,
+    };
+
+    // The covering column when the file has one and it really is a bbox
+    // struct: its leaves are the answer with no geometry read at all.
+    let covering: Option<String> = col_meta("covering")
+        .and_then(|c| {
+            c.get("bbox")?.get("xmin")?.as_array()?.first()?.as_str().map(str::to_string)
+        })
+        .filter(|n| {
+            schema.index_of(n).is_ok_and(|i| is_covering_struct(schema.field(i).data_type()))
+        });
+
+    let name = covering.as_deref().unwrap_or(&primary);
+    let idx = schema.index_of(name).map_err(|_| format!("column '{name}' not found"))?;
+    let mask = ProjectionMask::roots(meta.file_metadata().schema_descr(), [idx]);
+    let rows: usize = meta.file_metadata().num_rows().max(0) as usize;
+    let mut bboxes: Vec<Option<[f64; 4]>> = Vec::with_capacity(rows);
+    let mut types: HashSet<String> = HashSet::new();
+    let reader = builder
+        .with_projection(mask)
+        .with_batch_size(READ_BATCH)
+        .build()
+        .map_err(|e| format!("parquet read: {e}"))?;
+    for batch in reader {
+        let batch = batch.map_err(|e| format!("parquet decode error: {e}"))?;
+        let col = batch.column(0);
+        match covering.is_some() {
+            true => push_covering_bboxes(col, &mut bboxes)?,
+            false => scan_bboxes(col, encoding, &mut bboxes, &mut types, None)?,
+        }
+    }
+    Ok(super::partition::centroids_in(&bboxes, &data_crs, &super::crs::Crs::wgs84()))
+}
+
+/// The primary geometry column of a file, from its `geo` metadata or by
+/// the usual names.
+fn primary_of(geo: &Option<Value>, schema: &Schema) -> Result<String, String> {
+    geo.as_ref()
+        .and_then(|m| m.get("primary_column")?.as_str())
+        .map(str::to_string)
+        .or_else(|| guess_geom_column(schema))
+        .ok_or_else(|| "no geometry column".to_string())
+}
+
+/// Append the bboxes a covering struct column already holds.
+fn push_covering_bboxes(col: &ArrayRef, out: &mut Vec<Option<[f64; 4]>>) -> Result<(), String> {
+    let st = col
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or("covering column is not a struct")?;
+    let leaf = |n: &str| -> Result<Float64Array, String> {
+        let c = st.column_by_name(n).ok_or_else(|| format!("covering has no {n}"))?;
+        arrow::compute::cast(c, &DataType::Float64)
+            .map_err(|e| format!("covering {n}: {e}"))
+            .map(|a| a.as_any().downcast_ref::<Float64Array>().unwrap().clone())
+    };
+    let (xmin, ymin, xmax, ymax) = (leaf("xmin")?, leaf("ymin")?, leaf("xmax")?, leaf("ymax")?);
+    for i in 0..st.len() {
+        let null = st.is_null(i)
+            || xmin.is_null(i)
+            || ymin.is_null(i)
+            || xmax.is_null(i)
+            || ymax.is_null(i);
+        out.push((!null).then(|| {
+            [xmin.value(i), ymin.value(i), xmax.value(i), ymax.value(i)]
+        }));
+    }
+    Ok(())
+}
+
+/// The descriptor's `methods` block: the parameters this run actually
+/// used, for a human reading the file and for a re-run that wants to
+/// match it. Only the method that ran is described — a prune fraction
+/// beside a dissolved pyramid would read as something the files carry.
+fn pyramid_methods_json(p: &PyramidOptions, vertical: Vertical, note: Option<&str>) -> Value {
+    let mut out = json!({
+        "requested": p.method.label(),
+        "applied": match vertical {
+            Vertical::Simplify => "simplify",
+            Vertical::Prune => "prune",
+            Vertical::SimplifyThenPrune => "simplify+prune",
+            Vertical::Dissolve => "dissolve",
+        },
+    });
+    if vertical.simplifies() {
+        out["simplify"] = json!({
+            "algorithm": "douglas-peucker",
+            "tolerance": format!("gsd*{}", p.simplify_tolerance_factor),
+            "topology_preserved": false,
+            "z_dropped": true,
+        });
+    }
+    if vertical.prunes() {
+        let mut prune = match p.prune.mode {
+            PruneMode::Largest => json!({"mode": "largest", "keep": p.prune.keep_fraction}),
+            PruneMode::OneIn(x) => json!({"mode": "one_in", "x": x}),
+        };
+        if let Some((name, order)) = &p.prune.rank {
+            prune["rank"] = json!({
+                "column": name,
+                "order": if *order == RankOrder::Desc { "desc" } else { "asc" },
+            });
+        }
+        out["prune"] = prune;
+    }
+    if vertical == Vertical::Dissolve {
+        let mut attrs = vec![DISSOLVE_COUNT.to_string(), DISSOLVE_AREA.to_string()];
+        if let Some(c) = &p.dissolve.majority_column {
+            attrs.push(format!("{DISSOLVE_MAJORITY}{c}"));
+        }
+        out["dissolve"] = json!({
+            "by": "child_cell",
+            "attributes": attrs,
+            // Metres squared whatever the layer's CRS, so a dissolved
+            // level means the same thing across datasets.
+            "area_units": "m2",
+        });
+    }
+    if let Some(n) = note {
+        out["note"] = json!(n);
+    }
+    out
 }
 
 /// Hilbert curve distance of cell (x, y) on a 2^order × 2^order grid.
@@ -5934,4 +7426,682 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- H3 pyramid -----------------------------------------------------
+
+    /// WKB polygon: a regular n-gon, so simplification has vertices to
+    /// drop and a dissolve has an area to conserve.
+    fn wkb_ngon(cx: f64, cy: f64, r: f64, n: usize) -> Vec<u8> {
+        let mut b = vec![1u8];
+        b.extend_from_slice(&3u32.to_le_bytes()); // Polygon
+        b.extend_from_slice(&1u32.to_le_bytes()); // one ring
+        b.extend_from_slice(&(n as u32 + 1).to_le_bytes());
+        for i in 0..=n {
+            let a = (i % n) as f64 / n as f64 * std::f64::consts::TAU;
+            b.extend_from_slice(&(cx + r * a.cos()).to_le_bytes());
+            b.extend_from_slice(&(cy + r * a.sin()).to_le_bytes());
+        }
+        b
+    }
+
+    /// The pyramid fixture: a 12×12 grid of 40-gons over a fifth of a
+    /// degree near Paris, radii strictly increasing with the id so
+    /// "largest" is unambiguous, plus an attribute to take a majority of
+    /// and one null-geometry row. Geographic, because H3 is.
+    fn pyramid_fixture(path: &Path) -> usize {
+        let mut wkbs: Vec<Option<Vec<u8>>> = Vec::new();
+        let mut ids: Vec<i64> = Vec::new();
+        let mut cats: Vec<&str> = Vec::new();
+        for i in 0..144usize {
+            let (gx, gy) = (i % 12, i / 12);
+            let cx = 2.30 + gx as f64 * 0.017;
+            let cy = 48.80 + gy as f64 * 0.017;
+            wkbs.push(Some(wkb_ngon(cx, cy, 0.002 + 0.000_018 * i as f64, 40)));
+            ids.push(i as i64);
+            cats.push(["oak", "pine", "birch"][gy % 3]);
+        }
+        // One null geometry: it belongs in the leaf null part and nowhere
+        // else, which is what the layout promises.
+        wkbs.push(None);
+        ids.push(-1);
+        cats.push("none");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, true),
+            Field::new("id", DataType::Int64, false),
+            Field::new("cat", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter(wkbs.iter().map(|w| w.as_deref()))),
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(arrow::array::StringArray::from(cats)),
+            ],
+        )
+        .unwrap();
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {"encoding": "WKB", "geometry_types": ["Polygon"]}},
+        });
+        let mut w = ArrowWriter::try_new(File::create(path).unwrap(), schema, None).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        144
+    }
+
+    fn pyramid_opts(method: MethodChoice) -> PyramidOptions {
+        PyramidOptions {
+            reference_res: 5,
+            adaptive: true,
+            max_res: 7,
+            target_rows: 20,
+            from_res: Some(3),
+            method,
+            ..Default::default()
+        }
+    }
+
+    fn read_descriptor(root: &Path) -> crate::data::pyramid::Descriptor {
+        let text = std::fs::read_to_string(root.join(crate::data::pyramid::DESCRIPTOR))
+            .expect("descriptor written");
+        crate::data::pyramid::Descriptor::parse(&text).unwrap()
+    }
+
+    /// Every parquet part under a pyramid root, as descriptor-relative paths.
+    fn pyramid_parts(root: &Path) -> Vec<String> {
+        let mut out: Vec<String> = walk_files(root)
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/"))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// One part's rows, decoded: ids and geometries.
+    fn part_contents(path: &Path) -> (Vec<i64>, Vec<Option<geo_types::Geometry<f64>>>) {
+        let part = read_part(path).unwrap();
+        let col = part.column_by(&part.primary).unwrap();
+        let gc = GeomCol::new(col.as_ref(), part.encoding).unwrap();
+        let geoms = (0..part.batch.num_rows()).map(|i| gc.geometry(i)).collect();
+        let ids = match part.batch.schema().index_of("id") {
+            Ok(i) => {
+                let a = part.batch.column(i).as_any().downcast_ref::<Int64Array>().unwrap();
+                (0..a.len()).map(|i| a.value(i)).collect()
+            }
+            Err(_) => Vec::new(),
+        };
+        (ids, geoms)
+    }
+
+    fn part_f64(path: &Path, name: &str) -> Vec<f64> {
+        read_part(path).unwrap().opt_f64(name).unwrap().unwrap_or_default()
+    }
+
+    fn part_u64(path: &Path, name: &str) -> Vec<u64> {
+        read_part(path).unwrap().opt_u64(name).unwrap().unwrap_or_default()
+    }
+
+    fn write_pyramid(dir: &Path, name: &str, pyr: PyramidOptions) -> (PathBuf, OptimizeReport) {
+        let src = dir.join("src.parquet");
+        if !src.exists() {
+            pyramid_fixture(&src);
+        }
+        let dst = dir.join(name);
+        let opts = OptimizeOptions { pyramid: Some(pyr), ..Default::default() };
+        let rep = optimize(&Source::Local(src), &dst, &opts, None, None, &|_, _| {}).unwrap();
+        (dst, rep)
+    }
+
+    /// The layout contract, once per method: every source feature in
+    /// exactly one leaf file, every overview file saying what it is, and
+    /// a descriptor that validates and names exactly the files on disk.
+    #[test]
+    fn pyramid_writes_a_valid_dataset_for_every_method() {
+        use crate::data::pyramid::{self, Descriptor};
+        let dir = std::env::temp_dir().join(format!("geopq_pyr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for method in [MethodChoice::Simplify, MethodChoice::Prune, MethodChoice::Dissolve] {
+            let (root, rep) =
+                write_pyramid(&dir, &format!("out_{}", method.label()), pyramid_opts(method));
+            let desc: Descriptor = read_descriptor(&root);
+            desc.validate().unwrap_or_else(|e| panic!("{}: {e}", method.label()));
+            assert_eq!(desc.leaf.res, 5);
+            assert_eq!(desc.leaf.adaptive_max_res, 7);
+            assert!(desc.leaf.null_part, "the fixture has a null geometry");
+            assert_eq!(desc.pixels_per_cell, pyramid::DEFAULT_PIXELS_PER_CELL);
+            assert_eq!(desc.rows, Some(145));
+
+            // The descriptor names exactly the files that were written.
+            let mut listed = desc.files();
+            listed.sort();
+            assert_eq!(listed, pyramid_parts(&root), "{}", method.label());
+            assert_eq!(rep.files, listed.len(), "{}", method.label());
+
+            // Two overview levels, coarse first, each with a method.
+            let ov: Vec<u8> = desc.overviews().map(|l| l.res).collect();
+            assert_eq!(ov, vec![3, 4], "{}", method.label());
+            assert!(desc.leaves().all(|l| l.method.is_none()));
+            assert!(desc.leaves().any(|l| l.res > 5), "dense cells split finer");
+
+            // Every source feature lands in exactly one leaf file, and
+            // the null-geometry row lands in the null part alone.
+            let mut leaf_ids: Vec<i64> = Vec::new();
+            for l in desc.leaves() {
+                for c in &l.cells {
+                    leaf_ids.extend(part_contents(&root.join(pyramid::part_path(l.res, c))).0);
+                }
+            }
+            leaf_ids.sort();
+            assert_eq!(leaf_ids, (0..144).collect::<Vec<i64>>(), "{}", method.label());
+            let null = root.join(pyramid::part_path(5, pyramid::NULL_PART));
+            assert_eq!(part_contents(&null).0, vec![-1], "{}", method.label());
+
+            // Every overview file says it is one, and carries its own bbox.
+            for l in desc.overviews() {
+                assert!(!l.cells.is_empty());
+                for c in &l.cells {
+                    let p = root.join(pyramid::part_path(l.res, c));
+                    let meta: pyramid::FileMeta = {
+                        let b = ParquetRecordBatchReaderBuilder::try_new(File::open(&p).unwrap())
+                            .unwrap();
+                        let kv = b
+                            .metadata()
+                            .file_metadata()
+                            .key_value_metadata()
+                            .unwrap()
+                            .iter()
+                            .find(|kv| kv.key == pyramid::FILE_KEY)
+                            .unwrap_or_else(|| panic!("{}: no {} key", p.display(), pyramid::FILE_KEY))
+                            .clone();
+                        serde_json::from_str(kv.value.as_deref().unwrap()).unwrap()
+                    };
+                    assert!(meta.derived);
+                    assert_eq!(meta.res, l.res);
+                    assert_eq!(meta.source_res, l.res + 1);
+                    assert_eq!(Some(meta.method), l.method);
+                    let geo = read_geo_meta(&p);
+                    let bbox = geo["columns"]["geometry"]["bbox"].as_array().expect("file bbox");
+                    assert_eq!(bbox.len(), 4, "{}", p.display());
+                    assert!(
+                        geo["columns"]["geometry"]["covering"].is_object(),
+                        "overviews keep the covering column"
+                    );
+                }
+            }
+
+            // The report accounts for every level, leaf included.
+            let levels: Vec<u8> = rep.pyramid_levels.iter().map(|l| l.res).collect();
+            assert_eq!(levels[0], 3, "coarse first: {levels:?}");
+            assert!(levels.windows(2).all(|w| w[0] < w[1]), "{levels:?}");
+            assert!(rep.pyramid_overhead_pct().unwrap() > 0.0);
+            assert!(rep.pyramid_note.is_none(), "{:?}", rep.pyramid_note);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Simplification keeps every feature and drops vertices. A polygon
+    /// that simplifies past its own outline comes back as its bounding
+    /// box rather than vanishing.
+    #[test]
+    fn pyramid_simplify_thins_without_dropping() {
+        use crate::data::pyramid::{self, Descriptor};
+        let dir = std::env::temp_dir().join(format!("geopq_pyr_simp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (root, _) = write_pyramid(&dir, "out", pyramid_opts(MethodChoice::Simplify));
+        let desc: Descriptor = read_descriptor(&root);
+
+        let vertices = |g: &geo_types::Geometry<f64>| -> usize {
+            use geo::CoordsIter;
+            g.coords_count()
+        };
+        let mut leaf: std::collections::HashMap<i64, usize> = Default::default();
+        for l in desc.leaves() {
+            for c in &l.cells {
+                let (ids, geoms) = part_contents(&root.join(pyramid::part_path(l.res, c)));
+                for (id, g) in ids.iter().zip(&geoms) {
+                    if let Some(g) = g {
+                        leaf.insert(*id, vertices(g));
+                    }
+                }
+            }
+        }
+        assert_eq!(leaf.len(), 144);
+
+        for l in desc.overviews() {
+            let mut ids: Vec<i64> = Vec::new();
+            let mut thinner = 0usize;
+            for c in &l.cells {
+                let (part_ids, geoms) = part_contents(&root.join(pyramid::part_path(l.res, c)));
+                for (id, g) in part_ids.iter().zip(&geoms) {
+                    let g = g.as_ref().unwrap_or_else(|| panic!("r{}: feature {id} vanished", l.res));
+                    // Nothing simplifies away: a 40-gon that collapses at
+                    // this tolerance comes back as its bounding box, which
+                    // still has an outline and still has area.
+                    use geo::Area;
+                    assert!(vertices(g) >= 4, "r{}: feature {id} has no outline", l.res);
+                    assert!(g.unsigned_area() > 0.0, "r{}: feature {id} has no area", l.res);
+                    if vertices(g) < leaf[id] {
+                        thinner += 1;
+                    }
+                    ids.push(*id);
+                }
+            }
+            ids.sort();
+            assert_eq!(ids, (0..144).collect::<Vec<i64>>(), "r{} keeps every feature", l.res);
+            assert_eq!(thinner, 144, "r{} thinned every 40-gon", l.res);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pruning keeps the largest by bbox diagonal, a quarter of each
+    /// level's input by default, and the biggest feature of all survives
+    /// every level.
+    #[test]
+    fn pyramid_prune_keeps_the_largest() {
+        use crate::data::pyramid::{self, Descriptor};
+        let dir = std::env::temp_dir().join(format!("geopq_pyr_prune_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (root, _) = write_pyramid(&dir, "out", pyramid_opts(MethodChoice::Prune));
+        let desc: Descriptor = read_descriptor(&root);
+
+        let mut prev = 144usize;
+        for l in desc.overviews().collect::<Vec<_>>().into_iter().rev() {
+            let mut ids: Vec<i64> = Vec::new();
+            for c in &l.cells {
+                ids.extend(part_contents(&root.join(pyramid::part_path(l.res, c))).0);
+            }
+            assert!(!ids.is_empty(), "r{} is not empty", l.res);
+            assert!(ids.len() < prev, "r{} thins its input ({} of {prev})", l.res, ids.len());
+            // The fixture's radii grow with the id, so the largest
+            // feature is 143 and it must survive at every level.
+            assert!(ids.contains(&143), "r{} kept the largest", l.res);
+            // A quarter of the input, per cell, rounded up.
+            assert!(
+                ids.len() <= prev.div_ceil(4) + l.cells.len(),
+                "r{}: {} of {prev} over {} cells",
+                l.res,
+                ids.len(),
+                l.cells.len()
+            );
+            prev = ids.len();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dissolving unions by child cell: one row per occupied child, the
+    /// counts adding up to the source, and the unioned geometry covering
+    /// the same ground as its inputs.
+    #[test]
+    fn pyramid_dissolve_unions_by_child_cell() {
+        use crate::data::pyramid::{self, Descriptor};
+        use h3o::Resolution;
+        let dir = std::env::temp_dir().join(format!("geopq_pyr_dis_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pyr = PyramidOptions {
+            // Not simplified at all, so the area comparison measures the
+            // union rather than the Douglas-Peucker after it. The
+            // dissolve-then-simplify path is covered by the layout test.
+            simplify_tolerance_factor: 0.0,
+            dissolve: DissolveOptions { majority_column: Some("cat".into()) },
+            ..pyramid_opts(MethodChoice::Dissolve)
+        };
+        let (root, _) = write_pyramid(&dir, "out", pyr);
+        let desc: Descriptor = read_descriptor(&root);
+
+        // The r5 cells the leaf level occupies: one dissolved row per
+        // occupied child is what the r4 level owes them. Taken from the
+        // leaf cells rather than from a fresh lookup, because that is
+        // the assignment the pyramid actually made.
+        let mut children: std::collections::HashSet<u64> = Default::default();
+        for l in desc.leaves() {
+            for c in &l.cells {
+                let cell: h3o::CellIndex = c.parse().unwrap();
+                children.insert(u64::from(cell.parent(Resolution::Five).unwrap()));
+            }
+        }
+        // Source area, measured the way a dissolved level reports it.
+        let src = dir.join("src.parquet");
+        let (_, src_geoms) = part_contents(&src);
+        let mut src_area = 0.0;
+        for g in src_geoms.iter().flatten() {
+            let b = bbox_of(g).unwrap();
+            src_area += geom_area(
+                &as_multipolygon(g).unwrap(),
+                CogpUnits::Degrees,
+                (b[1] + b[3]) * 0.5,
+            );
+        }
+
+        let level_of = |res: u8| -> (u64, f64, f64, Vec<Option<String>>) {
+            let l = desc.levels.iter().find(|l| l.res == res).unwrap();
+            let (mut count, mut area, mut union_area) = (0u64, 0.0, 0.0);
+            let mut cats: Vec<Option<String>> = Vec::new();
+            for c in &l.cells {
+                let p = root.join(pyramid::part_path(res, c));
+                count += part_u64(&p, "count").iter().sum::<u64>();
+                area += part_f64(&p, "area_sum").iter().sum::<f64>();
+                let (_, geoms) = part_contents(&p);
+                for g in geoms.iter().flatten() {
+                    let b = bbox_of(g).unwrap();
+                    union_area += geom_area(
+                        &as_multipolygon(g).unwrap(),
+                        CogpUnits::Degrees,
+                        (b[1] + b[3]) * 0.5,
+                    );
+                }
+                cats.extend(
+                    read_part(&p).unwrap().opt_strings("majority:cat").unwrap().unwrap(),
+                );
+            }
+            (count, area, union_area, cats)
+        };
+
+        let (count4, area4, union4, cats4) = level_of(4);
+        assert_eq!(cats4.len(), children.len(), "one row per occupied r5 child");
+        assert_eq!(count4, 144, "every source feature counted once");
+        // The writer converts degrees to metres at the child cell's
+        // latitude and this sum at each feature's, so they agree to a
+        // fraction of a percent rather than exactly.
+        assert!(
+            (area4 - src_area).abs() / src_area < 0.005,
+            "area_sum is the inputs' area: {area4} vs {src_area}"
+        );
+        assert!(
+            (union4 - src_area).abs() / src_area < 0.01,
+            "the union covers the inputs within 1%: {union4} vs {src_area}"
+        );
+        assert!(cats4.iter().all(|c| matches!(c.as_deref(), Some("oak" | "pine" | "birch"))));
+
+        // Coarsening again conserves both totals.
+        let (count3, area3, _, _) = level_of(3);
+        assert_eq!(count3, 144);
+        // Coarsening sums the level below's own totals, so no second
+        // conversion happens and r3 matches r4 exactly.
+        assert!((area3 - area4).abs() / area4 < 1e-9, "{area3} vs {area4}");
+        assert!((area3 - src_area).abs() / src_area < 0.005, "{area3} vs {src_area}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dissolve of a layer that has no polygons prunes instead, and
+    /// says so rather than writing empty files.
+    #[test]
+    fn pyramid_dissolve_on_lines_falls_back_to_prune() {
+        let dir = std::env::temp_dir().join(format!("geopq_pyr_lines_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("lines.parquet");
+        let rows: Vec<(Vec<u8>, i64, i64)> = (0..120)
+            .map(|i| {
+                let x = 2.30 + (i % 12) as f64 * 0.017;
+                let y = 48.80 + (i / 12) as f64 * 0.017;
+                (wkb_line(x, y, x + 0.004, y + 0.004), i, i)
+            })
+            .collect();
+        write_wgs84_fixture(&src, rows, &["LineString"]);
+        let opts = OptimizeOptions {
+            pyramid: Some(pyramid_opts(MethodChoice::Dissolve)),
+            ..Default::default()
+        };
+        let dst = dir.join("out");
+        let rep = optimize(&Source::Local(src), &dst, &opts, None, None, &|_, _| {}).unwrap();
+        let note = rep.pyramid_note.expect("the fallback is reported");
+        assert!(note.contains("dissolve") && note.contains("prune"), "got {note}");
+        let desc = read_descriptor(&dst);
+        desc.validate().unwrap();
+        assert!(desc.overviews().all(|l| l.method == Some(crate::data::pyramid::Method::Prune)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The leaf level on its own: no overviews, no overview levels in
+    /// the descriptor, and the reference resolution still declared.
+    #[test]
+    fn pyramid_without_overviews_is_just_the_leaf() {
+        let dir = std::env::temp_dir().join(format!("geopq_pyr_leaf_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pyr = PyramidOptions { from_res: None, ..pyramid_opts(MethodChoice::Auto) };
+        let (root, rep) = write_pyramid(&dir, "out", pyr);
+        let desc = read_descriptor(&root);
+        desc.validate().unwrap();
+        assert_eq!(desc.overviews().count(), 0);
+        assert!(desc.levels.iter().any(|l| l.res == 5));
+        assert_eq!(rep.pyramid_overhead_pct(), Some(0.0));
+        let mut listed = desc.files();
+        listed.sort();
+        assert_eq!(listed, pyramid_parts(&root));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pyramid_refuses_the_combinations_it_cannot_honour() {
+        let dir = std::env::temp_dir().join(format!("geopq_pyr_no_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.parquet");
+        pyramid_fixture(&src);
+        let dst = dir.join("out");
+        let run = |o: &OptimizeOptions| {
+            optimize(&Source::Local(src.clone()), &dst, o, None, None, &|_, _| {}).unwrap_err()
+        };
+
+        let hive = OptimizeOptions {
+            pyramid: Some(pyramid_opts(MethodChoice::Auto)),
+            partition: crate::data::partition::PartitionBy::Fields(vec!["cat".into()]),
+            ..Default::default()
+        };
+        assert!(run(&hive).contains("partitioned output"), "{}", run(&hive));
+
+        let cogp = OptimizeOptions {
+            pyramid: Some(pyramid_opts(MethodChoice::Auto)),
+            cogp: Some(crate::data::settings::cogp_defaults().clone()),
+            ..Default::default()
+        };
+        assert!(run(&cogp).contains("COGP levels"), "{}", run(&cogp));
+
+        // Overviews have to be coarser than the leaf.
+        let backwards = OptimizeOptions {
+            pyramid: Some(PyramidOptions {
+                from_res: Some(6),
+                ..pyramid_opts(MethodChoice::Auto)
+            }),
+            ..Default::default()
+        };
+        assert!(run(&backwards).contains("coarser"), "{}", run(&backwards));
+
+        // A knob naming a column the output does not carry fails before
+        // the passes rather than at the first overview.
+        let missing = OptimizeOptions {
+            pyramid: Some(PyramidOptions {
+                prune: PruneOptions {
+                    rank: Some(("nope".into(), RankOrder::Desc)),
+                    ..PruneOptions::default()
+                },
+                ..pyramid_opts(MethodChoice::Prune)
+            }),
+            ..Default::default()
+        };
+        assert!(run(&missing).contains("rank column 'nope'"), "{}", run(&missing));
+        assert!(!dst.exists(), "a refused run leaves nothing behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Measured run on a real layer, opt-in through the environment:
+    /// `GEOPQ_PYR_FILE` is the source, `GEOPQ_PYR_OUT` the pyramid root,
+    /// and `GEOPQ_PYR_METHOD` / `_REF` / `_FROM` / `_TARGET` pick the
+    /// options. Prints the density table and the per-level cost.
+    #[test]
+    #[ignore = "needs a real file; set GEOPQ_PYR_FILE"]
+    fn pyramid_real_file() {
+        let Ok(src) = std::env::var("GEOPQ_PYR_FILE") else { return };
+        let src = PathBuf::from(src);
+        let dst = PathBuf::from(
+            std::env::var("GEOPQ_PYR_OUT").unwrap_or_else(|_| {
+                std::env::temp_dir().join("geopq_pyramid_real").to_string_lossy().into_owned()
+            }),
+        );
+        let num = |k: &str, d: usize| -> usize {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let target = num("GEOPQ_PYR_TARGET", 250_000);
+
+        let t = std::time::Instant::now();
+        let centroids = scan_centroids(&Source::Local(src.clone()), None).unwrap();
+        eprintln!("scan_centroids: {} rows in {:?}", centroids.len(), t.elapsed());
+
+        let t = std::time::Instant::now();
+        let table = crate::data::partition::density_table(&centroids, target, 10).unwrap();
+        eprintln!("density_table: {:?}", t.elapsed());
+        for r in &table {
+            eprintln!(
+                "  r{:<2} cells {:>7} median {:>8} max {:>9} files {:>7}",
+                r.res, r.cells, r.median_rows, r.max_rows, r.files
+            );
+        }
+
+        let reference_res = num("GEOPQ_PYR_REF", 0) as u8;
+        let reference_res = if reference_res > 0 {
+            reference_res
+        } else {
+            table.iter().find(|r| r.max_rows <= target).map_or(8, |r| r.res)
+        };
+        let method = match std::env::var("GEOPQ_PYR_METHOD").as_deref() {
+            Ok("simplify") => MethodChoice::Simplify,
+            Ok("prune") => MethodChoice::Prune,
+            Ok("dissolve") => MethodChoice::Dissolve,
+            _ => MethodChoice::Auto,
+        };
+        let opts = OptimizeOptions {
+            pyramid: Some(PyramidOptions {
+                reference_res,
+                adaptive: true,
+                max_res: (reference_res + 2).min(10),
+                target_rows: target,
+                from_res: Some(num("GEOPQ_PYR_FROM", reference_res.saturating_sub(3) as usize) as u8),
+                method,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        eprintln!("pyramid: {:?}", opts.pyramid);
+        let t = std::time::Instant::now();
+        let rep = optimize(
+            &Source::Local(src),
+            &dst,
+            &opts,
+            None,
+            None,
+            &|f, s| eprintln!("  {:>3.0}% {s}", f * 100.0),
+        )
+        .unwrap();
+        eprintln!("wrote {} files in {:?}", rep.files, t.elapsed());
+        for l in &rep.pyramid_levels {
+            eprintln!(
+                "  r{} {:<9} files {:>6} rows {:>9} bytes {:>12}",
+                l.res,
+                l.method.map(|m| m.label()).unwrap_or("source"),
+                l.files,
+                l.rows,
+                l.bytes
+            );
+        }
+        eprintln!(
+            "overview overhead: {:.1}% of the leaf; total {} bytes",
+            rep.pyramid_overhead_pct().unwrap_or(0.0),
+            rep.size_after
+        );
+        read_descriptor(&dst).validate().unwrap();
+    }
+
+    /// The batched union has to mean what one union of everything means,
+    /// and the generalization between batches has to take the slivers
+    /// with it rather than leave them to pile up.
+    #[test]
+    fn dissolve_union_batches_and_drops_slivers() {
+        use geo::Area;
+        use geo_types::{Coord, LineString, MultiPolygon, Polygon, Rect};
+        let rect = |x0: f64, x1: f64| -> MultiPolygon<f64> {
+            MultiPolygon::new(vec![
+                Rect::new(Coord { x: x0, y: 0.0 }, Coord { x: x1, y: 1.0 }).to_polygon(),
+            ])
+        };
+        // A run of touching squares, several batches long: one piece out,
+        // the same area in and out.
+        let n = DISSOLVE_BATCH * 2 + 5;
+        let polys: Vec<MultiPolygon<f64>> =
+            (0..n).map(|i| rect(i as f64, i as f64 + 1.0)).collect();
+        let expected: f64 = n as f64;
+        let batched = dissolve_union(&polys, 0.0);
+        assert_eq!(batched.0.len(), 1, "touching squares union into one piece");
+        assert!((batched.unsigned_area() - expected).abs() < 1e-9);
+        // The same at a tolerance that cannot touch a unit square.
+        let generalized = dissolve_union(&polys, 0.1);
+        assert_eq!(generalized.0.len(), 1);
+        assert!((generalized.unsigned_area() - expected).abs() < 1e-6);
+
+        // A hole thinner than the tolerance is a sliver, not a hole.
+        let ring = |c: &[(f64, f64)]| LineString::from(c.to_vec());
+        let holed = MultiPolygon::new(vec![Polygon::new(
+            ring(&[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0), (0.0, 0.0)]),
+            // Clockwise, the winding geo and i_overlay read as a hole.
+            vec![ring(&[(10.0, 10.0), (10.0, 90.0), (10.1, 90.0), (10.1, 10.0), (10.0, 10.0)])],
+        )]);
+        assert_eq!(holed.0[0].interiors().len(), 1);
+        let cleaned = dissolve_union(std::slice::from_ref(&holed), 1.0);
+        assert_eq!(cleaned.0.len(), 1);
+        assert!(cleaned.0[0].interiors().is_empty(), "the sliver hole is generalized away");
+        assert!((cleaned.unsigned_area() - 10_000.0).abs() < 1.0);
+        // At a tolerance finer than the sliver it survives.
+        let kept = dissolve_union(std::slice::from_ref(&holed), 0.01);
+        assert_eq!(kept.0[0].interiors().len(), 1);
+    }
+
+    /// The level tolerance is metres on the ground, converted into the
+    /// layer's own units — degrees at the file's latitude, or the
+    /// projected CRS's linear unit.
+    #[test]
+    fn pyramid_tolerance_converts_to_the_layer_units() {
+        use crate::data::pyramid::{gsd_for_res, DEFAULT_PIXELS_PER_CELL};
+        use h3o::Resolution;
+        let r5 = Resolution::Five;
+        let metres = gsd_for_res(r5, DEFAULT_PIXELS_PER_CELL) * 0.5;
+        assert!((50.0..150.0).contains(&metres), "r5 half-gsd is {metres} m");
+
+        // Metres pass through; feet divide by the foot.
+        assert!((level_tolerance(r5, 0.5, CogpUnits::Linear(1.0), 45.0) - metres).abs() < 1e-9);
+        let feet = level_tolerance(r5, 0.5, CogpUnits::Linear(0.3048), 45.0);
+        assert!((feet * 0.3048 - metres).abs() < 1e-9, "{feet} ft is {metres} m");
+
+        // Degrees: under a hundredth of a degree, converted by whichever
+        // axis is longest in metres, so the tolerance never exceeds the
+        // ground distance asked for on either of them. At the equator
+        // that is longitude, and away from it latitude, once cos φ has
+        // shrunk the longitude degree past it.
+        let equator = level_tolerance(r5, 0.5, CogpUnits::Degrees, 0.0);
+        let north = level_tolerance(r5, 0.5, CogpUnits::Degrees, 60.0);
+        assert!((equator - metres / M_PER_DEG_LON).abs() < 1e-12, "{equator}");
+        assert!((north - metres / M_PER_DEG_LAT).abs() < 1e-12, "{north}");
+        assert!(equator < north && north < 0.01, "{equator} then {north} degrees");
+
+        // A zero factor means no simplification at all, and the guard in
+        // simplify_geom returns the geometry untouched.
+        let square = geo_types::Geometry::Polygon(
+            geo_types::Rect::new(
+                geo_types::coord! { x: 0.0, y: 0.0 },
+                geo_types::coord! { x: 1.0, y: 1.0 },
+            )
+            .to_polygon(),
+        );
+        assert_eq!(simplify_geom(&square, 0.0), square);
+    }
 }

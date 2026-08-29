@@ -367,7 +367,98 @@ pub fn split_adaptive_h3(
     target_rows: usize,
     max_res: u8,
 ) -> Result<Vec<(String, Vec<u32>)>, String> {
+    let (cells, nulls) = adaptive_cells(order, lonlat, 0, target_rows, max_res)?;
+    let mut out: Vec<(String, Vec<u32>)> = cells
+        .into_iter()
+        .map(|(cell, rows)| (format!("h3={cell}"), rows))
+        .collect();
+    if !nulls.is_empty() {
+        out.push((format!("h3={NULL_PARTITION}"), nulls));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// One leaf part of an H3 pyramid: the cell whose file it is (None for the
+/// null-geometry part) and the rows it holds, in the caller's order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeafPart {
+    pub cell: Option<CellIndex>,
+    pub rows: Vec<u32>,
+}
+
+impl LeafPart {
+    /// Resolution of the file's directory: the cell's own, or the
+    /// reference resolution for the null part (which the layout puts at
+    /// the leaf level, `r<R>/__HIVE_DEFAULT_PARTITION__.parquet`).
+    pub fn res(&self, reference_res: u8) -> u8 {
+        self.cell.map_or(reference_res, |c| u8::from(c.resolution()))
+    }
+
+    /// Relative path inside the pyramid root.
+    pub fn path(&self, reference_res: u8) -> String {
+        match self.cell {
+            Some(c) => super::pyramid::part_path(u8::from(c.resolution()), &c.to_string()),
+            None => super::pyramid::part_path(reference_res, super::pyramid::NULL_PART),
+        }
+    }
+}
+
+/// Leaf parts of an H3 pyramid: the same adaptive descent, started at the
+/// reference resolution instead of res 0 and keyed by cell rather than by
+/// a hive `h3=` directory. `max_res == reference_res` means no splitting,
+/// i.e. one file per reference cell whatever its row count.
+///
+/// Parts come back coarse to fine and, within a resolution, in cell order,
+/// so the writer's sweeps and the descriptor's cell lists are both stable
+/// across runs. The null part sorts last.
+pub fn split_pyramid_leaf(
+    order: &[u32],
+    lonlat: &[Option<(f64, f64)>],
+    reference_res: u8,
+    target_rows: usize,
+    max_res: u8,
+) -> Result<Vec<LeafPart>, String> {
+    if max_res < reference_res {
+        return Err(format!(
+            "pyramid: adaptive max resolution r{max_res} is coarser than the reference r{reference_res}"
+        ));
+    }
+    let (cells, nulls) = adaptive_cells(order, lonlat, reference_res, target_rows, max_res)?;
+    let mut out: Vec<LeafPart> = cells
+        .into_iter()
+        .map(|(cell, rows)| LeafPart { cell: Some(cell), rows })
+        .collect();
+    out.sort_by_key(|p| {
+        let c = p.cell.expect("cells only");
+        (u8::from(c.resolution()), u64::from(c))
+    });
+    if !nulls.is_empty() {
+        out.push(LeafPart { cell: None, rows: nulls });
+    }
+    Ok(out)
+}
+
+/// A balanced set of cells with the rows in each, and the rows that have
+/// no cell at any resolution because their geometry has no centroid.
+type AdaptiveSplit = (Vec<(CellIndex, Vec<u32>)>, Vec<u32>);
+
+/// The descent both H3 partitionings share: bucket rows by their centroid
+/// cell at `start_res`, then split any bucket over `target_rows` into its
+/// children until `max_res`. Rows whose centroid is missing come back
+/// separately — they have no cell to be placed in at any resolution.
+fn adaptive_cells(
+    order: &[u32],
+    lonlat: &[Option<(f64, f64)>],
+    start_res: u8,
+    target_rows: usize,
+    max_res: u8,
+) -> Result<AdaptiveSplit, String> {
     let max_res = Resolution::try_from(max_res).map_err(|e| format!("H3 resolution: {e}"))?;
+    let start_res = Resolution::try_from(start_res).map_err(|e| format!("H3 resolution: {e}"))?;
+    if start_res > max_res {
+        return Err("H3 resolution: the start resolution is finer than the maximum".into());
+    }
     // Finest cells once, indexed by row; parents are cheap bit ops from there.
     let mut fine_of: Vec<Option<CellIndex>> = vec![None; lonlat.len()];
     let mut nulls: Vec<u32> = Vec::new();
@@ -380,7 +471,7 @@ pub fn split_adaptive_h3(
             None => nulls.push(r),
             Some(c) => {
                 fine_of[r as usize] = Some(c);
-                let coarse = c.parent(Resolution::Zero).unwrap_or(c);
+                let coarse = c.parent(start_res).unwrap_or(c);
                 work.entry(coarse).or_default().push(r);
             }
         }
@@ -405,19 +496,132 @@ pub fn split_adaptive_h3(
             ));
         }
     }
-
     // Buckets are filled by traversing `order` sequentially and re-bucketed
     // in that same relative order on split, so each partition already
     // preserves the global (Hilbert) order — no re-sort needed.
-    let mut out: Vec<(String, Vec<u32>)> = done
-        .into_iter()
-        .map(|(cell, rows)| (format!("h3={cell}"), rows))
-        .collect();
-    if !nulls.is_empty() {
-        out.push((format!("h3={NULL_PARTITION}"), nulls));
+    Ok((done, nulls))
+}
+
+/// Resolutions the pyramid density table covers, coarse to fine.
+pub const DENSITY_RES: std::ops::RangeInclusive<u8> = 3..=10;
+
+/// Resolution the density table computes every coarser one from. Cells at
+/// any res in `DENSITY_RES` are a `parent()` bit op away from one of these.
+const DENSITY_BASE_RES: u8 = 10;
+
+/// What one candidate reference resolution would produce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DensityRow {
+    pub res: u8,
+    /// Cells holding at least one feature.
+    pub cells: usize,
+    /// Rows in the median cell (lower median).
+    pub median_rows: usize,
+    pub max_rows: usize,
+    /// Files after adaptive splitting at `target_rows`, plus the null part
+    /// when there is one. Equals `cells` (+1) when splitting is off.
+    ///
+    /// An estimate to within a file or two: it descends from the r10
+    /// cells this table is built on, and H3 resolutions do not nest
+    /// geometrically, so a run that stops splitting above r10 can place
+    /// a handful of boundary features one cell over.
+    pub files: usize,
+}
+
+/// Density of the layer over H3 cells, res 3..=10, for the pyramid dialog:
+/// how many files each candidate reference resolution would produce and
+/// how uneven they would be.
+///
+/// One `LatLng::to_cell` per row at res 10 and nothing but `parent()` bit
+/// ops after that — a res-per-row hash join measured several seconds on
+/// 2.5M rows, which is too slow for a combo box the user drags through.
+/// Sorting the res-10 cells once is what makes the rest linear: an H3
+/// index puts the base cell and then one digit per resolution in
+/// descending bit order, so cells sharing a parent are contiguous in the
+/// sorted array at every resolution at once.
+pub fn density_table(
+    lonlat: &[Option<(f64, f64)>],
+    target_rows: usize,
+    max_res: u8,
+) -> Result<Vec<DensityRow>, String> {
+    let base = Resolution::try_from(DENSITY_BASE_RES).map_err(|e| e.to_string())?;
+    let max_res = Resolution::try_from(max_res.min(DENSITY_BASE_RES))
+        .map_err(|e| format!("H3 resolution: {e}"))?;
+    let target = target_rows.max(1);
+    let mut cells: Vec<CellIndex> = Vec::with_capacity(lonlat.len());
+    let mut nulls = 0usize;
+    for c in lonlat {
+        match c.and_then(|(lon, lat)| LatLng::new(lat, lon).ok()) {
+            Some(ll) => cells.push(ll.to_cell(base)),
+            None => nulls += 1,
+        }
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
+    cells.sort_unstable_by_key(|&c| u64::from(c));
+
+    let mut out = Vec::new();
+    for r in DENSITY_RES {
+        let res = Resolution::try_from(r).map_err(|e| e.to_string())?;
+        let mut lens: Vec<usize> = Vec::new();
+        let mut files = usize::from(nulls > 0);
+        for run in runs_by_parent(&cells, res) {
+            lens.push(run.len());
+            files += adaptive_files(run, res, target, max_res);
+        }
+        lens.sort_unstable();
+        out.push(DensityRow {
+            res: r,
+            cells: lens.len(),
+            median_rows: lens.get(lens.len() / 2).copied().unwrap_or(0),
+            max_rows: lens.last().copied().unwrap_or(0),
+            files,
+        });
+    }
     Ok(out)
+}
+
+/// Runs of a resolution-sorted cell array that share a parent at `res`.
+///
+/// Compared on the index bits rather than through `parent()`: an H3
+/// index lays out the base cell and then one three-bit digit per
+/// resolution in descending bit order, so cells sharing a parent at
+/// `res` are exactly those that agree above bit `45 - 3·res`. Every
+/// cell here is at the same resolution, so the resolution field agrees
+/// too and the shift is the whole comparison. `parent()` validates and
+/// rebuilds an index on every call, and over eight resolutions of 2.5M
+/// rows that was most of the table's cost.
+fn runs_by_parent(cells: &[CellIndex], res: Resolution) -> impl Iterator<Item = &[CellIndex]> {
+    let shift = 45 - 3 * u32::from(u8::from(res));
+    let key = move |c: &CellIndex| u64::from(*c) >> shift;
+    let mut i = 0usize;
+    std::iter::from_fn(move || {
+        if i >= cells.len() {
+            return None;
+        }
+        let p = key(&cells[i]);
+        let lo = i;
+        while i < cells.len() && key(&cells[i]) == p {
+            i += 1;
+        }
+        Some(&cells[lo..i])
+    })
+}
+
+/// Files one cell's worth of rows would become under adaptive splitting:
+/// itself when it fits or cannot split further, otherwise the sum over its
+/// occupied children. Mirrors `adaptive_cells`, on counts alone.
+fn adaptive_files(
+    cells: &[CellIndex],
+    res: Resolution,
+    target: usize,
+    max_res: Resolution,
+) -> usize {
+    if cells.len() <= target || res >= max_res {
+        return 1;
+    }
+    let Some(child) = res.succ() else { return 1 };
+    runs_by_parent(cells, child)
+        .map(|run| adaptive_files(run, child, target, max_res))
+        .sum()
 }
 
 /// Encode one Hive path component. Keep alphanumerics and a safe subset,
@@ -508,6 +712,141 @@ mod tests {
             assert!(rows.windows(2).all(|w| w[0] < w[1]), "{dir} keeps global order");
         }
         assert!(parts.len() > 3, "clusters must split: {}", parts.len());
+    }
+
+    /// Two dense clusters and a sparse scatter: the coarse resolutions
+    /// pile everything into a handful of cells, the fine ones spread it,
+    /// and the file count only ever grows with adaptive splitting on.
+    #[test]
+    fn density_table_describes_each_resolution() {
+        let mut lonlat: Vec<Option<(f64, f64)>> = Vec::new();
+        for i in 0..2000 {
+            let d = (i % 200) as f64 * 1e-4;
+            lonlat.push(Some((2.35 + d, 48.85 + d))); // Paris
+        }
+        for i in 0..600 {
+            let d = (i % 60) as f64 * 1e-3;
+            lonlat.push(Some((-71.06 + d, 42.36 + d))); // Boston
+        }
+        lonlat.push(None);
+
+        let table = density_table(&lonlat, 250, 10).unwrap();
+        assert_eq!(table.len(), 8, "res 3..=10");
+        assert_eq!(table.first().unwrap().res, 3);
+        assert_eq!(table.last().unwrap().res, 10);
+        for w in table.windows(2) {
+            assert!(w[0].cells <= w[1].cells, "cells grow with resolution: {w:?}");
+            assert!(w[0].max_rows >= w[1].max_rows, "cells hold less as they shrink: {w:?}");
+            assert!(w[0].median_rows > 0 && w[1].median_rows > 0);
+        }
+        // Two clusters an ocean apart cannot share a cell at any of these
+        // resolutions, and the null row buys exactly one extra file.
+        assert!(table[0].cells >= 2);
+        assert!(table.iter().all(|r| r.files > r.cells), "the null row is a file too");
+
+        // Splitting off is one file per occupied cell, plus the null part.
+        let flat = density_table(&lonlat, 250, 3).unwrap();
+        assert_eq!(flat[0].files, flat[0].cells + 1);
+        // ... and the row target is respected once splitting is allowed:
+        // every cluster cell over 250 rows must have been broken up.
+        assert!(table[0].files > flat[0].files, "{:?} vs {:?}", table[0], flat[0]);
+    }
+
+    /// The bit-shift grouping the density table runs on has to mean the
+    /// same thing as `parent()`, which is what the writer partitions
+    /// with. Checked across every resolution the table covers.
+    #[test]
+    fn run_grouping_agrees_with_parent() {
+        let mut cells: Vec<CellIndex> = Vec::new();
+        for i in 0..2000 {
+            let (dx, dy) = ((i % 50) as f64 * 0.01, (i / 50) as f64 * 0.01);
+            for (lon, lat) in [(2.35 + dx, 48.85 + dy), (-71.06 + dx, 42.36 - dy)] {
+                cells.push(LatLng::new(lat, lon).unwrap().to_cell(Resolution::Ten));
+            }
+        }
+        cells.sort_unstable_by_key(|&c| u64::from(c));
+        for r in DENSITY_RES {
+            let res = Resolution::try_from(r).unwrap();
+            let mut seen = 0usize;
+            for run in runs_by_parent(&cells, res) {
+                let p = run[0].parent(res).unwrap();
+                assert!(run.iter().all(|c| c.parent(res) == Some(p)), "r{r}");
+                seen += run.len();
+            }
+            assert_eq!(seen, cells.len(), "r{r} covers every cell exactly once");
+            // And the runs are maximal: as many runs as distinct parents.
+            let distinct: std::collections::HashSet<CellIndex> =
+                cells.iter().map(|c| c.parent(res).unwrap()).collect();
+            assert_eq!(runs_by_parent(&cells, res).count(), distinct.len(), "r{r}");
+        }
+    }
+
+    /// The file count the table promises is the file count the writer
+    /// produces — the whole point of showing it before the run. Exact
+    /// when the split may reach the resolution the table is built on;
+    /// see `DensityRow::files` for why it is an estimate below that.
+    #[test]
+    fn density_files_match_the_leaf_split() {
+        let mut lonlat: Vec<Option<(f64, f64)>> = Vec::new();
+        for i in 0..1500 {
+            let d = (i % 150) as f64 * 2e-4;
+            lonlat.push(Some((-122.39 + d, 37.77 + d)));
+        }
+        lonlat.push(None);
+        let order: Vec<u32> = (0..lonlat.len() as u32).collect();
+        let table = density_table(&lonlat, 200, 10).unwrap();
+        for row in &table {
+            let parts = split_pyramid_leaf(&order, &lonlat, row.res, 200, 10).unwrap();
+            assert_eq!(parts.len(), row.files, "r{}: {row:?}", row.res);
+            let placed: usize = parts.iter().map(|p| p.rows.len()).sum();
+            assert_eq!(placed, lonlat.len(), "every row lands in exactly one part");
+        }
+    }
+
+    #[test]
+    fn pyramid_leaf_parts_are_named_and_ordered() {
+        let mut lonlat: Vec<Option<(f64, f64)>> = Vec::new();
+        for i in 0..900 {
+            let d = (i % 90) as f64 * 3e-4;
+            lonlat.push(Some((2.35 + d, 48.85 + d)));
+        }
+        lonlat.push(None);
+        let order: Vec<u32> = (0..lonlat.len() as u32).collect();
+
+        // No splitting: every part sits at the reference resolution.
+        let flat = split_pyramid_leaf(&order, &lonlat, 6, 100, 6).unwrap();
+        assert!(flat.iter().all(|p| p.res(6) == 6));
+        assert!(flat.iter().any(|p| p.rows.len() > 100), "no splitting means big files");
+
+        let parts = split_pyramid_leaf(&order, &lonlat, 6, 100, 9).unwrap();
+        assert!(parts.iter().any(|p| p.res(6) > 6), "dense cells split finer");
+        // Coarse to fine, cells ordered inside a resolution, null last
+        // (the null part carries the reference resolution, not an order).
+        let keys: Vec<(u8, u64)> = parts
+            .iter()
+            .filter_map(|p| p.cell.map(|c| (u8::from(c.resolution()), u64::from(c))))
+            .collect();
+        assert!(keys.windows(2).all(|w| w[0] < w[1]), "{keys:?}");
+        assert_eq!(parts.last().unwrap().cell, None, "the null part sorts last");
+        assert_eq!(parts.last().unwrap().path(6), "r6/__HIVE_DEFAULT_PARTITION__.parquet");
+        for p in &parts {
+            let path = p.path(6);
+            assert!(path.starts_with(&format!("r{}/", p.res(6))), "{path}");
+            assert!(path.ends_with(".parquet"), "{path}");
+            // Rows keep the global (Hilbert) order inside every part.
+            assert!(p.rows.windows(2).all(|w| w[0] < w[1]), "{path}");
+        }
+        // A cell only ever splits when it is over target.
+        for p in parts.iter().filter(|p| p.cell.is_some() && p.res(6) < 9) {
+            assert!(p.rows.len() <= 100, "{}: {}", p.path(6), p.rows.len());
+        }
+        assert_eq!(parts.iter().map(|p| p.rows.len()).sum::<usize>(), lonlat.len());
+    }
+
+    #[test]
+    fn a_reference_finer_than_the_max_is_refused() {
+        let ll = vec![Some((2.35, 48.85))];
+        assert!(split_pyramid_leaf(&[0], &ll, 9, 100, 7).is_err());
     }
 
     #[test]
