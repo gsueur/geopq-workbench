@@ -7925,3 +7925,168 @@ mod wkb_detection_tests {
         assert!(!super::is_wkb_header(&[0x89, b'P', b'N', b'G', 0x0d]));
     }
 }
+
+/// Cloud Optimized GeoParquet Profile: reading the levels, and planning
+/// against the prefix they name.
+#[cfg(test)]
+mod cogp_tests {
+    use super::*;
+    use crate::data::cogp::Pruning;
+
+    fn fixture() -> Option<std::path::PathBuf> {
+        let p = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/parcels_cogp.parquet"
+        ));
+        p.exists().then_some(p)
+    }
+
+    /// The levels come off the footer, and level selection matches the
+    /// metadata it was read from: for each declared level, asking for
+    /// exactly its gsd must select exactly its prefix.
+    #[test]
+    fn cogp_levels_open_and_select_their_own_prefix() {
+        let Some(path) = fixture() else {
+            eprintln!("fixture missing, skipping");
+            return;
+        };
+        let (store, _crs, info, _rg) = open_store(&Source::Local(path)).unwrap();
+        let levels = store.cogp.as_ref().expect("cogp metadata");
+        assert_eq!(levels.version, "0.1.0");
+        // The spec's own structural invariants, re-checked against what
+        // the loader kept: coarse to fine, ending at the last row group.
+        assert!(levels.levels.windows(2).all(|w| w[0].row_group_end < w[1].row_group_end));
+        assert!(levels.levels.windows(2).all(|w| w[0].gsd > w[1].gsd));
+        let n_rg = store.rg_starts().len() - 1;
+        assert_eq!(levels.levels.last().unwrap().row_group_end, n_rg - 1);
+        // cogp convert reuses the input's covering column, so this is the
+        // profile as published rather than the 2.0 extension.
+        assert_eq!(levels.pruning, Pruning::Covering);
+
+        for (i, l) in levels.levels.iter().enumerate() {
+            assert_eq!(levels.level_for_gsd(l.gsd), i, "level {i} at its own gsd");
+            assert_eq!(levels.row_group_end_for_gsd(l.gsd), l.row_group_end);
+            // Just finer than this level still selects it, until the next
+            // level's gsd is reached.
+            if let Some(next) = levels.levels.get(i + 1) {
+                assert_eq!(levels.level_for_gsd(next.gsd * 1.001), i, "between {i} and {}", i + 1);
+            }
+        }
+        // Coarser than the file: level 0, per SPEC §7.1.
+        assert_eq!(levels.level_for_gsd(levels.levels[0].gsd * 10.0), 0);
+
+        // And the file info panel says what was found.
+        let line = info.geo.cogp.as_deref().expect("summary line");
+        assert!(line.starts_with("COGP 0.1.0: "), "{line}");
+        assert!(!line.contains("2.0 extension"), "{line}");
+        assert!(line.contains("prefix row groups 1/"), "{line}");
+
+        // C8 grades it, advisory and passing.
+        let q = info.quality.as_ref().unwrap();
+        let c8 = q.checks.iter().find(|c| c.code == "C8").unwrap();
+        assert_eq!(c8.status, crate::data::quality::Status::Pass);
+        assert!(!c8.gating);
+        assert!(c8.detail.contains("COGP 0.1.0:"), "{}", c8.detail);
+    }
+
+    /// A world-wide view of a COGP layer plans the coarse prefix and
+    /// nothing else — exact features at that scale, no boxes, no stride.
+    #[test]
+    fn a_wide_view_plans_the_coarse_prefix_exactly() {
+        let Some(path) = fixture() else {
+            eprintln!("fixture missing, skipping");
+            return;
+        };
+        let (store, crs, _info, rg) = open_store(&Source::Local(path)).unwrap();
+        let (_, boxes) = rg.expect("row-group boxes");
+        let n_rg = store.rg_starts().len() - 1;
+        let extent = union_of(&boxes).unwrap();
+
+        // The whole dataset on a 1600 px map: ~100 m of ground per pixel
+        // on a state-sized EPSG:26986 extent.
+        let view_px = 1600.0;
+        let gsd = view_gsd(extent, view_px, &crs).unwrap();
+        let end = cogp_prefix_end(&store, Some(extent), view_px, &crs).unwrap();
+        assert_eq!(end as usize, store.cogp.as_ref().unwrap().row_group_end_for_gsd(gsd));
+        assert!(end as usize + 1 < n_rg, "a wide view must not need every group");
+
+        let sel = plan_viewport_selection(
+            &store,
+            "t",
+            Some(&boxes),
+            Some(extent),
+            Some(end),
+            "test",
+        );
+        assert!(!sel.is_empty());
+        assert!(sel.iter().all(|s| s.group() <= end), "planned past the prefix: {sel:?}");
+        // Exact rows, not an approximation: this is the whole point of
+        // putting the level check before the budget fallbacks.
+        assert!(
+            sel.iter()
+                .all(|s| matches!(s, GroupSel::All(_) | GroupSel::Rect(_, _)
+                    | GroupSel::ResolvedRect { .. })),
+            "{sel:?}"
+        );
+
+        // Zooming in to a tenth of the extent moves the level finer, so
+        // the prefix can only grow — previously read groups stay valid.
+        let (w, h) = (extent[2] - extent[0], extent[3] - extent[1]);
+        let zoomed = [
+            extent[0] + w * 0.45,
+            extent[1] + h * 0.45,
+            extent[0] + w * 0.55,
+            extent[1] + h * 0.55,
+        ];
+        let zoomed_end = cogp_prefix_end(&store, Some(zoomed), view_px, &crs).unwrap();
+        assert!(zoomed_end >= end, "{zoomed_end} < {end}");
+    }
+
+    /// Without levels nothing changes: the planner sees the whole file.
+    #[test]
+    fn a_plain_file_has_no_prefix() {
+        let path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/parcels_hilbert.parquet"
+        ));
+        if !path.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let (store, crs, info, _rg) = open_store(&Source::Local(path)).unwrap();
+        assert!(store.cogp.is_none());
+        assert!(info.geo.cogp.is_none());
+        assert!(cogp_prefix_end(&store, Some([0.0, 0.0, 1.0, 1.0]), 800.0, &crs).is_none());
+        // C8 does not penalise it.
+        let c8 = info
+            .quality
+            .as_ref()
+            .unwrap()
+            .checks
+            .iter()
+            .find(|c| c.code == "C8")
+            .unwrap();
+        assert_eq!(c8.status, crate::data::quality::Status::Pass);
+        assert!(c8.detail.contains("optional"), "{}", c8.detail);
+    }
+
+    /// Metres per pixel: degrees convert at the viewport's centre
+    /// latitude, projected units pass through.
+    #[test]
+    fn view_gsd_converts_degrees_at_the_centre_latitude() {
+        let mut geo = Crs::wgs84();
+        geo.is_latlong = true;
+        // One degree of longitude over 1000 px, at the equator.
+        let g = view_gsd([0.0, -0.5, 1.0, 0.5], 1000.0, &geo).unwrap();
+        assert!((g - 111.32).abs() < 0.1, "{g}");
+        // The same span at 60°N covers half the ground.
+        let g60 = view_gsd([0.0, 59.5, 1.0, 60.5], 1000.0, &geo).unwrap();
+        assert!((g60 / g - 0.5).abs() < 0.01, "{g60} vs {g}");
+        // A projected CRS is already metres.
+        let l93 = Crs::from_epsg(2154).unwrap();
+        assert_eq!(view_gsd([0.0, 0.0, 10_000.0, 10_000.0], 1000.0, &l93), Some(10.0));
+        // Degenerate viewports have no scale.
+        assert_eq!(view_gsd([1.0, 0.0, 1.0, 1.0], 1000.0, &l93), None);
+        assert_eq!(view_gsd([0.0, 0.0, 1.0, 1.0], 0.0, &l93), None);
+    }
+}

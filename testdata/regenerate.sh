@@ -9,7 +9,8 @@
 #   ./regenerate.sh /path/to/parcels.parquet
 #       also builds parcels_hilbert.parquet (Hilbert-sorted, GeoParquet 1.1
 #       covering) from a MassGIS-style parcels file (needs geometry,
-#       LOC_ID, CITY, TOTAL_VAL columns in EPSG:26986).
+#       LOC_ID, CITY, TOTAL_VAL columns in EPSG:26986), and
+#       parcels_cogp.parquet from it when the `cogp` CLI is installed.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -119,6 +120,18 @@ md = pq.read_metadata('parcels_hilbert.parquet')
 print(f"parcels_hilbert.parquet: {md.num_rows} rows, {md.num_row_groups} row groups")
 EOF
   rm -f parcels_hilbert_nocover.parquet
+
+  # Cloud Optimized GeoParquet Profile: reorder the same features
+  # coarse-to-fine across row groups and stamp the `cogp` block.
+  #   cargo install --git https://github.com/Kanahiro/cloud-optimized-geoparquet cogp
+  if command -v cogp >/dev/null; then
+    echo "== parcels_cogp.parquet (COGP levels, default webmerc zooms) =="
+    cogp convert parcels_hilbert.parquet parcels_cogp.parquet
+    cogp validate parcels_cogp.parquet
+  else
+    echo "(cogp CLI not installed — skipping parcels_cogp.parquet;"
+    echo " the COGP tests self-skip without it)"
+  fi
 else
   echo "(no parcels source given — skipping parcels_hilbert.parquet;"
   echo " pruning/covering tests will self-skip without it)"
