@@ -76,6 +76,16 @@ pub struct FeatureStore {
     /// GeoParquet `edges: spherical`: segments are great-circle arcs, so
     /// long edges are densified on the sphere before projection.
     pub spherical_edges: bool,
+    /// The geometry column is stored as base64 text (Spark / Sedona
+    /// exports). Every read decodes it here, so `schema` says Binary and
+    /// nothing downstream — display, picking, SQL, the optimizer — has to
+    /// know the file spelled its geometry as a string.
+    pub base64_wkb: bool,
+    /// Validated COGP levels, when the file carries them: which prefix of
+    /// row groups the viewport planner needs at a given ground scale.
+    /// Single-file stores only — row-group indices in `cogp` are per
+    /// file, and a multi-fragment store renumbers them globally.
+    pub cogp: Option<super::cogp::CogpLevels>,
     /// The `geo` metadata declares polygons only. A polygon is the one
     /// geometry its bounding box can stand in for on screen; a line's
     /// box is a rectangle the line does not follow, and a point is its
@@ -187,6 +197,8 @@ impl FeatureStore {
             xy_geom,
             hidden_wkb: None,
             spherical_edges: false,
+            base64_wkb: false,
+            cogp: None,
             polygons_only: false,
             rg_rows,
             rg_starts,
@@ -417,6 +429,19 @@ impl FeatureStore {
             open_file_group_reader(frag.source.open()?, &frag.meta, local, batch_size, ranges, Some(&reads))?
         };
 
+        if self.base64_wkb && requested.contains(&self.geom_col) {
+            // `reads` and `requested` are the same sorted set here (a
+            // base64 store has no virtual geometry), so the geometry's
+            // position in the read batches is its position in the
+            // projection.
+            let schema = Arc::new(
+                self.schema
+                    .project(&requested)
+                    .map_err(|e| format!("projection: {e}"))?,
+            );
+            let geom_pos = requested.iter().position(|&i| i == self.geom_col).unwrap();
+            return Ok(GroupReader::Base64Wkb { inner, schema, geom_pos });
+        }
         if !geom_requested {
             return Ok(GroupReader::Plain(inner));
         }
@@ -484,8 +509,13 @@ impl FeatureStore {
             real.sort_unstable();
             real.dedup();
         }
-        let has_virtual =
-            geom_requested || cols.iter().any(|&c| c >= first_part) || real.len() != cols.len();
+        // Base64 geometry is rebuilt as WKB bytes, which means rebuilding
+        // the batch against the store's schema either way.
+        let decode_base64 = self.base64_wkb && cols.contains(&self.geom_col);
+        let has_virtual = geom_requested
+            || decode_base64
+            || cols.iter().any(|&c| c >= first_part)
+            || real.len() != cols.len();
         let out_schema = Arc::new(
             self.schema
                 .project(&cols)
@@ -517,7 +547,9 @@ impl FeatureStore {
                 let pos = |i: usize| real.binary_search(&i).expect("read col present");
                 let mut arrays: Vec<ArrayRef> = Vec::with_capacity(cols.len());
                 for &c in &cols {
-                    if c < base {
+                    if decode_base64 && c == self.geom_col {
+                        arrays.push(base64_wkb_array(b.column(pos(c)))?);
+                    } else if c < base {
                         arrays.push(Arc::clone(b.column(pos(c))));
                     } else if geom_requested && c == base {
                         let (x, y) = self.xy_geom.unwrap();
@@ -883,12 +915,49 @@ pub(crate) enum XyColSrc {
 
 /// Batches of one row group; on x/y stores the virtual geometry struct is
 /// assembled into each batch.
+/// Decode one base64 value to bytes. Sedona and Spark write the standard
+/// alphabet, padded; unpadded output exists in the wild too.
+pub(crate) fn decode_base64_wkb(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(s))
+        .ok()
+}
+
+/// A base64 text column as ordinary WKB bytes. Values that do not decode
+/// become nulls: one bad row is a bad feature, not a broken layer.
+pub(crate) fn base64_wkb_array(col: &ArrayRef) -> Result<ArrayRef, String> {
+    use arrow::array::{Array, BinaryBuilder};
+    let text = arrow::compute::cast(col, &DataType::Utf8)
+        .map_err(|e| format!("base64 geometry column: {e}"))?;
+    let text = text
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or("base64 geometry column: not text")?;
+    let mut out = BinaryBuilder::with_capacity(text.len(), text.value_data().len());
+    for i in 0..text.len() {
+        match text.is_valid(i).then(|| decode_base64_wkb(text.value(i))).flatten() {
+            Some(bytes) => out.append_value(bytes),
+            None => out.append_null(),
+        }
+    }
+    Ok(Arc::new(out.finish()))
+}
+
 pub enum GroupReader {
     Plain(ParquetRecordBatchReader),
     Xy {
         inner: ParquetRecordBatchReader,
         schema: SchemaRef,
         cols: Vec<XyColSrc>,
+    },
+    /// Base64 text geometry decoded to WKB bytes, batch by batch.
+    Base64Wkb {
+        inner: ParquetRecordBatchReader,
+        schema: SchemaRef,
+        /// Position of the geometry column in the read batches.
+        geom_pos: usize,
     },
 }
 
@@ -922,6 +991,19 @@ impl Iterator for GroupReader {
                 Some(
                     RecordBatch::try_new_with_options(Arc::clone(schema), arrays, &opts)
                 )
+            }
+            GroupReader::Base64Wkb { inner, schema, geom_pos } => {
+                let batch = match inner.next()? {
+                    Ok(b) => b,
+                    Err(e) => return Some(Err(e)),
+                };
+                let mut arrays: Vec<ArrayRef> = batch.columns().to_vec();
+                match base64_wkb_array(&arrays[*geom_pos]) {
+                    Ok(a) => arrays[*geom_pos] = a,
+                    Err(e) => return Some(Err(arrow::error::ArrowError::ComputeError(e))),
+                }
+                let opts = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+                Some(RecordBatch::try_new_with_options(Arc::clone(schema), arrays, &opts))
             }
         }
     }

@@ -9,6 +9,47 @@ use crate::map::warp::{self, TileMesh, Warp, WarpPlan};
 pub const TILE_PX: u32 = 256;
 const MAX_CACHED: usize = 600;
 const FETCH_THREADS: usize = 4;
+/// CARTO's basemaps need a (free) API key since 2026: without one the
+/// tiles come back watermarked "API KEY REQUIRED". The key is read once at
+/// startup from `GEOPQ_CARTO_API_KEY` or the settings file and appended to
+/// every cartocdn request; see <https://carto.com/basemaps/apikey>.
+static CARTO_API_KEY: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+pub fn set_carto_api_key(key: Option<String>) {
+    let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+    if let Ok(mut g) = CARTO_API_KEY.write() {
+        *g = key;
+    }
+}
+
+pub fn carto_api_key() -> Option<String> {
+    CARTO_API_KEY.read().ok().and_then(|g| g.clone())
+}
+
+/// Whether a source is served by CARTO and so needs the key.
+pub fn is_carto(source_idx: usize) -> bool {
+    TILE_SOURCES
+        .get(source_idx)
+        .is_some_and(|s| s.url.contains("cartocdn.com"))
+}
+
+/// The tile URL for a key, with the CARTO API key appended when the
+/// source needs one and the user has provided one.
+fn tile_url(source: &TileSource, id: TileId) -> String {
+    let mut url = source
+        .url
+        .replace("{z}", &id.z.to_string())
+        .replace("{x}", &id.x.to_string())
+        .replace("{y}", &id.y.to_string());
+    if source.url.contains("cartocdn.com")
+        && let Some(key) = carto_api_key()
+    {
+        url.push_str("?key=");
+        url.push_str(&key);
+    }
+    url
+}
+
 const USER_AGENT: &str = concat!(
     env!("CARGO_PKG_NAME"),
     "/",
@@ -418,6 +459,16 @@ impl TileCache {
     }
 
     /// Keys that renderers may keep GPU textures for.
+    /// Forget every cached tile, so the next frame refetches. Used when
+    /// the CARTO API key changes: the watermarked tiles fetched without it
+    /// would otherwise stay on screen until they scrolled out of view.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        if let Ok(mut g) = self.queue.0.lock() {
+            g.want.clear();
+        }
+    }
+
     pub fn alive_keys(&self) -> HashSet<TileKey> {
         self.entries
             .iter()
@@ -638,11 +689,7 @@ pub fn fetch_tile_blocking(key: TileKey) -> Option<Vec<MipLevel>> {
 
 fn fetch_tile(key: TileKey) -> Option<Vec<MipLevel>> {
     let source = &TILE_SOURCES[key.source as usize];
-    let url = source
-        .url
-        .replace("{z}", &key.id.z.to_string())
-        .replace("{x}", &key.id.x.to_string())
-        .replace("{y}", &key.id.y.to_string());
+    let url = tile_url(source, key.id);
     let mut res = ureq::get(&url)
         .header("User-Agent", USER_AGENT)
         .call()
@@ -660,6 +707,20 @@ mod tests {
 
     /// Every labelled Carto source needs a twin, since that is what a
     /// reprojected view falls back to.
+    #[test]
+    fn carto_urls_carry_the_api_key_only_when_set() {
+        let carto = TILE_SOURCES.iter().find(|s| s.url.contains("cartocdn.com")).unwrap();
+        let osm = TILE_SOURCES.iter().find(|s| s.name == "OpenStreetMap").unwrap();
+        let id = TileId { z: 3, x: 2, y: 3 };
+        set_carto_api_key(None);
+        assert!(!tile_url(carto, id).contains("key="));
+        set_carto_api_key(Some("  abc123 ".into()));
+        assert!(tile_url(carto, id).ends_with("/3/2/3.png?key=abc123"));
+        assert!(!tile_url(osm, id).contains("key="));
+        set_carto_api_key(Some(String::new()));
+        assert!(carto_api_key().is_none());
+    }
+
     #[test]
     fn carto_sources_have_nolabels_twins() {
         for (i, s) in TILE_SOURCES.iter().enumerate() {

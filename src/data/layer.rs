@@ -31,26 +31,55 @@ pub struct RgBboxes {
     /// GeoParquet 1.1 covering-column statistics, or computed at load.
     pub source: String,
     pub boxes: Vec<[f64; 4]>,
-    /// Average number of *other* row-group boxes each box intersects.
-    /// Raw counts aren't comparable across row-group counts; judge
-    /// clustering with [`Self::overlap_frac`].
+    /// Average number of *other* row-group boxes each box intersects,
+    /// over the run C2 judges the layer on. Raw counts aren't comparable
+    /// across run sizes; judge clustering with [`Self::overlap_frac`].
     pub avg_overlap: f64,
+    /// Boxes that average was measured over: every box normally, and on
+    /// a COGP layer only the worst level's, because levels overlap each
+    /// other by construction.
+    measured_over: usize,
+    /// C2's verdict on that run, so the panel and the scorecard cannot
+    /// disagree about the same file.
+    well_clustered: bool,
 }
 
 impl RgBboxes {
+    /// Measure the boxes as they are built.
+    ///
+    /// `cogp_levels` makes the measurement per COGP level instead of per
+    /// file — the same run C2 grades, so the panel and the scorecard
+    /// never disagree about whether a layer is well clustered.
+    pub fn new(
+        source: String,
+        boxes: Vec<[f64; 4]>,
+        cogp_levels: Option<&[crate::data::cogp::LevelRun]>,
+    ) -> Self {
+        let (_, m) = crate::data::quality::Clustering::worst(&boxes, cogp_levels);
+        Self {
+            source,
+            boxes,
+            avg_overlap: m.avg,
+            measured_over: m.n,
+            well_clustered: m.passes(),
+        }
+    }
+
     /// Overlap as a fraction of the possible overlaps (0 = disjoint boxes,
     /// 1 = every box intersects every other). Comparable across row-group
     /// counts, unlike the raw average. Reference points: Hilbert-sorted
     /// 65k-row groups land at 13–25% (adjacent groups necessarily touch),
     /// attribute-ordered data ~35%, spatially random data ~100%.
     pub fn overlap_frac(&self) -> f64 {
-        self.avg_overlap / (self.boxes.len().max(2) - 1) as f64
+        self.avg_overlap / (self.measured_over.max(2) - 1) as f64
     }
 
-    /// Heuristic: would a spatial-order rewrite (or finer row groups)
-    /// improve pruning?
+    /// Would a spatial-order rewrite (or finer row groups) improve
+    /// pruning? This is C2's own verdict over the same run, not a second
+    /// threshold: a file the scorecard passes must not be labelled
+    /// poorly clustered a panel away.
     pub fn poorly_clustered(&self) -> bool {
-        self.overlap_frac() > 0.3
+        !self.well_clustered
     }
 }
 

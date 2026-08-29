@@ -31,6 +31,9 @@ pub struct GeoParquetInfo {
     pub crs_summary: String,
     pub covering: Option<String>,
     pub edges: Option<String>,
+    /// Cloud Optimized GeoParquet Profile levels, summarized — or why a
+    /// `cogp` block was rejected.
+    pub cogp: Option<String>,
     /// Pretty-printed raw `geo` metadata JSON.
     pub raw_geo_json: Option<String>,
 }

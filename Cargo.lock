@@ -2806,6 +2806,7 @@ dependencies = [
  "a5",
  "arrow",
  "async-trait",
+ "base64",
  "bytemuck",
  "bytes",
  "crs-definitions",

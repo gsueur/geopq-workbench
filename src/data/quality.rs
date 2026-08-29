@@ -6,10 +6,11 @@
 //! the open policy (Indexed vs Direct mode, the optimize offer) is
 //! decided by the app from the report plus the row count.
 
+use super::cogp::LevelRun;
 use super::geoarrow::GeomEncoding;
 use super::info::GeoParquetInfo;
 
-/// C2 threshold on [`overlap_frac`]: above this, row-group bboxes
+/// C2 threshold on [`Clustering::frac`]: above this, row-group bboxes
 /// overlap so much that viewport pruning degenerates and whole-group
 /// refinement selects most of the file. Matches
 /// `RgBboxes::poorly_clustered` (measured reference points: Hilbert
@@ -54,9 +55,49 @@ pub enum Status {
     Fail,
 }
 
+/// COGP facts for C8, as resolved by the loader from the footer.
+#[derive(Clone, Debug)]
+pub struct CogpQuality {
+    pub version: String,
+    /// Each level's last row group and row count, coarse to fine. C2
+    /// reads them to measure clustering inside a level instead of across
+    /// the file; see the check for why that is the only honest measure
+    /// of a COGP layout.
+    pub levels: Vec<LevelRun>,
+    /// Rows in the whole file, against which level 0's prefix is the
+    /// share of the dataset a first paint costs.
+    pub total_rows: u64,
+    /// Which bbox statistics the prefix is prunable by.
+    pub pruning: &'static str,
+    /// Native 2.0 statistics rather than the 1.1 covering the published
+    /// profile names.
+    pub extension_2_0: bool,
+}
+
+impl CogpQuality {
+    fn runs(&self) -> Vec<LevelRun> {
+        self.levels.clone()
+    }
+
+    pub fn level_count(&self) -> usize {
+        self.levels.len()
+    }
+
+    /// Row groups a viewport covering the whole file bbox reads at the
+    /// coarsest level — the quality metric SPEC §8 suggests, which for a
+    /// whole-file viewport is simply level 0's prefix length.
+    pub fn level0_groups(&self) -> usize {
+        self.levels.first().map_or(0, |l| l.row_group_end + 1)
+    }
+
+    pub fn level0_rows(&self) -> u64 {
+        self.levels.first().map_or(0, |l| l.rows)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Check {
-    /// Stable code (C1…C7) referenced by docs/OPEN_POLICY.md.
+    /// Stable code (C1…C8) referenced by docs/OPEN_POLICY.md.
     pub code: &'static str,
     pub title: &'static str,
     pub status: Status,
@@ -109,20 +150,140 @@ pub struct QualityInput<'a> {
     pub geom_compression: Option<&'a str>,
     pub geo: &'a GeoParquetInfo,
     pub geom_bytes: u64,
+    /// COGP levels: None when the file carries no `cogp` block, Err when
+    /// it carries one that does not validate.
+    pub cogp: Option<Result<CogpQuality, String>>,
 }
 
-/// Average pairwise-overlap fraction of the boxes: 0 = disjoint,
-/// 1 = every box intersects every other. Same formula as
-/// `RgBboxes::overlap_frac` over `bbox_overlap_metric`.
-fn overlap_frac(boxes: &[[f64; 4]]) -> f64 {
-    super::loader::bbox_overlap_metric(boxes) / (boxes.len().max(2) - 1) as f64
+/// C2's clustering measurement over one run of row-group boxes.
+#[derive(Clone, Copy, Debug)]
+pub struct Clustering {
+    /// Boxes measured.
+    pub n: usize,
+    /// Average number of *other* boxes each one intersects.
+    pub avg: f64,
+    /// What the chain rule allows for `n` boxes.
+    allowed: f64,
+    /// Rows in the run, when it is a COGP level.
+    rows: Option<u64>,
+}
+
+impl Clustering {
+    fn measure(boxes: &[[f64; 4]], rows: Option<u64>) -> Self {
+        let n = boxes.len();
+        Clustering {
+            n,
+            avg: super::loader::bbox_overlap_metric(boxes),
+            allowed: (OVERLAP_FRAC_MAX * (n.max(2) - 1) as f64).max(CHAIN_OVERLAP_MIN),
+            rows,
+        }
+    }
+
+    /// A run small enough to decode whole cannot be the trap C2 exists
+    /// to catch: however badly its boxes overlap, every viewport in it
+    /// costs at most the whole run, and that is within budget.
+    ///
+    /// This is the per-level form of the policy's existing early pass
+    /// ("small files cannot fall into the permanent-preview trap"), and
+    /// it is what a COGP file needs: its coarse levels hold a handful of
+    /// groups of widely spread features, so they overlap each other more
+    /// than a chain does — the reference converter's own output measures
+    /// ×2.4 over a 5-group level — while being a few tens of thousands
+    /// of rows that are read whole and never previewed.
+    fn bounded(&self) -> bool {
+        self.rows.is_some_and(|r| r <= super::loader::MAX_BUILD_ROWS)
+    }
+
+    /// Overlap as a fraction of the possible overlaps: 0 = disjoint,
+    /// 1 = every box intersects every other.
+    pub fn frac(&self) -> f64 {
+        self.avg / (self.n.max(2) - 1) as f64
+    }
+
+    pub fn passes(&self) -> bool {
+        self.avg <= self.allowed || self.bounded()
+    }
+
+    /// How far past what the chain rule allows this run sits. `allowed`
+    /// is at least [`CHAIN_OVERLAP_MIN`], so this never divides by zero.
+    fn ratio(&self) -> f64 {
+        self.avg / self.allowed
+    }
+
+    /// The run C2 judges the file on: normally the whole file, and on a
+    /// COGP layout the worst level measured inside itself, with that
+    /// level's index.
+    ///
+    /// A COGP file is ordered by (level, spatial curve). Coarse levels
+    /// hold few features spread over the whole dataset, so their row
+    /// groups' bboxes span the whole extent and every finer group sits
+    /// inside them — by construction, not by bad sorting. Measured as
+    /// one sequence, a correct 55-group file reads ×36.5 overlaps (68%)
+    /// and fails the gate. What the profile promises, and what pruning
+    /// within a chosen prefix actually depends on, is tight clustering
+    /// *inside* a level.
+    pub fn worst(boxes: &[[f64; 4]], levels: Option<&[LevelRun]>) -> (Option<usize>, Self) {
+        let whole = || (None, Self::measure(boxes, None));
+        if boxes.is_empty() {
+            return whole();
+        }
+        let Some(levels) = levels else { return whole() };
+        let ends: Vec<usize> = levels.iter().map(|l| l.row_group_end).collect();
+        let Some(ranges) = super::cogp::level_ranges(&ends, boxes.len()) else {
+            return whole();
+        };
+        let measured: Vec<(usize, Self)> = ranges
+            .into_iter()
+            .enumerate()
+            .map(|(k, (start, end))| {
+                (k, Self::measure(&boxes[start..=end], Some(levels[k].rows)))
+            })
+            .collect();
+        // A level that fails decides the check, so it must also be the
+        // one reported; only when every level passes does the loudest
+        // one stand in as "the worst".
+        let pick = |c: &&(usize, Self)| c.1.ratio();
+        measured
+            .iter()
+            .filter(|c| !c.1.passes())
+            .max_by(|a, b| pick(a).total_cmp(&pick(b)))
+            .or_else(|| measured.iter().max_by(|a, b| pick(a).total_cmp(&pick(b))))
+            .map(|&(k, m)| (Some(k), m))
+            .unwrap_or_else(whole)
+    }
+}
+
+/// Why C2 sees the overlap it sees. The metric cannot tell a badly
+/// sorted file from one whose features genuinely sprawl (country
+/// outlines with overseas territories, long rivers, dateline crossers),
+/// and telling that second user to sort a sorted file sends them after a
+/// fix that does not exist. Average geometry size separates the two well
+/// enough to name the likely one.
+fn overlap_cause(inp: &QualityInput) -> String {
+    let per_feature = inp.geom_bytes / inp.rows.max(1);
+    if per_feature >= SPRAWL_BYTES {
+        format!(
+            "features average {} of geometry, so their bounding boxes may \
+             overlap whatever the row order",
+            super::info::fmt_bytes(per_feature)
+        )
+    } else {
+        "the rows are probably not spatially sorted".to_string()
+    }
 }
 
 pub fn analyze(inp: &QualityInput) -> QualityReport {
-    let mut checks = Vec::with_capacity(7);
+    let mut checks = Vec::with_capacity(8);
 
     // C1 — row-group bboxes available from metadata (gating).
-    let frac = inp.boxes.map(|(_, b)| overlap_frac(b));
+    // COGP levels, when the file carries valid ones, decide how C2
+    // measures — see `Clustering::worst`.
+    let runs = match &inp.cogp {
+        Some(Ok(c)) => Some(c.runs()),
+        _ => None,
+    };
+    let c2 = inp.boxes.map(|(_, b)| Clustering::worst(b, runs.as_deref()));
+    let frac = c2.map(|(_, m)| m.frac());
     let file_level = inp
         .boxes
         .is_some_and(|(src, _)| src.contains("file-level"));
@@ -158,57 +319,67 @@ pub fn analyze(inp: &QualityInput) -> QualityReport {
 
     // C2 — spatial clustering (gating). Only measurable with boxes.
     // Pass on the fraction OR the absolute chain floor: sorted files
-    // overlap ~2 neighbors per box regardless of group count.
-    checks.push(match inp.boxes {
-        Some((_, b)) => {
-            let n = b.len();
-            let avg = super::loader::bbox_overlap_metric(b);
-            let allowed = (OVERLAP_FRAC_MAX * (n.max(2) - 1) as f64).max(CHAIN_OVERLAP_MIN);
-            let f = frac.unwrap_or(0.0);
-            if avg <= allowed {
-                Check {
-                    code: "C2",
-                    title: "spatial ordering",
-                    status: Status::Pass,
-                    gating: true,
-                    detail: format!(
-                        "each row-group bbox overlaps ×{avg:.1} others of {n} \
-                         ({:.0}% of possible)",
-                        f * 100.0
-                    ),
-                }
-            } else {
-                // The metric sees overlapping boxes; it cannot see why.
-                // Sprawling features (country outlines with overseas
-                // territories, long rivers, dateline crossers) overlap
-                // whatever order they are written in, and telling that
-                // user to sort the file sends them after a fix that does
-                // not exist. Average geometry size separates the two
-                // cases well enough to name the likely one.
-                let per_feature = inp.geom_bytes / inp.rows.max(1);
-                let cause = if per_feature >= SPRAWL_BYTES {
+    // overlap ~2 neighbors per box regardless of group count. On a COGP
+    // file the run measured is one level, not the file.
+    checks.push(match c2 {
+        Some((Some(k), m)) => {
+            let head = format!(
+                "within COGP levels: worst level {k} overlaps ×{:.1} of {} \
+                 ({:.0}% of possible)",
+                m.avg,
+                m.n,
+                m.frac() * 100.0
+            );
+            Check {
+                code: "C2",
+                title: "spatial ordering",
+                status: if m.passes() { Status::Pass } else { Status::Fail },
+                gating: true,
+                detail: if m.avg <= m.allowed {
                     format!(
-                        "features average {} of geometry, so their bounding \
-                         boxes may overlap whatever the row order",
-                        super::info::fmt_bytes(per_feature)
+                        "{head}; levels each span the whole extent by design, so \
+                         the file as a whole is not the measure"
+                    )
+                } else if m.passes() {
+                    format!(
+                        "{head}, but it holds {} rows — small enough to decode \
+                         whole, so no viewport in it can be stuck previewing",
+                        m.rows.unwrap_or(0)
                     )
                 } else {
-                    "the rows are probably not spatially sorted".to_string()
-                };
-                Check {
-                    code: "C2",
-                    title: "spatial ordering",
-                    status: Status::Fail,
-                    gating: true,
-                    detail: format!(
-                        "each row-group bbox overlaps ×{avg:.1} others of {n} \
-                         ({:.0}% of possible): most viewports touch most row \
-                         groups — {cause}",
-                        f * 100.0
-                    ),
-                }
+                    format!(
+                        "{head}: most viewports touch most of that level's row \
+                         groups — {}",
+                        overlap_cause(inp)
+                    )
+                },
             }
         }
+        Some((None, m)) => Check {
+            code: "C2",
+            title: "spatial ordering",
+            status: if m.passes() { Status::Pass } else { Status::Fail },
+            gating: true,
+            detail: if m.passes() {
+                format!(
+                    "each row-group bbox overlaps ×{:.1} others of {} \
+                     ({:.0}% of possible)",
+                    m.avg,
+                    m.n,
+                    m.frac() * 100.0
+                )
+            } else {
+                format!(
+                    "each row-group bbox overlaps ×{:.1} others of {} \
+                     ({:.0}% of possible): most viewports touch most row \
+                     groups — {}",
+                    m.avg,
+                    m.n,
+                    m.frac() * 100.0,
+                    overlap_cause(inp)
+                )
+            },
+        },
         None => Check {
             code: "C2",
             title: "spatial ordering",
@@ -365,6 +536,46 @@ pub fn analyze(inp: &QualityInput) -> QualityReport {
         },
     });
 
+    // C8 — cloud-optimized levels (advisory, never gating).
+    //
+    // Absence is not a fault: COGP is one way to lay a file out, not a
+    // requirement, and a well-sorted 1.1 file with a covering column is
+    // already fast here. A `cogp` block that does not validate is worth
+    // a warning, because it means a producer meant to write one.
+    checks.push(match &inp.cogp {
+        None => Check {
+            code: "C8",
+            title: "cloud-optimized levels",
+            status: Status::Pass,
+            gating: false,
+            detail: "no COGP levels (optional)".into(),
+        },
+        Some(Err(e)) => Check {
+            code: "C8",
+            title: "cloud-optimized levels",
+            status: Status::Warn,
+            gating: false,
+            detail: format!("`cogp` metadata present but not usable: {e}"),
+        },
+        Some(Ok(c)) => Check {
+            code: "C8",
+            title: "cloud-optimized levels",
+            status: Status::Pass,
+            gating: false,
+            detail: format!(
+                "COGP {}{}: {} levels, prunable by {}; a whole-file viewport \
+                 reads {} of {} row groups at the coarsest level ({:.0}% of rows)",
+                c.version,
+                if c.extension_2_0 { " (2.0 extension)" } else { "" },
+                c.level_count(),
+                c.pruning,
+                c.level0_groups(),
+                inp.row_groups,
+                100.0 * c.level0_rows() as f64 / c.total_rows.max(1) as f64,
+            ),
+        },
+    });
+
     let indexable = !checks
         .iter()
         .any(|c| c.gating && c.status == Status::Fail);
@@ -421,6 +632,7 @@ mod tests {
             geom_compression: Some("ZSTD(ZstdLevel(3))"),
             geo,
             geom_bytes: 1 << 30,
+            cogp: None,
         }
     }
 
@@ -611,6 +823,171 @@ mod tests {
         ));
         assert_eq!(status(&r, "C2"), Status::Fail);
         assert!(!r.indexable);
+    }
+
+    fn cogp(extension_2_0: bool) -> CogpQuality {
+        CogpQuality {
+            version: "0.1.0".into(),
+            levels: vec![
+                LevelRun { row_group_end: 0, rows: 40_000 },
+                LevelRun { row_group_end: 3, rows: 160_000 },
+                LevelRun { row_group_end: 12, rows: 800_000 },
+                LevelRun { row_group_end: 67, rows: 3_000_000 },
+            ],
+            total_rows: 4_000_000,
+            pruning: if extension_2_0 {
+                "native geospatial statistics"
+            } else {
+                "covering column statistics"
+            },
+            extension_2_0,
+        }
+    }
+
+    /// C8 is advisory in every direction: a file without COGP levels is
+    /// not penalised, and a file whose `cogp` block is broken warns
+    /// rather than failing — the layout is still readable GeoParquet.
+    #[test]
+    fn c8_grades_cogp_levels_without_ever_gating() {
+        let geo = geo_ok();
+        let boxes = sorted_boxes(68);
+        let base = |c: Option<Result<CogpQuality, String>>| {
+            let mut inp = input(
+                Some(("covering column statistics", &boxes)),
+                4_000_000,
+                68,
+                65_536,
+                &geo,
+            );
+            inp.cogp = c;
+            analyze(&inp)
+        };
+        let detail = |r: &QualityReport| {
+            r.checks.iter().find(|c| c.code == "C8").unwrap().detail.clone()
+        };
+
+        // Absent: optional, so it passes and says so.
+        let r = base(None);
+        assert_eq!(status(&r, "C8"), Status::Pass);
+        assert!(detail(&r).contains("optional"), "{}", detail(&r));
+        assert!(r.indexable);
+
+        // Present and valid: the spec's suggested quality metrics — the
+        // coarsest level's prefix length and its share of the rows.
+        let r = base(Some(Ok(cogp(false))));
+        assert_eq!(status(&r, "C8"), Status::Pass);
+        let d = detail(&r);
+        assert!(d.contains("COGP 0.1.0:"), "{d}");
+        assert!(d.contains("4 levels"), "{d}");
+        assert!(d.contains("1 of 68 row groups"), "{d}");
+        assert!(d.contains("1% of rows"), "{d}");
+        assert!(d.contains("covering column statistics"), "{d}");
+
+        // The 2.0 form is labelled, so nobody reads it as conformance
+        // with the published 1.1 profile.
+        let d = detail(&base(Some(Ok(cogp(true)))));
+        assert!(d.contains("(2.0 extension)"), "{d}");
+        assert!(d.contains("native geospatial statistics"), "{d}");
+
+        // Present and broken: a warning, never a failure.
+        let r = base(Some(Err("gsd 250 does not decrease from 100".into())));
+        assert_eq!(status(&r, "C8"), Status::Warn);
+        assert!(detail(&r).contains("does not decrease"), "{}", detail(&r));
+        assert!(r.indexable, "C8 never gates");
+    }
+
+    /// A COGP layout the naive metric condemns and the per-level one
+    /// clears — the bug this check was rewritten for.
+    ///
+    /// The geometry is what a real conversion produces: coarse levels
+    /// hold a handful of widely spread features, so their single row
+    /// group's bbox is the whole dataset and every finer group sits
+    /// inside it. Twenty such levels plus one dense, tightly chained
+    /// level of 35 groups measures ×33.6 of 55 (62%) across the file —
+    /// the shape Guillaume hit at ×36.5 of 55 (68%) — while every level
+    /// is exactly as clustered as it should be.
+    #[test]
+    fn c2_measures_clustering_inside_cogp_levels() {
+        let geo = geo_ok();
+        const COARSE: usize = 20;
+        const FINE: usize = 35;
+        let extent = [0.0, 0.0, 100.0, 100.0];
+        let mut boxes = vec![extent; COARSE];
+        let w = 100.0 / FINE as f64;
+        boxes.extend((0..FINE).map(|i| {
+            let x = i as f64 * w;
+            [x, 0.0, x + w, 100.0]
+        }));
+        // The fine level is deliberately over the build budget, so it
+        // passes on its clustering and not on its size.
+        let fine_rows = super::super::loader::MAX_BUILD_ROWS + 100_000;
+        let mut levels: Vec<LevelRun> = (0..COARSE)
+            .map(|k| LevelRun { row_group_end: k, rows: 500 })
+            .collect();
+        levels.push(LevelRun { row_group_end: COARSE + FINE - 1, rows: fine_rows });
+        let total_rows = COARSE as u64 * 500 + fine_rows;
+
+        let cogp = |levels: Vec<LevelRun>| CogpQuality {
+            version: "0.1.0".into(),
+            levels,
+            total_rows,
+            pruning: "covering column statistics",
+            extension_2_0: false,
+        };
+        let run = |boxes: &[[f64; 4]], c: Option<CogpQuality>| {
+            let mut inp = input(
+                Some(("covering column statistics", boxes)),
+                total_rows,
+                boxes.len(),
+                65_536,
+                &geo,
+            );
+            inp.cogp = c.map(Ok);
+            analyze(&inp)
+        };
+        let detail = |r: &QualityReport| {
+            r.checks.iter().find(|c| c.code == "C2").unwrap().detail.clone()
+        };
+
+        // Measured as one file it looks like an unsorted export…
+        let naive = run(&boxes, None);
+        assert_eq!(status(&naive, "C2"), Status::Fail);
+        assert!(!naive.indexable, "this is the gate the user hit");
+        let d = detail(&naive);
+        assert!(d.contains("of possible") && d.contains("not spatially sorted"), "{d}");
+        assert!(naive.overlap_frac.unwrap() > 0.5, "{:?}", naive.overlap_frac);
+
+        // …and measured inside its levels it is exactly what COGP asks
+        // for. The worst level is the dense one, which is also the only
+        // one big enough to matter.
+        let r = run(&boxes, Some(cogp(levels.clone())));
+        assert_eq!(status(&r, "C2"), Status::Pass);
+        assert!(r.indexable, "a well-formed COGP file must pass the gate");
+        let d = detail(&r);
+        assert!(d.starts_with(&format!("within COGP levels: worst level {COARSE} ")), "{d}");
+        assert!(d.contains("of possible"), "{d}");
+        assert!(r.overlap_frac.unwrap() < 0.1, "{:?}", r.overlap_frac);
+
+        // Not a rubber stamp: a level that really cannot be pruned, and
+        // is too big to read whole, still fails.
+        let mut sprawling = vec![extent; COARSE];
+        sprawling.extend(vec![extent; FINE]);
+        let r = run(&sprawling, Some(cogp(levels.clone())));
+        assert_eq!(status(&r, "C2"), Status::Fail);
+        assert!(!r.indexable);
+        assert!(detail(&r).contains(&format!("worst level {COARSE}")), "{}", detail(&r));
+
+        // …but the same shape within the build budget passes on size:
+        // reading the level whole is bounded work, so no viewport in it
+        // can be stuck previewing.
+        let mut small = levels;
+        small[COARSE] = LevelRun {
+            row_group_end: COARSE + FINE - 1,
+            rows: super::super::loader::MAX_BUILD_ROWS,
+        };
+        let r = run(&sprawling, Some(cogp(small)));
+        assert_eq!(status(&r, "C2"), Status::Pass);
+        assert!(detail(&r).contains("small enough to decode whole"), "{}", detail(&r));
     }
 
     #[test]

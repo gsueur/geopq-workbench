@@ -154,20 +154,71 @@ metadata. Produces a `QualityReport` attached to `FileInfo`.
 | # | Check | Pass | Warn | Fail | Gate? |
 |---|-------|------|------|------|-------|
 | C1 | Row-group bboxes available from metadata (native geo stats, covering column stats, GeoArrow coord stats, or x/y column stats) | any source | — | none | **yes** |
-| C2 | Spatial clustering: `overlap_frac` over the C1 boxes | ≤ `OVERLAP_FRAC_MAX` | — | > `OVERLAP_FRAC_MAX` | **yes** |
+| C2 | Spatial clustering: `overlap_frac` over the C1 boxes (per COGP level when the file has levels) | ≤ `OVERLAP_FRAC_MAX` | — | > `OVERLAP_FRAC_MAX` | **yes** |
 | C3 | Row-group granularity: max rows per group | ≤ `RG_ROWS_MAX` | < `RG_ROWS_MIN` (footer bloat) | > `RG_ROWS_MAX` | **yes** |
 | C4 | Geometry encoding | GeoArrow / native GEOMETRY | WKB | — | no |
 | C5 | Page index (offset + column index) present | yes | no | — | no |
 | C6 | Compression | zstd/snappy/lz4 (non-zstd notes "zstd recommended for distribution") | uncompressed | — | no |
 | C7 | Metadata hygiene: geo version, declared `geometry_types`, CRS present, file bbox | all present | any missing | — | no |
+| C8 | Cloud Optimized GeoParquet Profile (COGP) levels: a valid `cogp` block naming a coarse-to-fine row-group prefix per rendering scale | valid, or absent (optional) | present but invalid | — | no |
 
-Verdict = C1 ∧ C2 ∧ C3. C4–C7 are advisory lines on the scorecard
+Verdict = C1 ∧ C2 ∧ C3. C4–C8 are advisory lines on the scorecard
 (the "good practices" education), never gate.
 
 Early pass: if `total_rows ≤ MAX_BUILD_ROWS` the verdict is forced to
 pass (mode Indexed, which degenerates to a plain full load). The gate
 only exists to prevent the permanent-preview trap, and small files
 cannot fall into it.
+
+### COGP levels
+
+[COGP](https://github.com/Kanahiro/cloud-optimized-geoparquet) v0.1 orders
+a file's features coarse-to-fine across row groups and names, in a `cogp`
+key, the prefix each rendering scale needs. The profile does not simplify
+or duplicate anything, so a prefix is not a preview: it is exactly the
+features that are independently meaningful at that scale.
+
+That is why the level check runs **before** the Boxes/stride fallbacks in
+`plan_viewport_selection`. A prefix that fits the build budget loads as
+exact geometry with no "approximate" badge; only if the prefix itself
+busts the budget does the existing fallback apply, and then over the
+prefix rather than the whole file. Refinement filters its candidate row
+groups the same way, so a camera settle at a wide zoom cannot pull in the
+detail levels the layout exists to defer.
+
+The published profile is written against GeoParquet 1.1 and requires a
+declared `covering.bbox` with row-group statistics. This workbench also
+accepts native Parquet geospatial statistics on the geometry column
+(GeoParquet 2.0, including its own writer's output): the requirement the
+spec is really stating is that a reader can prune row groups by bbox, and
+those answer it. Such files are labelled "COGP 0.1.0 (2.0 extension)" in
+the info panel and in C8, so the extension is never mistaken for the
+published profile.
+
+An invalid `cogp` block is recorded and otherwise ignored — the file is
+still ordinary GeoParquet and still opens.
+
+**C2 measures inside a level, never across the file.** A COGP file is
+ordered by (level, spatial curve). Coarse levels hold a handful of
+features spread over the whole dataset, so their row group's bbox *is*
+the whole extent and every finer group's box sits inside it — by
+construction, not by bad sorting. Averaged over the file, a correct
+55-row-group conversion of 2.56M parcels measured ×36.5 overlaps (68%)
+and failed the gate. `quality::Clustering::worst` therefore applies the
+same chain rule (`avg ≤ max(CHAIN_OVERLAP_MIN, OVERLAP_FRAC_MAX·(n−1))`,
+`n` = row groups in the level) to each level on its own and grades the
+worst one; levels of a single group pass trivially. `RgBboxes` measures
+the same run, so the layer panel's "poorly clustered" hint is C2's own
+verdict rather than a second threshold.
+
+One addition to the chain rule, per level: a level whose rows fit
+`MAX_BUILD_ROWS` passes whatever its clustering. This is the per-level
+form of the early pass above — a run that can be decoded whole can never
+strand a viewport in a permanent preview — and COGP needs it. A 2D
+packing of a handful of row groups touches more neighbours than a 1D
+chain does: the reference converter's own output measures ×2.4 over a
+five-group level, above the `CHAIN_OVERLAP_MIN` floor, for 43k rows that
+are simply read whole.
 
 ### Constants
 

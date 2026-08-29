@@ -11,6 +11,7 @@ use geo_traits::to_geo::ToGeoGeometry;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
+use parquet::arrow::ProjectionMask;
 use parquet::file::metadata::PageIndexPolicy;
 use rayon::prelude::*;
 use rstar::RTree;
@@ -253,6 +254,49 @@ pub(crate) const EMPTY_BBOX: [f64; 4] =
     [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
 
 /// Union of a set of bboxes, ignoring empty (inverted) sentinels.
+/// Ground sample distance of the current view: metres of ground per
+/// screen pixel, from the viewport's width in the data CRS and its width
+/// in physical pixels.
+///
+/// Geographic data converts at the viewport's centre latitude, because
+/// "metres of ground" for a rectangle on a globe is a function of where
+/// it sits. Projected CRSs are read as metres — the ones this matters
+/// for (COGP level choice) are, and being a few percent off on a
+/// foot-based grid picks the same level either way.
+pub fn view_gsd(rect: [f64; 4], view_px: f64, crs: &Crs) -> Option<f64> {
+    let width = rect[2] - rect[0];
+    if !(width.is_finite() && width > 0.0 && view_px.is_finite() && view_px >= 1.0) {
+        return None;
+    }
+    let per_px = width / view_px;
+    Some(if crs.is_latlong {
+        let lat = ((rect[1] + rect[3]) * 0.5).clamp(-89.9, 89.9);
+        per_px * 111_320.0 * lat.to_radians().cos().max(1e-6)
+    } else {
+        per_px
+    })
+}
+
+/// Last row group a COGP layer needs for this viewport: the finest level
+/// whose gsd still covers the view (SPEC §7.1). None for a layer with no
+/// COGP levels, or a view whose ground scale cannot be worked out — in
+/// both cases planning proceeds over every row group, as before.
+///
+/// This is not pruning. Row groups past the prefix hold features that
+/// are not independently meaningful at this scale; skipping them is the
+/// point of the layout, not a compromise, which is why a prefix that
+/// fits the build budget loads as exact geometry with no badge.
+pub fn cogp_prefix_end(
+    store: &FeatureStore,
+    rect: Option<[f64; 4]>,
+    view_px: f64,
+    crs: &Crs,
+) -> Option<u32> {
+    let levels = store.cogp.as_ref()?;
+    let gsd = view_gsd(rect?, view_px, crs)?;
+    Some(levels.row_group_end_for_gsd(gsd) as u32)
+}
+
 pub(crate) fn union_of(boxes: &[[f64; 4]]) -> Option<[f64; 4]> {
     boxes
         .iter()
@@ -578,6 +622,9 @@ pub fn spawn_load(
     display: DisplayCrs,
     color: eframe::egui::Color32,
     view_world: [f64; 4],
+    // Viewport width in physical pixels: with `view_world` it gives the
+    // ground scale a COGP layer picks its level from.
+    view_px: f64,
     auto_project: bool,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     style: Option<crate::data::layer::StyleBy>,
@@ -660,6 +707,7 @@ pub fn spawn_load(
                     display,
                     color,
                     view_world,
+                    view_px,
                     auto_project,
                     &cancel,
                     style,
@@ -687,6 +735,7 @@ pub fn spawn_load_gated(
     display: DisplayCrs,
     color: eframe::egui::Color32,
     view_world: [f64; 4],
+    view_px: f64,
     auto_project: bool,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     style: Option<crate::data::layer::StyleBy>,
@@ -701,6 +750,7 @@ pub fn spawn_load_gated(
             display,
             color,
             view_world,
+            view_px,
             auto_project,
             &cancel,
             style,
@@ -721,6 +771,7 @@ fn build_opened(
     display: DisplayCrs,
     color: eframe::egui::Color32,
     view_world: [f64; 4],
+    view_px: f64,
     auto_project: bool,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
     style: Option<crate::data::layer::StyleBy>,
@@ -795,6 +846,7 @@ fn build_opened(
             &store.source.label(),
             rg_meta.as_ref().map(|(_, b)| b.as_slice()),
             rect,
+            cogp_prefix_end(&store, rect, view_px, &crs),
             "initial load",
         )
     };
@@ -841,12 +893,19 @@ fn build_opened(
                         .then(|| ("computed at load".to_string(), rg_computed))
                 })
                 .map(|(source, boxes)| {
-                    let avg_overlap = bbox_overlap_metric(&boxes);
-                    RgBboxes {
+                    // Measured the way C2 measures it: on a COGP layer the
+                    // worst level, inside itself. A file-wide average
+                    // there reports a correct layout as poorly clustered
+                    // (see `quality::Clustering::worst`), and this is what
+                    // the info panel and the "consider Export…" hint read.
+                    let starts = store.rg_starts();
+                    let rg_rows: Vec<u64> =
+                        starts.windows(2).map(|w| w[1] - w[0]).collect();
+                    RgBboxes::new(
                         source,
                         boxes,
-                        avg_overlap,
-                    }
+                        store.cogp.as_ref().map(|c| c.runs(&rg_rows)).as_deref(),
+                    )
                 });
             let stats = LoadStats {
                 read_ms: 0,
@@ -1575,10 +1634,17 @@ struct FileOpen {
     hidden_wkb: Option<usize>,
     /// `edges: spherical` metadata, or a GEOGRAPHY logical type.
     spherical_edges: bool,
+    /// The geometry column holds base64 text, not WKB bytes: `schema`
+    /// already says Binary and the store decodes on read.
+    base64_wkb: bool,
+    /// Parsed `cogp` block, or why it was rejected. A rejected block
+    /// leaves the file perfectly openable — it is simply not COGP.
+    cogp: Option<Result<super::cogp::CogpLevels, String>>,
 }
 
 /// Quality analysis over an opened file / merged dataset (footer facts
 /// only). `boxes` are the merged per-row-group bboxes.
+#[allow(clippy::too_many_arguments)]
 fn quality_report(
     info: &FileInfo,
     boxes: Option<&(String, Vec<[f64; 4]>)>,
@@ -1586,6 +1652,7 @@ fn quality_report(
     xy_synthesized: bool,
     page_index: bool,
     geom_bytes: u64,
+    cogp: Option<Result<super::quality::CogpQuality, String>>,
 ) -> super::quality::QualityReport {
     super::quality::analyze(&super::quality::QualityInput {
         rows: info.rows,
@@ -1603,6 +1670,7 @@ fn quality_report(
             .map(|c| c.compression.as_str()),
         geo: &info.geo,
         geom_bytes,
+        cogp,
     })
 }
 
@@ -1615,10 +1683,27 @@ fn plan_viewport_selection(
     label: &str,
     boxes: Option<&[[f64; 4]]>,
     rect: Option<[f64; 4]>,
+    cogp_end: Option<u32>,
     caller: &str,
 ) -> Vec<GroupSel> {
     log::debug!("plan_viewport_selection from {caller}");
     let n_rg = store.rg_starts().len().saturating_sub(1);
+    if n_rg == 0 {
+        return Vec::new();
+    }
+    // COGP levels first, before any budget fallback: the prefix is the
+    // set of features that are independently meaningful at this scale,
+    // so a prefix that fits the budget is an exact load. Falling back to
+    // boxes or a stride over the whole file would trade real geometry
+    // for approximated geometry the user then sees badged as such.
+    let last_group = cogp_end.unwrap_or(u32::MAX).min(n_rg as u32 - 1);
+    if let Some(levels) = store.cogp.as_ref().filter(|_| cogp_end.is_some()) {
+        log::info!(
+            "{label}: COGP level ending at row group {last_group} of {n_rg} \
+             ({} levels available)",
+            levels.levels.len()
+        );
+    }
     // A dataset that will be drawn from covering boxes loads all of them,
     // whatever the camera is looking at. Boxes are four doubles a feature
     // and no geometry read at all, and pruning them to the opening
@@ -1627,28 +1712,29 @@ fn plan_viewport_selection(
     // stays unloaded, and zooming towards it finds no boxes to show.
     // Complete coverage from the first frame is the property that makes
     // this display mode worth having.
+    let prefix_rows = store.rg_starts()[last_group as usize + 1];
     let all_boxes = matches!(
         over_budget_plan(store.covering.is_some(), store.polygons_only),
         OverBudget::Boxes
     ) && preview_stride(
-        store.total_rows(),
-        (0..n_rg as u32).map(|g| store.rg_geom_bytes(g)).sum(),
+        prefix_rows,
+        (0..=last_group).map(|g| store.rg_geom_bytes(g)).sum(),
     )
     .is_some();
     if all_boxes {
         log::info!(
-            "{label}: {} rows of polygons with a covering column: drawing \
-             every feature from its bounding box",
-            store.total_rows()
+            "{label}: {prefix_rows} rows of polygons with a covering column: \
+             drawing every feature from its bounding box"
         );
-        return (0..n_rg as u32)
+        return (0..=last_group)
             .map(|group| GroupSel::Boxes { group, rect: None })
             .collect();
     }
-    let groups: Vec<u32> = match (boxes, rect) {
+    let mut groups: Vec<u32> = match (boxes, rect) {
         (Some(b), Some(r)) => intersecting_rgs(b, r),
-        _ => (0..n_rg as u32).collect(),
+        _ => (0..=last_group).collect(),
     };
+    groups.retain(|&g| g <= last_group);
     if groups.len() < n_rg {
         log::info!("{label}: row-group pruning {n_rg} -> {} groups", groups.len());
     }
@@ -1736,6 +1822,7 @@ pub fn spawn_reload(
     boxes: Option<Vec<[f64; 4]>>,
     display: DisplayCrs,
     view_world: [f64; 4],
+    view_px: f64,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     style: Option<crate::data::layer::StyleBy>,
 ) {
@@ -1749,6 +1836,7 @@ pub fn spawn_reload(
             &store.source.label(),
             boxes.as_deref(),
             rect,
+            cogp_prefix_end(&store, rect, view_px, &crs),
             "viewport reload",
         );
         let style_sel = style.as_ref().and_then(|sb| resolve_style(&store, sb));
@@ -1815,6 +1903,17 @@ fn open_store_with_view(
         return open_stac_store(source, url, stac_rect);
     }
     let mut f = open_file(source)?;
+    let cogp_quality = f.cogp.as_ref().map(|r| {
+        r.as_ref()
+            .map(|c| super::quality::CogpQuality {
+                version: c.version.clone(),
+                levels: c.runs(&f.rg_rows),
+                total_rows: f.info.rows,
+                pruning: c.pruning.label(),
+                extension_2_0: c.pruning == super::cogp::Pruning::NativeStats,
+            })
+            .map_err(String::clone)
+    });
     f.info.quality = Some(quality_report(
         &f.info,
         f.rg_boxes.as_ref(),
@@ -1822,6 +1921,7 @@ fn open_store_with_view(
         f.xy.is_some(),
         f.page_index,
         f.geom_bytes,
+        cogp_quality,
     ));
     let mut store = FeatureStore::new(
         source.clone(),
@@ -1835,6 +1935,8 @@ fn open_store_with_view(
     );
     store.hidden_wkb = f.hidden_wkb;
     store.spherical_edges = f.spherical_edges;
+    store.base64_wkb = f.base64_wkb;
+    store.cogp = f.cogp.clone().and_then(Result::ok);
     // Declared types only: an undeclared file stays out of the bbox
     // path rather than guessing from the first feature it decodes.
     store.polygons_only = !f.info.geo.geometry_types.is_empty()
@@ -2351,6 +2453,10 @@ fn open_multi_store(
     let rg_boxes = boxes
         .filter(|b| !b.is_empty())
         .map(|b| (box_source.unwrap_or_else(|| "mixed".into()), b));
+    // COGP row-group indices are per file, and this store renumbers them
+    // across fragments: a per-part `cogp` block says nothing about the
+    // dataset, so it is not carried over.
+    info.geo.cogp = None;
     info.quality = Some(quality_report(
         &info,
         rg_boxes.as_ref(),
@@ -2358,6 +2464,7 @@ fn open_multi_store(
         first.xy.is_some(),
         page_index,
         geom_bytes,
+        None,
     ));
     let mut store = FeatureStore::from_fragments(
         source.clone(),
@@ -2371,6 +2478,7 @@ fn open_multi_store(
     );
     store.hidden_wkb = first.hidden_wkb;
     store.spherical_edges = first.spherical_edges;
+    store.base64_wkb = first.base64_wkb;
     Ok((store, first.crs, info, rg_boxes))
 }
 
@@ -2427,6 +2535,9 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
     let mut encoding = GeomEncoding::Wkb;
     let mut xy: Option<(usize, usize)> = None;
     let mut spherical_edges = false;
+    // Geometry spelled as base64 text (Spark/Sedona exports): the store
+    // decodes it to WKB bytes on read.
+    let mut base64_wkb = false;
     let (geom_name, crs) = match &geo_meta {
         Some(meta) => {
             let primary = meta
@@ -2472,30 +2583,27 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
             (name, crs_from_type_string(crs_str.as_deref())?)
         }
         None => {
-            // Not GeoParquet-tagged: guess a WKB column, assume CRS84.
-            let guess = ["geometry", "geom", "wkb_geometry", "wkb"]
-                .iter()
-                .find(|n| schema.index_of(n).is_ok())
-                .map(|n| n.to_string())
-                .or_else(|| {
-                    schema
-                        .fields()
-                        .iter()
-                        .find(|f| {
-                            matches!(
-                                f.data_type(),
-                                DataType::Binary | DataType::LargeBinary | DataType::BinaryView
-                            )
-                        })
-                        .map(|f| f.name().clone())
-                });
-            match guess {
-                Some(name) => (name, Crs::wgs84()),
+            // Not GeoParquet-tagged: find a WKB column, assume CRS84.
+            //
+            // The name list is only a ranking, never a promise, and "the
+            // first binary column" is a coin flip: a thumbnail, a hash or
+            // a protobuf blob is binary too, and adopting one produces a
+            // layer of garbage instead of an honest refusal. Every
+            // candidate is probed against real values before it is taken.
+            let candidates = wkb_candidates(&schema);
+            let found = candidates
+                .into_iter()
+                .find(|&(i, b64)| probe_wkb_column(source, &arrow_meta, i, b64));
+            match found {
+                Some((i, b64)) => {
+                    base64_wkb = b64;
+                    (schema.field(i).name().clone(), Crs::wgs84())
+                }
                 None => {
                     // Last resort: coordinate columns → synthesized points.
                     let (xi, yi) = xy_columns(&schema).ok_or(
-                        "no 'geo' metadata, no binary geometry column, and no \
-                         lon/lat or x/y coordinate columns found",
+                        "no 'geo' metadata, no column whose values read as WKB \
+                         geometry, and no lon/lat or x/y coordinate columns found",
                     )?;
                     xy = Some((xi, yi));
                     encoding = GeomEncoding::Point;
@@ -2664,10 +2772,41 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
     };
     let covering = covering_column(geo_meta.as_ref(), &primary_name, &schema);
 
+    // COGP: a prefix of row groups per rendering scale (docs at
+    // src/data/cogp.rs). Validated here, from the footer, and a block
+    // that fails validation is recorded and otherwise ignored — the file
+    // is still an ordinary GeoParquet and must still open.
+    let cogp = kv
+        .iter()
+        .find(|kv| kv.key == "cogp")
+        .and_then(|kv| kv.value.clone())
+        .map(|v| {
+            super::cogp::parse(
+                &v,
+                rg_rows.len(),
+                cogp_pruning_signal(
+                    &builder,
+                    geo_meta.as_ref(),
+                    &primary_name,
+                    geom_leaf,
+                    encoding,
+                    crs.is_latlong,
+                ),
+            )
+        });
+
     let mut info = info;
     if hidden_wkb.is_some() {
         info.geo.encoding = format!("{} + GeoArrow column (used for display)", info.geo.encoding);
     }
+    if base64_wkb {
+        info.geo.encoding = "WKB, base64 text (decoded on read)".into();
+    }
+    info.geo.cogp = match &cogp {
+        Some(Ok(c)) => Some(c.summary()),
+        Some(Err(e)) => Some(format!("`cogp` metadata present but not usable: {e}")),
+        None => None,
+    };
     if let Some((xi, yi)) = xy {
         info.geo.version_label = "none (points synthesized from coordinate columns)".into();
         info.geo.primary_column = "geometry (virtual)".into();
@@ -2685,6 +2824,26 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
         });
     }
 
+    // The store hands out decoded WKB bytes for a base64 column, so the
+    // schema the rest of the app plans against must already say so. The
+    // info panel's column list was built above from the file's own types,
+    // which is what that panel is for.
+    let schema = if base64_wkb {
+        let mut fields: Vec<arrow::datatypes::Field> =
+            schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+        fields[geom_col] = arrow::datatypes::Field::new(
+            fields[geom_col].name(),
+            DataType::Binary,
+            true,
+        );
+        std::sync::Arc::new(arrow::datatypes::Schema::new_with_metadata(
+            fields,
+            schema.metadata().clone(),
+        ))
+    } else {
+        schema
+    };
+
     Ok(FileOpen {
         meta: arrow_meta,
         schema,
@@ -2700,6 +2859,8 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
         geom_bytes,
         hidden_wkb,
         spherical_edges,
+        base64_wkb,
+        cogp,
     })
 }
 
@@ -2787,6 +2948,151 @@ fn crs_from_type_string(s: Option<&str>) -> Result<Crs, String> {
     );
     crs.epsg = None;
     Ok(crs)
+}
+
+/// Column names that conventionally hold WKB geometry, matched
+/// case-insensitively when a file carries no `geo` metadata at all.
+const WKB_COLUMN_NAMES: [&str; 6] =
+    ["geometry", "geom", "wkb_geometry", "geometry_wkb", "geom_wkb", "wkb"];
+
+/// Values sampled before an untagged column is accepted as geometry.
+const WKB_PROBE_VALUES: usize = 16;
+
+/// Does `buf` open with a plausible WKB header — a byte-order flag of 0
+/// or 1 followed by a geometry type code in the ISO/EWKB set?
+///
+/// EWKB puts its Z/M/SRID flags in the top three bits of the code and ISO
+/// WKB adds 1000/2000/3000 for Z/M/ZM, so the discriminant is what is left
+/// modulo 1000: 1..=7, Point through GeometryCollection.
+fn is_wkb_header(buf: &[u8]) -> bool {
+    if buf.len() < 5 {
+        return false;
+    }
+    let code = match buf[0] {
+        0 => u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]),
+        1 => u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]),
+        _ => return false,
+    } & !(0x8000_0000 | 0x4000_0000 | 0x2000_0000);
+    code / 1000 <= 3 && (1..=7).contains(&(code % 1000))
+}
+
+/// Geometry-column candidates for a file with no `geo` metadata, best
+/// first: named binary columns, then any other binary column, then named
+/// text columns (which can only be base64 WKB). The bool is "decode
+/// base64 first".
+///
+/// Text is ranked last and only by name because an unnamed string column
+/// that happens to base64-decode is far likelier to be an opaque blob
+/// than a geometry, and unlike binary there is no cheap type signal.
+fn wkb_candidates(schema: &arrow::datatypes::SchemaRef) -> Vec<(usize, bool)> {
+    let named = |f: &arrow::datatypes::Field| {
+        WKB_COLUMN_NAMES.contains(&f.name().to_ascii_lowercase().as_str())
+    };
+    let binary = |f: &arrow::datatypes::Field| {
+        matches!(
+            f.data_type(),
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+        )
+    };
+    let text = |f: &arrow::datatypes::Field| {
+        matches!(
+            f.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        )
+    };
+    let mut out: Vec<(usize, bool)> = Vec::new();
+    let mut push = |i: usize, b64: bool| {
+        if !out.iter().any(|o| o.0 == i) {
+            out.push((i, b64));
+        }
+    };
+    for (i, f) in schema.fields().iter().enumerate() {
+        if binary(f) && named(f) {
+            push(i, false);
+        }
+    }
+    for (i, f) in schema.fields().iter().enumerate() {
+        if binary(f) {
+            push(i, false);
+        }
+    }
+    for (i, f) in schema.fields().iter().enumerate() {
+        if text(f) && named(f) {
+            push(i, true);
+        }
+    }
+    out
+}
+
+/// Read up to [`WKB_PROBE_VALUES`] non-null values of one column and test
+/// every one against [`is_wkb_header`], base64-decoding first when asked.
+/// A column with nothing to sample fails: nothing was seen, nothing is
+/// proven.
+///
+/// This is the only point in the opener that touches a data page, and it
+/// costs one page of one column. That is the price of not handing the
+/// user a map of a thumbnail column.
+fn probe_wkb_column(
+    source: &Source,
+    meta: &ArrowReaderMetadata,
+    root: usize,
+    base64: bool,
+) -> bool {
+    let Ok(reader) = source.open() else {
+        return false;
+    };
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(reader, meta.clone());
+    let mask = ProjectionMask::roots(builder.parquet_schema(), [root]);
+    let Ok(mut rdr) = builder
+        .with_projection(mask)
+        .with_batch_size(WKB_PROBE_VALUES)
+        .build()
+    else {
+        return false;
+    };
+    let want = if base64 { DataType::Utf8 } else { DataType::Binary };
+    let mut seen = 0usize;
+    while seen < WKB_PROBE_VALUES {
+        let Some(Ok(batch)) = rdr.next() else {
+            break;
+        };
+        let Ok(col) = arrow::compute::cast(batch.column(0), &want) else {
+            return false;
+        };
+        // One closure over both shapes: the base64 case decodes, the
+        // binary case is already bytes.
+        let value = |i: usize| -> Option<Option<Vec<u8>>> {
+            if base64 {
+                let a = col.as_any().downcast_ref::<arrow::array::StringArray>()?;
+                if !a.is_valid(i) {
+                    return Some(None);
+                }
+                // A named text column whose values are not base64 at all
+                // is not geometry: fail the probe, do not skip the value.
+                Some(Some(super::store::decode_base64_wkb(a.value(i))?))
+            } else {
+                let a = col.as_any().downcast_ref::<BinaryArray>()?;
+                Some(a.is_valid(i).then(|| a.value(i).to_vec()))
+            }
+        };
+        for i in 0..batch.num_rows() {
+            match value(i) {
+                Some(Some(bytes)) => {
+                    if !is_wkb_header(&bytes) {
+                        return false;
+                    }
+                    seen += 1;
+                    if seen >= WKB_PROBE_VALUES {
+                        break;
+                    }
+                }
+                // Null: neither evidence for nor against.
+                Some(None) => {}
+                None => return false,
+            }
+        }
+    }
+    seen > 0
 }
 
 /// Coordinate-column pair (x/lon, y/lat) guessed from names, for files
@@ -2996,6 +3302,41 @@ pub(crate) fn rg_bboxes_from_metadata(
     boxes
         .filter(|b| !b.is_empty())
         .map(|b| ("coordinate column statistics (GeoArrow)".into(), b))
+}
+
+/// Which row-group bbox statistics this file offers, as COGP requires
+/// (SPEC §5.1). Runs the loader's own bbox sources one at a time so the
+/// answer names the source that exists rather than the one that won:
+/// `geom_leaf` None disables the native branch, `geo_meta` None the
+/// covering one, and a WKB `encoding` the GeoArrow coordinate leaves.
+///
+/// Covering wins a tie because it is what the published profile asks
+/// for, so a file carrying both is plain COGP rather than an extension.
+fn cogp_pruning_signal(
+    builder: &ParquetRecordBatchReaderBuilder<super::source::SourceReader>,
+    geo_meta: Option<&Value>,
+    primary: &str,
+    geom_leaf: Option<usize>,
+    encoding: GeomEncoding,
+    is_latlong: bool,
+) -> Option<super::cogp::Pruning> {
+    use super::cogp::Pruning;
+    if rg_bboxes_from_metadata(builder, geo_meta, None, primary, GeomEncoding::Wkb, is_latlong)
+        .is_some()
+    {
+        return Some(Pruning::Covering);
+    }
+    if rg_bboxes_from_metadata(builder, None, geom_leaf, primary, GeomEncoding::Wkb, is_latlong)
+        .is_some()
+    {
+        return Some(Pruning::NativeStats);
+    }
+    // Last, because it is the weakest claim of the three: the coordinate
+    // leaves are a decode format's side effect rather than a declared
+    // spatial index. They still bound every row group, which is all the
+    // levels ask of them.
+    rg_bboxes_from_metadata(builder, None, None, primary, encoding, is_latlong)
+        .map(|_| Pruning::GeoArrowLeaves)
 }
 
 /// Parquet geospatial statistics allow xmin > xmax for row groups that
@@ -4942,6 +5283,7 @@ mod pruning_tests {
             "t",
             Some(&boxes),
             Some(elsewhere),
+            None,
             "test",
         );
         assert_eq!(sel.len(), n_rg, "every group is planned, not just visible ones");
@@ -5549,6 +5891,7 @@ mod pruning_tests {
             display,
             eframe::egui::Color32::RED,
             [0.0, 0.0, 1.0, 1.0],
+            1024.0,
             true,
             &Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
@@ -6585,7 +6928,7 @@ mod native_2_0_tests {
         assert_eq!(selected, 64, "{ranges:?}");
         // And the planner uses Rect for a sub-extent viewport.
         let boxes = vec![[2.0, 48.0, 2.15, 48.15], [2.0, 48.0, 2.15, 48.15]];
-        let sel = plan_viewport_selection(&store, "t", Some(&boxes), Some(rect), "test");
+        let sel = plan_viewport_selection(&store, "t", Some(&boxes), Some(rect), None, "test");
         assert!(
             sel.iter().all(|s| matches!(s, GroupSel::Rect(_, _))),
             "{sel:?}"
@@ -6697,15 +7040,22 @@ mod reload_plan_tests {
             "t",
             Some(&boxes),
             Some([9.5, -1.0, 12.0, 2.0]),
+            None,
             "test",
         );
         assert!(matches!(sel.as_slice(), [GroupSel::Rect(1, _)]), "{sel:?}");
         // Disjoint rect: nothing to read.
-        let sel =
-            plan_viewport_selection(&store, "t", Some(&boxes), Some([50.0, 0.0, 60.0, 1.0]), "test");
+        let sel = plan_viewport_selection(
+            &store,
+            "t",
+            Some(&boxes),
+            Some([50.0, 0.0, 60.0, 1.0]),
+            None,
+            "test",
+        );
         assert!(sel.is_empty(), "{sel:?}");
         // No rect: everything.
-        let sel = plan_viewport_selection(&store, "t", Some(&boxes), None, "test");
+        let sel = plan_viewport_selection(&store, "t", Some(&boxes), None, None, "test");
         assert_eq!(sel.len(), 3);
         assert!(matches!(sel[0], GroupSel::All(0)));
         assert!(matches!(sel[2], GroupSel::All(2)));
@@ -7415,5 +7765,362 @@ mod norm_bin_tests {
         assert_eq!(norm_bin(f64::NAN, 5.0, &breaks), 0);
         assert_eq!(norm_bin(1000.0, 0.0, &breaks), 0);
         assert_eq!(norm_bin(1000.0, -1.0, &breaks), 0);
+    }
+}
+
+/// Geometry-column detection on files with no `geo` metadata at all: the
+/// column has to prove itself, by name and then by its bytes.
+#[cfg(test)]
+mod wkb_detection_tests {
+    use super::*;
+    use arrow::array::{ArrayRef, BinaryArray, Float64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use std::fs::File;
+    use std::sync::Arc;
+
+    fn wkb_point(x: f64, y: f64) -> Vec<u8> {
+        let mut b = vec![1u8];
+        b.extend(1u32.to_le_bytes());
+        b.extend(x.to_le_bytes());
+        b.extend(y.to_le_bytes());
+        b
+    }
+
+    /// Write a file with no `geo` key from (name, array) pairs.
+    fn write(path: &std::path::Path, cols: Vec<(&str, ArrayRef)>) {
+        let fields: Vec<Field> = cols
+            .iter()
+            .map(|(n, a)| Field::new(*n, a.data_type().clone(), true))
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+        let batch =
+            RecordBatch::try_new(schema.clone(), cols.into_iter().map(|(_, a)| a).collect())
+                .unwrap();
+        let mut w = ArrowWriter::try_new(File::create(path).unwrap(), schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    /// A blob column is binary, and before the probe existed it was
+    /// adopted as geometry on sight — a map of decoded PNG headers. The
+    /// x/y columns beside it are the real answer.
+    #[test]
+    fn a_thumbnail_column_is_not_geometry() {
+        let path = std::env::temp_dir().join("geopq_thumbnail.parquet");
+        let blobs: Vec<Vec<u8>> = (0..64)
+            .map(|i| {
+                let mut v = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+                v.push(i as u8);
+                v
+            })
+            .collect();
+        let lon: Vec<f64> = (0..64).map(|i| 2.0 + i as f64 * 0.01).collect();
+        let lat: Vec<f64> = (0..64).map(|i| 48.0 + i as f64 * 0.01).collect();
+        write(
+            &path,
+            vec![
+                ("thumbnail", Arc::new(BinaryArray::from_iter_values(blobs.iter()))),
+                ("lon", Arc::new(Float64Array::from(lon))),
+                ("lat", Arc::new(Float64Array::from(lat))),
+            ],
+        );
+        let (store, crs, info, _rg) = open_store(&Source::Local(path)).unwrap();
+        assert!(store.xy_geom.is_some(), "points must come from lon/lat");
+        assert_eq!(store.encoding, GeomEncoding::Point);
+        assert!(crs.name.contains("points from"), "{}", crs.name);
+        assert!(info.geo.encoding.contains("lon"), "{}", info.geo.encoding);
+    }
+
+    /// …and with no coordinate columns to fall back on, a blob column is
+    /// an honest failure rather than a garbage layer.
+    #[test]
+    fn a_blob_only_file_refuses_to_open() {
+        let path = std::env::temp_dir().join("geopq_blob_only.parquet");
+        let blobs: Vec<Vec<u8>> = (0..64).map(|i| vec![9u8, 9, 9, 9, 9, i as u8]).collect();
+        write(
+            &path,
+            vec![("thumbnail", Arc::new(BinaryArray::from_iter_values(blobs.iter())))],
+        );
+        let err = open_store(&Source::Local(path))
+            .err()
+            .expect("a blob column is not geometry");
+        assert!(err.contains("read as WKB"), "{err}");
+    }
+
+    /// A binary column named outside the list still opens when its bytes
+    /// are WKB: the name list ranks candidates, it does not gate them.
+    #[test]
+    fn an_oddly_named_binary_column_opens_when_it_is_wkb() {
+        let path = std::env::temp_dir().join("geopq_odd_name.parquet");
+        let wkbs: Vec<Vec<u8>> = (0..64).map(|i| wkb_point(i as f64, 1.0)).collect();
+        write(
+            &path,
+            vec![("shape", Arc::new(BinaryArray::from_iter_values(wkbs.iter())))],
+        );
+        let (store, _crs, _info, _rg) = open_store(&Source::Local(path)).unwrap();
+        assert!(store.xy_geom.is_none());
+        assert_eq!(store.schema.field(store.geom_col).name(), "shape");
+    }
+
+    /// `geometry_wkb` is one of the conventional names, and a named
+    /// candidate wins over an unnamed binary column that also passes.
+    #[test]
+    fn geometry_wkb_is_a_known_name() {
+        let path = std::env::temp_dir().join("geopq_geometry_wkb.parquet");
+        let wkbs: Vec<Vec<u8>> = (0..64).map(|i| wkb_point(i as f64, 1.0)).collect();
+        write(
+            &path,
+            vec![
+                ("payload", Arc::new(BinaryArray::from_iter_values(wkbs.iter()))),
+                ("geometry_wkb", Arc::new(BinaryArray::from_iter_values(wkbs.iter()))),
+            ],
+        );
+        let (store, _crs, _info, _rg) = open_store(&Source::Local(path)).unwrap();
+        assert_eq!(store.schema.field(store.geom_col).name(), "geometry_wkb");
+    }
+
+    /// Spark / Sedona exports hand out WKB as base64 text. The store
+    /// decodes it on read, so the layer is an ordinary WKB layer.
+    #[test]
+    fn base64_wkb_text_column_opens_and_decodes() {
+        use base64::Engine as _;
+        let path = std::env::temp_dir().join("geopq_base64_wkb.parquet");
+        let b64: Vec<String> = (0..64)
+            .map(|i| {
+                base64::engine::general_purpose::STANDARD
+                    .encode(wkb_point(2.0 + i as f64 * 0.01, 48.0))
+            })
+            .collect();
+        write(
+            &path,
+            vec![("geometry", Arc::new(StringArray::from(b64)))],
+        );
+        let (store, _crs, info, _rg) = open_store(&Source::Local(path)).unwrap();
+        assert!(store.base64_wkb);
+        assert!(store.encoding.is_wkb());
+        // The schema the app plans against says bytes, not text.
+        assert_eq!(store.schema.field(store.geom_col).data_type(), &DataType::Binary);
+        assert!(info.geo.encoding.contains("base64"), "{}", info.geo.encoding);
+        // And a read really does yield decodable WKB.
+        let geoms = store.fetch_geoms(&[0, 5, 63]).unwrap();
+        assert_eq!(geoms.len(), 3);
+        for (row, g) in geoms {
+            let g = g.unwrap_or_else(|| panic!("row {row} did not decode"));
+            assert!(matches!(g, geo_types::Geometry::Point(_)));
+        }
+    }
+
+    /// Text that is not base64, in a column named `geometry`: rejected,
+    /// like any other column that fails the probe.
+    #[test]
+    fn plain_text_named_geometry_is_not_adopted() {
+        let path = std::env::temp_dir().join("geopq_text_geometry.parquet");
+        let names: Vec<String> = (0..64).map(|i| format!("feature {i}")).collect();
+        write(&path, vec![("geometry", Arc::new(StringArray::from(names)))]);
+        let err = open_store(&Source::Local(path))
+            .err()
+            .expect("a blob column is not geometry");
+        assert!(err.contains("read as WKB"), "{err}");
+    }
+
+    #[test]
+    fn wkb_header_check_accepts_iso_and_ewkb() {
+        // Little-endian point, big-endian polygon.
+        assert!(super::is_wkb_header(&wkb_point(1.0, 2.0)));
+        assert!(super::is_wkb_header(&[0, 0, 0, 0, 3]));
+        // ISO Z/M/ZM offsets, and the EWKB flag bits.
+        assert!(super::is_wkb_header(&[1, 0xE9, 0x03, 0, 0])); // 1001, PointZ
+        assert!(super::is_wkb_header(&[1, 0x01, 0, 0, 0x20])); // SRID flag
+        // Not WKB: bad byte order, unknown type, truncated.
+        assert!(!super::is_wkb_header(&[2, 1, 0, 0, 0]));
+        assert!(!super::is_wkb_header(&[1, 0x63, 0, 0, 0])); // type 99
+        assert!(!super::is_wkb_header(&[1, 0, 0, 0, 0])); // type 0
+        assert!(!super::is_wkb_header(&[1, 1, 0]));
+        assert!(!super::is_wkb_header(&[0x89, b'P', b'N', b'G', 0x0d]));
+    }
+}
+
+/// Cloud Optimized GeoParquet Profile: reading the levels, and planning
+/// against the prefix they name.
+#[cfg(test)]
+mod cogp_tests {
+    use super::*;
+    use crate::data::cogp::Pruning;
+
+    fn fixture() -> Option<std::path::PathBuf> {
+        let p = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/parcels_cogp.parquet"
+        ));
+        p.exists().then_some(p)
+    }
+
+    /// The levels come off the footer, and level selection matches the
+    /// metadata it was read from: for each declared level, asking for
+    /// exactly its gsd must select exactly its prefix.
+    #[test]
+    fn cogp_levels_open_and_select_their_own_prefix() {
+        let Some(path) = fixture() else {
+            eprintln!("fixture missing, skipping");
+            return;
+        };
+        let (store, _crs, info, rg) = open_store(&Source::Local(path)).unwrap();
+        let rg_rows: Vec<u64> =
+            store.rg_starts().windows(2).map(|w| w[1] - w[0]).collect();
+        let levels = store.cogp.as_ref().expect("cogp metadata");
+        assert_eq!(levels.version, "0.1.0");
+        // The spec's own structural invariants, re-checked against what
+        // the loader kept: coarse to fine, ending at the last row group.
+        assert!(levels.levels.windows(2).all(|w| w[0].row_group_end < w[1].row_group_end));
+        assert!(levels.levels.windows(2).all(|w| w[0].gsd > w[1].gsd));
+        let n_rg = store.rg_starts().len() - 1;
+        assert_eq!(levels.levels.last().unwrap().row_group_end, n_rg - 1);
+        // cogp convert reuses the input's covering column, so this is the
+        // profile as published rather than the 2.0 extension.
+        assert_eq!(levels.pruning, Pruning::Covering);
+
+        for (i, l) in levels.levels.iter().enumerate() {
+            assert_eq!(levels.level_for_gsd(l.gsd), i, "level {i} at its own gsd");
+            assert_eq!(levels.row_group_end_for_gsd(l.gsd), l.row_group_end);
+            // Just finer than this level still selects it, until the next
+            // level's gsd is reached.
+            if let Some(next) = levels.levels.get(i + 1) {
+                assert_eq!(levels.level_for_gsd(next.gsd * 1.001), i, "between {i} and {}", i + 1);
+            }
+        }
+        // Coarser than the file: level 0, per SPEC §7.1.
+        assert_eq!(levels.level_for_gsd(levels.levels[0].gsd * 10.0), 0);
+
+        // And the file info panel says what was found.
+        let line = info.geo.cogp.as_deref().expect("summary line");
+        assert!(line.starts_with("COGP 0.1.0: "), "{line}");
+        assert!(!line.contains("2.0 extension"), "{line}");
+        assert!(line.contains("prefix row groups 1/"), "{line}");
+
+        // The gate must not condemn a correct COGP layout. Levels
+        // overlap each other by construction — measured as one file this
+        // fixture reads far past the C2 threshold — so C2 measures
+        // inside them (see `quality::Clustering::worst`).
+        let q = info.quality.as_ref().unwrap();
+        let c2 = q.checks.iter().find(|c| c.code == "C2").unwrap();
+        assert_eq!(c2.status, crate::data::quality::Status::Pass, "{}", c2.detail);
+        assert!(c2.detail.starts_with("within COGP levels:"), "{}", c2.detail);
+        assert!(q.indexable, "a file the reference converter wrote must open ungated");
+        // …and the layer panel reads the same run, so it cannot call the
+        // same file poorly clustered.
+        let rg = rg.as_ref().expect("row-group boxes");
+        let boxes = crate::data::layer::RgBboxes::new(
+            rg.0.clone(),
+            rg.1.clone(),
+            store.cogp.as_ref().map(|c| c.runs(&rg_rows)).as_deref(),
+        );
+        assert!(!boxes.poorly_clustered(), "avg ×{:.1}", boxes.avg_overlap);
+        let c8 = q.checks.iter().find(|c| c.code == "C8").unwrap();
+        assert_eq!(c8.status, crate::data::quality::Status::Pass);
+        assert!(!c8.gating);
+        assert!(c8.detail.contains("COGP 0.1.0:"), "{}", c8.detail);
+    }
+
+    /// A world-wide view of a COGP layer plans the coarse prefix and
+    /// nothing else — exact features at that scale, no boxes, no stride.
+    #[test]
+    fn a_wide_view_plans_the_coarse_prefix_exactly() {
+        let Some(path) = fixture() else {
+            eprintln!("fixture missing, skipping");
+            return;
+        };
+        let (store, crs, _info, rg) = open_store(&Source::Local(path)).unwrap();
+        let (_, boxes) = rg.expect("row-group boxes");
+        let n_rg = store.rg_starts().len() - 1;
+        let extent = union_of(&boxes).unwrap();
+
+        // The whole dataset on a 1600 px map: ~100 m of ground per pixel
+        // on a state-sized EPSG:26986 extent.
+        let view_px = 1600.0;
+        let gsd = view_gsd(extent, view_px, &crs).unwrap();
+        let end = cogp_prefix_end(&store, Some(extent), view_px, &crs).unwrap();
+        assert_eq!(end as usize, store.cogp.as_ref().unwrap().row_group_end_for_gsd(gsd));
+        assert!(end as usize + 1 < n_rg, "a wide view must not need every group");
+
+        let sel = plan_viewport_selection(
+            &store,
+            "t",
+            Some(&boxes),
+            Some(extent),
+            Some(end),
+            "test",
+        );
+        assert!(!sel.is_empty());
+        assert!(sel.iter().all(|s| s.group() <= end), "planned past the prefix: {sel:?}");
+        // Exact rows, not an approximation: this is the whole point of
+        // putting the level check before the budget fallbacks.
+        assert!(
+            sel.iter()
+                .all(|s| matches!(s, GroupSel::All(_) | GroupSel::Rect(_, _)
+                    | GroupSel::ResolvedRect { .. })),
+            "{sel:?}"
+        );
+
+        // Zooming in to a tenth of the extent moves the level finer, so
+        // the prefix can only grow — previously read groups stay valid.
+        let (w, h) = (extent[2] - extent[0], extent[3] - extent[1]);
+        let zoomed = [
+            extent[0] + w * 0.45,
+            extent[1] + h * 0.45,
+            extent[0] + w * 0.55,
+            extent[1] + h * 0.55,
+        ];
+        let zoomed_end = cogp_prefix_end(&store, Some(zoomed), view_px, &crs).unwrap();
+        assert!(zoomed_end >= end, "{zoomed_end} < {end}");
+    }
+
+    /// Without levels nothing changes: the planner sees the whole file.
+    #[test]
+    fn a_plain_file_has_no_prefix() {
+        let path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/parcels_hilbert.parquet"
+        ));
+        if !path.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let (store, crs, info, _rg) = open_store(&Source::Local(path)).unwrap();
+        assert!(store.cogp.is_none());
+        assert!(info.geo.cogp.is_none());
+        assert!(cogp_prefix_end(&store, Some([0.0, 0.0, 1.0, 1.0]), 800.0, &crs).is_none());
+        // C8 does not penalise it.
+        let c8 = info
+            .quality
+            .as_ref()
+            .unwrap()
+            .checks
+            .iter()
+            .find(|c| c.code == "C8")
+            .unwrap();
+        assert_eq!(c8.status, crate::data::quality::Status::Pass);
+        assert!(c8.detail.contains("optional"), "{}", c8.detail);
+    }
+
+    /// Metres per pixel: degrees convert at the viewport's centre
+    /// latitude, projected units pass through.
+    #[test]
+    fn view_gsd_converts_degrees_at_the_centre_latitude() {
+        let mut geo = Crs::wgs84();
+        geo.is_latlong = true;
+        // One degree of longitude over 1000 px, at the equator.
+        let g = view_gsd([0.0, -0.5, 1.0, 0.5], 1000.0, &geo).unwrap();
+        assert!((g - 111.32).abs() < 0.1, "{g}");
+        // The same span at 60°N covers half the ground.
+        let g60 = view_gsd([0.0, 59.5, 1.0, 60.5], 1000.0, &geo).unwrap();
+        assert!((g60 / g - 0.5).abs() < 0.01, "{g60} vs {g}");
+        // A projected CRS is already metres.
+        let l93 = Crs::from_epsg(2154).unwrap();
+        assert_eq!(view_gsd([0.0, 0.0, 10_000.0, 10_000.0], 1000.0, &l93), Some(10.0));
+        // Degenerate viewports have no scale.
+        assert_eq!(view_gsd([1.0, 0.0, 1.0, 1.0], 1000.0, &l93), None);
+        assert_eq!(view_gsd([0.0, 0.0, 1.0, 1.0], 0.0, &l93), None);
     }
 }

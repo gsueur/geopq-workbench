@@ -78,7 +78,13 @@ pub fn window(ctx: &egui::Context, open: &mut bool, area: egui::Rect) {
                     "Geometry becomes a first-class Parquet type: GEOMETRY / \
                      GEOGRAPHY logical types with the CRS inside and native \
                      geospatial statistics per row group. Any Parquet reader \
-                     can prune spatially, no geo-awareness required.");
+                     can prune spatially, no geo-awareness required. \
+                     Reader support is still catching up: DuckDB spatial up \
+                     to 1.4 — and everything that bundles it, e.g. \
+                     duckdb-wasm 1.31 behind maplibre-gl-vector — refuses a \
+                     file whose `geo` block declares version 2.0.0 outright \
+                     (\"Geoparquet version 2.0.0 is not supported\"). DuckDB \
+                     1.5 reads them.");
             });
 
             h(ui, "Geometry encodings");
@@ -99,7 +105,10 @@ pub fn window(ctx: &egui::Context, open: &mut bool, area: egui::Rect) {
                 row(ui, wide, "Native GEOMETRY (2.0)",
                     "WKB storage + built-in spatial statistics + CRS in the \
                      type. The interoperability choice: pruning works in any \
-                     2.0-aware reader without extra columns.");
+                     2.0-aware reader without extra columns. Writers vary on \
+                     the CRS half: DuckDB 1.5 emits GeometryType(crs=<null>) \
+                     and states the CRS only in the `geo` block, so a reader \
+                     that trusts the logical type alone finds none.");
             });
 
             h(ui, "What makes a file fast");
@@ -176,7 +185,8 @@ pub fn window(ctx: &egui::Context, open: &mut bool, area: egui::Rect) {
                          GEOMETRY — pick per file",
                         "1.0 from a plain COPY; 2.0 native via \
                          GEOPARQUET_VERSION 'V2'. No 1.1 covering or \
-                         GeoArrow flavors",
+                         GeoArrow flavors. Reads 2.0 only from 1.5: up to \
+                         1.4 a `geo` version of 2.0.0 is rejected",
                         "1.1 by default (3.9+); GeoArrow via \
                          GEOMETRY_ENCODING; 2.0 native via \
                          USE_PARQUET_GEO_TYPES (3.12+)");
@@ -195,7 +205,8 @@ pub fn window(ctx: &egui::Context, open: &mut bool, area: egui::Rect) {
                     row4(ui, col_w, "CRS",
                         "Preserved across rewrites (PROJJSON / EPSG)",
                         "Preserved since DuckDB 1.5; older versions dropped \
-                         it on write",
+                         it on write. Its 2.0 writer leaves the logical \
+                         type's crs null and states the CRS in `geo` only",
                         "Preserved (PROJJSON)");
                     row4(ui, col_w, "Row groups",
                         "Tuned presets (16k–131k rows)",
