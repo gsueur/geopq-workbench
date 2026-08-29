@@ -155,6 +155,442 @@ impl BloomMode {
     }
 }
 
+/// Web Mercator equatorial circumference (2π · 6_378_137 m), the constant
+/// the COGP reference converter derives its zoom-based GSDs from.
+const WEB_MERCATOR_CIRCUMFERENCE_M: f64 = 40_075_016.685_578_49;
+
+/// Where a COGP export's level GSDs come from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GsdSource {
+    /// A Web Mercator tile pyramid: `gsd(z) = circumference / (resolution ·
+    /// 2^z)` metres for z in `minzoom..=maxzoom`. `resolution` is base units
+    /// per tile side; the reference default of 1024 is ~4× a 256 px tile, so
+    /// features that collapse within a few subpixels defer to a finer level.
+    WebMercator {
+        minzoom: u32,
+        maxzoom: u32,
+        resolution: u32,
+    },
+    /// Explicit GSDs in metres, coarse to fine (strictly decreasing).
+    Explicit(Vec<f64>),
+}
+
+/// Which end of a rank column wins a point-thinning cell.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RankOrder {
+    /// Largest value wins.
+    Desc,
+    /// Smallest value wins.
+    Asc,
+}
+
+impl RankOrder {
+    pub fn label(&self) -> &'static str {
+        match self {
+            RankOrder::Desc => "largest wins",
+            RankOrder::Asc => "smallest wins",
+        }
+    }
+}
+
+/// Cloud Optimized GeoParquet Profile levels (see `super::cogp`).
+///
+/// The heuristic reproduces the reference converter's, so a file this app
+/// writes behaves like one `cogp-rs convert` writes: a feature lands in the
+/// coarsest level at which it is *independently renderable*. Lines and
+/// polygons qualify by bbox diagonal against a multiple of the level's GSD;
+/// points have no extent, so they qualify by grid thinning instead — one
+/// point per cell survives per level and the rest defer to finer ones.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CogpOptions {
+    pub gsd: GsdSource,
+    /// A line is renderable at a level once its bbox diagonal reaches
+    /// `line_factor · gsd`. A diagonal of exactly one GSD is a hairline.
+    pub line_factor: u32,
+    /// Same for polygons, defaulting higher: a shape under ~4 cells across
+    /// is not a shape yet, and letting them in crowds the coarse levels.
+    pub polygon_factor: u32,
+    /// Point-thinning grid pitch, in multiples of the level's GSD. Each
+    /// step up thins by roughly its square.
+    pub point_factor: u32,
+    /// Attribute column deciding which point wins a contested cell, and
+    /// which end of it wins. Without one the winner is the largest bbox,
+    /// then a deterministic hash of the row — arbitrary but stable.
+    pub rank: Option<(String, RankOrder)>,
+}
+
+impl Default for CogpOptions {
+    fn default() -> Self {
+        // The reference converter's defaults, verbatim.
+        Self {
+            gsd: GsdSource::WebMercator {
+                minzoom: 0,
+                maxzoom: 16,
+                resolution: 1024,
+            },
+            line_factor: 2,
+            polygon_factor: 4,
+            point_factor: 4,
+            rank: None,
+        }
+    }
+}
+
+impl CogpOptions {
+    /// The level GSDs in metres, coarse to fine. Validated here rather than
+    /// at write time: a bad zoom range or a non-decreasing explicit list is
+    /// a dialog mistake, and it should not surface as a half-written file.
+    pub fn gsds(&self) -> Result<Vec<f64>, String> {
+        let list: Vec<f64> = match &self.gsd {
+            GsdSource::WebMercator {
+                minzoom,
+                maxzoom,
+                resolution,
+            } => {
+                if minzoom > maxzoom {
+                    return Err(format!("COGP: min zoom {minzoom} is past max {maxzoom}"));
+                }
+                if *maxzoom > 30 {
+                    return Err(format!("COGP: max zoom {maxzoom} is past 30"));
+                }
+                if *resolution == 0 {
+                    return Err("COGP: resolution must be positive".into());
+                }
+                let z0 = WEB_MERCATOR_CIRCUMFERENCE_M / *resolution as f64;
+                (*minzoom..=*maxzoom)
+                    .map(|z| z0 / (1u64 << z) as f64)
+                    .collect()
+            }
+            GsdSource::Explicit(v) => v.clone(),
+        };
+        if list.is_empty() {
+            return Err("COGP: no levels".into());
+        }
+        // One level per byte of the per-row level code, and long before 255
+        // the levels have stopped meaning anything.
+        if list.len() > 255 {
+            return Err(format!("COGP: {} levels is past the 255 limit", list.len()));
+        }
+        for (i, g) in list.iter().enumerate() {
+            if !(g.is_finite() && *g > 0.0) {
+                return Err(format!("COGP: level {i} has a non-positive gsd {g}"));
+            }
+            if i > 0 && *g >= list[i - 1] {
+                return Err(format!(
+                    "COGP: gsd must strictly decrease, got {} then {g}",
+                    list[i - 1]
+                ));
+            }
+        }
+        if self.line_factor == 0 || self.polygon_factor == 0 || self.point_factor == 0 {
+            return Err("COGP: the visibility factors must be at least 1".into());
+        }
+        Ok(list)
+    }
+}
+
+/// Geometry family of one feature, for the COGP visibility rules. One byte
+/// per exported row, which is why it is not `geometry::GeomKind` (that one
+/// carries Mixed/Unknown, which have no rule here).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CogpKind {
+    Point,
+    Line,
+    Polygon,
+}
+
+impl CogpKind {
+    /// A geometry type name from `geom_type_name`. A GeometryCollection is
+    /// spatially extended and has no rule of its own, so it takes the
+    /// strictest one rather than being let into level 0 as a "point".
+    fn from_type_name(name: &str) -> Self {
+        match name {
+            "Point" | "MultiPoint" => CogpKind::Point,
+            "LineString" | "MultiLineString" => CogpKind::Line,
+            _ => CogpKind::Polygon,
+        }
+    }
+}
+
+/// Metres per degree of longitude at the equator, and per degree of
+/// latitude. Rendering-grade constants: COGP thresholds decide which level
+/// a feature is *drawn* at, so a percent of sphere-vs-ellipsoid error moves
+/// nothing a viewer can see.
+const M_PER_DEG_LON: f64 = 111_320.0;
+const M_PER_DEG_LAT: f64 = 110_540.0;
+
+/// How the layer's coordinates convert to the metres COGP measures in.
+///
+/// The spec is explicit (§4.2) that `gsd` is metres on the ground whatever
+/// the file's CRS, so degrees have to be converted rather than compared
+/// directly — a threshold of "1000" against degrees would defer every
+/// feature on Earth to the finest level.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CogpUnits {
+    /// Geographic degrees. Metres per degree of longitude shrink with the
+    /// cosine of latitude, so the conversion is per feature rather than the
+    /// flat scale factor the reference converter uses.
+    Degrees,
+    /// Projected linear units, this many metres each (1.0 for metres).
+    Linear(f64),
+}
+
+impl CogpUnits {
+    fn label(&self) -> String {
+        match self {
+            CogpUnits::Degrees => "degrees (converted at each feature's latitude)".into(),
+            CogpUnits::Linear(f) if *f == 1.0 => "metres".into(),
+            CogpUnits::Linear(f) => format!("projected units of {f} m"),
+        }
+    }
+
+    /// A bbox's width and height in metres.
+    fn extent_m(self, b: &[f64; 4]) -> (f64, f64) {
+        match self {
+            CogpUnits::Linear(f) => ((b[2] - b[0]) * f, (b[3] - b[1]) * f),
+            CogpUnits::Degrees => {
+                let lat = ((b[1] + b[3]) * 0.5).to_radians();
+                (
+                    (b[2] - b[0]) * M_PER_DEG_LON * lat.cos().abs(),
+                    (b[3] - b[1]) * M_PER_DEG_LAT,
+                )
+            }
+        }
+    }
+
+    /// The thinning-grid cell of a bbox centre, at `pitch` metres.
+    ///
+    /// Degrees go through a sinusoidal projection (x = R·λ·cos φ, y = R·φ)
+    /// rather than a per-feature scale factor: the projection is continuous,
+    /// so two neighbouring points always agree on where the cell boundary
+    /// between them is. Scaling each feature by the cosine of *its own*
+    /// latitude does not, and would let a cluster spanning a boundary keep
+    /// two winners at the same level.
+    fn cell(self, b: &[f64; 4], pitch: f64) -> (i64, i64) {
+        let (cx, cy) = ((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5);
+        let (mx, my) = match self {
+            CogpUnits::Linear(f) => (cx * f, cy * f),
+            CogpUnits::Degrees => (
+                cx * M_PER_DEG_LON * cy.to_radians().cos(),
+                cy * M_PER_DEG_LAT,
+            ),
+        };
+        ((mx / pitch).floor() as i64, (my / pitch).floor() as i64)
+    }
+}
+
+/// Metres per linear unit of a proj string (`+to_meter`, or the unit names
+/// proj4 abbreviates). Unknown units read as metres, which is what proj
+/// itself defaults to.
+fn proj4_meters_per_unit(proj4: &str) -> f64 {
+    for tok in proj4.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("+to_meter=")
+            && let Ok(f) = v.parse::<f64>()
+            && f.is_finite()
+            && f > 0.0
+        {
+            return f;
+        }
+        match tok {
+            "+units=us-ft" => return 0.304_800_609_601_219_2,
+            "+units=ft" => return 0.3048,
+            "+units=km" => return 1000.0,
+            _ => {}
+        }
+    }
+    1.0
+}
+
+/// What the exported coordinates measure in, best evidence first.
+///
+/// A CRS the app can actually build answers directly (`is_latlong` plus the
+/// proj string's unit); otherwise the PROJJSON `type` is enough to tell a
+/// projected CRS from a geographic one, which is the distinction that
+/// matters. GeoParquet's default when `crs` is absent is OGC:CRS84, so an
+/// absent CRS means degrees, not metres.
+fn cogp_units(crs: Option<&Value>, vendor_crs: Option<&Value>) -> CogpUnits {
+    let from_crs = |c: &super::crs::Crs| {
+        if c.is_latlong {
+            CogpUnits::Degrees
+        } else {
+            CogpUnits::Linear(proj4_meters_per_unit(&c.proj4))
+        }
+    };
+    if let Some(p4) = vendor_crs.and_then(|v| v.get("proj4")?.as_str()) {
+        if let Ok(c) = super::crs::Crs::from_proj4(p4, None, "vendor") {
+            return from_crs(&c);
+        }
+    }
+    let Some(v) = crs else {
+        return CogpUnits::Degrees; // absent crs means CRS84
+    };
+    if v.is_null() {
+        // Declared-unknown. The data still has to be placed somewhere and
+        // the app renders it as CRS84, so measure it the same way.
+        return CogpUnits::Degrees;
+    }
+    if let Ok(c) = super::crs::Crs::from_geoparquet_crs(Some(v)) {
+        return from_crs(&c);
+    }
+    // Last resort: the PROJJSON type alone, the way the reference converter
+    // decides it.
+    fn classify(v: &Value) -> Option<CogpUnits> {
+        let t = v.get("type")?.as_str()?;
+        if t.contains("Projected") {
+            return Some(CogpUnits::Linear(1.0));
+        }
+        if t.contains("Geographic") {
+            return Some(CogpUnits::Degrees);
+        }
+        if t == "BoundCRS" {
+            return v.get("source_crs").and_then(classify);
+        }
+        None
+    }
+    classify(v).unwrap_or(CogpUnits::Degrees)
+}
+
+/// Winner priority inside a point-thinning cell: the rank column leads, a
+/// larger bbox breaks ties (a MultiPoint spanning ground beats a single
+/// point), then a hash of the row index so the choice is deterministic and
+/// not simply "whichever came first in the file".
+fn cogp_priority(b: &[f64; 4], rank: u32, row: u32) -> (u32, u64, u64) {
+    let (w, h) = ((b[2] - b[0]).max(0.0), (b[3] - b[1]).max(0.0));
+    let sq = w * w + h * h;
+    let sq_bits = if sq.is_finite() { sq.to_bits() } else { 0 };
+    let mut hash = row as u64;
+    hash = hash.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    hash ^= hash >> 30;
+    (rank, sq_bits, hash)
+}
+
+/// Assign every exported row to a COGP level, coarse (0) to fine.
+///
+/// Lines and polygons enter at the coarsest level whose GSD their bbox
+/// diagonal clears — a hard gate, so a reader that stops after the coarse
+/// prefix never pays for sub-resolution features. Points have no extent and
+/// so cannot be gated that way; they compete for grid cells instead, one
+/// winner per cell per level, with the cells a coarser level already used
+/// blocked so a tight cluster does not surface a near-identical neighbour
+/// at every level. Whatever is left over lands in the finest level, which
+/// is what makes the assignment total: every feature is placed exactly once.
+fn assign_cogp_levels(
+    bboxes: &[Option<[f64; 4]>],
+    kinds: &[CogpKind],
+    gsds: &[f64],
+    units: CogpUnits,
+    opts: &CogpOptions,
+    ranks: Option<&[u32]>,
+) -> Vec<u8> {
+    use std::collections::HashMap;
+    let n = bboxes.len();
+    let last = (gsds.len() - 1) as u8;
+    let rank_of = |i: usize| ranks.map_or(0, |r| r[i]);
+
+    // Coarsest level each feature could possibly enter at. Points: 0.
+    // Null geometry renders nothing, so it defers all the way.
+    let mut floor: Vec<u8> = vec![0; n];
+    for i in 0..n {
+        let Some(b) = bboxes[i] else {
+            floor[i] = last;
+            continue;
+        };
+        if kinds[i] == CogpKind::Point {
+            continue;
+        }
+        let (dx, dy) = units.extent_m(&b);
+        let sq = dx * dx + dy * dy;
+        if sq <= 0.0 {
+            // A zero-extent line or polygon is degenerate, not small: it has
+            // no diagonal to gate on, so it is treated as point-like. Same
+            // call the reference converter makes.
+            continue;
+        }
+        let factor = if kinds[i] == CogpKind::Line {
+            opts.line_factor
+        } else {
+            opts.polygon_factor
+        } as f64;
+        // Squared throughout: a per-row sqrt buys nothing here.
+        floor[i] = gsds
+            .iter()
+            .position(|g| {
+                let t = g * factor;
+                sq >= t * t
+            })
+            .unwrap_or(gsds.len() - 1) as u8;
+    }
+
+    let mut level: Vec<u8> = vec![u8::MAX; n];
+    let mut remaining: Vec<u32> = (0..n as u32)
+        .filter(|&i| bboxes[i as usize].is_some())
+        .collect();
+    for i in 0..n {
+        if bboxes[i].is_none() {
+            level[i] = last;
+        }
+    }
+    // Points already placed, re-projected onto each new level's grid to
+    // block its cells.
+    let mut placed_points: Vec<u32> = Vec::new();
+    for (li, gsd) in gsds.iter().enumerate() {
+        if remaining.is_empty() {
+            break;
+        }
+        let pitch = gsd * opts.point_factor as f64;
+        let blocked: HashSet<(i64, i64)> = placed_points
+            .iter()
+            .map(|&r| units.cell(&bboxes[r as usize].unwrap(), pitch))
+            .collect();
+        let mut best: HashMap<(i64, i64), u32> = HashMap::new();
+        let mut picked: Vec<u32> = Vec::new();
+        for &r in &remaining {
+            let i = r as usize;
+            if floor[i] as usize > li {
+                continue;
+            }
+            if kinds[i] != CogpKind::Point {
+                // Extended geometry contributes across many cells; deciding
+                // it by its centre would hide a long river behind a pond.
+                picked.push(r);
+                continue;
+            }
+            let b = bboxes[i].unwrap();
+            let key = units.cell(&b, pitch);
+            if blocked.contains(&key) {
+                continue;
+            }
+            let prio = cogp_priority(&b, rank_of(i), r);
+            match best.get(&key) {
+                Some(&cur) => {
+                    let c = bboxes[cur as usize].unwrap();
+                    if prio > cogp_priority(&c, rank_of(cur as usize), cur) {
+                        best.insert(key, r);
+                    }
+                }
+                None => {
+                    best.insert(key, r);
+                }
+            }
+        }
+        let winners: Vec<u32> = best.into_values().collect();
+        placed_points.extend(winners.iter().copied());
+        picked.extend(winners);
+        if picked.is_empty() {
+            continue;
+        }
+        for &r in &picked {
+            level[r as usize] = li as u8;
+        }
+        let taken: HashSet<u32> = picked.into_iter().collect();
+        remaining.retain(|r| !taken.contains(r));
+    }
+    for r in remaining {
+        level[r as usize] = last;
+    }
+    level
+}
+
 #[derive(Clone)]
 pub struct OptimizeOptions {
     pub version: GpVersion,
@@ -188,6 +624,12 @@ pub struct OptimizeOptions {
     pub h3_resolution: Option<u8>,
     /// Split the output into hive directories / adaptive H3 cells.
     pub partition: super::partition::PartitionBy,
+    /// Order the output coarse to fine and write the `cogp` level metadata
+    /// (Cloud Optimized GeoParquet Profile). Implies the Hilbert sort and,
+    /// on 1.1, the covering column; cannot combine with partitioning
+    /// (levels and hive parts both want to own the file layout) or with the
+    /// GeoArrow flavour.
+    pub cogp: Option<CogpOptions>,
     /// Source has no geometry column: synthesize WKB points from these
     /// coordinate columns (x/lon, y/lat) — materializes x/y layers into
     /// real GeoParquet.
@@ -211,6 +653,7 @@ impl Default for OptimizeOptions {
             filter_rect: None,
             h3_resolution: None,
             partition: super::partition::PartitionBy::None,
+            cogp: None,
             xy_geom: None,
         }
     }
@@ -231,6 +674,18 @@ pub struct OptimizeReport {
     pub elapsed_ms: u64,
     /// Output files written (1 unless partitioned).
     pub files: usize,
+    /// COGP levels actually written, coarse to fine (empty when off).
+    pub cogp_levels: Vec<CogpLevelReport>,
+}
+
+/// One written COGP level, for the completion summary.
+#[derive(Clone, Debug)]
+pub struct CogpLevelReport {
+    pub gsd: f64,
+    pub rows: u64,
+    /// Row groups this level owns, inclusive.
+    pub rg_start: usize,
+    pub rg_end: usize,
 }
 
 impl OptimizeReport {
@@ -289,6 +744,21 @@ fn key_pass_bytes_per_row(
             n += 28;
         }
     }
+    if let Some(c) = &opts.cogp {
+        // Geometry family (1), the visibility floor (1) and the assigned
+        // level (1), plus the `remaining` and `placed_points` lists (8).
+        // Dominating all of it: the per-level winner map and the blocked
+        // set it is rebuilt from — a hashbrown entry for a 16-byte cell key
+        // and a 4-byte row, at the load factor, and in the worst case
+        // (every point alone in its cell at level 0) there is one per row.
+        n += 3 + 8 + 48;
+        if c.rank.is_some() {
+            // The u32 rank, and slack for the ranked column's own values
+            // while they are concatenated. A wide string column costs more
+            // than this; it is read once and dropped before the sort.
+            n += 8;
+        }
+    }
     n
 }
 
@@ -310,6 +780,10 @@ struct ScanPlan<'a> {
     /// (slot in `part_names`, source column) for keys read from the data.
     part_src: &'a [(usize, usize)],
     part_names: &'a [String],
+    /// COGP: record each feature's geometry family, and keep the values of
+    /// this source column for the cell-winner rank.
+    cogp_kinds: bool,
+    cogp_rank_src: Option<usize>,
 }
 
 /// What it accumulates. Everything here is per exported row and fixed
@@ -323,6 +797,11 @@ struct ScanOut {
     kept: Vec<u32>,
     geom_types: HashSet<String>,
     interners: Vec<super::partition::Interner>,
+    /// COGP: geometry family per exported row (one byte each).
+    row_kinds: Vec<CogpKind>,
+    /// COGP: the rank column's exported values, concatenated and ranked
+    /// once the scan is over. Dropped before the sort order is built.
+    rank_parts: Vec<ArrayRef>,
     /// Union over the row group being scanned (reset by the caller).
     group_box: Option<[f64; 4]>,
     scanned: u64,
@@ -331,7 +810,14 @@ struct ScanOut {
 fn scan_batch(batch: &RecordBatch, plan: &ScanPlan, out: &mut ScanOut) -> Result<(), String> {
     let geom = chunk_geometry(batch, plan.map, plan.geom_idx, plan.xy)?;
     let mut boxes: Vec<Option<[f64; 4]>> = Vec::with_capacity(batch.num_rows());
-    scan_bboxes(&geom, plan.encoding, &mut boxes, &mut out.geom_types)?;
+    let mut kinds: Vec<CogpKind> = Vec::new();
+    scan_bboxes(
+        &geom,
+        plan.encoding,
+        &mut boxes,
+        &mut out.geom_types,
+        plan.cogp_kinds.then_some(&mut kinds),
+    )?;
     out.group_box = union_bboxes(out.group_box.iter().chain(boxes.iter().flatten()));
     // Viewport exports drop rows here rather than after the read, so
     // nothing downstream carries a row that will not be written.
@@ -348,6 +834,20 @@ fn scan_batch(batch: &RecordBatch, plan: &ScanPlan, out: &mut ScanOut) -> Result
     out.kept
         .extend(keep.iter().map(|&i| (out.scanned + i as u64) as u32));
     out.row_bboxes.extend(keep.iter().map(|&i| boxes[i]));
+    if plan.cogp_kinds {
+        out.row_kinds.extend(keep.iter().map(|&i| kinds[i]));
+    }
+    if let Some(col_idx) = plan.cogp_rank_src {
+        // Kept rows only, so the ranks line up with `row_bboxes` without a
+        // second mapping — and a viewport export does not rank rows it
+        // will not write.
+        let col = batch.column(plan.map.pos(col_idx));
+        let idx = UInt32Array::from_iter_values(keep.iter().map(|&i| i as u32));
+        out.rank_parts.push(
+            arrow::compute::take(col.as_ref(), &idx, None)
+                .map_err(|e| format!("COGP rank column: {e}"))?,
+        );
+    }
 
     use arrow::util::display::{ArrayFormatter, FormatOptions};
     let fopts = FormatOptions::default().with_display_error(true);
@@ -1358,8 +1858,53 @@ pub fn optimize(
         part_src.push((slot, idx));
     }
 
+    // --- COGP levels ---
+    // The profile owns the physical layout of the file, which is why it
+    // refuses to share it: hive parts would each need their own level list
+    // (the spec has no notion of a partitioned dataset), and the GeoArrow
+    // flavour is left out deliberately to keep the surface small. What it
+    // *takes over* rather than refuses is the sort and the covering column,
+    // both of which it requires.
+    let cogp_gsds: Option<Vec<f64>> = match &opts.cogp {
+        None => None,
+        Some(c) => {
+            if partitioned {
+                return Err("COGP levels and partitioned output cannot combine: \
+                            the profile describes one file's row groups"
+                    .into());
+            }
+            if opts.version == GpVersion::V1_1GeoArrow {
+                return Err("COGP needs the WKB 1.1 or the native 2.0 flavour, \
+                            not GeoArrow"
+                    .into());
+            }
+            Some(c.gsds()?)
+        }
+    };
+    let cogp_on = cogp_gsds.is_some();
+    // COGP v0.1 requires the covering bbox with row-group statistics
+    // (§5.1). On 2.0 the native GEOMETRY statistics are the pruning signal
+    // instead, so the covering column stays the user's choice there.
+    let cogp_needs_covering = cogp_on && opts.version == GpVersion::V1_1;
+    // §5.2 asks producers to cluster spatially within each level; the
+    // Hilbert order is what this app has, so COGP simply switches it on.
+    let hilbert_sort = opts.hilbert_sort || cogp_on;
+    let cogp_units = cogp_on.then(|| cogp_units(crs_value.as_ref(), vendor_crs.as_ref()));
+    if let Some(u) = cogp_units {
+        log::info!("COGP: measuring gsd thresholds in {}", u.label());
+    }
+    // The rank column is read by the key pass like a partition key is.
+    let cogp_rank_src: Option<usize> = match opts.cogp.as_ref().and_then(|c| c.rank.as_ref()) {
+        Some((name, _)) => Some(
+            src_schema
+                .index_of(name)
+                .map_err(|_| format!("COGP rank column '{name}' not found"))?,
+        ),
+        None => None,
+    };
+
     // --- output columns, and what each pass therefore reads ---
-    let write_covering = opts.covering;
+    let write_covering = opts.covering || cogp_needs_covering;
     let drop_covering = write_covering.then_some(src_covering_root.as_deref()).flatten();
     let mut kept_src_indices: Vec<usize> = Vec::new();
     for (i, f) in src_schema.fields().iter().enumerate() {
@@ -1388,6 +1933,7 @@ pub fn optimize(
         None => vec![geom_idx],
     };
     key_cols.extend(part_src.iter().map(|&(_, i)| i));
+    key_cols.extend(cogp_rank_src);
     key_cols.sort_unstable();
     key_cols.dedup();
     let mut read_cols: Vec<usize> = kept_src_indices
@@ -1447,6 +1993,8 @@ pub fn optimize(
         filter: opts.filter_rect,
         part_src: &part_src,
         part_names: &part_fields,
+        cogp_kinds: cogp_on,
+        cogp_rank_src,
     };
     let key_plan = ScanPlan { map: &key_map, ..base_plan };
     for gi in 0..keep_groups.len() {
@@ -1469,7 +2017,15 @@ pub fn optimize(
     if scan.scanned == 0 {
         return Err("file has no rows".into());
     }
-    let ScanOut { row_bboxes, kept, geom_types, interners, .. } = scan;
+    let ScanOut {
+        row_bboxes,
+        kept,
+        geom_types,
+        interners,
+        row_kinds,
+        rank_parts,
+        ..
+    } = scan;
     let rows = row_bboxes.len();
     if rows == 0 {
         return Err("no features intersect the current viewport".into());
@@ -1478,10 +2034,49 @@ pub fn optimize(
     // Metadata bbox reflects what is actually exported.
     let file_bbox = union_bboxes(row_bboxes.iter().flatten());
 
+    // --- COGP level per row ---
+    // Before the sort, because the sort is by (level, Hilbert key): the
+    // levels decide the coarse-to-fine order of the file and the Hilbert
+    // key clusters within each of them.
+    let cogp_level: Option<Vec<u8>> = match (&cogp_gsds, opts.cogp.as_ref()) {
+        (Some(gsds), Some(c)) => {
+            progress(0.39, "assigning COGP levels");
+            let ranks: Option<Vec<u32>> = match &c.rank {
+                None => None,
+                Some((name, order)) => {
+                    let parts: Vec<&dyn Array> = rank_parts.iter().map(|a| a.as_ref()).collect();
+                    let col = arrow::compute::concat(&parts)
+                        .map_err(|e| format!("COGP rank column '{name}': {e}"))?;
+                    // nulls_first keeps nulls at the lowest rank whichever
+                    // way round the order is; `descending` only decides
+                    // which end of the values earns the winning rank.
+                    let sort = arrow::compute::SortOptions {
+                        descending: *order == RankOrder::Asc,
+                        nulls_first: true,
+                    };
+                    Some(
+                        arrow::compute::rank(col.as_ref(), Some(sort))
+                            .map_err(|e| format!("COGP rank column '{name}': {e}"))?,
+                    )
+                }
+            };
+            Some(assign_cogp_levels(
+                &row_bboxes,
+                &row_kinds,
+                gsds,
+                cogp_units.unwrap_or(CogpUnits::Linear(1.0)),
+                c,
+                ranks.as_deref(),
+            ))
+        }
+        _ => None,
+    };
+    drop(rank_parts);
+
     // --- sort order ---
     progress(0.40, "sorting (Hilbert)");
     let mut order: Vec<u32> = (0..rows as u32).collect();
-    if opts.hilbert_sort {
+    if hilbert_sort {
         let fb = file_bbox.unwrap_or([0.0, 0.0, 1.0, 1.0]);
         let sx = (fb[2] - fb[0]).max(f64::MIN_POSITIVE);
         let sy = (fb[3] - fb[1]).max(f64::MIN_POSITIVE);
@@ -1499,8 +2094,17 @@ pub fn optimize(
                 None => u64::MAX, // null geometries sort last
             })
             .collect();
-        order.sort_by_key(|&i| codes[i as usize]);
+        // COGP: level first, Hilbert key within it. The file then reads
+        // coarse to fine, and each level is still spatially clustered, which
+        // is what keeps the row-group bboxes tight enough for §5.1 pruning
+        // to be worth anything inside a level.
+        match &cogp_level {
+            Some(lv) => order.sort_by_key(|&i| (lv[i as usize], codes[i as usize])),
+            None => order.sort_by_key(|&i| codes[i as usize]),
+        }
     }
+    // (No `else` branch for levels: `hilbert_sort` is forced on above
+    // whenever COGP is, so an unsorted COGP export cannot happen.)
 
     // --- derived columns ---
     progress(0.43, "computing derived columns");
@@ -1823,6 +2427,31 @@ pub fn optimize(
         .position(|&i| i == geom_idx)
         .ok_or("geometry column dropped from output")?;
 
+    // COGP level boundaries as (gsd, end offset in `order`), exclusive.
+    // A level that received no feature is dropped rather than written: it
+    // cannot own a row group, and an entry repeating the previous
+    // `row_group_end` would break the strictly-increasing rule of §5.3.
+    // Its GSD simply disappears from the list, which stays legal — the
+    // remaining ones are still strictly decreasing.
+    let cogp_bounds: Option<Vec<(f64, usize)>> = match (&cogp_gsds, &cogp_level) {
+        (Some(gsds), Some(lv)) => {
+            let mut counts = vec![0usize; gsds.len()];
+            for &r in &order {
+                counts[lv[r as usize] as usize] += 1;
+            }
+            let mut end = 0usize;
+            let mut out: Vec<(f64, usize)> = Vec::new();
+            for (li, n) in counts.iter().enumerate() {
+                end += n;
+                if *n > 0 {
+                    out.push((gsds[li], end));
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    };
+
     // Which partition each row belongs to, so one sweep of the sorted
     // order can feed every open writer.
     let row_part: Vec<u32> = if parts.len() > 1 {
@@ -1851,6 +2480,9 @@ pub fn optimize(
     let mut rg_after_boxes: Vec<[f64; 4]> = Vec::new();
     let mut rg_after = 0usize;
     let mut written = 0usize;
+    // Row group each COGP level ended on, in the writer's own count.
+    let mut cogp_rg_ends: Vec<usize> = Vec::new();
+    let mut cogp_meta: Option<super::cogp::Cogp> = None;
     for lo in (0..parts.len()).step_by(MAX_OPEN_WRITERS) {
         let hi = (lo + MAX_OPEN_WRITERS).min(parts.len());
         let mut open: Vec<PartWriter> = Vec::new();
@@ -1874,10 +2506,17 @@ pub fn optimize(
                     out_encoding,
                     part_bbox,
                     &covering_name,
+                    write_covering,
                 )
                 .to_string(),
             ));
-            for entry in kv.iter().filter(|kv| kv.key != "geo" && kv.key != "ARROW:schema") {
+            // `cogp` joins `geo` in being rebuilt rather than copied: the
+            // source's level boundaries describe the source's row groups,
+            // and carrying them onto a file this pass has just re-laid out
+            // would publish a confidently wrong index.
+            for entry in kv.iter().filter(|kv| {
+                kv.key != "geo" && kv.key != "ARROW:schema" && kv.key != super::cogp::KEY
+            }) {
                 writer.append_key_value_metadata(entry.clone());
             }
             open.push(PartWriter { writer, part: pi });
@@ -1892,7 +2531,28 @@ pub fn optimize(
                 .filter(|&r| (lo..hi).contains(&(row_part[r as usize] as usize)))
                 .collect()
         };
-        for chunk in sweep.chunks(chunk_rows) {
+        // Chunk boundaries, cut at every COGP level end. A row group must
+        // hold rows from one level only (§5.3), and the writer can only
+        // close a group between `write` calls — so a level end has to be a
+        // chunk end too, or the tail of one level and the head of the next
+        // land in the same group and no flush can separate them after the
+        // fact. Without COGP this is one run of `chunk_rows` slices, as
+        // before.
+        let level_ends: Vec<usize> = match &cogp_bounds {
+            Some(b) => b.iter().map(|&(_, end)| end).collect(),
+            None => vec![sweep.len()],
+        };
+        let mut chunks: Vec<(std::ops::Range<usize>, bool)> = Vec::new();
+        let mut seg_lo = 0usize;
+        for end in level_ends {
+            while seg_lo < end {
+                let hi = (seg_lo + chunk_rows).min(end);
+                chunks.push((seg_lo..hi, hi == end));
+                seg_lo = hi;
+            }
+        }
+        for (range, at_level_end) in chunks {
+            let chunk = &sweep[range];
             let src_rows: Vec<u32> = chunk.iter().map(|&r| kept[r as usize]).collect();
             let gathered = gather.gather(&src_rows)?;
             let geom_array = chunk_geometry(&gathered, &read_map, geom_idx, opts.xy_geom)?;
@@ -1955,10 +2615,57 @@ pub fn optimize(
             written += chunk.len();
             fail_point(written)?;
             progress(0.45 + 0.55 * (written as f32 / rows.max(1) as f32), "writing");
+            if at_level_end && cogp_bounds.is_some() {
+                // COGP never partitions, so there is exactly one writer and
+                // this is its level boundary. The row-group index is read
+                // back from the writer rather than derived from row counts:
+                // the byte cap can close a group anywhere inside a level,
+                // and arithmetic that assumed otherwise would drift from
+                // the file without ever saying so.
+                let w = &mut open[0];
+                w.writer
+                    .flush()
+                    .map_err(|e| format!("row group flush failed: {e}"))?;
+                let end = w
+                    .writer
+                    .flushed_row_groups()
+                    .len()
+                    .checked_sub(1)
+                    .ok_or("internal: COGP level closed with no row group")?;
+                cogp_rg_ends.push(end);
+            }
         }
 
-        for w in open {
+        for mut w in open {
+            if let Some(bounds) = &cogp_bounds {
+                let levels: Vec<super::cogp::Level> = bounds
+                    .iter()
+                    .zip(&cogp_rg_ends)
+                    .map(|(&(gsd, _), &row_group_end)| super::cogp::Level { row_group_end, gsd })
+                    .collect();
+                cogp_meta = Some(super::cogp::Cogp::new(levels));
+                w.writer
+                    .append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+                        super::cogp::KEY.to_string(),
+                        cogp_meta.as_ref().unwrap().to_json(),
+                    ));
+            }
             let closed = w.writer.close().map_err(|e| format!("finalize failed: {e}"))?;
+            if cogp_meta.is_some() {
+                // Read back out of the closed footer rather than checked in
+                // memory: the profile is only worth writing if it is true of
+                // the file that came out, and that includes the key having
+                // survived serialisation. Anything failing here is an
+                // internal bug, and a silently non-conformant file is worse
+                // than a failed export.
+                let json = closed
+                    .file_metadata()
+                    .key_value_metadata()
+                    .and_then(|kv| kv.iter().find(|k| k.key == super::cogp::KEY))
+                    .and_then(|k| k.value.clone())
+                    .ok_or("internal: the cogp key did not reach the file")?;
+                super::cogp::Cogp::parse(&json)?.validate(closed.num_row_groups())?;
+            }
             let part_order = &parts[w.part].1;
             let mut off = 0usize;
             for rg in closed.row_groups() {
@@ -1985,6 +2692,35 @@ pub fn optimize(
     );
     record_gather_stats(&gather.cache);
 
+    // Per-level feature counts and the row groups each level owns, so the
+    // completion summary can show what the levels actually cost.
+    let cogp_levels: Vec<CogpLevelReport> = match (&cogp_bounds, &cogp_meta) {
+        (Some(bounds), Some(meta)) => {
+            let mut start_row = 0usize;
+            let mut rg_start = 0usize;
+            let mut out = Vec::with_capacity(bounds.len());
+            for (&(gsd, end_row), l) in bounds.iter().zip(&meta.levels) {
+                out.push(CogpLevelReport {
+                    gsd,
+                    rows: (end_row - start_row) as u64,
+                    rg_start,
+                    rg_end: l.row_group_end,
+                });
+                start_row = end_row;
+                rg_start = l.row_group_end + 1;
+            }
+            out
+        }
+        _ => Vec::new(),
+    };
+    if !cogp_levels.is_empty() {
+        log::info!(
+            "COGP: {} levels, {} row groups",
+            cogp_levels.len(),
+            rg_after
+        );
+    }
+
     Ok(OptimizeReport {
         rows: rows as u64,
         size_before: src.size(),
@@ -2001,6 +2737,7 @@ pub fn optimize(
         },
         elapsed_ms: t0.elapsed().as_millis() as u64,
         files: parts.len(),
+        cogp_levels,
     })
 }
 
@@ -2062,6 +2799,10 @@ fn build_geo_meta(
     out_encoding: GeomEncoding,
     file_bbox: Option<[f64; 4]>,
     covering_name: &str,
+    // Not `opts.covering`: a COGP 1.1 export writes the column whether the
+    // user ticked it or not, and the metadata has to describe the file that
+    // was actually written.
+    covering: bool,
 ) -> Value {
     // GeoArrow columns store exactly one type (singles promoted, Z dropped
     // by the coordinate rebuild).
@@ -2088,7 +2829,7 @@ fn build_geo_meta(
     if let Some(b) = file_bbox {
         col["bbox"] = json!([b[0], b[1], b[2], b[3]]);
     }
-    if opts.covering {
+    if covering {
         col["covering"] = json!({"bbox": {
             "xmin": [covering_name, "xmin"], "ymin": [covering_name, "ymin"],
             "xmax": [covering_name, "xmax"], "ymax": [covering_name, "ymax"],
@@ -2186,6 +2927,9 @@ fn scan_bboxes(
     encoding: GeomEncoding,
     out: &mut Vec<Option<[f64; 4]>>,
     geom_types: &mut HashSet<String>,
+    // COGP needs the family of each individual feature, not just the set of
+    // families in the file; it comes free from the type name already read.
+    mut kinds: Option<&mut Vec<CogpKind>>,
 ) -> Result<(), String> {
     use geo::BoundingRect;
     let geoms = GeomCol::new(col.as_ref(), encoding)
@@ -2197,6 +2941,11 @@ fn scan_bboxes(
     for i in 0..col.len() {
         if geoms.is_null(i) {
             out.push(None);
+            // A null geometry has no family; it renders nothing and the
+            // level assignment defers it on the missing bbox alone.
+            if let Some(k) = kinds.as_deref_mut() {
+                k.push(CogpKind::Point);
+            }
             continue;
         }
         // GeoArrow arrays are 2D; only WKB values can carry Z.
@@ -2207,17 +2956,29 @@ fn scan_bboxes(
         if let Some((x, y)) = geoms.point2(i) {
             insert_type(geom_types, "Point", z);
             out.push((x.is_finite() && y.is_finite()).then_some([x, y, x, y]));
+            if let Some(k) = kinds.as_deref_mut() {
+                k.push(CogpKind::Point);
+            }
             continue;
         }
         match geoms.geometry(i) {
             Some(geom) => {
-                insert_type(geom_types, geom_type_name(&geom), z);
+                let name = geom_type_name(&geom);
+                insert_type(geom_types, name, z);
+                if let Some(k) = kinds.as_deref_mut() {
+                    k.push(CogpKind::from_type_name(name));
+                }
                 out.push(geom.bounding_rect().map(|r| {
                     let (min, max) = (r.min(), r.max());
                     [min.x, min.y, max.x, max.y]
                 }));
             }
-            None => out.push(None),
+            None => {
+                out.push(None);
+                if let Some(k) = kinds.as_deref_mut() {
+                    k.push(CogpKind::Point);
+                }
+            }
         }
     }
     Ok(())
@@ -4399,4 +5160,556 @@ mod tests {
         );
         assert_eq!(GpVersion::preferred(&[]), GpVersion::V1_1, "unknown types");
     }
+
+    // --- COGP (Cloud Optimized GeoParquet Profile) ---
+
+    fn wkb_line(x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<u8> {
+        let mut b = vec![1u8];
+        b.extend_from_slice(&2u32.to_le_bytes()); // LineString
+        b.extend_from_slice(&2u32.to_le_bytes());
+        for (x, y) in [(x0, y0), (x1, y1)] {
+            b.extend_from_slice(&x.to_le_bytes());
+            b.extend_from_slice(&y.to_le_bytes());
+        }
+        b
+    }
+
+    /// An axis-aligned square, `half` units either side of its centre.
+    fn wkb_square(cx: f64, cy: f64, half: f64) -> Vec<u8> {
+        let ring = [
+            (cx - half, cy - half),
+            (cx + half, cy - half),
+            (cx + half, cy + half),
+            (cx - half, cy + half),
+            (cx - half, cy - half),
+        ];
+        let mut b = vec![1u8];
+        b.extend_from_slice(&3u32.to_le_bytes()); // Polygon
+        b.extend_from_slice(&1u32.to_le_bytes()); // one ring
+        b.extend_from_slice(&(ring.len() as u32).to_le_bytes());
+        for (x, y) in ring {
+            b.extend_from_slice(&x.to_le_bytes());
+            b.extend_from_slice(&y.to_le_bytes());
+        }
+        b
+    }
+
+    /// Write a GeoParquet 1.0 fixture in metres (EPSG:2154) from
+    /// (wkb, id, rank) triples, unsorted.
+    fn write_metric_fixture(path: &Path, rows: Vec<(Vec<u8>, i64, i64)>, types: &[&str]) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("rank", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(rows.iter().map(|r| &r.0))),
+                Arc::new(Int64Array::from(rows.iter().map(|r| r.1).collect::<Vec<_>>())),
+                Arc::new(Int64Array::from(rows.iter().map(|r| r.2).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap();
+        let geo = serde_json::json!({
+            "version": "1.0.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {
+                "encoding": "WKB", "geometry_types": types,
+                // A projected CRS, so the metre thresholds apply directly.
+                "crs": {"id": {"authority": "EPSG", "code": 2154}},
+            }},
+        });
+        let mut w = ArrowWriter::try_new(File::create(path).unwrap(), schema, None).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    /// The `cogp` metadata of a written file, plus its row-group count.
+    fn read_cogp(path: &Path) -> (crate::data::cogp::Cogp, usize) {
+        let b = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap()).unwrap();
+        let md = b.metadata().clone();
+        let json = md
+            .file_metadata()
+            .key_value_metadata()
+            .expect("file has key-value metadata")
+            .iter()
+            .find(|k| k.key == crate::data::cogp::KEY)
+            .expect("cogp key present")
+            .value
+            .clone()
+            .expect("cogp key has a value");
+        (
+            crate::data::cogp::Cogp::parse(&json).unwrap(),
+            md.num_row_groups(),
+        )
+    }
+
+    /// One decoded batch per row group, in file order.
+    fn read_per_row_group(path: &Path) -> Vec<RecordBatch> {
+        let n = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+            .unwrap()
+            .metadata()
+            .num_row_groups();
+        (0..n)
+            .map(|g| {
+                let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+                    .unwrap()
+                    .with_row_groups(vec![g])
+                    .with_batch_size(1 << 20)
+                    .build()
+                    .unwrap();
+                let batches: Vec<RecordBatch> = reader.map(Result::unwrap).collect();
+                concat_batches(&batches[0].schema(), &batches).unwrap()
+            })
+            .collect()
+    }
+
+    /// Every exported feature with the level it landed in: (level, id,
+    /// bbox, kind). Read back from the file alone, so it validates the
+    /// output rather than repeating the writer's bookkeeping.
+    fn cogp_features(path: &Path) -> (crate::data::cogp::Cogp, Vec<(usize, i64, [f64; 4], CogpKind)>) {
+        let (meta, n_rg) = read_cogp(path);
+        meta.validate(n_rg).expect("cogp metadata conforms");
+        let mut out = Vec::new();
+        for (gi, batch) in read_per_row_group(path).into_iter().enumerate() {
+            let level = meta
+                .levels
+                .iter()
+                .position(|l| gi <= l.row_group_end)
+                .expect("every row group belongs to a level");
+            let geom = batch.column(batch.schema().index_of("geometry").unwrap()).clone();
+            let ids = batch
+                .column(batch.schema().index_of("id").unwrap())
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .clone();
+            let (mut boxes, mut kinds, mut types) = (Vec::new(), Vec::new(), HashSet::new());
+            scan_bboxes(&geom, GeomEncoding::Wkb, &mut boxes, &mut types, Some(&mut kinds)).unwrap();
+            for i in 0..batch.num_rows() {
+                out.push((level, ids.value(i), boxes[i].unwrap(), kinds[i]));
+            }
+        }
+        (meta, out)
+    }
+
+    /// Points at three densities, lines and polygons at three sizes, all in
+    /// metres. Sized against gsds [10000, 1000, 100] with the default
+    /// factors so each extended feature has an unambiguous level.
+    fn cogp_mixed_fixture(path: &Path) -> usize {
+        let mut rows: Vec<(Vec<u8>, i64, i64)> = Vec::new();
+        let mut id = 0i64;
+        let mut push = |rows: &mut Vec<_>, wkb: Vec<u8>, rank: i64| {
+            rows.push((wkb, id, rank));
+            id += 1;
+        };
+        // Polygons: diagonal 84853 m (level 0), 4243 m (level 1), 14 m (last).
+        for k in 0..3 {
+            push(&mut rows, wkb_square(k as f64 * 120_000.0, 0.0, 30_000.0), 0);
+        }
+        for k in 0..4 {
+            push(&mut rows, wkb_square(k as f64 * 9_000.0, 200_000.0, 1_500.0), 0);
+        }
+        for k in 0..5 {
+            push(&mut rows, wkb_square(k as f64 * 300.0, 400_000.0, 5.0), 0);
+        }
+        // Lines: 50000 m (level 0), 3000 m (level 1), 50 m (last).
+        for k in 0..3 {
+            let y = 600_000.0 + k as f64 * 1_000.0;
+            push(&mut rows, wkb_line(0.0, y, 50_000.0, y), 0);
+        }
+        for k in 0..4 {
+            let y = 700_000.0 + k as f64 * 5_000.0;
+            push(&mut rows, wkb_line(0.0, y, 3_000.0, y), 0);
+        }
+        for k in 0..5 {
+            let y = 800_000.0 + k as f64 * 200.0;
+            push(&mut rows, wkb_line(0.0, y, 50.0, y), 0);
+        }
+        // Points: a sparse 100 km spread plus two dense clusters.
+        for k in 0..40 {
+            let (gx, gy) = (k % 8, k / 8);
+            push(
+                &mut rows,
+                wkb_point(gx as f64 * 12_500.0, 900_000.0 + gy as f64 * 12_500.0),
+                k as i64,
+            );
+        }
+        for k in 0..60 {
+            push(
+                &mut rows,
+                wkb_point(1_000_000.0 + k as f64 * 30.0, 1_000_000.0),
+                k as i64,
+            );
+        }
+        let n = rows.len();
+        // Scramble, so nothing passes by accident of input order.
+        let stride = n / 2 + 1;
+        let scrambled: Vec<_> = (0..n).map(|i| rows[(i * stride) % n].clone()).collect();
+        write_metric_fixture(
+            path,
+            scrambled,
+            &["Point", "LineString", "Polygon"],
+        );
+        n
+    }
+
+    fn cogp_opts(gsds: &[f64]) -> CogpOptions {
+        CogpOptions {
+            gsd: GsdSource::Explicit(gsds.to_vec()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cogp_levels_validate_and_place_every_feature() {
+        let dir = std::env::temp_dir().join(format!("geopq_cogp_mixed_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("mixed.parquet");
+        let n = cogp_mixed_fixture(&src);
+        let gsds = [10_000.0, 1_000.0, 100.0];
+
+        // Both flavours COGP is offered on: 1.1 with the covering column the
+        // profile requires, and 2.0 leaning on native geospatial statistics.
+        for (name, version, covering) in [
+            ("v11", GpVersion::V1_1, true),
+            ("v20", GpVersion::V2_0, false),
+        ] {
+            let dst = dir.join(format!("{name}.parquet"));
+            let opts = OptimizeOptions {
+                version,
+                covering,
+                // Small groups, so every level owns several of them and the
+                // boundary logic is actually exercised.
+                row_group_size: 16,
+                cogp: Some(cogp_opts(&gsds)),
+                ..Default::default()
+            };
+            let rep =
+                optimize(&Source::Local(src.clone()), &dst, &opts, None, None, &|_, _| {}).unwrap();
+
+            let (meta, feats) = cogp_features(&dst);
+            let (_, n_rg) = read_cogp(&dst);
+            assert_eq!(n_rg, rep.rg_after, "{name}: report agrees with the file");
+            assert_eq!(
+                meta.levels.last().unwrap().row_group_end,
+                n_rg - 1,
+                "{name}: the last level owns the last row group"
+            );
+
+            // Every input row, exactly once.
+            let mut ids: Vec<i64> = feats.iter().map(|f| f.1).collect();
+            ids.sort_unstable();
+            assert_eq!(ids, (0..n as i64).collect::<Vec<_>>(), "{name}: rows");
+
+            // COGP 1.1 must declare the covering; 2.0 is this app's
+            // extension and relies on the native statistics instead.
+            let geo = read_geo_meta(&dst);
+            let col = &geo["columns"]["geometry"];
+            if version == GpVersion::V1_1 {
+                assert!(!col["covering"].is_null(), "{name}: covering declared");
+            }
+
+            // Semantics, checked from the output alone: every extended
+            // feature is renderable at its own level's gsd, and was not
+            // renderable at the previous one (or it would have been placed
+            // there). Together that is "one level per row group", stated in
+            // terms a reader can verify.
+            for &(level, id, b, kind) in &feats {
+                if kind == CogpKind::Point {
+                    continue;
+                }
+                let factor = if kind == CogpKind::Line { 2.0 } else { 4.0 };
+                let diag = ((b[2] - b[0]).powi(2) + (b[3] - b[1]).powi(2)).sqrt();
+                let gsd = meta.levels[level].gsd;
+                if level + 1 < meta.levels.len() {
+                    assert!(
+                        diag >= factor * gsd - 1e-6,
+                        "{name}: feature {id} ({diag} m) is below level {level}'s {gsd} m gsd"
+                    );
+                }
+                if level > 0 {
+                    let coarser = meta.levels[level - 1].gsd;
+                    assert!(
+                        diag < factor * coarser,
+                        "{name}: feature {id} ({diag} m) belonged in level {}",
+                        level - 1
+                    );
+                }
+            }
+
+            // Levels appear coarse to fine in the file and the report says
+            // the same thing.
+            assert_eq!(rep.cogp_levels.len(), meta.levels.len(), "{name}: report");
+            let total: u64 = rep.cogp_levels.iter().map(|l| l.rows).sum();
+            assert_eq!(total, n as u64, "{name}: report row counts");
+            for (i, l) in rep.cogp_levels.iter().enumerate() {
+                assert_eq!(l.rg_end, meta.levels[i].row_group_end);
+                assert!(l.rg_start <= l.rg_end && l.rows > 0);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cogp_puts_the_big_polygon_first_and_the_tiny_one_last() {
+        let dir = std::env::temp_dir().join(format!("geopq_cogp_size_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("mixed.parquet");
+        cogp_mixed_fixture(&src);
+        let dst = dir.join("out.parquet");
+        let opts = OptimizeOptions {
+            row_group_size: 16,
+            cogp: Some(cogp_opts(&[10_000.0, 1_000.0, 100.0])),
+            ..Default::default()
+        };
+        optimize(&Source::Local(src), &dst, &opts, None, None, &|_, _| {}).unwrap();
+        let (meta, feats) = cogp_features(&dst);
+        assert_eq!(meta.levels.len(), 3, "all three levels received features");
+        let level_of = |id: i64| feats.iter().find(|f| f.1 == id).unwrap().0;
+        // id 0: a 60 km square. id 7: a 10 m one.
+        assert_eq!(level_of(0), 0, "the 60 km polygon is in the coarse level");
+        assert_eq!(level_of(7), 2, "the 10 m polygon is in the finest level");
+        // id 12: a 50 km line. id 19: a 50 m one.
+        assert_eq!(level_of(12), 0);
+        assert_eq!(level_of(19), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cogp_thins_points_by_cell_and_honours_the_rank_column() {
+        let dir = std::env::temp_dir().join(format!("geopq_cogp_thin_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("points.parquet");
+        // Four clusters of five points each, every cluster inside one
+        // 1000 m cell and the clusters far apart. Ranks ascend within a
+        // cluster, so the winner is knowable: id 4, 9, 14, 19.
+        let mut rows: Vec<(Vec<u8>, i64, i64)> = Vec::new();
+        for c in 0..4 {
+            for k in 0..5 {
+                let id = (c * 5 + k) as i64;
+                rows.push((
+                    wkb_point(c as f64 * 50_000.0 + k as f64 * 10.0, 0.0),
+                    id,
+                    k as i64,
+                ));
+            }
+        }
+        write_metric_fixture(&src, rows, &["Point"]);
+
+        let dst = dir.join("out.parquet");
+        let opts = OptimizeOptions {
+            row_group_size: 4,
+            cogp: Some(CogpOptions {
+                gsd: GsdSource::Explicit(vec![1_000.0, 100.0]),
+                // One winner per gsd-sized cell, no extra coarsening.
+                point_factor: 1,
+                rank: Some(("rank".to_string(), RankOrder::Desc)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        optimize(&Source::Local(src), &dst, &opts, None, None, &|_, _| {}).unwrap();
+        let (_, feats) = cogp_features(&dst);
+
+        let coarse: Vec<i64> = feats
+            .iter()
+            .filter(|f| f.0 == 0)
+            .map(|f| f.1)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            coarse,
+            vec![4, 9, 14, 19],
+            "one winner per 1000 m cell, the highest rank in each"
+        );
+        // And no two coarse points share a cell.
+        let cells: HashSet<(i64, i64)> = feats
+            .iter()
+            .filter(|f| f.0 == 0)
+            .map(|f| CogpUnits::Linear(1.0).cell(&f.2, 1_000.0))
+            .collect();
+        assert_eq!(cells.len(), coarse.len(), "one point per cell per level");
+        assert_eq!(feats.len(), 20, "the other sixteen deferred, none lost");
+
+        // Ascending order flips which end of the column wins.
+        let asc = dir.join("asc.parquet");
+        let opts = OptimizeOptions {
+            row_group_size: 4,
+            cogp: Some(CogpOptions {
+                gsd: GsdSource::Explicit(vec![1_000.0, 100.0]),
+                point_factor: 1,
+                rank: Some(("rank".to_string(), RankOrder::Asc)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let src2 = dir.join("points.parquet");
+        optimize(&Source::Local(src2), &asc, &opts, None, None, &|_, _| {}).unwrap();
+        let (_, feats) = cogp_features(&asc);
+        let coarse: Vec<i64> = feats
+            .iter()
+            .filter(|f| f.0 == 0)
+            .map(|f| f.1)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(coarse, vec![0, 5, 10, 15], "smallest rank wins instead");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cogp_drops_levels_that_received_nothing() {
+        let dir = std::env::temp_dir().join(format!("geopq_cogp_empty_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("tiny.parquet");
+        // Nothing here clears even the finest gsd, so every feature falls
+        // through to the last level and the three coarse ones stay empty.
+        let rows: Vec<(Vec<u8>, i64, i64)> = (0..40)
+            .map(|k| (wkb_square(k as f64 * 10.0, 0.0, 1.0), k as i64, 0))
+            .collect();
+        write_metric_fixture(&src, rows, &["Polygon"]);
+        let dst = dir.join("out.parquet");
+        let opts = OptimizeOptions {
+            row_group_size: 8,
+            cogp: Some(cogp_opts(&[1e6, 1e5, 1e4, 1e3])),
+            ..Default::default()
+        };
+        optimize(&Source::Local(src), &dst, &opts, None, None, &|_, _| {}).unwrap();
+        let (meta, n_rg) = read_cogp(&dst);
+        meta.validate(n_rg).unwrap();
+        assert_eq!(meta.levels.len(), 1, "the three empty levels collapsed");
+        assert_eq!(meta.levels[0].gsd, 1e3);
+        assert_eq!(meta.levels[0].row_group_end, n_rg - 1);
+        assert!(n_rg > 1, "the fixture should span several row groups");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cogp_refuses_the_combinations_it_cannot_honour() {
+        let dir = std::env::temp_dir().join(format!("geopq_cogp_refuse_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("mixed.parquet");
+        cogp_mixed_fixture(&src);
+        let dst = dir.join("out.parquet");
+
+        let partitioned = OptimizeOptions {
+            partition: crate::data::partition::PartitionBy::AdaptiveH3 {
+                target_rows: 10,
+                max_res: 6,
+            },
+            cogp: Some(cogp_opts(&[1_000.0, 100.0])),
+            ..Default::default()
+        };
+        let err = optimize(
+            &Source::Local(src.clone()),
+            &dst,
+            &partitioned,
+            None,
+            None,
+            &|_, _| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("partitioned"), "got {err}");
+
+        let geoarrow = OptimizeOptions {
+            version: GpVersion::V1_1GeoArrow,
+            cogp: Some(cogp_opts(&[1_000.0, 100.0])),
+            ..Default::default()
+        };
+        let err = optimize(&Source::Local(src.clone()), &dst, &geoarrow, None, None, &|_, _| {})
+            .unwrap_err();
+        assert!(err.contains("GeoArrow"), "got {err}");
+
+        // A gsd list that is not strictly decreasing is caught before any
+        // file is touched.
+        let bad = OptimizeOptions {
+            cogp: Some(cogp_opts(&[100.0, 1_000.0])),
+            ..Default::default()
+        };
+        let err = optimize(&Source::Local(src), &dst, &bad, None, None, &|_, _| {}).unwrap_err();
+        assert!(err.contains("strictly decrease"), "got {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn web_mercator_gsds_halve_per_zoom() {
+        let g = CogpOptions {
+            gsd: GsdSource::WebMercator {
+                minzoom: 0,
+                maxzoom: 3,
+                resolution: 1024,
+            },
+            ..Default::default()
+        }
+        .gsds()
+        .unwrap();
+        assert_eq!(g.len(), 4);
+        assert!((g[0] - 40_075_016.685_578_49 / 1024.0).abs() < 1e-6);
+        for w in g.windows(2) {
+            assert!((w[0] / w[1] - 2.0).abs() < 1e-9, "each zoom halves the gsd");
+        }
+    }
+
+    /// Degrees convert to metres per feature; a projected CRS in metres does
+    /// not convert at all. Same layer, same shapes, same levels.
+    #[test]
+    fn cogp_measures_degrees_in_metres() {
+        let dir = std::env::temp_dir().join(format!("geopq_cogp_deg_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // ~1 degree square at the equator is ~111 km across: comfortably
+        // over a 10 km gsd at polygon factor 4, and it must be placed
+        // there rather than compared against a raw "1" of longitude.
+        let rows: Vec<(Vec<u8>, i64, i64)> = vec![
+            (wkb_square(0.0, 0.0, 0.5), 0, 0),
+            (wkb_square(10.0, 0.0, 0.000_01), 1, 0),
+        ];
+        let src = dir.join("deg.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("rank", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(rows.iter().map(|r| &r.0))),
+                Arc::new(Int64Array::from(vec![0i64, 1])),
+                Arc::new(Int64Array::from(vec![0i64, 0])),
+            ],
+        )
+        .unwrap();
+        // No `crs`, which per GeoParquet means OGC:CRS84 — degrees.
+        let geo = serde_json::json!({
+            "version": "1.0.0", "primary_column": "geometry",
+            "columns": {"geometry": {"encoding": "WKB", "geometry_types": ["Polygon"]}},
+        });
+        let mut w = ArrowWriter::try_new(File::create(&src).unwrap(), schema, None).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let dst = dir.join("out.parquet");
+        let opts = OptimizeOptions {
+            row_group_size: 1,
+            cogp: Some(cogp_opts(&[10_000.0, 100.0])),
+            ..Default::default()
+        };
+        optimize(&Source::Local(src), &dst, &opts, None, None, &|_, _| {}).unwrap();
+        let (meta, feats) = cogp_features(&dst);
+        assert_eq!(meta.levels.len(), 2);
+        assert_eq!(feats.iter().find(|f| f.1 == 0).unwrap().0, 0);
+        assert_eq!(feats.iter().find(|f| f.1 == 1).unwrap().0, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }
