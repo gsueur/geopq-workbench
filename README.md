@@ -323,7 +323,7 @@ overview.
 ```
 <root>/
   h3-pyramid.json          root descriptor: levels, cells, methods, CRS
-  collection.json          the usual STAC collection, one asset per part
+  collection.json          the usual STAC collection, written on publish
   r5/852a3067fffffff.parquet   overview level, derived
   r8/882a3066d1fffff.parquet   leaf level, source features verbatim
   r8/__HIVE_DEFAULT_PARTITION__.parquet   null geometries
