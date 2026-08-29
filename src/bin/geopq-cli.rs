@@ -63,6 +63,25 @@ struct Cli {
     #[arg(long)]
     h3: Option<u8>,
 
+    /// Partition output into hive directories by these output column
+    /// names (comma-separated, e.g. `ISO3` or `ISO3,STATUS_YR`). With
+    /// this set, --output is a directory: parts land at
+    /// <output>/<field>=<value>/part-0.parquet. Mutually exclusive with
+    /// --partition-h3.
+    #[arg(long, value_delimiter = ',')]
+    partition_by: Vec<String>,
+
+    /// Partition output into adaptive H3 cells instead of fields: cells
+    /// over --partition-h3-target-rows split into children until
+    /// balanced or --h3 (used as the max resolution here) is reached.
+    /// Requires --h3. Mutually exclusive with --partition-by.
+    #[arg(long)]
+    partition_h3: bool,
+
+    /// Row target per adaptive-H3 partition (only with --partition-h3).
+    #[arg(long, default_value_t = 100_000)]
+    partition_h3_target_rows: usize,
+
     /// List the layers/tables in --input and exit, instead of converting.
     #[arg(long)]
     list_layers: bool,
@@ -120,6 +139,18 @@ fn run() -> Result<(), String> {
         (tmp, true)
     };
 
+    if !cli.partition_by.is_empty() && cli.partition_h3 {
+        return Err("--partition-by and --partition-h3 are mutually exclusive".into());
+    }
+    let partition = if cli.partition_h3 {
+        let max_res = cli.h3.ok_or("--partition-h3 requires --h3 (used as the max resolution)")?;
+        PartitionBy::AdaptiveH3 { target_rows: cli.partition_h3_target_rows, max_res }
+    } else if !cli.partition_by.is_empty() {
+        PartitionBy::Fields(cli.partition_by.clone())
+    } else {
+        PartitionBy::None
+    };
+
     let opts = OptimizeOptions {
         version: match cli.format {
             FormatArg::Wkb => GpVersion::V1_1,
@@ -136,7 +167,7 @@ fn run() -> Result<(), String> {
         hilbert_sort: !cli.no_hilbert,
         covering: !cli.no_covering,
         h3_resolution: cli.h3,
-        partition: PartitionBy::None,
+        partition,
         ..Default::default()
     };
 
@@ -155,8 +186,9 @@ fn run() -> Result<(), String> {
     }
 
     let report = result?;
+    let files = if report.files > 1 { format!(" | {} partition files", report.files) } else { String::new() };
     println!(
-        "{} rows | row groups {} -> {} | {} -> {}",
+        "{} rows | row groups {} -> {} | {} -> {}{files}",
         report.rows,
         report.rg_before,
         report.rg_after,
