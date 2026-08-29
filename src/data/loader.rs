@@ -1586,6 +1586,7 @@ struct FileOpen {
 
 /// Quality analysis over an opened file / merged dataset (footer facts
 /// only). `boxes` are the merged per-row-group bboxes.
+#[allow(clippy::too_many_arguments)]
 fn quality_report(
     info: &FileInfo,
     boxes: Option<&(String, Vec<[f64; 4]>)>,
@@ -1593,6 +1594,7 @@ fn quality_report(
     xy_synthesized: bool,
     page_index: bool,
     geom_bytes: u64,
+    cogp: Option<Result<super::quality::CogpQuality, String>>,
 ) -> super::quality::QualityReport {
     super::quality::analyze(&super::quality::QualityInput {
         rows: info.rows,
@@ -1610,6 +1612,7 @@ fn quality_report(
             .map(|c| c.compression.as_str()),
         geo: &info.geo,
         geom_bytes,
+        cogp,
     })
 }
 
@@ -1822,6 +1825,19 @@ fn open_store_with_view(
         return open_stac_store(source, url, stac_rect);
     }
     let mut f = open_file(source)?;
+    let cogp_quality = f.cogp.as_ref().map(|r| {
+        r.as_ref()
+            .map(|c| super::quality::CogpQuality {
+                version: c.version.clone(),
+                levels: c.levels.len(),
+                level0_groups: c.levels[0].row_group_end + 1,
+                level0_rows: c.level0_rows(&f.rg_rows),
+                total_rows: f.info.rows,
+                pruning: c.pruning.label(),
+                extension_2_0: c.pruning == super::cogp::Pruning::NativeStats,
+            })
+            .map_err(String::clone)
+    });
     f.info.quality = Some(quality_report(
         &f.info,
         f.rg_boxes.as_ref(),
@@ -1829,6 +1845,7 @@ fn open_store_with_view(
         f.xy.is_some(),
         f.page_index,
         f.geom_bytes,
+        cogp_quality,
     ));
     let mut store = FeatureStore::new(
         source.clone(),
@@ -2371,6 +2388,7 @@ fn open_multi_store(
         first.xy.is_some(),
         page_index,
         geom_bytes,
+        None,
     ));
     let mut store = FeatureStore::from_fragments(
         source.clone(),

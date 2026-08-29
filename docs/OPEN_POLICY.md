@@ -160,14 +160,43 @@ metadata. Produces a `QualityReport` attached to `FileInfo`.
 | C5 | Page index (offset + column index) present | yes | no | — | no |
 | C6 | Compression | zstd/snappy/lz4 (non-zstd notes "zstd recommended for distribution") | uncompressed | — | no |
 | C7 | Metadata hygiene: geo version, declared `geometry_types`, CRS present, file bbox | all present | any missing | — | no |
+| C8 | Cloud Optimized GeoParquet Profile (COGP) levels: a valid `cogp` block naming a coarse-to-fine row-group prefix per rendering scale | valid, or absent (optional) | present but invalid | — | no |
 
-Verdict = C1 ∧ C2 ∧ C3. C4–C7 are advisory lines on the scorecard
+Verdict = C1 ∧ C2 ∧ C3. C4–C8 are advisory lines on the scorecard
 (the "good practices" education), never gate.
 
 Early pass: if `total_rows ≤ MAX_BUILD_ROWS` the verdict is forced to
 pass (mode Indexed, which degenerates to a plain full load). The gate
 only exists to prevent the permanent-preview trap, and small files
 cannot fall into it.
+
+### COGP levels
+
+[COGP](https://github.com/Kanahiro/cloud-optimized-geoparquet) v0.1 orders
+a file's features coarse-to-fine across row groups and names, in a `cogp`
+key, the prefix each rendering scale needs. The profile does not simplify
+or duplicate anything, so a prefix is not a preview: it is exactly the
+features that are independently meaningful at that scale.
+
+That is why the level check runs **before** the Boxes/stride fallbacks in
+`plan_viewport_selection`. A prefix that fits the build budget loads as
+exact geometry with no "approximate" badge; only if the prefix itself
+busts the budget does the existing fallback apply, and then over the
+prefix rather than the whole file. Refinement filters its candidate row
+groups the same way, so a camera settle at a wide zoom cannot pull in the
+detail levels the layout exists to defer.
+
+The published profile is written against GeoParquet 1.1 and requires a
+declared `covering.bbox` with row-group statistics. This workbench also
+accepts native Parquet geospatial statistics on the geometry column
+(GeoParquet 2.0, including its own writer's output): the requirement the
+spec is really stating is that a reader can prune row groups by bbox, and
+those answer it. Such files are labelled "COGP 0.1.0 (2.0 extension)" in
+the info panel and in C8, so the extension is never mistaken for the
+published profile.
+
+An invalid `cogp` block is recorded and otherwise ignored — the file is
+still ordinary GeoParquet and still opens.
 
 ### Constants
 

@@ -54,9 +54,29 @@ pub enum Status {
     Fail,
 }
 
+/// COGP facts for C8, as resolved by the loader from the footer.
+#[derive(Clone, Debug)]
+pub struct CogpQuality {
+    pub version: String,
+    pub levels: usize,
+    /// Row groups a viewport covering the whole file bbox reads at the
+    /// coarsest level — the quality metric SPEC §8 suggests, which for a
+    /// whole-file viewport is simply level 0's prefix length.
+    pub level0_groups: usize,
+    /// Rows in that prefix, and the file's total, for the share of the
+    /// dataset a first paint costs.
+    pub level0_rows: u64,
+    pub total_rows: u64,
+    /// Which bbox statistics the prefix is prunable by.
+    pub pruning: &'static str,
+    /// Native 2.0 statistics rather than the 1.1 covering the published
+    /// profile names.
+    pub extension_2_0: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Check {
-    /// Stable code (C1…C7) referenced by docs/OPEN_POLICY.md.
+    /// Stable code (C1…C8) referenced by docs/OPEN_POLICY.md.
     pub code: &'static str,
     pub title: &'static str,
     pub status: Status,
@@ -109,6 +129,9 @@ pub struct QualityInput<'a> {
     pub geom_compression: Option<&'a str>,
     pub geo: &'a GeoParquetInfo,
     pub geom_bytes: u64,
+    /// COGP levels: None when the file carries no `cogp` block, Err when
+    /// it carries one that does not validate.
+    pub cogp: Option<Result<CogpQuality, String>>,
 }
 
 /// Average pairwise-overlap fraction of the boxes: 0 = disjoint,
@@ -119,7 +142,7 @@ fn overlap_frac(boxes: &[[f64; 4]]) -> f64 {
 }
 
 pub fn analyze(inp: &QualityInput) -> QualityReport {
-    let mut checks = Vec::with_capacity(7);
+    let mut checks = Vec::with_capacity(8);
 
     // C1 — row-group bboxes available from metadata (gating).
     let frac = inp.boxes.map(|(_, b)| overlap_frac(b));
@@ -365,6 +388,46 @@ pub fn analyze(inp: &QualityInput) -> QualityReport {
         },
     });
 
+    // C8 — cloud-optimized levels (advisory, never gating).
+    //
+    // Absence is not a fault: COGP is one way to lay a file out, not a
+    // requirement, and a well-sorted 1.1 file with a covering column is
+    // already fast here. A `cogp` block that does not validate is worth
+    // a warning, because it means a producer meant to write one.
+    checks.push(match &inp.cogp {
+        None => Check {
+            code: "C8",
+            title: "cloud-optimized levels",
+            status: Status::Pass,
+            gating: false,
+            detail: "no COGP levels (optional)".into(),
+        },
+        Some(Err(e)) => Check {
+            code: "C8",
+            title: "cloud-optimized levels",
+            status: Status::Warn,
+            gating: false,
+            detail: format!("`cogp` metadata present but not usable: {e}"),
+        },
+        Some(Ok(c)) => Check {
+            code: "C8",
+            title: "cloud-optimized levels",
+            status: Status::Pass,
+            gating: false,
+            detail: format!(
+                "COGP {}{}: {} levels, prunable by {}; a whole-file viewport \
+                 reads {} of {} row groups at the coarsest level ({:.0}% of rows)",
+                c.version,
+                if c.extension_2_0 { " (2.0 extension)" } else { "" },
+                c.levels,
+                c.pruning,
+                c.level0_groups,
+                inp.row_groups,
+                100.0 * c.level0_rows as f64 / c.total_rows.max(1) as f64,
+            ),
+        },
+    });
+
     let indexable = !checks
         .iter()
         .any(|c| c.gating && c.status == Status::Fail);
@@ -421,6 +484,7 @@ mod tests {
             geom_compression: Some("ZSTD(ZstdLevel(3))"),
             geo,
             geom_bytes: 1 << 30,
+            cogp: None,
         }
     }
 
@@ -611,6 +675,74 @@ mod tests {
         ));
         assert_eq!(status(&r, "C2"), Status::Fail);
         assert!(!r.indexable);
+    }
+
+    fn cogp(extension_2_0: bool) -> CogpQuality {
+        CogpQuality {
+            version: "0.1.0".into(),
+            levels: 4,
+            level0_groups: 1,
+            level0_rows: 40_000,
+            total_rows: 4_000_000,
+            pruning: if extension_2_0 {
+                "native geospatial statistics"
+            } else {
+                "covering column statistics"
+            },
+            extension_2_0,
+        }
+    }
+
+    /// C8 is advisory in every direction: a file without COGP levels is
+    /// not penalised, and a file whose `cogp` block is broken warns
+    /// rather than failing — the layout is still readable GeoParquet.
+    #[test]
+    fn c8_grades_cogp_levels_without_ever_gating() {
+        let geo = geo_ok();
+        let boxes = sorted_boxes(68);
+        let base = |c: Option<Result<CogpQuality, String>>| {
+            let mut inp = input(
+                Some(("covering column statistics", &boxes)),
+                4_000_000,
+                68,
+                65_536,
+                &geo,
+            );
+            inp.cogp = c;
+            analyze(&inp)
+        };
+        let detail = |r: &QualityReport| {
+            r.checks.iter().find(|c| c.code == "C8").unwrap().detail.clone()
+        };
+
+        // Absent: optional, so it passes and says so.
+        let r = base(None);
+        assert_eq!(status(&r, "C8"), Status::Pass);
+        assert!(detail(&r).contains("optional"), "{}", detail(&r));
+        assert!(r.indexable);
+
+        // Present and valid: the spec's suggested quality metrics — the
+        // coarsest level's prefix length and its share of the rows.
+        let r = base(Some(Ok(cogp(false))));
+        assert_eq!(status(&r, "C8"), Status::Pass);
+        let d = detail(&r);
+        assert!(d.contains("COGP 0.1.0:"), "{d}");
+        assert!(d.contains("4 levels"), "{d}");
+        assert!(d.contains("1 of 68 row groups"), "{d}");
+        assert!(d.contains("1% of rows"), "{d}");
+        assert!(d.contains("covering column statistics"), "{d}");
+
+        // The 2.0 form is labelled, so nobody reads it as conformance
+        // with the published 1.1 profile.
+        let d = detail(&base(Some(Ok(cogp(true)))));
+        assert!(d.contains("(2.0 extension)"), "{d}");
+        assert!(d.contains("native geospatial statistics"), "{d}");
+
+        // Present and broken: a warning, never a failure.
+        let r = base(Some(Err("gsd 250 does not decrease from 100".into())));
+        assert_eq!(status(&r, "C8"), Status::Warn);
+        assert!(detail(&r).contains("does not decrease"), "{}", detail(&r));
+        assert!(r.indexable, "C8 never gates");
     }
 
     #[test]
