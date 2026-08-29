@@ -22,6 +22,7 @@ use super::geoarrow::{GeomCol, GeomEncoding};
 use super::geometry::{FeatureRef, MeshBuilder};
 use super::info::{summarize_geo_meta, ColumnInfo, FileInfo};
 use super::layer::{GroupLoad, LayerGeometry, LoadStats, PickItem, RgBboxes, VectorLayer};
+use super::pyramid::{self, PyramidState};
 use super::source::Source;
 use super::store::{CoveringCol, FeatureStore};
 
@@ -661,12 +662,13 @@ pub fn spawn_load(
             handle.send(LoadMsg::Failed { job, source: label, error: CANCELLED.into() });
             return;
         }
-        // STAC part pruning happens at open, before any CRS is known; item
-        // bboxes are WGS84 lon/lat by spec.
-        let stac_rect = matches!(source, Source::Stac { .. })
-            .then(|| viewport_to_data_bbox(view_world, &display, &Crs::wgs84()))
-            .flatten();
-        match open_store_with_view(&source, stac_rect) {
+        // Part pruning happens at open, before any CRS is known. STAC
+        // item bboxes are WGS84 lon/lat by spec, and so is an H3 cell;
+        // the pixel width comes along because a pyramid picks its level
+        // from the ground scale, not from where the camera is.
+        let view = viewport_to_data_bbox(view_world, &display, &Crs::wgs84())
+            .map(|rect| ViewHint { rect, view_px });
+        match open_store_with_view(&source, view) {
             Ok((store, crs, info, rg_meta)) => {
                 if cancelled() {
                     handle.send(LoadMsg::Failed {
@@ -1878,6 +1880,303 @@ pub fn spawn_reload(
     });
 }
 
+// ---------------------------------------------------------------------
+// H3 pyramid: detection, level choice, and opening one level's parts.
+// Layout and descriptor: `super::pyramid`; design notes:
+// `_WIKI/concepts/h3-pyramid.md`.
+// ---------------------------------------------------------------------
+
+/// The viewport as the store opener sees it, before any data CRS is
+/// known: WGS84 lon/lat plus its width in physical pixels.
+///
+/// STAC part pruning only ever needed the rect. A pyramid needs the
+/// ground scale as well, because the level it reads is a function of
+/// metres per pixel, not of where the camera is.
+#[derive(Clone, Copy, Debug)]
+pub struct ViewHint {
+    pub rect: [f64; 4],
+    pub view_px: f64,
+}
+
+impl ViewHint {
+    /// Metres of ground per pixel at the view centre.
+    fn gsd(&self) -> Option<f64> {
+        view_gsd(self.rect, self.view_px, &Crs::wgs84())
+    }
+}
+
+/// Where a pyramid's files live: the three prefixes a dataset opens
+/// from, each able to read one small document and address one part.
+enum PyramidRoot {
+    Dir(std::path::PathBuf),
+    S3 {
+        bucket: String,
+        prefix: String,
+        profile: Option<String>,
+        endpoint: Option<String>,
+    },
+    /// An HTTPS prefix, with its trailing slash.
+    Https(String),
+}
+
+/// The root a source's parts hang off, when the source is a prefix that
+/// could hold a pyramid. A single file cannot, and neither can a glob or
+/// a fixed part list: both name files, not a root.
+fn pyramid_root(source: &Source) -> Option<PyramidRoot> {
+    match source {
+        Source::Dir(dir) => Some(PyramidRoot::Dir(dir.clone())),
+        Source::S3 { uri, profile, endpoint, .. } if source.is_s3_prefix() => {
+            let rest = uri.strip_prefix("s3://").unwrap_or(uri);
+            if rest.contains('*') {
+                return None;
+            }
+            let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+            Some(PyramidRoot::S3 {
+                bucket: bucket.to_string(),
+                prefix: prefix.to_string(),
+                profile: profile.clone(),
+                endpoint: endpoint.clone(),
+            })
+        }
+        // An https prefix is routed as its `collection.json`; the
+        // pyramid sits beside that document, and takes precedence over
+        // it when both are there (the writer leaves both).
+        Source::Stac { url, .. } => url
+            .strip_suffix("collection.json")
+            .map(|root| PyramidRoot::Https(root.to_string())),
+        _ => None,
+    }
+}
+
+/// GET one small document; Ok(None) on 404.
+fn http_text(url: &str) -> Result<Option<String>, String> {
+    let res = crate::data::source::http_agent()
+        .get(url)
+        .call()
+        .map_err(|e| format!("cannot reach {url}: {e}"))?;
+    match res.status().as_u16() {
+        200 => res
+            .into_body()
+            .read_to_string()
+            .map(Some)
+            .map_err(|e| format!("read {url}: {e}")),
+        404 => Ok(None),
+        s => Err(format!("{url}: HTTP {s}")),
+    }
+}
+
+impl PyramidRoot {
+    fn label(&self) -> String {
+        match self {
+            PyramidRoot::Dir(d) => d.display().to_string(),
+            PyramidRoot::S3 { bucket, prefix, .. } => format!("s3://{bucket}/{prefix}"),
+            PyramidRoot::Https(u) => u.clone(),
+        }
+    }
+
+    /// `h3-pyramid.json`, or None when there is none to read.
+    fn read_descriptor(&self) -> Result<Option<String>, String> {
+        match self {
+            PyramidRoot::Dir(d) => match std::fs::read_to_string(d.join(pyramid::DESCRIPTOR)) {
+                Ok(s) => Ok(Some(s)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(format!("{}: {e}", pyramid::DESCRIPTOR)),
+            },
+            PyramidRoot::S3 { bucket, prefix, profile, endpoint } => {
+                crate::data::source::aws::fetch_small(
+                    &format!("s3://{bucket}/{prefix}{}", pyramid::DESCRIPTOR),
+                    profile.as_deref(),
+                    endpoint.as_deref(),
+                )
+            }
+            PyramidRoot::Https(root) => http_text(&format!("{root}{}", pyramid::DESCRIPTOR)),
+        }
+    }
+
+    /// The source of one part, by its path relative to the root.
+    fn child(&self, rel: &str) -> Result<Source, String> {
+        match self {
+            PyramidRoot::Dir(d) => Ok(Source::Local(d.join(rel))),
+            PyramidRoot::S3 { bucket, prefix, profile, endpoint } => Source::S3 {
+                uri: format!("s3://{bucket}/{prefix}{rel}"),
+                profile: profile.clone(),
+                endpoint: endpoint.clone(),
+                url: String::new(),
+                len: 0,
+            }
+            .resolve(),
+            PyramidRoot::Https(root) => {
+                Source::Remote { url: format!("{root}{rel}"), len: 0 }.resolve()
+            }
+        }
+    }
+
+    /// Parquet files under the root, relative to it — one listing, used
+    /// both to drop cells whose file is not there and to answer C9.
+    /// None when the root cannot be listed: an HTTPS prefix serves no
+    /// index, so the descriptor is taken at its word.
+    fn list(&self) -> Option<std::collections::HashSet<String>> {
+        match self {
+            // The pyramid's own layout, not the generic dataset walk:
+            // the null part is spelled `__HIVE_DEFAULT_PARTITION__` and
+            // `list_dataset_files` skips leading underscores as sidecar
+            // names. Here that name is data.
+            PyramidRoot::Dir(d) => {
+                let mut out = std::collections::HashSet::new();
+                for level in std::fs::read_dir(d).ok()?.filter_map(Result::ok) {
+                    let dir = level.file_name().to_string_lossy().into_owned();
+                    if !dir.starts_with('r') || !dir[1..].chars().all(|c| c.is_ascii_digit()) {
+                        continue;
+                    }
+                    for e in std::fs::read_dir(level.path()).ok()?.filter_map(Result::ok) {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        if name.ends_with(".parquet") {
+                            out.insert(format!("{dir}/{name}"));
+                        }
+                    }
+                }
+                Some(out)
+            }
+            PyramidRoot::S3 { bucket, prefix, profile, endpoint } => {
+                let listed = crate::data::source::aws::list_prefix(
+                    &format!("s3://{bucket}/{prefix}"),
+                    profile.as_deref(),
+                    endpoint.as_deref(),
+                )
+                .ok()?;
+                Some(
+                    listed
+                        .iter()
+                        .filter_map(|(k, _)| k.strip_prefix(prefix.as_str()))
+                        .map(str::to_string)
+                        .collect(),
+                )
+            }
+            PyramidRoot::Https(_) => None,
+        }
+    }
+}
+
+/// Look for a pyramid at a dataset root: one small read, before any
+/// parquet footer.
+///
+/// A descriptor that does not parse or validate is not fatal. The tree
+/// underneath is still ordinary parquet and still opens as a plain
+/// partitioned dataset; the error travels to C9 instead, where the user
+/// can see it.
+fn find_pyramid(root: &PyramidRoot) -> Option<Result<PyramidState, String>> {
+    match root.read_descriptor() {
+        Ok(None) => None,
+        Ok(Some(text)) => Some(
+            pyramid::Descriptor::parse(&text)
+                .and_then(|d| PyramidState::new(d, root.label())),
+        ),
+        Err(e) => Some(Err(e)),
+    }
+}
+
+/// Hive value of a part: its file name is the cell id, and the null part
+/// keeps hive's own spelling for "no value".
+fn pyramid_hive(rel: &str) -> Vec<(String, Option<String>)> {
+    let stem = rel
+        .rsplit('/')
+        .next()
+        .and_then(|f| f.strip_suffix(".parquet"))
+        .unwrap_or_default();
+    let value = (stem != pyramid::NULL_PART).then(|| stem.to_string());
+    vec![(pyramid::CELL_COLUMN.to_string(), value)]
+}
+
+/// Open exactly the parts one level of a pyramid needs for a viewport.
+///
+/// Never a mix of levels: an overview holds derived features and the
+/// leaf holds the source's own, and drawing both would double the map.
+/// Each part's cell id becomes the virtual `h3` partition column, so
+/// picking, the attribute table and SQL can all say which cell a row
+/// came from without the file name being parsed again downstream.
+fn open_pyramid_store(
+    source: &Source,
+    root: &PyramidRoot,
+    state: &PyramidState,
+    view: Option<ViewHint>,
+    listing: Option<&std::collections::HashSet<String>>,
+) -> Result<StoreOpen, String> {
+    let mut plan = state.plan(
+        view.and_then(|v| v.gsd()),
+        view.map(|v| v.rect),
+        pyramid::MAX_LEVEL_PARTS,
+    );
+    // The descriptor lists cells, not files. Where the root can be
+    // listed we believe the listing: a cell whose file is missing would
+    // otherwise fail the whole open, and C9 reports the same gap.
+    if let Some(have) = listing {
+        plan.parts.retain(|p| have.contains(p));
+    }
+    // The null part draws nothing, so it stays out of viewport plans;
+    // SQL and the scorecard still count it (see `leaf_parts`).
+    if plan.parts.is_empty() {
+        return Err(format!(
+            "no cells of this pyramid are inside the current view (level r{})",
+            plan.res
+        ));
+    }
+    if let Some(from) = plan.coarsened_from {
+        log::info!(
+            "{}: level r{from} would open more than {} parts here; reading r{} instead",
+            root.label(),
+            pyramid::MAX_LEVEL_PARTS,
+            plan.res
+        );
+    }
+    log::info!(
+        "{}: H3 pyramid level r{}, {} part file(s)",
+        root.label(),
+        plan.res,
+        plan.parts.len()
+    );
+    let files: Vec<(Source, String)> = {
+        use rayon::prelude::*;
+        plan.parts
+            .par_iter()
+            .map(|rel| {
+                root.child(rel)
+                    .map(|src| (src, rel.clone()))
+                    .map_err(|e| format!("{rel}: {e}"))
+            })
+            .collect::<Result<_, _>>()?
+    };
+    let hive: Vec<Vec<(String, Option<String>)>> =
+        plan.parts.iter().map(|rel| pyramid_hive(rel)).collect();
+    let mut opened = open_multi_store(source, files, hive)?;
+    opened.2.pyramid = Some(state.info_line());
+    opened.0.pyramid = Some(state.with_active(plan.res));
+    Ok(opened)
+}
+
+/// C9's facts: what the descriptor says, and whether the files it names
+/// are there.
+fn pyramid_quality(
+    found: Option<&Result<PyramidState, String>>,
+    listing: Option<&std::collections::HashSet<String>>,
+) -> Option<Result<super::quality::PyramidQuality, String>> {
+    match found? {
+        Err(e) => Some(Err(e.clone())),
+        Ok(state) => {
+            let listed = state.all_parts();
+            let missing: Vec<String> = match listing {
+                Some(have) => listed.iter().filter(|p| !have.contains(*p)).cloned().collect(),
+                None => Vec::new(),
+            };
+            Some(Ok(super::quality::PyramidQuality {
+                summary: state.info_line(),
+                listed: listed.len(),
+                missing,
+                unlisted: listing.is_none(),
+            }))
+        }
+    }
+}
+
 /// Un-gated open with no viewport: what the in-crate tests and the
 /// `geopq-cli` integration tests read a written file back with. The app
 /// itself always goes through `open_store_with_view`.
@@ -1885,9 +2184,48 @@ pub fn open_store(source: &Source) -> Result<StoreOpen, String> {
     open_store_with_view(source, None)
 }
 
+/// Open a dataset for a viewport.
+///
+/// An H3 pyramid is looked for first, because it changes what "open"
+/// means: one level's cells instead of every file under the root. The
+/// look costs one small read of `h3-pyramid.json`, and a descriptor that
+/// does not validate simply falls through to the plain multi-part path —
+/// the tree underneath is still ordinary parquet — with the error
+/// carried to the scorecard as C9.
+fn open_store_with_view(
+    source: &Source,
+    view: Option<ViewHint>,
+) -> Result<StoreOpen, String> {
+    let root = pyramid_root(source);
+    let found = root.as_ref().and_then(find_pyramid);
+    // One listing, shared by the plan (cells whose file is absent) and
+    // by C9 (which files the descriptor promised).
+    let listing = found
+        .as_ref()
+        .is_some_and(Result::is_ok)
+        .then(|| root.as_ref().and_then(PyramidRoot::list))
+        .flatten();
+    let mut opened = match (&root, &found) {
+        (Some(r), Some(Ok(state))) => {
+            open_pyramid_store(source, r, state, view, listing.as_ref())?
+        }
+        _ => {
+            if let Some(Err(e)) = &found {
+                log::warn!("{}: {e}; opening as a plain partitioned dataset", source.label());
+            }
+            open_plain_store(source, view.map(|v| v.rect))?
+        }
+    };
+    if let Some(q) = opened.2.quality.as_mut() {
+        q.checks
+            .push(super::quality::pyramid_check(pyramid_quality(found.as_ref(), listing.as_ref()).as_ref()));
+    }
+    Ok(opened)
+}
+
 /// `stac_rect`: current viewport in WGS84 lon/lat, for part-level pruning
 /// of STAC collections (their item bboxes are WGS84 by spec).
-fn open_store_with_view(
+fn open_plain_store(
     source: &Source,
     stac_rect: Option<[f64; 4]>,
 ) -> Result<StoreOpen, String> {
@@ -2772,6 +3110,10 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
         files: 1,
         attribution: super::attribution::find(source, &kv),
         quality: None,
+        // Set by the pyramid open path, which is the only thing that
+        // knows the root a part belongs to.
+        pyramid: None,
+        pyramid_file: None,
     };
 
     let rg_boxes = match xy {
@@ -2817,6 +3159,22 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
         });
 
     let mut info = info;
+    // `geopq:pyramid`: an overview file says what it is even when it is
+    // opened on its own, away from the descriptor that would otherwise
+    // badge it. Derived geometry is never on screen unmarked
+    // (docs/OPEN_POLICY.md invariant 1), and one file out of a pyramid
+    // is exactly the case where the layer has no other way to know.
+    info.pyramid_file = kv
+        .iter()
+        .find(|kv| kv.key == pyramid::FILE_KEY)
+        .and_then(|kv| kv.value.as_ref())
+        .and_then(|v| match serde_json::from_str::<pyramid::FileMeta>(v) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                log::warn!("{}: unusable {}: {e}", source.name(), pyramid::FILE_KEY);
+                None
+            }
+        });
     if hidden_wkb.is_some() {
         info.geo.encoding = format!("{} + GeoArrow column (used for display)", info.geo.encoding);
     }
@@ -7334,13 +7692,13 @@ mod stac_tests {
 
         // A viewport over the west part only opens that file.
         let (store, _, info, _) =
-            open_store_with_view(&source, Some([-12.0, 43.0, -8.0, 47.0])).unwrap();
+            open_store_with_view(&source, Some(ViewHint { rect: [-12.0, 43.0, -8.0, 47.0], view_px: 1600.0 })).unwrap();
         assert_eq!(store.fragments.len(), 1);
         assert_eq!(store.total_rows(), 200);
         assert_eq!(info.files, 1);
 
         // A viewport intersecting nothing is a load error, not an empty map.
-        let Err(err) = open_store_with_view(&source, Some([100.0, 0.0, 110.0, 5.0])) else {
+        let Err(err) = open_store_with_view(&source, Some(ViewHint { rect: [100.0, 0.0, 110.0, 5.0], view_px: 1600.0 })) else {
             panic!("disjoint viewport must not open a store");
         };
         assert!(err.contains("no parts"), "{err}");
@@ -7391,7 +7749,7 @@ mod stac_tests {
         // would also be the symptom of a reader handing every part the
         // collection's own extent.
         let (paris, _, info, _) =
-            open_store_with_view(&source, Some([2.0, 48.5, 2.7, 49.1])).unwrap();
+            open_store_with_view(&source, Some(ViewHint { rect: [2.0, 48.5, 2.7, 49.1], view_px: 1600.0 })).unwrap();
         assert_eq!(paris.fragments.len(), 1);
         assert_eq!(paris.total_rows(), 300);
         assert_eq!(info.files, 1);
@@ -7436,7 +7794,7 @@ mod stac_tests {
         };
         let t = Instant::now();
         let (store, crs, info, rg_meta) =
-            open_store_with_view(&source, Some([2.0, 48.5, 3.0, 49.2])).unwrap();
+            open_store_with_view(&source, Some(ViewHint { rect: [2.0, 48.5, 3.0, 49.2], view_px: 1600.0 })).unwrap();
         println!(
             "opened {} parts / {} rows / {} rgs in {:?} (crs {})",
             info.files,
@@ -8283,5 +8641,377 @@ mod cogp_tests {
         // Degenerate viewports have no scale.
         assert_eq!(view_gsd([1.0, 0.0, 1.0, 1.0], 1000.0, &l93), None);
         assert_eq!(view_gsd([0.0, 0.0, 1.0, 1.0], 0.0, &l93), None);
+    }
+}
+
+/// A synthetic H3 pyramid on disk, and the reader's trip back through
+/// it: detection, level choice, the exact parts a viewport opens, the
+/// adaptive band, and C9.
+#[cfg(test)]
+pub(crate) mod pyramid_tests {
+    use super::*;
+    use crate::data::pyramid::{
+        part_path, Descriptor, FileMeta, Leaf, Level, Method, PyramidState, DESCRIPTOR, NULL_PART,
+        VERSION,
+    };
+    use arrow::array::{ArrayRef, BinaryArray, Float64Array, Int64Array, StructArray};
+    use arrow::datatypes::{Field, Fields, Schema};
+    use h3o::{CellIndex, LatLng, Resolution};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use std::collections::HashSet;
+    use std::fs::File;
+
+    fn wkb_point(x: f64, y: f64) -> Vec<u8> {
+        let mut b = vec![1u8];
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&x.to_le_bytes());
+        b.extend_from_slice(&y.to_le_bytes());
+        b
+    }
+
+    /// One part file: four points around the cell's centre (well inside
+    /// it at every resolution used here), a covering column, and — for
+    /// an overview — the `geopq:pyramid` entry the layout asks for.
+    fn write_cell(path: &std::path::Path, cell: Option<CellIndex>, meta: Option<FileMeta>) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let pts: Vec<(f64, f64)> = match cell {
+            Some(c) => {
+                let ll = LatLng::from(c);
+                [(0.0, 0.0), (5e-5, 0.0), (0.0, 5e-5), (-5e-5, -5e-5)]
+                    .iter()
+                    .map(|(dx, dy)| (ll.lng() + dx, ll.lat() + dy))
+                    .collect()
+            }
+            // The null part: one row, no shape, no extent.
+            None => Vec::new(),
+        };
+        let mut col = serde_json::json!({
+            "encoding": "WKB",
+            "geometry_types": ["Point"],
+            "covering": {"bbox": {
+                "xmin": ["bbox", "xmin"], "ymin": ["bbox", "ymin"],
+                "xmax": ["bbox", "xmax"], "ymax": ["bbox", "ymax"],
+            }},
+        });
+        if !pts.is_empty() {
+            let (xs, ys): (Vec<f64>, Vec<f64>) = pts.iter().copied().unzip();
+            col["bbox"] = serde_json::json!([
+                xs.iter().copied().fold(f64::INFINITY, f64::min),
+                ys.iter().copied().fold(f64::INFINITY, f64::min),
+                xs.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                ys.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            ]);
+        }
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": col},
+        });
+        let bbox_fields: Fields = vec![
+            Field::new("xmin", DataType::Float64, true),
+            Field::new("ymin", DataType::Float64, true),
+            Field::new("xmax", DataType::Float64, true),
+            Field::new("ymax", DataType::Float64, true),
+        ]
+        .into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, true),
+            Field::new("id", DataType::Int64, false),
+            Field::new("bbox", DataType::Struct(bbox_fields.clone()), true),
+        ]));
+        let (geoms, xs, ys): (Vec<Option<Vec<u8>>>, Vec<Option<f64>>, Vec<Option<f64>>) =
+            if pts.is_empty() {
+                (vec![None], vec![None], vec![None])
+            } else {
+                pts.iter()
+                    .map(|(x, y)| (Some(wkb_point(*x, *y)), Some(*x), Some(*y)))
+                    .collect()
+            };
+        let rows = geoms.len();
+        let coord = |v: &[Option<f64>]| Arc::new(Float64Array::from(v.to_vec())) as ArrayRef;
+        let bbox = StructArray::try_new(
+            bbox_fields,
+            vec![coord(&xs), coord(&ys), coord(&xs), coord(&ys)],
+            None,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter(geoms.iter().map(Option::as_deref))),
+                Arc::new(Int64Array::from((0..rows as i64).collect::<Vec<_>>())),
+                Arc::new(bbox),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder().set_max_row_group_row_count(Some(128)).build();
+        let mut w = ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(props)).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        ));
+        if let Some(m) = meta {
+            w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+                crate::data::pyramid::FILE_KEY.to_string(),
+                serde_json::to_string(&m).unwrap(),
+            ));
+        }
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    pub(crate) struct Fixture {
+        pub root: std::path::PathBuf,
+        pub r5: Vec<CellIndex>,
+        pub r6: Vec<CellIndex>,
+        pub r7: Vec<CellIndex>,
+        /// The one adaptive child, and the r7 cell it replaced (which
+        /// therefore has no file of its own).
+        pub r8: CellIndex,
+        pub split: CellIndex,
+    }
+
+    /// r5: 2 dissolve cells; r6: 6 dissolve cells; r7: 20 leaf cells;
+    /// r8: one adaptive child of a 21st r7 cell; plus the null part.
+    pub(crate) fn fixture(name: &str) -> Fixture {
+        let root = std::env::temp_dir().join(format!("geopq_pyr_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let a = LatLng::new(45.5, -73.6).unwrap().to_cell(Resolution::Five);
+        let b = a.grid_disk::<Vec<_>>(1)[1];
+        let r5 = vec![a, b];
+        let r6: Vec<CellIndex> = a.children(Resolution::Six).take(6).collect();
+        let mut r7all: Vec<CellIndex> =
+            r6.iter().flat_map(|c| c.children(Resolution::Seven)).collect();
+        r7all.sort_unstable();
+        r7all.dedup();
+        let r7: Vec<CellIndex> = r7all[..20].to_vec();
+        let split = r7all[20];
+        let r8 = split.children(Resolution::Eight).next().unwrap();
+
+        let meta = |res: u8| {
+            Some(FileMeta { res, method: Method::Dissolve, source_res: res + 1, derived: true })
+        };
+        for c in &r5 {
+            write_cell(&root.join(part_path(5, &c.to_string())), Some(*c), meta(5));
+        }
+        for c in &r6 {
+            write_cell(&root.join(part_path(6, &c.to_string())), Some(*c), meta(6));
+        }
+        for c in &r7 {
+            write_cell(&root.join(part_path(7, &c.to_string())), Some(*c), None);
+        }
+        write_cell(&root.join(part_path(8, &r8.to_string())), Some(r8), None);
+        write_cell(&root.join(part_path(7, NULL_PART)), None, None);
+        let f = Fixture { root, r5, r6, r7, r8, split };
+        std::fs::write(f.root.join(DESCRIPTOR), f.descriptor().to_json()).unwrap();
+        f
+    }
+
+    impl Fixture {
+        pub fn descriptor(&self) -> Descriptor {
+            let ids = |cells: &[CellIndex]| cells.iter().map(CellIndex::to_string).collect();
+            Descriptor {
+                version: VERSION.into(),
+                leaf: Leaf { res: 7, adaptive_max_res: 8, target_rows: 100, null_part: true },
+                levels: vec![
+                    Level { res: 5, method: Some(Method::Dissolve), cells: ids(&self.r5), rows: None },
+                    Level { res: 6, method: Some(Method::Dissolve), cells: ids(&self.r6), rows: None },
+                    Level { res: 7, method: None, cells: ids(&self.r7), rows: None },
+                    Level { res: 8, method: None, cells: ids(&[self.r8]), rows: None },
+                ],
+                pixels_per_cell: crate::data::pyramid::DEFAULT_PIXELS_PER_CELL,
+                crs: serde_json::Value::Null,
+                bbox: None,
+                rows: None,
+                methods: serde_json::Value::Null,
+            }
+        }
+
+        pub fn source(&self) -> Source {
+            Source::Dir(self.root.clone())
+        }
+    }
+
+    /// A square viewport centred on a cell, `gsd` metres per pixel wide.
+    fn view_at(cell: CellIndex, gsd: f64) -> ViewHint {
+        let ll = LatLng::from(cell);
+        let view_px = 1600.0;
+        let half = gsd * view_px / (111_320.0 * ll.lat().to_radians().cos()) / 2.0;
+        ViewHint {
+            rect: [ll.lng() - half, ll.lat() - half, ll.lng() + half, ll.lat() + half],
+            view_px,
+        }
+    }
+
+    /// Cell ids of the parts a store opened, from the virtual `h3`
+    /// column rather than from any path parsing.
+    fn opened_cells(store: &FeatureStore) -> HashSet<String> {
+        assert_eq!(store.part_cols, vec![crate::data::pyramid::CELL_COLUMN.to_string()]);
+        (0..store.rg_starts().len() - 1)
+            .filter_map(|g| store.part_value(g, 0).map(str::to_string))
+            .collect()
+    }
+
+    fn check<'a>(info: &'a FileInfo, code: &str) -> &'a crate::data::quality::Check {
+        info.quality
+            .as_ref()
+            .expect("a pyramid store went through parquet footers")
+            .checks
+            .iter()
+            .find(|c| c.code == code)
+            .expect("check present")
+    }
+
+    /// The descriptor is found, the ground scale picks the level, and
+    /// the info panel gets its line.
+    #[test]
+    fn the_ground_scale_picks_the_pyramid_level() {
+        let f = fixture("level");
+        let src = f.source();
+        // r7 edge ~1.2 km at 64 px per cell is ~19 m/px; r6 ~50; r5 ~133.
+        for (gsd, res, badge) in [
+            (0.02, 7u8, None),
+            (40.0, 6, Some("overview r6 (dissolve)")),
+            (100.0, 5, Some("overview r5 (dissolve)")),
+        ] {
+            let (store, _crs, info, _) =
+                open_store_with_view(&src, Some(view_at(f.r5[0], gsd))).unwrap();
+            let p = store.pyramid.as_ref().expect("pyramid detected");
+            assert_eq!(p.active_res, res, "at {gsd} m/px");
+            assert_eq!(p.badge().as_deref(), badge, "at {gsd} m/px");
+            assert_eq!(
+                info.pyramid.as_deref(),
+                Some("leaf r7 (adaptive to r8), overviews r5..r6 (dissolve), 64 px/cell")
+            );
+            assert_eq!(check(&info, "C9").status, crate::data::quality::Status::Pass);
+        }
+    }
+
+    /// A viewport inside one cell opens that cell and the ring around
+    /// it — the cells the descriptor lists there, and no others.
+    #[test]
+    fn a_viewport_opens_exactly_the_cells_it_covers() {
+        let f = fixture("exact");
+        let listed: HashSet<CellIndex> = f.r7.iter().copied().collect();
+        let centre = f.r7[0];
+        let (store, ..) = open_store_with_view(&f.source(), Some(view_at(centre, 0.02))).unwrap();
+        let want: HashSet<String> = centre
+            .grid_disk::<Vec<_>>(1)
+            .into_iter()
+            .filter(|c| listed.contains(c))
+            .map(|c| c.to_string())
+            .collect();
+        assert!(want.len() > 1, "the fixture must have neighbours to leave out");
+        assert_eq!(opened_cells(&store), want);
+        assert!(
+            store.fragments.len() < f.r7.len(),
+            "the whole level must not be opened for one cell"
+        );
+    }
+
+    /// The writer replaced a dense cell by children at a finer
+    /// resolution: a viewport over that cell must find them.
+    #[test]
+    fn an_adaptive_child_arrives_with_its_parent_cell() {
+        let f = fixture("adaptive");
+        let (store, ..) = open_store_with_view(&f.source(), Some(view_at(f.split, 0.02))).unwrap();
+        let cells = opened_cells(&store);
+        assert!(cells.contains(&f.r8.to_string()), "the r8 child of the split cell: {cells:?}");
+        assert!(!cells.contains(&f.split.to_string()), "the split cell has no file");
+    }
+
+    #[test]
+    fn a_viewport_outside_every_cell_opens_nothing() {
+        let f = fixture("empty");
+        let far = ViewHint { rect: [10.0, 10.0, 10.01, 10.01], view_px: 1600.0 };
+        let Err(err) = open_store_with_view(&f.source(), Some(far)) else {
+            panic!("a view outside every cell has nothing to open");
+        };
+        assert!(err.contains("no cells of this pyramid"), "{err}");
+    }
+
+    /// C9 warns when the descriptor promises a file the root does not
+    /// hold — and the layer still opens, from the cells that are there.
+    #[test]
+    fn c9_warns_about_a_missing_cell_file() {
+        let f = fixture("missing");
+        let gone = f.root.join(part_path(7, &f.r7[3].to_string()));
+        std::fs::remove_file(&gone).unwrap();
+        let (store, _crs, info, _) =
+            open_store_with_view(&f.source(), Some(view_at(f.r5[0], 0.02))).unwrap();
+        assert!(store.pyramid.is_some(), "a gap does not stop the pyramid opening");
+        let c9 = check(&info, "C9");
+        assert_eq!(c9.status, crate::data::quality::Status::Warn);
+        assert!(c9.detail.contains("1 of 30 listed files are missing"), "{}", c9.detail);
+        assert!(!c9.gating);
+    }
+
+    /// A descriptor that does not validate is not fatal: the tree under
+    /// it is still parquet, so it opens as a plain partitioned dataset
+    /// with every file in it, and C9 says what went wrong.
+    #[test]
+    fn a_bad_descriptor_falls_back_to_the_plain_open() {
+        let f = fixture("bad");
+        // An r6 cell listed at r5: structurally impossible.
+        let mut d = f.descriptor();
+        d.levels[0].cells = vec![f.r6[0].to_string()];
+        std::fs::write(f.root.join(DESCRIPTOR), d.to_json()).unwrap();
+        let (store, _crs, info, _) =
+            open_store_with_view(&f.source(), Some(view_at(f.r7[0], 0.02))).unwrap();
+        assert!(store.pyramid.is_none(), "no pyramid state from a descriptor that does not hold");
+        // Every part file the plain dataset walk sees, which is every
+        // one but the null part: `__HIVE_DEFAULT_PARTITION__.parquet`
+        // reads as a sidecar name there, exactly as it did before this
+        // work. The pyramid path knows better, and lists it.
+        assert_eq!(store.fragments.len(), 2 + 6 + 20 + 1);
+        let c9 = check(&info, "C9");
+        assert_eq!(c9.status, crate::data::quality::Status::Warn);
+        assert!(c9.detail.contains("plain partitioned dataset"), "{}", c9.detail);
+    }
+
+    /// No descriptor at all: C9 passes, saying a pyramid is optional.
+    #[test]
+    fn no_descriptor_is_not_a_fault() {
+        let f = fixture("absent");
+        std::fs::remove_file(f.root.join(DESCRIPTOR)).unwrap();
+        let (store, _crs, info, _) = open_store_with_view(&f.source(), None).unwrap();
+        assert!(store.pyramid.is_none());
+        let c9 = check(&info, "C9");
+        assert_eq!(c9.status, crate::data::quality::Status::Pass);
+        assert_eq!(c9.detail, "no pyramid (optional)");
+    }
+
+    /// One overview file opened on its own still says it is derived:
+    /// the `geopq:pyramid` entry is the only thing that can say so when
+    /// the descriptor is not in the picture.
+    #[test]
+    fn a_lone_overview_file_says_it_is_derived() {
+        let f = fixture("lone");
+        let path = f.root.join(part_path(6, &f.r6[0].to_string()));
+        let (_store, _crs, info, _) = open_store(&Source::Local(path)).unwrap();
+        let meta = info.pyramid_file.expect("the file's own pyramid entry");
+        assert_eq!(meta, FileMeta { res: 6, method: Method::Dissolve, source_res: 7, derived: true });
+        assert_eq!(
+            crate::data::pyramid::layer_badge(None, Some(&meta)).as_deref(),
+            Some("overview r6 (dissolve)")
+        );
+        // A leaf file carries none, and badges nothing.
+        let leaf = f.root.join(part_path(7, &f.r7[0].to_string()));
+        let (_s, _c, leaf_info, _) = open_store(&Source::Local(leaf)).unwrap();
+        assert!(leaf_info.pyramid_file.is_none());
+        assert_eq!(crate::data::pyramid::layer_badge(None, None), None);
+    }
+
+    /// Opened with no viewport at all (the CLI path), a pyramid reads
+    /// its leaf band whole.
+    #[test]
+    fn no_viewport_reads_the_leaf_band() {
+        let f = fixture("noview");
+        let (store, ..) = open_store(&f.source()).unwrap();
+        let p = store.pyramid.as_ref().unwrap();
+        assert_eq!(p.active_res, 7);
+        assert_eq!(store.fragments.len(), f.r7.len() + 1, "20 leaf cells and the adaptive child");
+        assert!(PyramidState::new(f.descriptor(), "x").is_ok());
     }
 }

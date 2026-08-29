@@ -500,6 +500,18 @@ impl PyramidState {
     }
 }
 
+/// What a layer must say about the pyramid content it is showing:
+/// the active level when the layer was opened from a descriptor, or
+/// what a single file says about itself when it was not. None on the
+/// leaf level and on ordinary files, where nothing is derived.
+pub fn layer_badge(state: Option<&PyramidState>, file: Option<&FileMeta>) -> Option<String> {
+    if let Some(state) = state {
+        return state.badge();
+    }
+    let m = file.filter(|m| m.derived)?;
+    Some(format!("overview r{} ({})", m.res, m.method.label()))
+}
+
 /// Does a part's cell answer to `h3 = <filter>`?
 ///
 /// Equality, plus the one relation the layout adds: an adaptive child

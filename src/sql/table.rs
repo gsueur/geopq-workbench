@@ -249,10 +249,34 @@ impl TableProvider for LayerTable {
         for f in filters {
             part_eq_constraints(f, &part_names, &mut part_eq);
         }
-        let group_kept = |g: usize| {
-            part_eq
+        // A pyramid layer answers from its leaf level only. The
+        // overview levels hold derived features — counts, unions,
+        // majorities — and a query that mixed them with source rows
+        // would double-count without saying so. When an overview is the
+        // level on screen the table is simply empty; the scan's plan
+        // line says why.
+        let leaf_only = self
+            .store
+            .pyramid
+            .as_ref()
+            .is_none_or(|p| !p.is_overview());
+        // `h3 = '<cell>'` names a leaf file by its own name. It also
+        // names the adaptive children the writer split that cell into,
+        // which live at a finer resolution under their own parent.
+        let cell_col = self.store.pyramid.as_ref().and(
+            self.store
+                .part_cols
                 .iter()
-                .all(|(k, v)| self.store.part_value(g, *k) == Some(v.as_str()))
+                .position(|c| c == crate::data::pyramid::CELL_COLUMN),
+        );
+        let group_kept = |g: usize| {
+            leaf_only
+                && part_eq.iter().all(|(k, v)| match self.store.part_value(g, *k) {
+                    Some(have) if Some(*k) == cell_col => {
+                        crate::data::pyramid::cell_matches(have, v)
+                    }
+                    have => have == Some(v.as_str()),
+                })
         };
 
         let parts: Vec<GroupPart> = match (bbox, rects.is_empty()) {
@@ -456,10 +480,17 @@ impl DisplayAs for LayerScanExec {
         let ranged = self.parts.iter().filter(|p| p.ranges.is_some()).count();
         write!(
             f,
-            "LayerScanExec: {} ({} of {} row groups, {ranged} row-pruned)",
+            "LayerScanExec: {} ({} of {} row groups, {ranged} row-pruned){}",
             self.store.source.name(),
             self.parts.len(),
             self.store.rg_starts().len().saturating_sub(1),
+            match self.store.pyramid.as_ref().filter(|p| p.is_overview()) {
+                Some(p) => format!(
+                    " [pyramid overview r{} is on screen; SQL reads the leaf level only]",
+                    p.active_res
+                ),
+                None => String::new(),
+            }
         )
     }
 }

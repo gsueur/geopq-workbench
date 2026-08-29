@@ -161,8 +161,9 @@ metadata. Produces a `QualityReport` attached to `FileInfo`.
 | C6 | Compression | zstd/snappy/lz4 (non-zstd notes "zstd recommended for distribution") | uncompressed | — | no |
 | C7 | Metadata hygiene: geo version, declared `geometry_types`, CRS present, file bbox | all present | any missing | — | no |
 | C8 | Cloud Optimized GeoParquet Profile (COGP) levels: a valid `cogp` block naming a coarse-to-fine row-group prefix per rendering scale | valid, or absent (optional) | present but invalid | — | no |
+| C9 | H3 pyramid: a valid `h3-pyramid.json` at the dataset root whose listed cells all have files | valid and complete, or absent (optional) | present but invalid, or listed files missing | — | no |
 
-Verdict = C1 ∧ C2 ∧ C3. C4–C8 are advisory lines on the scorecard
+Verdict = C1 ∧ C2 ∧ C3. C4–C9 are advisory lines on the scorecard
 (the "good practices" education), never gate.
 
 Early pass: if `total_rows ≤ MAX_BUILD_ROWS` the verdict is forced to
@@ -197,6 +198,58 @@ published profile.
 
 An invalid `cogp` block is recorded and otherwise ignored — the file is
 still ordinary GeoParquet and still opens.
+
+### H3 pyramid levels
+
+An [H3 pyramid](../_WIKI/concepts/h3-pyramid.md) is the vector answer to
+a COG's overviews: a `h3-pyramid.json` at a dataset root over
+`r<res>/<cell>.parquet` files, with a leaf level holding the source
+features partitioned by H3 cell (plus adaptive children where a cell was
+too dense) and coarser levels holding features derived from the next
+finer one by simplify, prune or dissolve.
+
+The reader looks for the descriptor first — one small read on a local
+directory, an S3 prefix or an HTTPS prefix — because it changes what
+opening means. A plain partitioned dataset opens every file under the
+root; a pyramid opens one level, and only the cells the viewport covers
+at that level. The level comes from the ground scale
+(`Descriptor::res_for_gsd`, `pixels_per_cell` pixels per cell edge, 64
+by default), and levels are never mixed: an overview holds derived
+features and the leaf holds the source's own, so drawing both would
+double the map.
+
+Three consequences worth spelling out:
+
+- **Part caps do not apply.** `STAC_PART_CAP` (16 at open) and
+  `PART_TOTAL_CAP` (256 total) exist because a STAC collection's parts
+  are guesses ranked by bbox overlap, and a wide viewport would open
+  half a terabyte of footers to find out. A pyramid's cell list is
+  exact, so it opens every cell the viewport needs. What it will not do
+  is open a level that costs more than `MAX_LEVEL_PARTS` files: that is
+  the wrong level, not a level to truncate, and the plan steps to the
+  next coarser one (which covers the same ground in fewer files) and
+  records where it came from.
+- **Overviews are badged.** Invariant 1 covers derived geometry as much
+  as decimated geometry, so an active overview badges as
+  "overview r6 (dissolve)" and clears on the leaf. An overview file
+  opened *alone*, away from its descriptor, badges from its own
+  `geopq:pyramid` key — which is what that key is for. Attribute display
+  and picking on an overview show the overview's own attributes (count,
+  area_sum, majority); they are not dressed up as source rows.
+- **SQL reads the leaf level only.** The overview levels are aggregates,
+  and a query that mixed them with source rows would double-count
+  without saying so. Each part's cell id is exposed as the virtual `h3`
+  partition column, so `WHERE h3 = '<cell>'` prunes to that one file
+  through the same hive machinery as before, and also reaches the
+  adaptive children that cell was split into (they match by `parent()`).
+  While an overview is the level on screen the table is empty; the
+  scan's `EXPLAIN` line says so.
+
+An invalid descriptor is not fatal. The tree under it is still ordinary
+parquet, so the dataset opens through the plain multi-part path exactly
+as it did before, and the error travels to C9. For an HTTPS prefix,
+which serves no listing, the descriptor's file list is taken at its word
+and C9 says it was not verified.
 
 **C2 measures inside a level, never across the file.** A COGP file is
 ordered by (level, spatial curve). Coarse levels hold a handful of

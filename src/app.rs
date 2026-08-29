@@ -10006,6 +10006,30 @@ impl ViewerApp {
                         if let Some(c) = &info.geo.cogp {
                             row(ui, "cloud-optimized", c.clone());
                         }
+                        // The pyramid this layer is one level of, and
+                        // which level that is — an overview is derived
+                        // data and has to say so wherever it is named.
+                        if let Some(p) = &info.pyramid {
+                            let level = match layer.store.pyramid.as_ref() {
+                                Some(st) => format!(
+                                    " — reading {}",
+                                    st.badge().unwrap_or_else(|| format!("leaf r{}", st.active_res))
+                                ),
+                                None => String::new(),
+                            };
+                            row(ui, "H3 pyramid", format!("{p}{level}"));
+                        } else if let Some(m) = &info.pyramid_file {
+                            row(
+                                ui,
+                                "H3 pyramid",
+                                format!(
+                                    "one overview file: r{} ({}, derived from r{})",
+                                    m.res,
+                                    m.method.label(),
+                                    m.source_res
+                                ),
+                            );
+                        }
                         if let Some(rg) = &layer.rg_bboxes {
                             row(
                                 ui,
