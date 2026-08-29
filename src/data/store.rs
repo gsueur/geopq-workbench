@@ -86,6 +86,12 @@ pub struct FeatureStore {
     /// Single-file stores only — row-group indices in `cogp` are per
     /// file, and a multi-fragment store renumbers them globally.
     pub cogp: Option<super::cogp::CogpLevels>,
+    /// The H3 pyramid this store is one level of, when it was opened
+    /// from a `h3-pyramid.json` root: the descriptor, the root the part
+    /// names hang off, and which level is on screen. None for every
+    /// other dataset, including a pyramid whose descriptor did not
+    /// validate (which opens as a plain partitioned dataset).
+    pub pyramid: Option<super::pyramid::PyramidState>,
     /// The `geo` metadata declares polygons only. A polygon is the one
     /// geometry its bounding box can stand in for on screen; a line's
     /// box is a rectangle the line does not follow, and a point is its
@@ -199,6 +205,7 @@ impl FeatureStore {
             spherical_edges: false,
             base64_wkb: false,
             cogp: None,
+            pyramid: None,
             polygons_only: false,
             rg_rows,
             rg_starts,

@@ -249,10 +249,34 @@ impl TableProvider for LayerTable {
         for f in filters {
             part_eq_constraints(f, &part_names, &mut part_eq);
         }
-        let group_kept = |g: usize| {
-            part_eq
+        // A pyramid layer answers from its leaf level only. The
+        // overview levels hold derived features — counts, unions,
+        // majorities — and a query that mixed them with source rows
+        // would double-count without saying so. When an overview is the
+        // level on screen the table is simply empty; the scan's plan
+        // line says why.
+        let leaf_only = self
+            .store
+            .pyramid
+            .as_ref()
+            .is_none_or(|p| !p.is_overview());
+        // `h3 = '<cell>'` names a leaf file by its own name. It also
+        // names the adaptive children the writer split that cell into,
+        // which live at a finer resolution under their own parent.
+        let cell_col = self.store.pyramid.as_ref().and(
+            self.store
+                .part_cols
                 .iter()
-                .all(|(k, v)| self.store.part_value(g, *k) == Some(v.as_str()))
+                .position(|c| c == crate::data::pyramid::CELL_COLUMN),
+        );
+        let group_kept = |g: usize| {
+            leaf_only
+                && part_eq.iter().all(|(k, v)| match self.store.part_value(g, *k) {
+                    Some(have) if Some(*k) == cell_col => {
+                        crate::data::pyramid::cell_matches(have, v)
+                    }
+                    have => have == Some(v.as_str()),
+                })
         };
 
         let parts: Vec<GroupPart> = match (bbox, rects.is_empty()) {
@@ -456,10 +480,17 @@ impl DisplayAs for LayerScanExec {
         let ranged = self.parts.iter().filter(|p| p.ranges.is_some()).count();
         write!(
             f,
-            "LayerScanExec: {} ({} of {} row groups, {ranged} row-pruned)",
+            "LayerScanExec: {} ({} of {} row groups, {ranged} row-pruned){}",
             self.store.source.name(),
             self.parts.len(),
             self.store.rg_starts().len().saturating_sub(1),
+            match self.store.pyramid.as_ref().filter(|p| p.is_overview()) {
+                Some(p) => format!(
+                    " [pyramid overview r{} is on screen; SQL reads the leaf level only]",
+                    p.active_res
+                ),
+                None => String::new(),
+            }
         )
     }
 }
@@ -715,6 +746,84 @@ mod tests {
         )
         .unwrap();
         buf
+    }
+
+
+    /// A pyramid layer's table is its leaf level, addressed by cell:
+    /// `h3 = '<cell>'` selects that cell's file, and the adaptive
+    /// children the writer split it into. An overview level answers
+    /// nothing at all rather than passing derived rows off as source.
+    #[test]
+    fn a_pyramid_table_is_addressed_by_cell() {
+        use crate::data::loader::pyramid_tests::fixture;
+        use crate::data::pyramid::CELL_COLUMN;
+        use datafusion::logical_expr::lit;
+
+        let f = fixture("sql");
+        let scan_of = |plan: &Arc<dyn ExecutionPlan>| {
+            plan.downcast_ref::<LayerScanExec>().expect("layer scan").parts.len()
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        // No viewport: the leaf band whole, one row group per part file.
+        let (store, _crs, _info, rg_meta) =
+            crate::data::loader::open_store(&f.source()).unwrap();
+        let store = Arc::new(store);
+        let n_groups = store.rg_starts().len() - 1;
+        assert_eq!(n_groups, store.fragments.len(), "one row group per cell file");
+        assert_eq!(store.part_cols, vec![CELL_COLUMN.to_string()]);
+        let table = LayerTable::new(
+            Arc::clone(&store),
+            rg_meta.map(|(_, b)| Arc::new(b)),
+        );
+
+        let plan = rt.block_on(table.scan(&state, None, &[], None)).unwrap();
+        assert_eq!(scan_of(&plan), n_groups, "no filter reads the whole leaf level");
+
+        // One cell: its own file and nothing else.
+        let one = col(CELL_COLUMN).eq(lit(f.r7[0].to_string()));
+        assert_eq!(
+            table.supports_filters_pushdown(&[&one]).unwrap(),
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+        let plan = rt.block_on(table.scan(&state, None, std::slice::from_ref(&one), None)).unwrap();
+        assert_eq!(scan_of(&plan), 1);
+
+        // The cell the writer split: no file of its own, but the query
+        // still reaches the child it was split into.
+        let split = col(CELL_COLUMN).eq(lit(f.split.to_string()));
+        let plan = rt.block_on(table.scan(&state, None, std::slice::from_ref(&split), None)).unwrap();
+        assert_eq!(scan_of(&plan), 1, "the r8 child answers for its parent");
+
+        // A cell the pyramid does not hold.
+        let elsewhere = h3o::LatLng::new(-33.9, 151.2)
+            .unwrap()
+            .to_cell(h3o::Resolution::Seven);
+        let none = col(CELL_COLUMN).eq(lit(elsewhere.to_string()));
+        let plan = rt.block_on(table.scan(&state, None, std::slice::from_ref(&none), None)).unwrap();
+        assert_eq!(scan_of(&plan), 0);
+
+        // An overview on screen: derived features, so the table is empty
+        // and the plan line says why.
+        let wide = crate::data::loader::ViewHint {
+            rect: {
+                let ll = h3o::LatLng::from(f.r5[0]);
+                [ll.lng() - 1.0, ll.lat() - 1.0, ll.lng() + 1.0, ll.lat() + 1.0]
+            },
+            view_px: 1600.0,
+        };
+        let (ov, _crs, _info, ov_boxes) =
+            crate::data::loader::open_store_with_view_for_test(&f.source(), Some(wide)).unwrap();
+        assert!(ov.pyramid.as_ref().unwrap().is_overview());
+        let ov = Arc::new(ov);
+        let table = LayerTable::new(Arc::clone(&ov), ov_boxes.map(|(_, b)| Arc::new(b)));
+        let plan = rt.block_on(table.scan(&state, None, &[], None)).unwrap();
+        assert_eq!(scan_of(&plan), 0, "SQL reads the leaf level only");
+        let scan = plan.downcast_ref::<LayerScanExec>().unwrap();
+        let shown = format!("{}", datafusion::physical_plan::displayable(scan).one_line());
+        assert!(shown.contains("SQL reads the leaf level only"), "{shown}");
     }
 
     /// Pushing an st_intersects filter must prune row groups (metadata

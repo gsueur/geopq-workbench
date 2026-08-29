@@ -34,7 +34,16 @@ so it doubles as a hands-on guide to GeoParquet best practices.
   GeoParquet (spatially sorted, indexed, zstd), in your choice of 1.1
   WKB, 1.1 GeoArrow, or 2.0 native, with optional H3 / admin-boundary
   columns and partitioned output — saved locally or published straight
-  to S3 / R2, ready to open in place from its `s3://` URI.
+  to S3 / R2, ready to open in place from its `s3://` URI. Ordering is
+  the Hilbert spatial sort, or coarse-to-fine COGP levels (experimental)
+  for readers that stream by zoom.
+- **H3 pyramid**: publish a layer as `r<res>/<cell>.parquet` files at a
+  reference H3 resolution (a density table picks it, dense cells split
+  further), plus coarser overview levels derived by simplify, prune or
+  dissolve, described by one `h3-pyramid.json`. The workbench reads it
+  back level by level, choosing the level from the zoom the way a COG
+  reader picks an overview, and any tool can address a file by cell id.
+  2.56M parcels to a dissolve pyramid in ~90 s with 0.5% overhead.
 - **Remote-native**: open `https://` and `s3://` files in place over
   range requests — or a whole `s3://bucket/prefix/` of hive-partitioned
   parts as one layer. A 304 MB file opens in ~1.3 s; only the row
@@ -69,6 +78,9 @@ so it doubles as a hands-on guide to GeoParquet best practices.
 - **No barriers to entry**: browse public catalogs from the app, and a
   pure-Rust importer for GeoPackage, Shapefile and GeoJSON (no GDAL) if
   your data is not in GeoParquet yet.
+- **Scriptable**: `geopq-cli` runs the same import and Optimize pipeline
+  headless (no window, no GPU) for cron jobs and batch refreshes,
+  including hive and adaptive-H3 partitioning.
 
 ## Install
 
@@ -283,8 +295,9 @@ Beyond the rewrite itself:
 - **Derived columns**: an H3 cell column at your chosen resolution, and
   admin attribution (state, county, …) from any loaded boundary layer.
 - **Partitioned output**: hive directories by chosen fields
-  (`state=MA/part-0.parquet`) or adaptive H3 cells that split until each
-  file is under a row target. Every part keeps the full treatment.
+  (`state=MA/part-0.parquet`), adaptive H3 cells that split until each
+  file is under a row target, or an H3 pyramid that adds derived
+  coarser levels on top. Every part keeps the full treatment.
 - **Ordering**: the usual Hilbert spatial sort, or coarse-to-fine
   levels (COGP), which order the file so a reader fetches only the
   leading row groups its zoom needs. See below.
@@ -310,6 +323,48 @@ row for the sort index, more when H3, an admin join, partitioning or
 COGP levels add derived columns — COGP costs 59 bytes a row on top,
 most of it the point-thinning grid) rather than the file size, so there is no size cap — a
 rewrite is refused only when the row count alone would not fit.
+
+### H3 pyramid
+
+The Export dialog's fourth partition mode writes the layer as an
+H3-addressed pyramid: a leaf level holding the source features one file
+per cell, plus coarser levels holding features derived from the next
+finer one, so a reader picks a level by zoom the way it picks a COG
+overview.
+
+```
+<root>/
+  h3-pyramid.json          root descriptor: levels, cells, methods, CRS
+  collection.json          the usual STAC collection, written on publish
+  r5/852a3067fffffff.parquet   overview level, derived
+  r8/882a3066d1fffff.parquet   leaf level, source features verbatim
+  r8/__HIVE_DEFAULT_PARTITION__.parquet   null geometries
+```
+
+The leaf level is the adaptive-H3 split started at a reference
+resolution you pick against a density table the dialog computes from the
+layer itself: cells, median and max rows per cell, and the resulting
+file count, for r3 to r10. Cells over the row target are replaced by
+their children, which appear under their own resolution directory.
+
+Three ways to derive an overview level, chosen once for the whole
+pyramid:
+
+- **simplify**: every feature kept, Douglas-Peucker at half the level's
+  ground sample distance; topology is not preserved and Z is dropped.
+- **prune**: fewer features, the largest by bbox diagonal (or by a rank
+  column), a quarter of each level by default, or one in x.
+- **dissolve**: polygons unioned per child cell, carrying `count`,
+  `area_sum` in metres squared and an optional `majority:<column>`.
+
+`auto` picks per geometry family: points prune, lines simplify then
+prune, polygons dissolve.
+
+Overview levels are derived data, never the source. Every overview file
+carries a `geopq:pyramid` metadata key saying which resolution it is,
+which method made it and which level it came from, so a file opened
+alone still says that what it holds is approximate. Full detail only
+ever lives at the leaf.
 
 ### Coarse-to-fine levels (COGP)
 

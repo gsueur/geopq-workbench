@@ -90,6 +90,8 @@ enum OptMsg {
     /// Distinct-value counts for partition-field candidates, tagged with
     /// the layer they were scanned for (the dialog may have moved on).
     Cardinalities(u64, std::collections::HashMap<String, usize>),
+    /// Feature centroids for the pyramid density table, same tagging.
+    Centroids(u64, Result<Arc<Vec<Option<(f64, f64)>>>, String>),
 }
 
 /// State of the per-layer "Optimize" export dialog (one at a time).
@@ -99,6 +101,47 @@ enum PartMode {
     None,
     Fields,
     AdaptiveH3,
+    /// An H3 pyramid: the leaf level plus derived overview levels.
+    Pyramid,
+}
+
+/// The pyramid controls of the optimize dialog, and the density table
+/// the reference resolution is chosen against.
+struct PyramidUi {
+    opts: crate::data::optimize::PyramidOptions,
+    /// Feature centroids, scanned once per layer so the table can be
+    /// rebuilt as the knobs move. Twenty-four bytes a row while the
+    /// dialog is open, which is what answering "how many files at r7?"
+    /// without a trial run costs.
+    centroids: Option<Arc<Vec<Option<(f64, f64)>>>>,
+    scanning: bool,
+    density: Vec<crate::data::partition::DensityRow>,
+    /// The (target rows, max res) the table was built for.
+    density_key: (usize, u8),
+    /// The reference resolution has been preselected from the table.
+    preselected: bool,
+    error: Option<String>,
+}
+
+impl Default for PyramidUi {
+    fn default() -> Self {
+        let opts = crate::data::optimize::PyramidOptions {
+            // Three levels of overviews below the leaf, the brief's
+            // default; the reference resolution is preselected from the
+            // density table as soon as it arrives.
+            from_res: Some(5),
+            ..Default::default()
+        };
+        Self {
+            opts,
+            centroids: None,
+            scanning: false,
+            density: Vec::new(),
+            density_key: (0, 0),
+            preselected: false,
+            error: None,
+        }
+    }
 }
 
 /// A load the loader paused at the quality gate: the opened store plus
@@ -143,6 +186,7 @@ struct OptimizeState {
     part_mode: PartMode,
     part_fields: Vec<String>,
     adaptive_target: usize,
+    pyramid: PyramidUi,
     /// Quality-gate flow: when the export completes, open the optimized
     /// file as a layer automatically.
     open_result: bool,
@@ -2161,6 +2205,53 @@ impl ViewerApp {
                         }
                     }
                 }
+                LoadMsg::LevelSwitched {
+                    layer_id,
+                    generation,
+                    level,
+                    store,
+                    rg_bboxes,
+                    files,
+                    geometry,
+                    loaded,
+                    rows,
+                    bad_geoms,
+                    build_ms,
+                } => {
+                    self.appending.remove(&layer_id);
+                    self.part_appending.remove(&layer_id);
+                    self.append_cancel.remove(&layer_id);
+                    // Row-group indices mean something else now, and the
+                    // selection was keyed by them.
+                    self.clear_selection();
+                    if let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id)
+                        && l.generation == generation
+                    {
+                        log::info!(
+                            "{}: pyramid level r{level}, {files} part file(s), \
+                             {rows} features in {build_ms} ms",
+                            l.name
+                        );
+                        // The store, the boxes, the decode state and
+                        // the sections all change together: a level
+                        // is a different set of files, so leaving any
+                        // one of them behind would point the layer at
+                        // row groups that no longer exist.
+                        l.store = store;
+                        l.rg_bboxes = *rg_bboxes;
+                        l.sections = vec![geometry];
+                        l.draw_gen += 1;
+                        l.loaded = loaded;
+                        l.feature_count = rows;
+                        // A row filter selected rows of the level
+                        // that just went away.
+                        l.filter = None;
+                        l.info.files = files;
+                        l.stats.build_ms = build_ms;
+                        l.stats.bad_geoms = bad_geoms;
+                    }
+                    release_freed_memory();
+                }
                 LoadMsg::AppendEnded { layer_id, error } => {
                     self.appending.remove(&layer_id);
                     self.append_cancel.remove(&layer_id);
@@ -2842,9 +2933,54 @@ impl ViewerApp {
         ((self.last_view_world[2] - self.last_view_world[0]) * self.camera.scale()).max(1.0)
     }
 
+    /// Move pyramid layers to the level this viewport calls for.
+    ///
+    /// The COGP twin of this is a filter inside refinement, because a
+    /// COGP level is a prefix of row groups the store already holds. A
+    /// pyramid level is a different set of *files*, so it has to be
+    /// planned and opened like a part append — and it takes the same
+    /// in-flight slot, for the same reason: a pass either changes what
+    /// the layer holds or refines what is in it, never both.
+    fn switch_pyramid_levels(&mut self, ctx: &egui::Context) {
+        let view = self.last_view_world;
+        let view_px = self.view_px_width();
+        for l in &self.layers {
+            if l.store.pyramid.is_none()
+                || !l.style.visible
+                || l.mode == crate::data::layer::LayerMode::Direct
+                || self.appending.contains(&l.id)
+                || self.rebuilding.contains(&l.id)
+                || self.part_hold.contains(&l.id)
+            {
+                continue;
+            }
+            self.appending.insert(l.id);
+            self.part_appending.insert(l.id);
+            self.refine_epoch.insert(l.id, self.cam_epoch);
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.append_cancel.insert(l.id, Arc::clone(&cancel));
+            loader::spawn_pyramid_level(
+                LoaderHandle {
+                    tx: self.load_tx.clone(),
+                    egui_ctx: ctx.clone(),
+                },
+                l.id,
+                l.generation,
+                l.store.clone(),
+                l.crs.clone(),
+                self.display.clone(),
+                view,
+                view_px,
+                cancel,
+                l.style.style_by.clone(),
+            );
+        }
+    }
+
     fn refine_partial_layers(&mut self, ctx: &egui::Context) {
         use crate::data::layer::GroupLoad;
         use crate::data::loader::{complement_ranges, GroupSel};
+        self.switch_pyramid_levels(ctx);
         self.append_parts_for_view(ctx);
         let view = self.last_view_world;
         for l in &self.layers {
@@ -4149,6 +4285,27 @@ impl ViewerApp {
                             .small(),
                         );
                     }
+                    // A pyramid overview holds features derived from
+                    // the level below it — dissolved, pruned or
+                    // simplified — so it is approximated content and
+                    // says so whether or not the layer is partial
+                    // (docs/OPEN_POLICY.md invariant 1). The leaf level
+                    // is the source's own rows and badges nothing.
+                    if let Some(badge) = crate::data::pyramid::layer_badge(
+                        l.store.pyramid.as_ref(),
+                        l.info.pyramid_file.as_ref(),
+                    ) {
+                        ui.label(
+                            RichText::new(badge)
+                                .color(Color32::from_rgb(242, 140, 26))
+                                .small(),
+                        )
+                        .on_hover_text(
+                            "derived features, not the source rows: their attributes \n\
+                             are the overview's own (count, area_sum, majority).\n\
+                             Zoom in and the layer reads the leaf level.",
+                        );
+                    }
                     if l.is_partial() && l.filter.is_none() {
                         ui.horizontal(|ui| {
                             let preview = l.preview_rgs();
@@ -4377,6 +4534,7 @@ impl ViewerApp {
                         part_mode: PartMode::None,
                         part_fields: Vec::new(),
                         adaptive_target: 1_000_000,
+                        pyramid: PyramidUi::default(),
                         cardinalities: None,
                         card_pending: false,
                         open_result: false,
@@ -7436,6 +7594,15 @@ impl ViewerApp {
                         o.card_pending = false;
                     }
                 }
+                OptMsg::Centroids(id, r) => {
+                    if o.layer_id == id {
+                        o.pyramid.scanning = false;
+                        match r {
+                            Ok(c) => o.pyramid.centroids = Some(c),
+                            Err(e) => o.pyramid.error = Some(e),
+                        }
+                    }
+                }
             }
         }
         if let Some(path) = open_result {
@@ -7556,7 +7723,10 @@ impl ViewerApp {
                 target_rows: o.adaptive_target,
                 max_res: 10,
             },
+            PartMode::Pyramid => PartitionBy::None,
         };
+        // The pyramid owns the layout instead of the partition plan.
+        o.opts.pyramid = (o.part_mode == PartMode::Pyramid).then(|| o.pyramid.opts.clone());
         if o.admin_layer.is_some() && o.admin_column.is_empty() {
             o.running = false;
             o.error = Some("pick the boundary layer's value column".into());
@@ -7878,6 +8048,7 @@ impl ViewerApp {
         });
         let Some(o) = &mut self.optimize else { return };
         let layer_id = o.layer_id;
+        let (o_src, o_epsg) = (o.src.clone(), o.epsg);
         let mut open = true;
         let mut start: Option<PathBuf> = None;
         // The output picker is a native dialog and cannot open from inside
@@ -7890,6 +8061,9 @@ impl ViewerApp {
         let mut load_remote: Option<S3Dest> = None;
         let mut close = false;
         let mut want_cards = false;
+        // (source, CRS hint) of the density scan, captured while the
+        // dialog state is still borrowed.
+        let mut want_density: Option<(Source, Option<u32>)> = None;
         egui::Window::new(format!("Export — {}", o.layer_name))
             .id(egui::Id::new("optimize_dialog"))
             .open(&mut open)
@@ -7998,6 +8172,35 @@ impl ViewerApp {
                                     .collect::<Vec<_>>()
                                     .join(", "),
                             );
+                        }
+                        // One row per pyramid level, coarse to fine: what
+                        // each level costs is the whole question a
+                        // pyramid asks the user to answer.
+                        for l in &rep.pyramid_levels {
+                            row(
+                                ui,
+                                &format!(
+                                    "r{} ({})",
+                                    l.res,
+                                    l.method.map(|m| m.label()).unwrap_or("source")
+                                ),
+                                format!(
+                                    "{} files · {} rows · {}",
+                                    fmt_count(l.files),
+                                    fmt_count(l.rows as usize),
+                                    fmt_bytes(l.bytes)
+                                ),
+                            );
+                        }
+                        if let Some(pct) = rep.pyramid_overhead_pct() {
+                            row(
+                                ui,
+                                "overview overhead",
+                                format!("{pct:.1}% of the leaf level"),
+                            );
+                        }
+                        if let Some(n) = &rep.pyramid_note {
+                            row(ui, "pyramid", n.clone());
                         }
                     });
                     ui.add_space(6.0);
@@ -8371,6 +8574,12 @@ impl ViewerApp {
                                  row target — balanced, non-overlapping spatial \
                                  partitions when no natural field exists",
                             );
+                        ui.radio_value(&mut o.part_mode, PartMode::Pyramid, "pyramid")
+                            .on_hover_text(
+                                "Adaptive H3 for the full-detail level, plus coarser \
+                                 levels of derived features a reader picks by zoom — \
+                                 what a COG gets from its overviews",
+                            );
                     });
                     match o.part_mode {
                         PartMode::None => {}
@@ -8445,6 +8654,312 @@ impl ViewerApp {
                                         .range(10_000..=10_000_000)
                                         .speed(10_000),
                                 );
+                            });
+                        }
+                        PartMode::Pyramid => {
+                            use crate::data::optimize::{MethodChoice, PruneMode};
+                            use crate::data::partition as part;
+                            let p = &mut o.pyramid;
+                            if p.centroids.is_none() && !p.scanning && p.error.is_none() {
+                                p.scanning = true;
+                                want_density = Some((o_src.clone(), o_epsg));
+                            }
+                            // The table depends on the row target and on how
+                            // far splitting may go; rebuild it when either
+                            // settles, not on every frame of a drag.
+                            let key = (
+                                p.opts.target_rows,
+                                if p.opts.adaptive { p.opts.max_res } else { p.opts.reference_res },
+                            );
+                            if let Some(c) = p.centroids.clone()
+                                && p.density_key != key
+                                && !ui.ctx().input(|i| i.pointer.any_down())
+                            {
+                                match part::density_table(&c, key.0, key.1) {
+                                    Ok(t) => p.density = t,
+                                    Err(e) => p.error = Some(e),
+                                }
+                                p.density_key = key;
+                                // The brief's preselection: the coarsest
+                                // resolution whose fullest cell already fits
+                                // the row target, so splitting has nothing
+                                // left to do.
+                                if !p.preselected {
+                                    if let Some(row) =
+                                        p.density.iter().find(|r| r.max_rows <= p.opts.target_rows)
+                                    {
+                                        p.opts.reference_res = row.res;
+                                        p.opts.from_res = Some(row.res.saturating_sub(3));
+                                        p.opts.max_res = (row.res + 2).min(10);
+                                    }
+                                    p.preselected = true;
+                                }
+                            }
+
+                            ui.horizontal_top(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label("reference res:");
+                                        let mut r = p.opts.reference_res;
+                                        egui::ComboBox::from_id_salt("pyr_ref_res")
+                                            .selected_text(format!(
+                                                "r{r} ({})",
+                                                part::h3_res_hint(r)
+                                            ))
+                                            .width(160.0)
+                                            .show_ui(ui, |ui| {
+                                                for c in part::DENSITY_RES {
+                                                    ui.selectable_value(
+                                                        &mut r,
+                                                        c,
+                                                        format!("r{c} ({})", part::h3_res_hint(c)),
+                                                    );
+                                                }
+                                            });
+                                        if r != p.opts.reference_res {
+                                            p.opts.reference_res = r;
+                                            p.opts.max_res = (r + 2).min(10);
+                                            if p.opts.from_res.is_some() {
+                                                p.opts.from_res = Some(r.saturating_sub(3));
+                                            }
+                                        }
+                                    });
+                                    let upto = p.opts.max_res;
+                                    ui.checkbox(
+                                        &mut p.opts.adaptive,
+                                        format!("split denser cells further (up to r{upto})"),
+                                    )
+                                    .on_hover_text(
+                                        "A reference cell over the row target is \
+                                         replaced by its children, so no leaf file \
+                                         ends up far bigger than the others",
+                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.label("target rows per file:");
+                                        ui.add(
+                                            egui::DragValue::new(&mut p.opts.target_rows)
+                                                .range(1_000..=10_000_000)
+                                                .speed(5_000),
+                                        );
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("overview levels from:");
+                                        let r = p.opts.reference_res;
+                                        egui::ComboBox::from_id_salt("pyr_from_res")
+                                            .selected_text(match p.opts.from_res {
+                                                None => "none (leaf only)".to_string(),
+                                                Some(f) => format!("r{f}"),
+                                            })
+                                            .width(130.0)
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut p.opts.from_res,
+                                                    None,
+                                                    "none (leaf only)",
+                                                );
+                                                for c in 0..r {
+                                                    ui.selectable_value(
+                                                        &mut p.opts.from_res,
+                                                        Some(c),
+                                                        format!("r{c}"),
+                                                    );
+                                                }
+                                            });
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("method:");
+                                        egui::ComboBox::from_id_salt("pyr_method")
+                                            .selected_text(p.opts.method.label())
+                                            .width(110.0)
+                                            .show_ui(ui, |ui| {
+                                                for m in [
+                                                    MethodChoice::Auto,
+                                                    MethodChoice::Simplify,
+                                                    MethodChoice::Prune,
+                                                    MethodChoice::Dissolve,
+                                                ] {
+                                                    ui.selectable_value(
+                                                        &mut p.opts.method,
+                                                        m,
+                                                        m.label(),
+                                                    )
+                                                    .on_hover_text(m.hint());
+                                                }
+                                            });
+                                    });
+                                    ui.label(
+                                        RichText::new(p.opts.method.hint()).weak().small(),
+                                    );
+                                });
+                                ui.add_space(10.0);
+                                ui.vertical(|ui| {
+                                    if p.scanning {
+                                        ui.label(
+                                            RichText::new("measuring density…").weak().small(),
+                                        );
+                                    } else if let Some(e) = &p.error {
+                                        ui.label(RichText::new(e).weak().small());
+                                    } else {
+                                        egui::Grid::new("pyr_density")
+                                            .num_columns(5)
+                                            .spacing([10.0, 1.0])
+                                            .striped(true)
+                                            .show(ui, |ui| {
+                                                for h in
+                                                    ["res", "cells", "median", "max", "files"]
+                                                {
+                                                    ui.label(RichText::new(h).weak().small());
+                                                }
+                                                ui.end_row();
+                                                for row in &p.density {
+                                                    let sel = row.res == p.opts.reference_res;
+                                                    let cell = |ui: &mut egui::Ui, t: String| {
+                                                        let t = RichText::new(t).small();
+                                                        ui.label(if sel { t.strong() } else { t });
+                                                    };
+                                                    cell(ui, format!("r{}", row.res));
+                                                    cell(ui, fmt_count(row.cells));
+                                                    cell(ui, fmt_count(row.median_rows));
+                                                    cell(ui, fmt_count(row.max_rows));
+                                                    cell(ui, fmt_count(row.files));
+                                                    ui.end_row();
+                                                }
+                                            });
+                                    }
+                                });
+                            });
+
+                            ui.collapsing("Advanced", |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("finest split resolution:");
+                                    let r = p.opts.reference_res;
+                                    let mut m = p.opts.max_res.max(r);
+                                    egui::ComboBox::from_id_salt("pyr_max_res")
+                                        .selected_text(format!("r{m}"))
+                                        .width(70.0)
+                                        .show_ui(ui, |ui| {
+                                            // Capped at r10: the density
+                                            // table computes its file counts
+                                            // from r10 cells, and a split
+                                            // finer than it can see would
+                                            // make the table a lie.
+                                            for c in r..=10 {
+                                                ui.selectable_value(&mut m, c, format!("r{c}"));
+                                            }
+                                        });
+                                    p.opts.max_res = m.max(r);
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("simplify tolerance:");
+                                    ui.add(
+                                        egui::DragValue::new(
+                                            &mut p.opts.simplify_tolerance_factor,
+                                        )
+                                        .range(0.0..=4.0)
+                                        .speed(0.05),
+                                    );
+                                    ui.label(
+                                        RichText::new("× the level's ground sample distance")
+                                            .weak()
+                                            .small(),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("prune keeps:");
+                                    let one_in = matches!(p.opts.prune.mode, PruneMode::OneIn(_));
+                                    if ui.radio(!one_in, "the largest").clicked() {
+                                        p.opts.prune.mode = PruneMode::Largest;
+                                    }
+                                    if ui.radio(one_in, "one in").clicked() {
+                                        p.opts.prune.mode = PruneMode::OneIn(4);
+                                    }
+                                    match &mut p.opts.prune.mode {
+                                        PruneMode::Largest => {
+                                            ui.add(
+                                                egui::DragValue::new(
+                                                    &mut p.opts.prune.keep_fraction,
+                                                )
+                                                .range(0.01..=1.0)
+                                                .speed(0.01),
+                                            )
+                                            .on_hover_text("share of each level kept");
+                                        }
+                                        PruneMode::OneIn(x) => {
+                                            ui.add(
+                                                egui::DragValue::new(x).range(2..=100).speed(1),
+                                            );
+                                        }
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("prune rank column:");
+                                    let cur = p
+                                        .opts
+                                        .prune
+                                        .rank
+                                        .as_ref()
+                                        .map(|(n, _)| n.clone())
+                                        .unwrap_or_else(|| "(bbox size)".into());
+                                    egui::ComboBox::from_id_salt("pyr_rank")
+                                        .selected_text(cur)
+                                        .width(140.0)
+                                        .show_ui(ui, |ui| {
+                                            if ui
+                                                .selectable_label(
+                                                    p.opts.prune.rank.is_none(),
+                                                    "(bbox size)",
+                                                )
+                                                .clicked()
+                                            {
+                                                p.opts.prune.rank = None;
+                                            }
+                                            for c in &candidates {
+                                                let on = p
+                                                    .opts
+                                                    .prune
+                                                    .rank
+                                                    .as_ref()
+                                                    .is_some_and(|(n, _)| n == c);
+                                                if ui.selectable_label(on, c).clicked() {
+                                                    p.opts.prune.rank = Some((
+                                                        c.clone(),
+                                                        crate::data::optimize::RankOrder::Desc,
+                                                    ));
+                                                }
+                                            }
+                                        });
+                                    if let Some((_, order)) = &mut p.opts.prune.rank {
+                                        use crate::data::optimize::RankOrder;
+                                        ui.selectable_value(order, RankOrder::Desc, "highest");
+                                        ui.selectable_value(order, RankOrder::Asc, "lowest");
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("dissolve majority column:");
+                                    let cur = p
+                                        .opts
+                                        .dissolve
+                                        .majority_column
+                                        .clone()
+                                        .unwrap_or_else(|| "(none)".into());
+                                    egui::ComboBox::from_id_salt("pyr_majority")
+                                        .selected_text(cur)
+                                        .width(140.0)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut p.opts.dissolve.majority_column,
+                                                None,
+                                                "(none)",
+                                            );
+                                            for c in &candidates {
+                                                ui.selectable_value(
+                                                    &mut p.opts.dissolve.majority_column,
+                                                    Some(c.clone()),
+                                                    c,
+                                                );
+                                            }
+                                        });
+                                });
                             });
                         }
                     }
@@ -8641,8 +9156,13 @@ impl ViewerApp {
                                     )));
                                 }
                             } else {
+                                let suffix = if o.part_mode == PartMode::Pyramid {
+                                    "pyramid"
+                                } else {
+                                    "partitioned"
+                                };
                                 o.s3_uri = if needs_name {
-                                    format!("{uri}/{stem}_partitioned/")
+                                    format!("{uri}/{stem}_{suffix}/")
                                 } else {
                                     format!("{uri}/")
                                 };
@@ -8688,6 +9208,17 @@ impl ViewerApp {
                     }
                 }
             }
+        }
+        // Feature centroids for the density table: one projected scan on
+        // a worker thread, the first time "pyramid" is selected.
+        if let Some((src, epsg)) = want_density {
+            let tx = self.opt_tx.clone();
+            let egui_ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let r = crate::data::optimize::scan_centroids(&src, epsg).map(Arc::new);
+                let _ = tx.send(OptMsg::Centroids(layer_id, r));
+                egui_ctx.request_repaint();
+            });
         }
         if let Some((dir, stem, partitioned)) = want_output {
             let what = if partitioned {
@@ -9911,6 +10442,7 @@ impl ViewerApp {
                         part_mode: PartMode::None,
                         part_fields: Vec::new(),
                         adaptive_target: 1_000_000,
+                        pyramid: PyramidUi::default(),
                         cardinalities: None,
                         card_pending: false,
                         open_result: true,
@@ -10005,6 +10537,30 @@ impl ViewerApp {
                         }
                         if let Some(c) = &info.geo.cogp {
                             row(ui, "cloud-optimized", c.clone());
+                        }
+                        // The pyramid this layer is one level of, and
+                        // which level that is — an overview is derived
+                        // data and has to say so wherever it is named.
+                        if let Some(p) = &info.pyramid {
+                            let level = match layer.store.pyramid.as_ref() {
+                                Some(st) => format!(
+                                    " — reading {}",
+                                    st.badge().unwrap_or_else(|| format!("leaf r{}", st.active_res))
+                                ),
+                                None => String::new(),
+                            };
+                            row(ui, "H3 pyramid", format!("{p}{level}"));
+                        } else if let Some(m) = &info.pyramid_file {
+                            row(
+                                ui,
+                                "H3 pyramid",
+                                format!(
+                                    "one overview file: r{} ({}, derived from r{})",
+                                    m.res,
+                                    m.method.label(),
+                                    m.source_res
+                                ),
+                            );
                         }
                         if let Some(rg) = &layer.rg_bboxes {
                             row(
