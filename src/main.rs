@@ -1,15 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
-mod context;
-mod cookbook;
-mod data;
-mod map;
-mod picking;
-mod sql;
-mod theme;
-
 use eframe::egui;
+use geopq_workbench::{app, data, map};
 
 /// Window/taskbar icon, embedded at build time (macOS Dock needs an .app
 /// bundle with assets/geopq-workbench.icns instead).
@@ -35,7 +27,7 @@ fn main() -> eframe::Result {
 
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
-        multisampling: crate::map::renderer::MSAA_SAMPLES as u16,
+        multisampling: map::renderer::MSAA_SAMPLES as u16,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1480.0, 940.0])
             .with_min_inner_size([800.0, 500.0])

@@ -906,7 +906,7 @@ fn xy_struct(x: &ArrayRef, y: &ArrayRef) -> Result<ArrayRef, String> {
 }
 
 /// Where one output column of a [`GroupReader::Xy`] batch comes from.
-pub(crate) enum XyColSrc {
+pub enum XyColSrc {
     /// Position in the decoded file batch.
     Read(usize),
     /// The virtual geometry, assembled from these batch positions.
