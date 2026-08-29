@@ -7647,6 +7647,130 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+
+    /// The round trip: what the writer publishes is what the reader
+    /// picks up. One pyramid — reference r6, no adaptive splitting,
+    /// dissolve overviews from r4 — read back at three ground scales,
+    /// with the descriptor, the per-file `geopq:pyramid` keys and the
+    /// scorecard all checked from the reader's side rather than from
+    /// the writer's own bookkeeping.
+    #[test]
+    fn a_written_pyramid_reads_back_level_by_level() {
+        use crate::data::loader::{open_store_with_view_for_test, ViewHint};
+        use crate::data::pyramid::{self, Descriptor, FileMeta, Method};
+        use crate::data::quality::Status;
+
+        let dir = std::env::temp_dir().join(format!("geopq_pyr_rt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let features = pyramid_fixture(&dir.join("src.parquet")) as u64;
+        let (root, _rep) = write_pyramid(
+            &dir,
+            "out",
+            PyramidOptions {
+                reference_res: 6,
+                adaptive: false,
+                max_res: 6,
+                target_rows: 20,
+                from_res: Some(4),
+                method: MethodChoice::Dissolve,
+                ..Default::default()
+            },
+        );
+        let desc: Descriptor = read_descriptor(&root);
+        desc.validate().unwrap();
+        assert_eq!(desc.rows, Some(features + 1), "the fixture's null-geometry row too");
+
+        // The descriptor names exactly the parquet files on disk. The
+        // STAC collection beside them is not one of its own, and
+        // `pyramid_parts` does not count it.
+        let mut listed = desc.files();
+        listed.sort();
+        assert_eq!(listed, pyramid_parts(&root));
+
+        const LINE: &str = "leaf r6, overviews r4..r5 (dissolve), 64 px/cell";
+        let cells_at = |res: u8| {
+            desc.levels.iter().find(|l| l.res == res).expect("level listed").cells.len()
+        };
+        // Zooming, as the app does it: one viewport width in pixels, a
+        // rect that shrinks around the data as the ground scale gets
+        // finer. Every one of these covers the whole fixture, so only
+        // the level changes.
+        let view = |gsd: f64| {
+            let (cx, cy): (f64, f64) = (2.395, 48.895);
+            let view_px = 1600.0;
+            let half = gsd * view_px / (111_320.0 * cy.to_radians().cos()) / 2.0;
+            ViewHint { rect: [cx - half, cy - half, cx + half, cy + half], view_px }
+        };
+        // r4 cells are ~22.6 km across, r5 ~8.5 km, r6 ~3.2 km; at 64
+        // pixels per cell edge that is ~353, ~133 and ~50 m/px.
+        let read = |gsd: f64| {
+            open_store_with_view_for_test(&Source::Dir(root.clone()), Some(view(gsd))).unwrap()
+        };
+
+        // Coarse: the r4 overview, every cell of it, each file saying
+        // it was dissolved from r5.
+        let (store, _crs, info, _) = read(300.0);
+        let p = store.pyramid.as_ref().expect("the reader found h3-pyramid.json");
+        assert_eq!(p.active_res, 4);
+        assert_eq!(p.info_line(), LINE);
+        assert_eq!(info.pyramid.as_deref(), Some(LINE));
+        assert_eq!(p.badge().as_deref(), Some("overview r4 (dissolve)"));
+        assert_eq!(store.fragments.len(), cells_at(4));
+        for frag in &store.fragments {
+            let kv = frag
+                .meta
+                .metadata()
+                .file_metadata()
+                .key_value_metadata()
+                .expect("file metadata")
+                .iter()
+                .find(|kv| kv.key == pyramid::FILE_KEY)
+                .unwrap_or_else(|| panic!("no {} key", pyramid::FILE_KEY));
+            let meta: FileMeta = serde_json::from_str(kv.value.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                meta,
+                FileMeta { res: 4, method: Method::Dissolve, source_res: 5, derived: true }
+            );
+        }
+        let c9 = info
+            .quality
+            .as_ref()
+            .unwrap()
+            .checks
+            .iter()
+            .find(|c| c.code == "C9")
+            .expect("C9 on the scorecard");
+        assert_eq!(c9.status, Status::Pass, "{}", c9.detail);
+        assert!(c9.detail.starts_with(LINE), "{}", c9.detail);
+        assert!(
+            c9.detail.contains(&format!("all {} listed files present", listed.len())),
+            "{}",
+            c9.detail
+        );
+
+        // Mid: the r5 overview, dissolved from the leaf.
+        let (store, ..) = read(100.0);
+        let p = store.pyramid.as_ref().unwrap();
+        assert_eq!(p.active_res, 5);
+        assert_eq!(p.badge().as_deref(), Some("overview r5 (dissolve)"));
+        assert_eq!(store.fragments.len(), cells_at(5));
+
+        // Fine: the leaf, badging nothing, holding every source feature
+        // exactly once. The null-geometry row is the one thing missing:
+        // it draws nothing, so it stays out of viewport plans, and the
+        // descriptor's own row count is the one that accounts for it.
+        let (store, _crs, info, _) = read(20.0);
+        let p = store.pyramid.as_ref().unwrap();
+        assert_eq!(p.active_res, desc.leaf.res);
+        assert_eq!(p.badge(), None);
+        assert!(!p.is_overview());
+        assert_eq!(store.fragments.len(), cells_at(6));
+        assert_eq!(store.total_rows(), features);
+        assert!(info.pyramid_file.is_none(), "a leaf file is not derived from anything");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Simplification keeps every feature and drops vertices. A polygon
     /// that simplifies past its own outline comes back as its bounding
     /// box rather than vanishing.
