@@ -7959,7 +7959,10 @@ impl ViewerApp {
                             "Native geo statistics replace the covering column for pruning;\n\
                              needs GeoParquet 2.0 aware readers.\n\
                              Selecting it applies the official recommended settings;\n\
-                             the flavor options below are workbench extras.",
+                             the flavor options below are workbench extras.\n\
+                             DuckDB spatial up to 1.4 (and everything bundling it, e.g.\n\
+                             duckdb-wasm 1.31) refuses a file whose geo block says version\n\
+                             2.0.0 outright; DuckDB 1.5 reads it.",
                         )
                         .clicked()
                     {
