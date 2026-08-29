@@ -11,6 +11,7 @@ use geo_traits::to_geo::ToGeoGeometry;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
+use parquet::arrow::ProjectionMask;
 use parquet::file::metadata::PageIndexPolicy;
 use rayon::prelude::*;
 use rstar::RTree;
@@ -1575,6 +1576,9 @@ struct FileOpen {
     hidden_wkb: Option<usize>,
     /// `edges: spherical` metadata, or a GEOGRAPHY logical type.
     spherical_edges: bool,
+    /// The geometry column holds base64 text, not WKB bytes: `schema`
+    /// already says Binary and the store decodes on read.
+    base64_wkb: bool,
 }
 
 /// Quality analysis over an opened file / merged dataset (footer facts
@@ -1835,6 +1839,7 @@ fn open_store_with_view(
     );
     store.hidden_wkb = f.hidden_wkb;
     store.spherical_edges = f.spherical_edges;
+    store.base64_wkb = f.base64_wkb;
     // Declared types only: an undeclared file stays out of the bbox
     // path rather than guessing from the first feature it decodes.
     store.polygons_only = !f.info.geo.geometry_types.is_empty()
@@ -2371,6 +2376,7 @@ fn open_multi_store(
     );
     store.hidden_wkb = first.hidden_wkb;
     store.spherical_edges = first.spherical_edges;
+    store.base64_wkb = first.base64_wkb;
     Ok((store, first.crs, info, rg_boxes))
 }
 
@@ -2427,6 +2433,9 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
     let mut encoding = GeomEncoding::Wkb;
     let mut xy: Option<(usize, usize)> = None;
     let mut spherical_edges = false;
+    // Geometry spelled as base64 text (Spark/Sedona exports): the store
+    // decodes it to WKB bytes on read.
+    let mut base64_wkb = false;
     let (geom_name, crs) = match &geo_meta {
         Some(meta) => {
             let primary = meta
@@ -2472,30 +2481,27 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
             (name, crs_from_type_string(crs_str.as_deref())?)
         }
         None => {
-            // Not GeoParquet-tagged: guess a WKB column, assume CRS84.
-            let guess = ["geometry", "geom", "wkb_geometry", "wkb"]
-                .iter()
-                .find(|n| schema.index_of(n).is_ok())
-                .map(|n| n.to_string())
-                .or_else(|| {
-                    schema
-                        .fields()
-                        .iter()
-                        .find(|f| {
-                            matches!(
-                                f.data_type(),
-                                DataType::Binary | DataType::LargeBinary | DataType::BinaryView
-                            )
-                        })
-                        .map(|f| f.name().clone())
-                });
-            match guess {
-                Some(name) => (name, Crs::wgs84()),
+            // Not GeoParquet-tagged: find a WKB column, assume CRS84.
+            //
+            // The name list is only a ranking, never a promise, and "the
+            // first binary column" is a coin flip: a thumbnail, a hash or
+            // a protobuf blob is binary too, and adopting one produces a
+            // layer of garbage instead of an honest refusal. Every
+            // candidate is probed against real values before it is taken.
+            let candidates = wkb_candidates(&schema);
+            let found = candidates
+                .into_iter()
+                .find(|&(i, b64)| probe_wkb_column(source, &arrow_meta, i, b64));
+            match found {
+                Some((i, b64)) => {
+                    base64_wkb = b64;
+                    (schema.field(i).name().clone(), Crs::wgs84())
+                }
                 None => {
                     // Last resort: coordinate columns → synthesized points.
                     let (xi, yi) = xy_columns(&schema).ok_or(
-                        "no 'geo' metadata, no binary geometry column, and no \
-                         lon/lat or x/y coordinate columns found",
+                        "no 'geo' metadata, no column whose values read as WKB \
+                         geometry, and no lon/lat or x/y coordinate columns found",
                     )?;
                     xy = Some((xi, yi));
                     encoding = GeomEncoding::Point;
@@ -2668,6 +2674,9 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
     if hidden_wkb.is_some() {
         info.geo.encoding = format!("{} + GeoArrow column (used for display)", info.geo.encoding);
     }
+    if base64_wkb {
+        info.geo.encoding = "WKB, base64 text (decoded on read)".into();
+    }
     if let Some((xi, yi)) = xy {
         info.geo.version_label = "none (points synthesized from coordinate columns)".into();
         info.geo.primary_column = "geometry (virtual)".into();
@@ -2685,6 +2694,26 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
         });
     }
 
+    // The store hands out decoded WKB bytes for a base64 column, so the
+    // schema the rest of the app plans against must already say so. The
+    // info panel's column list was built above from the file's own types,
+    // which is what that panel is for.
+    let schema = if base64_wkb {
+        let mut fields: Vec<arrow::datatypes::Field> =
+            schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+        fields[geom_col] = arrow::datatypes::Field::new(
+            fields[geom_col].name(),
+            DataType::Binary,
+            true,
+        );
+        std::sync::Arc::new(arrow::datatypes::Schema::new_with_metadata(
+            fields,
+            schema.metadata().clone(),
+        ))
+    } else {
+        schema
+    };
+
     Ok(FileOpen {
         meta: arrow_meta,
         schema,
@@ -2700,6 +2729,7 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
         geom_bytes,
         hidden_wkb,
         spherical_edges,
+        base64_wkb,
     })
 }
 
@@ -2787,6 +2817,151 @@ fn crs_from_type_string(s: Option<&str>) -> Result<Crs, String> {
     );
     crs.epsg = None;
     Ok(crs)
+}
+
+/// Column names that conventionally hold WKB geometry, matched
+/// case-insensitively when a file carries no `geo` metadata at all.
+const WKB_COLUMN_NAMES: [&str; 6] =
+    ["geometry", "geom", "wkb_geometry", "geometry_wkb", "geom_wkb", "wkb"];
+
+/// Values sampled before an untagged column is accepted as geometry.
+const WKB_PROBE_VALUES: usize = 16;
+
+/// Does `buf` open with a plausible WKB header — a byte-order flag of 0
+/// or 1 followed by a geometry type code in the ISO/EWKB set?
+///
+/// EWKB puts its Z/M/SRID flags in the top three bits of the code and ISO
+/// WKB adds 1000/2000/3000 for Z/M/ZM, so the discriminant is what is left
+/// modulo 1000: 1..=7, Point through GeometryCollection.
+fn is_wkb_header(buf: &[u8]) -> bool {
+    if buf.len() < 5 {
+        return false;
+    }
+    let code = match buf[0] {
+        0 => u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]),
+        1 => u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]),
+        _ => return false,
+    } & !(0x8000_0000 | 0x4000_0000 | 0x2000_0000);
+    code / 1000 <= 3 && (1..=7).contains(&(code % 1000))
+}
+
+/// Geometry-column candidates for a file with no `geo` metadata, best
+/// first: named binary columns, then any other binary column, then named
+/// text columns (which can only be base64 WKB). The bool is "decode
+/// base64 first".
+///
+/// Text is ranked last and only by name because an unnamed string column
+/// that happens to base64-decode is far likelier to be an opaque blob
+/// than a geometry, and unlike binary there is no cheap type signal.
+fn wkb_candidates(schema: &arrow::datatypes::SchemaRef) -> Vec<(usize, bool)> {
+    let named = |f: &arrow::datatypes::Field| {
+        WKB_COLUMN_NAMES.contains(&f.name().to_ascii_lowercase().as_str())
+    };
+    let binary = |f: &arrow::datatypes::Field| {
+        matches!(
+            f.data_type(),
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+        )
+    };
+    let text = |f: &arrow::datatypes::Field| {
+        matches!(
+            f.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        )
+    };
+    let mut out: Vec<(usize, bool)> = Vec::new();
+    let mut push = |i: usize, b64: bool| {
+        if !out.iter().any(|o| o.0 == i) {
+            out.push((i, b64));
+        }
+    };
+    for (i, f) in schema.fields().iter().enumerate() {
+        if binary(f) && named(f) {
+            push(i, false);
+        }
+    }
+    for (i, f) in schema.fields().iter().enumerate() {
+        if binary(f) {
+            push(i, false);
+        }
+    }
+    for (i, f) in schema.fields().iter().enumerate() {
+        if text(f) && named(f) {
+            push(i, true);
+        }
+    }
+    out
+}
+
+/// Read up to [`WKB_PROBE_VALUES`] non-null values of one column and test
+/// every one against [`is_wkb_header`], base64-decoding first when asked.
+/// A column with nothing to sample fails: nothing was seen, nothing is
+/// proven.
+///
+/// This is the only point in the opener that touches a data page, and it
+/// costs one page of one column. That is the price of not handing the
+/// user a map of a thumbnail column.
+fn probe_wkb_column(
+    source: &Source,
+    meta: &ArrowReaderMetadata,
+    root: usize,
+    base64: bool,
+) -> bool {
+    let Ok(reader) = source.open() else {
+        return false;
+    };
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(reader, meta.clone());
+    let mask = ProjectionMask::roots(builder.parquet_schema(), [root]);
+    let Ok(mut rdr) = builder
+        .with_projection(mask)
+        .with_batch_size(WKB_PROBE_VALUES)
+        .build()
+    else {
+        return false;
+    };
+    let want = if base64 { DataType::Utf8 } else { DataType::Binary };
+    let mut seen = 0usize;
+    while seen < WKB_PROBE_VALUES {
+        let Some(Ok(batch)) = rdr.next() else {
+            break;
+        };
+        let Ok(col) = arrow::compute::cast(batch.column(0), &want) else {
+            return false;
+        };
+        // One closure over both shapes: the base64 case decodes, the
+        // binary case is already bytes.
+        let value = |i: usize| -> Option<Option<Vec<u8>>> {
+            if base64 {
+                let a = col.as_any().downcast_ref::<arrow::array::StringArray>()?;
+                if !a.is_valid(i) {
+                    return Some(None);
+                }
+                // A named text column whose values are not base64 at all
+                // is not geometry: fail the probe, do not skip the value.
+                Some(Some(super::store::decode_base64_wkb(a.value(i))?))
+            } else {
+                let a = col.as_any().downcast_ref::<BinaryArray>()?;
+                Some(a.is_valid(i).then(|| a.value(i).to_vec()))
+            }
+        };
+        for i in 0..batch.num_rows() {
+            match value(i) {
+                Some(Some(bytes)) => {
+                    if !is_wkb_header(&bytes) {
+                        return false;
+                    }
+                    seen += 1;
+                    if seen >= WKB_PROBE_VALUES {
+                        break;
+                    }
+                }
+                // Null: neither evidence for nor against.
+                Some(None) => {}
+                None => return false,
+            }
+        }
+    }
+    seen > 0
 }
 
 /// Coordinate-column pair (x/lon, y/lat) guessed from names, for files
@@ -7415,5 +7590,179 @@ mod norm_bin_tests {
         assert_eq!(norm_bin(f64::NAN, 5.0, &breaks), 0);
         assert_eq!(norm_bin(1000.0, 0.0, &breaks), 0);
         assert_eq!(norm_bin(1000.0, -1.0, &breaks), 0);
+    }
+}
+
+/// Geometry-column detection on files with no `geo` metadata at all: the
+/// column has to prove itself, by name and then by its bytes.
+#[cfg(test)]
+mod wkb_detection_tests {
+    use super::*;
+    use arrow::array::{ArrayRef, BinaryArray, Float64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use std::fs::File;
+    use std::sync::Arc;
+
+    fn wkb_point(x: f64, y: f64) -> Vec<u8> {
+        let mut b = vec![1u8];
+        b.extend(1u32.to_le_bytes());
+        b.extend(x.to_le_bytes());
+        b.extend(y.to_le_bytes());
+        b
+    }
+
+    /// Write a file with no `geo` key from (name, array) pairs.
+    fn write(path: &std::path::Path, cols: Vec<(&str, ArrayRef)>) {
+        let fields: Vec<Field> = cols
+            .iter()
+            .map(|(n, a)| Field::new(*n, a.data_type().clone(), true))
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+        let batch =
+            RecordBatch::try_new(schema.clone(), cols.into_iter().map(|(_, a)| a).collect())
+                .unwrap();
+        let mut w = ArrowWriter::try_new(File::create(path).unwrap(), schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    /// A blob column is binary, and before the probe existed it was
+    /// adopted as geometry on sight — a map of decoded PNG headers. The
+    /// x/y columns beside it are the real answer.
+    #[test]
+    fn a_thumbnail_column_is_not_geometry() {
+        let path = std::env::temp_dir().join("geopq_thumbnail.parquet");
+        let blobs: Vec<Vec<u8>> = (0..64)
+            .map(|i| {
+                let mut v = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+                v.push(i as u8);
+                v
+            })
+            .collect();
+        let lon: Vec<f64> = (0..64).map(|i| 2.0 + i as f64 * 0.01).collect();
+        let lat: Vec<f64> = (0..64).map(|i| 48.0 + i as f64 * 0.01).collect();
+        write(
+            &path,
+            vec![
+                ("thumbnail", Arc::new(BinaryArray::from_iter_values(blobs.iter()))),
+                ("lon", Arc::new(Float64Array::from(lon))),
+                ("lat", Arc::new(Float64Array::from(lat))),
+            ],
+        );
+        let (store, crs, info, _rg) = open_store(&Source::Local(path)).unwrap();
+        assert!(store.xy_geom.is_some(), "points must come from lon/lat");
+        assert_eq!(store.encoding, GeomEncoding::Point);
+        assert!(crs.name.contains("points from"), "{}", crs.name);
+        assert!(info.geo.encoding.contains("lon"), "{}", info.geo.encoding);
+    }
+
+    /// …and with no coordinate columns to fall back on, a blob column is
+    /// an honest failure rather than a garbage layer.
+    #[test]
+    fn a_blob_only_file_refuses_to_open() {
+        let path = std::env::temp_dir().join("geopq_blob_only.parquet");
+        let blobs: Vec<Vec<u8>> = (0..64).map(|i| vec![9u8, 9, 9, 9, 9, i as u8]).collect();
+        write(
+            &path,
+            vec![("thumbnail", Arc::new(BinaryArray::from_iter_values(blobs.iter())))],
+        );
+        let err = open_store(&Source::Local(path))
+            .err()
+            .expect("a blob column is not geometry");
+        assert!(err.contains("read as WKB"), "{err}");
+    }
+
+    /// A binary column named outside the list still opens when its bytes
+    /// are WKB: the name list ranks candidates, it does not gate them.
+    #[test]
+    fn an_oddly_named_binary_column_opens_when_it_is_wkb() {
+        let path = std::env::temp_dir().join("geopq_odd_name.parquet");
+        let wkbs: Vec<Vec<u8>> = (0..64).map(|i| wkb_point(i as f64, 1.0)).collect();
+        write(
+            &path,
+            vec![("shape", Arc::new(BinaryArray::from_iter_values(wkbs.iter())))],
+        );
+        let (store, _crs, _info, _rg) = open_store(&Source::Local(path)).unwrap();
+        assert!(store.xy_geom.is_none());
+        assert_eq!(store.schema.field(store.geom_col).name(), "shape");
+    }
+
+    /// `geometry_wkb` is one of the conventional names, and a named
+    /// candidate wins over an unnamed binary column that also passes.
+    #[test]
+    fn geometry_wkb_is_a_known_name() {
+        let path = std::env::temp_dir().join("geopq_geometry_wkb.parquet");
+        let wkbs: Vec<Vec<u8>> = (0..64).map(|i| wkb_point(i as f64, 1.0)).collect();
+        write(
+            &path,
+            vec![
+                ("payload", Arc::new(BinaryArray::from_iter_values(wkbs.iter()))),
+                ("geometry_wkb", Arc::new(BinaryArray::from_iter_values(wkbs.iter()))),
+            ],
+        );
+        let (store, _crs, _info, _rg) = open_store(&Source::Local(path)).unwrap();
+        assert_eq!(store.schema.field(store.geom_col).name(), "geometry_wkb");
+    }
+
+    /// Spark / Sedona exports hand out WKB as base64 text. The store
+    /// decodes it on read, so the layer is an ordinary WKB layer.
+    #[test]
+    fn base64_wkb_text_column_opens_and_decodes() {
+        use base64::Engine as _;
+        let path = std::env::temp_dir().join("geopq_base64_wkb.parquet");
+        let b64: Vec<String> = (0..64)
+            .map(|i| {
+                base64::engine::general_purpose::STANDARD
+                    .encode(wkb_point(2.0 + i as f64 * 0.01, 48.0))
+            })
+            .collect();
+        write(
+            &path,
+            vec![("geometry", Arc::new(StringArray::from(b64)))],
+        );
+        let (store, _crs, info, _rg) = open_store(&Source::Local(path)).unwrap();
+        assert!(store.base64_wkb);
+        assert!(store.encoding.is_wkb());
+        // The schema the app plans against says bytes, not text.
+        assert_eq!(store.schema.field(store.geom_col).data_type(), &DataType::Binary);
+        assert!(info.geo.encoding.contains("base64"), "{}", info.geo.encoding);
+        // And a read really does yield decodable WKB.
+        let geoms = store.fetch_geoms(&[0, 5, 63]).unwrap();
+        assert_eq!(geoms.len(), 3);
+        for (row, g) in geoms {
+            let g = g.unwrap_or_else(|| panic!("row {row} did not decode"));
+            assert!(matches!(g, geo_types::Geometry::Point(_)));
+        }
+    }
+
+    /// Text that is not base64, in a column named `geometry`: rejected,
+    /// like any other column that fails the probe.
+    #[test]
+    fn plain_text_named_geometry_is_not_adopted() {
+        let path = std::env::temp_dir().join("geopq_text_geometry.parquet");
+        let names: Vec<String> = (0..64).map(|i| format!("feature {i}")).collect();
+        write(&path, vec![("geometry", Arc::new(StringArray::from(names)))]);
+        let err = open_store(&Source::Local(path))
+            .err()
+            .expect("a blob column is not geometry");
+        assert!(err.contains("read as WKB"), "{err}");
+    }
+
+    #[test]
+    fn wkb_header_check_accepts_iso_and_ewkb() {
+        // Little-endian point, big-endian polygon.
+        assert!(super::is_wkb_header(&wkb_point(1.0, 2.0)));
+        assert!(super::is_wkb_header(&[0, 0, 0, 0, 3]));
+        // ISO Z/M/ZM offsets, and the EWKB flag bits.
+        assert!(super::is_wkb_header(&[1, 0xE9, 0x03, 0, 0])); // 1001, PointZ
+        assert!(super::is_wkb_header(&[1, 0x01, 0, 0, 0x20])); // SRID flag
+        // Not WKB: bad byte order, unknown type, truncated.
+        assert!(!super::is_wkb_header(&[2, 1, 0, 0, 0]));
+        assert!(!super::is_wkb_header(&[1, 0x63, 0, 0, 0])); // type 99
+        assert!(!super::is_wkb_header(&[1, 0, 0, 0, 0])); // type 0
+        assert!(!super::is_wkb_header(&[1, 1, 0]));
+        assert!(!super::is_wkb_header(&[0x89, b'P', b'N', b'G', 0x0d]));
     }
 }
