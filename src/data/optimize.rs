@@ -4031,9 +4031,8 @@ fn dissolve_cell(
         if g.polys.is_empty() {
             continue; // a file of non-polygons contributes no row
         }
-        let union = geo::algorithm::bool_ops::unary_union(g.polys.iter());
-        let geom = simplify_geom(&geo_types::Geometry::MultiPolygon(union), tol);
-        geoms.push(Some(geom));
+        let union = dissolve_union(&g.polys, tol);
+        geoms.push(Some(geo_types::Geometry::MultiPolygon(union)));
         counts.push(g.count);
         areas.push(g.area);
         // Ties break on the value itself, so two runs write the same file.
@@ -4063,6 +4062,75 @@ fn dissolve_cell(
     }
     RecordBatch::try_new(ctx.dissolve_schema.clone(), cols)
         .map_err(|e| format!("dissolve batch assembly failed: {e}"))
+}
+
+/// Features unioned in one pass before the running result is
+/// generalized. Small enough that a batch's own output stays cheap to
+/// extract, large enough that a dense cell is not a thousand passes.
+const DISSOLVE_BATCH: usize = 256;
+
+/// Union many polygons into the level's geometry.
+///
+/// `unary_union` over a whole cell at once did not finish on 2.5M
+/// Massachusetts parcels: i_overlay spends its time in OGC extraction,
+/// which pairs every hole with every shell, and cadastral data unions
+/// into a blob riddled with sliver holes where neighbouring parcels do
+/// not quite meet. The ring count, not the vertex count, is what runs
+/// away.
+///
+/// So the union runs in batches with the running result generalized at
+/// the level's tolerance between them: slivers below the tolerance
+/// disappear instead of accumulating, and every batch unions a few
+/// hundred rings rather than tens of thousands. Sub-tolerance pieces are
+/// dropped rather than kept as boxes the way `simplify_geom` keeps a
+/// collapsed *feature* — here the level's feature is the union, and a
+/// fragment of it is not one.
+fn dissolve_union(polys: &[geo_types::MultiPolygon<f64>], tol: f64) -> geo_types::MultiPolygon<f64> {
+    use geo::algorithm::bool_ops::unary_union;
+    let mut acc = geo_types::MultiPolygon::new(Vec::new());
+    for (i, chunk) in polys.chunks(DISSOLVE_BATCH).enumerate() {
+        let union = if i == 0 {
+            unary_union(chunk.iter())
+        } else {
+            unary_union(chunk.iter().chain(std::iter::once(&acc)))
+        };
+        acc = generalize(union, tol);
+    }
+    acc
+}
+
+/// Simplify a dissolved union and drop what it simplifies away: pieces
+/// that lose their outline, and holes narrower than the tolerance.
+///
+/// Holes are what the extraction cost is quadratic in, and a coverage's
+/// unwanted holes are slivers: a gap where two parcels do not quite
+/// meet is long but hair-thin. So a hole goes when the shorter side of
+/// its bounding box is under the tolerance — under a pixel wide at the
+/// zoom this level is read at, whatever its length. Pieces are held to
+/// the gentler rule of having any area left, because a thin *piece* of
+/// a coverage is still coverage.
+fn generalize(mp: geo_types::MultiPolygon<f64>, tol: f64) -> geo_types::MultiPolygon<f64> {
+    use geo::{Area, BoundingRect, Simplify};
+    if !(tol.is_finite() && tol > 0.0) {
+        return mp;
+    }
+    let thin = |ls: &geo_types::LineString<f64>| match ls.bounding_rect() {
+        Some(r) => r.width().min(r.height()) < tol,
+        None => true,
+    };
+    let keep = |p: &geo_types::Polygon<f64>| -> Option<geo_types::Polygon<f64>> {
+        let out = p.simplify(tol);
+        (out.exterior().0.len() >= 4 && out.unsigned_area() > 0.0).then(|| {
+            let interiors: Vec<_> = out
+                .interiors()
+                .iter()
+                .filter(|r| r.0.len() >= 4 && !thin(r))
+                .cloned()
+                .collect();
+            geo_types::Polygon::new(out.exterior().clone(), interiors)
+        })
+    };
+    geo_types::MultiPolygon::new(mp.0.iter().filter_map(keep).collect())
 }
 
 /// One pyramid part read back for derivation.
@@ -7953,6 +8021,49 @@ mod tests {
             rep.size_after
         );
         read_descriptor(&dst).validate().unwrap();
+    }
+
+    /// The batched union has to mean what one union of everything means,
+    /// and the generalization between batches has to take the slivers
+    /// with it rather than leave them to pile up.
+    #[test]
+    fn dissolve_union_batches_and_drops_slivers() {
+        use geo::Area;
+        use geo_types::{Coord, LineString, MultiPolygon, Polygon, Rect};
+        let rect = |x0: f64, x1: f64| -> MultiPolygon<f64> {
+            MultiPolygon::new(vec![
+                Rect::new(Coord { x: x0, y: 0.0 }, Coord { x: x1, y: 1.0 }).to_polygon(),
+            ])
+        };
+        // A run of touching squares, several batches long: one piece out,
+        // the same area in and out.
+        let n = DISSOLVE_BATCH * 2 + 5;
+        let polys: Vec<MultiPolygon<f64>> =
+            (0..n).map(|i| rect(i as f64, i as f64 + 1.0)).collect();
+        let expected: f64 = n as f64;
+        let batched = dissolve_union(&polys, 0.0);
+        assert_eq!(batched.0.len(), 1, "touching squares union into one piece");
+        assert!((batched.unsigned_area() - expected).abs() < 1e-9);
+        // The same at a tolerance that cannot touch a unit square.
+        let generalized = dissolve_union(&polys, 0.1);
+        assert_eq!(generalized.0.len(), 1);
+        assert!((generalized.unsigned_area() - expected).abs() < 1e-6);
+
+        // A hole thinner than the tolerance is a sliver, not a hole.
+        let ring = |c: &[(f64, f64)]| LineString::from(c.to_vec());
+        let holed = MultiPolygon::new(vec![Polygon::new(
+            ring(&[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0), (0.0, 0.0)]),
+            // Clockwise, the winding geo and i_overlay read as a hole.
+            vec![ring(&[(10.0, 10.0), (10.0, 90.0), (10.1, 90.0), (10.1, 10.0), (10.0, 10.0)])],
+        )]);
+        assert_eq!(holed.0[0].interiors().len(), 1);
+        let cleaned = dissolve_union(std::slice::from_ref(&holed), 1.0);
+        assert_eq!(cleaned.0.len(), 1);
+        assert!(cleaned.0[0].interiors().is_empty(), "the sliver hole is generalized away");
+        assert!((cleaned.unsigned_area() - 10_000.0).abs() < 1.0);
+        // At a tolerance finer than the sliver it survives.
+        let kept = dissolve_union(std::slice::from_ref(&holed), 0.01);
+        assert_eq!(kept.0[0].interiors().len(), 1);
     }
 
     /// The level tolerance is metres on the ground, converted into the
