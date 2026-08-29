@@ -126,8 +126,12 @@ Any platform with stable Rust:
 ```bash
 git clone https://github.com/gsueur/geopq-workbench
 cd geopq-workbench
-cargo build --release   # binary in target/release/geopq-workbench
+cargo build --release --bins   # target/release/{geopq-workbench,geopq-cli}
 ```
+
+On Windows without administrator rights (no Visual Studio Build Tools),
+a portable MinGW-w64 toolchain builds both binaries — see
+[docs/WINDOWS_GNU_BUILD.md](docs/WINDOWS_GNU_BUILD.md).
 
 ## Quick start
 
@@ -554,11 +558,42 @@ Measured on real datasets, release build:
   geometry), not by file size, and the row budget (~2.5M rows per load)
   keeps worst-case files from exhausting RAM.
 
+## Command-line batch conversion (geopq-cli)
+
+For scripted pipelines — a monthly source refresh, a CI job, a cron
+task — the Import + Optimize flow is also available headless as a
+second binary, `geopq-cli`, built alongside the app from the same
+crate:
+
+```bash
+cargo build --release --bins
+target/release/geopq-cli --input roads.gpkg --list-layers
+target/release/geopq-cli --input roads.gpkg --layer roads \
+  --output roads.parquet --format geoarrow --h3 8
+```
+
+It wraps the same import (`data::gpkg`/`shp`/`geojson`) and optimize
+(`data::optimize`) machinery the GUI dialogs call, opens no window,
+and touches no GPU — `geopq-cli --help` lists every flag (format
+flavor, row group size and bytes, compression, Hilbert sort, covering
+column, H3 resolution). Point it at an existing `.parquet` instead of
+a raw source to skip straight to the optimize pass.
+
+Progress goes to stderr, the one-line summary to stdout, and a failure
+exits non-zero — so a shell pipeline can read the result and a cron
+job can trust the exit status.
+
 ## Under the hood
 
 Pure-Rust stack end to end: parquet/arrow readers, proj4rs
 reprojection, rayon + lyon tessellation, custom wgpu render pipelines
 inside an egui shell. No GDAL, no web view, no server process.
+
+The crate is a `lib.rs` (everything below) plus two thin binaries:
+`main.rs` (the GUI) and `bin/geopq-cli.rs` (the headless converter).
+Both link the full dependency tree — `geopq-cli` never touches wgpu or
+eframe at runtime, but the binary still carries them, since nothing
+splits the CLI's dependencies out of the shared lib today.
 
 | Module | Role |
 |---|---|
@@ -572,6 +607,7 @@ inside an egui shell. No GDAL, no web view, no server process.
 | `map/` | wgpu pipelines, tiles, chunked f64-origin geometry for jitter-free deep zoom, SVG export of the frame |
 | `sql/` | DataFusion integration, ST_* UDFs, spatial pushdown, console UI |
 | `app.rs` | the egui application |
+| `bin/geopq-cli.rs` | headless import + optimize, no window, no GPU |
 
 Design notes live in [docs/OPEN_POLICY.md](docs/OPEN_POLICY.md) (file
 quality gate and display policy).
