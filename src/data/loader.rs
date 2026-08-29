@@ -362,7 +362,7 @@ pub enum GroupSel {
 }
 
 impl GroupSel {
-    fn group(&self) -> u32 {
+    pub(crate) fn group(&self) -> u32 {
         match self {
             GroupSel::All(g) | GroupSel::Rect(g, _) | GroupSel::Ranges(g, _) => *g,
             GroupSel::Preview { group, .. }
@@ -4732,6 +4732,40 @@ pub fn open_store_for_test(path: &std::path::PathBuf) -> Result<StoreOpen, Strin
 #[cfg(test)]
 pub fn open_source_for_test(source: &Source) -> Result<StoreOpen, String> {
     open_store(source)
+}
+
+/// Open with the viewport the app would have when the user drops a
+/// collection URL in: STAC part pruning happens at open, so a benchmark
+/// that skips the rect measures a different code path than the app.
+#[cfg(test)]
+pub fn open_source_with_view_for_test(
+    source: &Source,
+    stac_rect: Option<[f64; 4]>,
+) -> Result<StoreOpen, String> {
+    open_store_with_view(source, stac_rect)
+}
+
+/// The app's own viewport plan (row-group pruning + per-feature covering
+/// selection + the preview/box budget), for benchmarks.
+#[cfg(test)]
+pub fn plan_viewport_for_test(
+    store: &FeatureStore,
+    boxes: Option<&[[f64; 4]]>,
+    rect: Option<[f64; 4]>,
+) -> Vec<GroupSel> {
+    plan_viewport_selection(store, "bench", boxes, rect, None, "bench")
+}
+
+/// Run one planned selection through the real build path.
+/// Returns (rows decoded, groups whose geometry was read).
+#[cfg(test)]
+pub fn build_planned_for_test(
+    store: &FeatureStore,
+    crs: &Crs,
+    display: &DisplayCrs,
+    sel: Vec<GroupSel>,
+) -> Result<usize, String> {
+    build_geometry(store, crs, display, None, sel, None, None).map(|(_, r, _, _, _)| r)
 }
 
 

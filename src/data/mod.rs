@@ -25,3 +25,6 @@ pub mod shp;
 pub mod source;
 pub mod stac;
 pub mod store;
+
+#[cfg(test)]
+mod bench_h3;
