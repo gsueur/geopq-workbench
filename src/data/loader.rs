@@ -6882,6 +6882,146 @@ mod hive_tests {
             run_query_for_test("select state, count(*) c from t group by state", &layers).unwrap();
         assert_eq!(out.total_rows, 3);
     }
+
+    /// One part of a partitioned dataset with a covering column: `n`
+    /// points at (cx, cy) when `extent` is true, one null-geometry row
+    /// with an all-null covering and no `bbox` in `geo` when it is not.
+    /// The second shape is what adaptive H3 writes into
+    /// `h3=__HIVE_DEFAULT_PARTITION__`, and it is the case under test.
+    fn write_covering_part(path: &std::path::Path, n: usize, cx: f64, cy: f64, extent: bool) {
+        use arrow::array::{ArrayRef, Float64Array, StructArray};
+        use arrow::datatypes::Fields;
+
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut col = serde_json::json!({
+            "encoding": "WKB",
+            "geometry_types": ["Point"],
+            "covering": {"bbox": {
+                "xmin": ["bbox", "xmin"],
+                "ymin": ["bbox", "ymin"],
+                "xmax": ["bbox", "xmax"],
+                "ymax": ["bbox", "ymax"],
+            }},
+        });
+        // A part with no features has no extent to declare, so it
+        // declares none. Inventing one here would test the wrong file.
+        if extent {
+            col["bbox"] = serde_json::json!([cx - 1.0, cy - 1.0, cx + 1.0, cy + 1.0]);
+        }
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": col},
+        });
+        let bbox_fields: Fields = vec![
+            Field::new("xmin", DataType::Float64, true),
+            Field::new("ymin", DataType::Float64, true),
+            Field::new("xmax", DataType::Float64, true),
+            Field::new("ymax", DataType::Float64, true),
+        ]
+        .into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, true),
+            Field::new("id", DataType::Int64, false),
+            Field::new("bbox", DataType::Struct(bbox_fields.clone()), true),
+        ]));
+
+        let (geoms, xs, ys): (Vec<Option<Vec<u8>>>, Vec<Option<f64>>, Vec<Option<f64>>) = if extent
+        {
+            (0..n)
+                .map(|i| {
+                    let (x, y) = (cx + (i % 10) as f64 * 0.01, cy + (i / 10) as f64 * 0.01);
+                    (Some(wkb_point(x, y)), Some(x), Some(y))
+                })
+                .collect()
+        } else {
+            // One row, no shape: null geometry, null covering.
+            (vec![None], vec![None], vec![None])
+        };
+        let rows = geoms.len();
+        let coord = |v: &[Option<f64>]| Arc::new(Float64Array::from(v.to_vec())) as ArrayRef;
+        let bbox = StructArray::try_new(
+            bbox_fields,
+            vec![coord(&xs), coord(&ys), coord(&xs), coord(&ys)],
+            None,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter(geoms.iter().map(Option::as_deref))),
+                Arc::new(Int64Array::from((0..rows as i64).collect::<Vec<_>>())),
+                Arc::new(bbox),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder().set_max_row_group_row_count(Some(128)).build();
+        let mut w = ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(props)).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    /// A partition holding only null geometries describes no extent: its
+    /// covering column has no min/max statistics and its `geo` metadata
+    /// carries no bbox. That part must not cost every *other* part its
+    /// row-group bounding boxes, which is what dropping the dataset's
+    /// boxes on the first undescribed part did: one shapeless row left a
+    /// 696-file H3 tree with no spatial index at all, and a 1 km viewport
+    /// over Boston decoded 305,737 rows instead of 6,684.
+    #[test]
+    fn a_part_with_no_extent_does_not_void_the_dataset_index() {
+        let root = std::env::temp_dir().join(format!("geopq_no_extent_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // Sorted first, so the dataset's schema and covering come from
+        // the part that has both.
+        write_covering_part(&root.join("a_real.parquet"), 200, 10.0, 45.0, true);
+        write_covering_part(&root.join("b_no_extent.parquet"), 0, 0.0, 0.0, false);
+
+        let (store, _crs, _info, rg_meta) = open_store(&Source::Dir(root.clone())).unwrap();
+        assert_eq!(store.fragments.len(), 2);
+        assert_eq!(store.total_rows(), 201);
+        assert!(store.covering.is_some(), "the covering column survives");
+
+        let (label, boxes) = rg_meta.expect("one undescribed part must not void the boxes");
+        let n_rg = store.rg_starts().len() - 1;
+        assert_eq!(boxes.len(), n_rg, "one box per row group");
+        assert!(label.contains("covering"), "{label}");
+
+        // Groups belong to the fragment whose rg_offset covers them.
+        let null_part = store.fragments.last().unwrap().rg_offset;
+        let (real, null): (Vec<u32>, Vec<u32>) = (0..n_rg as u32)
+            .partition(|&g| store.frag_of_group(g as usize).rg_offset != null_part);
+        assert_eq!(real.len(), 2, "200 rows in 128-row groups");
+        assert_eq!(null.len(), 1);
+
+        // The real part keeps usable boxes...
+        for &g in &real {
+            let b = boxes[g as usize];
+            assert!(b.iter().all(|v| v.is_finite()), "group {g}: {b:?}");
+            assert!(b[0] >= 9.0 && b[2] <= 11.0 && b[1] >= 44.0 && b[3] <= 46.0, "{b:?}");
+        }
+        // ...and the part with no extent gets an empty box, which
+        // intersects nothing. Its rows have no geometry, so never
+        // selecting them loses nothing drawable.
+        for &g in &null {
+            assert_eq!(
+                boxes[g as usize],
+                [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
+                "group {g}"
+            );
+        }
+
+        // The whole point: pruning still works. A viewport over the real
+        // part selects its groups and only its groups.
+        assert_eq!(intersecting_rgs(&boxes, [9.9, 44.9, 10.2, 45.2]), real);
+        // And a viewport somewhere else selects nothing at all, rather
+        // than every group for want of an index.
+        assert!(intersecting_rgs(&boxes, [-50.0, -20.0, -49.0, -19.0]).is_empty());
+    }
 }
 
 #[cfg(test)]
