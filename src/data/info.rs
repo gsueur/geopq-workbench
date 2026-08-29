@@ -63,6 +63,13 @@ pub struct FileInfo {
     /// Footer-only display-readiness analysis (docs/OPEN_POLICY.md);
     /// None only for stores that never went through a parquet footer.
     pub quality: Option<super::quality::QualityReport>,
+    /// One-line summary of the H3 pyramid this dataset was opened from,
+    /// when it has one (`PyramidState::info_line`).
+    pub pyramid: Option<String>,
+    /// The file's own `geopq:pyramid` entry, when it carries one: what
+    /// an overview file says about itself, so a part opened alone is
+    /// still badged as derived data.
+    pub pyramid_file: Option<super::pyramid::FileMeta>,
 }
 
 pub fn fmt_bytes(b: u64) -> String {

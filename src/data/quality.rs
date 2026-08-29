@@ -97,7 +97,7 @@ impl CogpQuality {
 
 #[derive(Clone, Debug)]
 pub struct Check {
-    /// Stable code (C1…C8) referenced by docs/OPEN_POLICY.md.
+    /// Stable code (C1…C9) referenced by docs/OPEN_POLICY.md.
     pub code: &'static str,
     pub title: &'static str,
     pub status: Status,
@@ -587,9 +587,120 @@ pub fn analyze(inp: &QualityInput) -> QualityReport {
     }
 }
 
+/// Pyramid facts for C9, as resolved by the loader from
+/// `h3-pyramid.json` and one listing of the root.
+#[derive(Clone, Debug)]
+pub struct PyramidQuality {
+    /// The descriptor in one line (`PyramidState::info_line`).
+    pub summary: String,
+    /// Files the descriptor's cell lists name.
+    pub listed: usize,
+    /// …of those, the ones the root does not hold.
+    pub missing: Vec<String>,
+    /// The root serves no listing (an HTTPS prefix), so the descriptor
+    /// is taken at its word rather than checked.
+    pub unlisted: bool,
+}
+
+/// C9 — H3 pyramid (advisory, never gating).
+///
+/// Absence is not a fault: a pyramid is one way to publish a layer, and
+/// the plain partitioned datasets this app has always read are not worse
+/// files for lacking one. A descriptor that is there but does not hold
+/// up is worth a warning, because a producer meant to write one and a
+/// reader will silently fall back to reading every file under the root.
+pub fn pyramid_check(p: Option<&Result<PyramidQuality, String>>) -> Check {
+    const TITLE: &str = "H3 pyramid";
+    match p {
+        None => Check {
+            code: "C9",
+            title: TITLE,
+            status: Status::Pass,
+            gating: false,
+            detail: "no pyramid (optional)".into(),
+        },
+        Some(Err(e)) => Check {
+            code: "C9",
+            title: TITLE,
+            status: Status::Warn,
+            gating: false,
+            detail: format!("{e}; opened as a plain partitioned dataset"),
+        },
+        Some(Ok(q)) if !q.missing.is_empty() => Check {
+            code: "C9",
+            title: TITLE,
+            status: Status::Warn,
+            gating: false,
+            detail: format!(
+                "{}; {} of {} listed files are missing (e.g. {})",
+                q.summary,
+                q.missing.len(),
+                q.listed,
+                q.missing
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        },
+        Some(Ok(q)) => Check {
+            code: "C9",
+            title: TITLE,
+            status: Status::Pass,
+            gating: false,
+            detail: if q.unlisted {
+                format!(
+                    "{}; {} files listed, not verified (an https prefix serves no listing)",
+                    q.summary, q.listed
+                )
+            } else {
+                format!("{}; all {} listed files present", q.summary, q.listed)
+            },
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// C9 is advisory in every direction: no pyramid is not a fault, a
+    /// descriptor that does not hold is a warning, and a listed file
+    /// that is not there is a warning the user can act on.
+    #[test]
+    fn c9_reports_the_pyramid_without_ever_gating() {
+        let ok = |missing: Vec<String>, unlisted: bool| {
+            Ok(PyramidQuality {
+                summary: "leaf r8, overviews r5..r7 (dissolve), 64 px/cell".into(),
+                listed: 700,
+                missing,
+                unlisted,
+            })
+        };
+        let c = pyramid_check(None);
+        assert_eq!((c.code, c.status, c.gating), ("C9", Status::Pass, false));
+        assert_eq!(c.detail, "no pyramid (optional)");
+
+        let c = pyramid_check(Some(&ok(Vec::new(), false)));
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.detail.ends_with("all 700 listed files present"), "{}", c.detail);
+
+        let c = pyramid_check(Some(&ok(Vec::new(), true)));
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.detail.contains("not verified"), "{}", c.detail);
+
+        let c = pyramid_check(Some(&ok(vec!["r8/abc.parquet".into()], false)));
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("1 of 700 listed files are missing"), "{}", c.detail);
+        assert!(!c.gating);
+
+        let c = pyramid_check(Some(&Err("pyramid: resolution 16 out of range".into())));
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("out of range"), "{}", c.detail);
+        assert!(!c.gating);
+    }
 
     fn geo_ok() -> GeoParquetInfo {
         GeoParquetInfo {

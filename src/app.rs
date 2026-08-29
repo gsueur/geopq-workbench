@@ -2205,6 +2205,53 @@ impl ViewerApp {
                         }
                     }
                 }
+                LoadMsg::LevelSwitched {
+                    layer_id,
+                    generation,
+                    level,
+                    store,
+                    rg_bboxes,
+                    files,
+                    geometry,
+                    loaded,
+                    rows,
+                    bad_geoms,
+                    build_ms,
+                } => {
+                    self.appending.remove(&layer_id);
+                    self.part_appending.remove(&layer_id);
+                    self.append_cancel.remove(&layer_id);
+                    // Row-group indices mean something else now, and the
+                    // selection was keyed by them.
+                    self.clear_selection();
+                    if let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id)
+                        && l.generation == generation
+                    {
+                        log::info!(
+                            "{}: pyramid level r{level}, {files} part file(s), \
+                             {rows} features in {build_ms} ms",
+                            l.name
+                        );
+                        // The store, the boxes, the decode state and
+                        // the sections all change together: a level
+                        // is a different set of files, so leaving any
+                        // one of them behind would point the layer at
+                        // row groups that no longer exist.
+                        l.store = store;
+                        l.rg_bboxes = *rg_bboxes;
+                        l.sections = vec![geometry];
+                        l.draw_gen += 1;
+                        l.loaded = loaded;
+                        l.feature_count = rows;
+                        // A row filter selected rows of the level
+                        // that just went away.
+                        l.filter = None;
+                        l.info.files = files;
+                        l.stats.build_ms = build_ms;
+                        l.stats.bad_geoms = bad_geoms;
+                    }
+                    release_freed_memory();
+                }
                 LoadMsg::AppendEnded { layer_id, error } => {
                     self.appending.remove(&layer_id);
                     self.append_cancel.remove(&layer_id);
@@ -2886,9 +2933,54 @@ impl ViewerApp {
         ((self.last_view_world[2] - self.last_view_world[0]) * self.camera.scale()).max(1.0)
     }
 
+    /// Move pyramid layers to the level this viewport calls for.
+    ///
+    /// The COGP twin of this is a filter inside refinement, because a
+    /// COGP level is a prefix of row groups the store already holds. A
+    /// pyramid level is a different set of *files*, so it has to be
+    /// planned and opened like a part append — and it takes the same
+    /// in-flight slot, for the same reason: a pass either changes what
+    /// the layer holds or refines what is in it, never both.
+    fn switch_pyramid_levels(&mut self, ctx: &egui::Context) {
+        let view = self.last_view_world;
+        let view_px = self.view_px_width();
+        for l in &self.layers {
+            if l.store.pyramid.is_none()
+                || !l.style.visible
+                || l.mode == crate::data::layer::LayerMode::Direct
+                || self.appending.contains(&l.id)
+                || self.rebuilding.contains(&l.id)
+                || self.part_hold.contains(&l.id)
+            {
+                continue;
+            }
+            self.appending.insert(l.id);
+            self.part_appending.insert(l.id);
+            self.refine_epoch.insert(l.id, self.cam_epoch);
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.append_cancel.insert(l.id, Arc::clone(&cancel));
+            loader::spawn_pyramid_level(
+                LoaderHandle {
+                    tx: self.load_tx.clone(),
+                    egui_ctx: ctx.clone(),
+                },
+                l.id,
+                l.generation,
+                l.store.clone(),
+                l.crs.clone(),
+                self.display.clone(),
+                view,
+                view_px,
+                cancel,
+                l.style.style_by.clone(),
+            );
+        }
+    }
+
     fn refine_partial_layers(&mut self, ctx: &egui::Context) {
         use crate::data::layer::GroupLoad;
         use crate::data::loader::{complement_ranges, GroupSel};
+        self.switch_pyramid_levels(ctx);
         self.append_parts_for_view(ctx);
         let view = self.last_view_world;
         for l in &self.layers {
@@ -4191,6 +4283,27 @@ impl ViewerApp {
                             RichText::new(text)
                             .color(Color32::from_rgb(242, 140, 26))
                             .small(),
+                        );
+                    }
+                    // A pyramid overview holds features derived from
+                    // the level below it — dissolved, pruned or
+                    // simplified — so it is approximated content and
+                    // says so whether or not the layer is partial
+                    // (docs/OPEN_POLICY.md invariant 1). The leaf level
+                    // is the source's own rows and badges nothing.
+                    if let Some(badge) = crate::data::pyramid::layer_badge(
+                        l.store.pyramid.as_ref(),
+                        l.info.pyramid_file.as_ref(),
+                    ) {
+                        ui.label(
+                            RichText::new(badge)
+                                .color(Color32::from_rgb(242, 140, 26))
+                                .small(),
+                        )
+                        .on_hover_text(
+                            "derived features, not the source rows: their attributes \n\
+                             are the overview's own (count, area_sum, majority).\n\
+                             Zoom in and the layer reads the leaf level.",
                         );
                     }
                     if l.is_partial() && l.filter.is_none() {
@@ -10424,6 +10537,30 @@ impl ViewerApp {
                         }
                         if let Some(c) = &info.geo.cogp {
                             row(ui, "cloud-optimized", c.clone());
+                        }
+                        // The pyramid this layer is one level of, and
+                        // which level that is — an overview is derived
+                        // data and has to say so wherever it is named.
+                        if let Some(p) = &info.pyramid {
+                            let level = match layer.store.pyramid.as_ref() {
+                                Some(st) => format!(
+                                    " — reading {}",
+                                    st.badge().unwrap_or_else(|| format!("leaf r{}", st.active_res))
+                                ),
+                                None => String::new(),
+                            };
+                            row(ui, "H3 pyramid", format!("{p}{level}"));
+                        } else if let Some(m) = &info.pyramid_file {
+                            row(
+                                ui,
+                                "H3 pyramid",
+                                format!(
+                                    "one overview file: r{} ({}, derived from r{})",
+                                    m.res,
+                                    m.method.label(),
+                                    m.source_res
+                                ),
+                            );
                         }
                         if let Some(rg) = &layer.rg_bboxes {
                             row(
