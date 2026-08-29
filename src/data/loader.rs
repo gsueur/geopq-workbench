@@ -2269,7 +2269,8 @@ pub fn spawn_pyramid_level(
                 let rg_rows: Vec<u64> =
                     fresh.rg_starts().windows(2).map(|w| w[1] - w[0]).collect();
                 let boxes = rg_meta.map(|(source, boxes)| {
-                    RgBboxes::new(source, boxes, fresh.cogp.as_ref().map(|c| c.runs(&rg_rows)).as_deref())
+                    let levels = fresh.cogp.as_ref().map(|c| c.runs(&rg_rows));
+                    RgBboxes::new(source, boxes, levels.as_deref())
                 });
                 handle.send(LoadMsg::LevelSwitched {
                     layer_id,
@@ -2359,8 +2360,8 @@ fn open_store_with_view(
         }
     };
     if let Some(q) = opened.2.quality.as_mut() {
-        q.checks
-            .push(super::quality::pyramid_check(pyramid_quality(found.as_ref(), listing.as_ref()).as_ref()));
+        let facts = pyramid_quality(found.as_ref(), listing.as_ref());
+        q.checks.push(super::quality::pyramid_check(facts.as_ref()));
     }
     Ok(opened)
 }
@@ -5225,6 +5226,16 @@ pub(crate) fn parse_wkb_point_2d(buf: &[u8]) -> Option<(f64, f64)> {
 
 /// Test-only re-exports for headless benchmarks.
 #[cfg(test)]
+/// `open_store_with_view` for tests outside this module (the SQL table
+/// needs a store on a chosen pyramid level).
+#[cfg(test)]
+pub fn open_store_with_view_for_test(
+    source: &Source,
+    view: Option<ViewHint>,
+) -> Result<StoreOpen, String> {
+    open_store_with_view(source, view)
+}
+
 pub fn open_store_for_test(path: &std::path::PathBuf) -> Result<StoreOpen, String> {
     open_store(&Source::Local(path.clone()))
 }
@@ -7833,14 +7844,15 @@ mod stac_tests {
         assert_eq!(boxes.len(), store.rg_starts().len() - 1);
 
         // A viewport over the west part only opens that file.
-        let (store, _, info, _) =
-            open_store_with_view(&source, Some(ViewHint { rect: [-12.0, 43.0, -8.0, 47.0], view_px: 1600.0 })).unwrap();
+        let west = ViewHint { rect: [-12.0, 43.0, -8.0, 47.0], view_px: 1600.0 };
+        let (store, _, info, _) = open_store_with_view(&source, Some(west)).unwrap();
         assert_eq!(store.fragments.len(), 1);
         assert_eq!(store.total_rows(), 200);
         assert_eq!(info.files, 1);
 
         // A viewport intersecting nothing is a load error, not an empty map.
-        let Err(err) = open_store_with_view(&source, Some(ViewHint { rect: [100.0, 0.0, 110.0, 5.0], view_px: 1600.0 })) else {
+        let elsewhere = ViewHint { rect: [100.0, 0.0, 110.0, 5.0], view_px: 1600.0 };
+        let Err(err) = open_store_with_view(&source, Some(elsewhere)) else {
             panic!("disjoint viewport must not open a store");
         };
         assert!(err.contains("no parts"), "{err}");
@@ -7890,8 +7902,8 @@ mod stac_tests {
         // Per-asset bboxes make pruning real: opening both parts here
         // would also be the symptom of a reader handing every part the
         // collection's own extent.
-        let (paris, _, info, _) =
-            open_store_with_view(&source, Some(ViewHint { rect: [2.0, 48.5, 2.7, 49.1], view_px: 1600.0 })).unwrap();
+        let round_paris = ViewHint { rect: [2.0, 48.5, 2.7, 49.1], view_px: 1600.0 };
+        let (paris, _, info, _) = open_store_with_view(&source, Some(round_paris)).unwrap();
         assert_eq!(paris.fragments.len(), 1);
         assert_eq!(paris.total_rows(), 300);
         assert_eq!(info.files, 1);
@@ -7935,8 +7947,9 @@ mod stac_tests {
             name: "division_area".into(),
         };
         let t = Instant::now();
+        let paris = ViewHint { rect: [2.0, 48.5, 3.0, 49.2], view_px: 1600.0 };
         let (store, crs, info, rg_meta) =
-            open_store_with_view(&source, Some(ViewHint { rect: [2.0, 48.5, 3.0, 49.2], view_px: 1600.0 })).unwrap();
+            open_store_with_view(&source, Some(paris)).unwrap();
         println!(
             "opened {} parts / {} rows / {} rgs in {:?} (crs {})",
             info.files,
@@ -8862,14 +8875,16 @@ pub(crate) mod pyramid_tests {
             Field::new("id", DataType::Int64, false),
             Field::new("bbox", DataType::Struct(bbox_fields.clone()), true),
         ]));
-        let (geoms, xs, ys): (Vec<Option<Vec<u8>>>, Vec<Option<f64>>, Vec<Option<f64>>) =
-            if pts.is_empty() {
-                (vec![None], vec![None], vec![None])
-            } else {
-                pts.iter()
-                    .map(|(x, y)| (Some(wkb_point(*x, *y)), Some(*x), Some(*y)))
-                    .collect()
-            };
+        // One row with no shape for the null part, a point per entry
+        // otherwise.
+        let mut geoms: Vec<Option<Vec<u8>>> = vec![None];
+        let mut xs: Vec<Option<f64>> = vec![None];
+        let mut ys: Vec<Option<f64>> = vec![None];
+        if !pts.is_empty() {
+            geoms = pts.iter().map(|(x, y)| Some(wkb_point(*x, *y))).collect();
+            xs = pts.iter().map(|(x, _)| Some(*x)).collect();
+            ys = pts.iter().map(|(_, y)| Some(*y)).collect();
+        }
         let rows = geoms.len();
         let coord = |v: &[Option<f64>]| Arc::new(Float64Array::from(v.to_vec())) as ArrayRef;
         let bbox = StructArray::try_new(

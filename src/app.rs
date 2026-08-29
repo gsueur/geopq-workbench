@@ -2180,30 +2180,31 @@ impl ViewerApp {
                     // Row-group indices mean something else now, and the
                     // selection was keyed by them.
                     self.clear_selection();
-                    if let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) {
-                        if l.generation == generation {
-                            log::info!(
-                                "{}: pyramid level r{level}, {files} part file(s),                                  {rows} features in {build_ms} ms",
-                                l.name
-                            );
-                            // The store, the boxes, the decode state and
-                            // the sections all change together: a level
-                            // is a different set of files, so leaving any
-                            // one of them behind would point the layer at
-                            // row groups that no longer exist.
-                            l.store = store;
-                            l.rg_bboxes = *rg_bboxes;
-                            l.sections = vec![geometry];
-                            l.draw_gen += 1;
-                            l.loaded = loaded;
-                            l.feature_count = rows;
-                            // A row filter selected rows of the level
-                            // that just went away.
-                            l.filter = None;
-                            l.info.files = files;
-                            l.stats.build_ms = build_ms;
-                            l.stats.bad_geoms = bad_geoms;
-                        }
+                    if let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id)
+                        && l.generation == generation
+                    {
+                        log::info!(
+                            "{}: pyramid level r{level}, {files} part file(s), \
+                             {rows} features in {build_ms} ms",
+                            l.name
+                        );
+                        // The store, the boxes, the decode state and
+                        // the sections all change together: a level
+                        // is a different set of files, so leaving any
+                        // one of them behind would point the layer at
+                        // row groups that no longer exist.
+                        l.store = store;
+                        l.rg_bboxes = *rg_bboxes;
+                        l.sections = vec![geometry];
+                        l.draw_gen += 1;
+                        l.loaded = loaded;
+                        l.feature_count = rows;
+                        // A row filter selected rows of the level
+                        // that just went away.
+                        l.filter = None;
+                        l.info.files = files;
+                        l.stats.build_ms = build_ms;
+                        l.stats.bad_geoms = bad_geoms;
                     }
                     release_freed_memory();
                 }
