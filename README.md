@@ -34,7 +34,16 @@ so it doubles as a hands-on guide to GeoParquet best practices.
   GeoParquet (spatially sorted, indexed, zstd), in your choice of 1.1
   WKB, 1.1 GeoArrow, or 2.0 native, with optional H3 / admin-boundary
   columns and partitioned output — saved locally or published straight
-  to S3 / R2, ready to open in place from its `s3://` URI.
+  to S3 / R2, ready to open in place from its `s3://` URI. Ordering is
+  the Hilbert spatial sort, or coarse-to-fine COGP levels (experimental)
+  for readers that stream by zoom.
+- **H3 pyramid**: publish a layer as `r<res>/<cell>.parquet` files at a
+  reference H3 resolution (a density table picks it, dense cells split
+  further), plus coarser overview levels derived by simplify, prune or
+  dissolve, described by one `h3-pyramid.json`. The workbench reads it
+  back level by level, choosing the level from the zoom the way a COG
+  reader picks an overview, and any tool can address a file by cell id.
+  2.56M parcels to a dissolve pyramid in ~90 s with 0.5% overhead.
 - **Remote-native**: open `https://` and `s3://` files in place over
   range requests — or a whole `s3://bucket/prefix/` of hive-partitioned
   parts as one layer. A 304 MB file opens in ~1.3 s; only the row
@@ -69,6 +78,9 @@ so it doubles as a hands-on guide to GeoParquet best practices.
 - **No barriers to entry**: browse public catalogs from the app, and a
   pure-Rust importer for GeoPackage, Shapefile and GeoJSON (no GDAL) if
   your data is not in GeoParquet yet.
+- **Scriptable**: `geopq-cli` runs the same import and Optimize pipeline
+  headless (no window, no GPU) for cron jobs and batch refreshes,
+  including hive and adaptive-H3 partitioning.
 
 ## Install
 
