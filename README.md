@@ -576,9 +576,13 @@ It wraps the same import (`data::gpkg`/`shp`/`geojson`) and optimize
 (`data::optimize`) machinery the GUI dialogs call, opens no window,
 and touches no GPU — `geopq-cli --help` lists every flag (format
 flavor, row group size and bytes, compression, Hilbert sort, covering
-column, H3 resolution, partitioning). Point it at an existing
-`.parquet` instead of a raw source to skip straight to the optimize
-pass.
+column, H3 resolution, partitioning, COGP levels).
+
+Sources are the ones the Import dialog takes — `.gpkg`, `.shp`,
+`.geojson` — plus `.parquet`, which skips the import and goes straight
+to the optimize pass. That last one is how you re-optimize an existing
+file: change the flavor, retune the row groups, add a covering column
+to a file that has none.
 
 Partitioned output works the same way it does in the GUI's Export
 dialog — hive directories by field, or adaptive H3:
@@ -592,20 +596,34 @@ geopq-cli --input roads.gpkg --output by_country/ \
 geopq-cli --input roads.gpkg --output by_country_year/ \
   --format native2 --partition-by ISO3,YEAR
 
-# adaptive H3: cells split until under --partition-h3-target-rows;
-# --h3 doubles as the max resolution to split down to
+# adaptive H3: cells split until under --partition-h3-target-rows,
+# or until --partition-h3-max-res (default: --h3 if set, else 10)
 geopq-cli --input roads.gpkg --output by_h3/ \
-  --format native2 --h3 8 --partition-h3 --partition-h3-target-rows 100000
+  --format native2 --partition-h3 --partition-h3-target-rows 100000
 ```
 
 `--output` becomes a directory in either case, not a file path.
 
-Not yet exposed on the CLI: multi-layer merge, S3 publish. Both work
-through the GUI today.
+`--cogp` writes [coarse-to-fine levels](#coarse-to-fine-levels-cogp)
+instead, reading its GSDs and thinning factors from the same
+`~/.geopq-workbench.json` block the Export dialog uses, so a file the
+CLI writes and one the app writes are the same file. Levels own the
+physical layout, so it cannot be combined with partitioning — the CLI
+says so before it reads anything rather than halfway through a write.
 
-Progress goes to stderr, the one-line summary to stdout, and a failure
-exits non-zero — so a shell pipeline can read the result and a cron
-job can trust the exit status.
+Progress goes to stderr and the summary to stdout, one parseable line:
+
+```
+1274531 rows | row groups 3 -> 42 | 412.5 MB -> 388.1 MB | 1 file
+```
+
+A failure prints to stderr and exits non-zero, and nothing is left
+behind at `--output`: outputs are staged and renamed into place only
+once they are complete, so a cron job that dies mid-write never
+publishes a truncated file.
+
+Not yet exposed on the CLI: multi-layer merge, admin-attribution
+columns, S3 publish. All three work through the GUI today.
 
 ## Under the hood
 
@@ -681,7 +699,12 @@ instead of refusing to open past a part count.
 ```bash
 cargo test          # 240+ tests, no fixtures needed for most
 cargo run --release testdata/points_1m_wgs84.parquet
+cargo run --release --bin geopq-cli -- --help
 ```
+
+`cargo test` covers both binaries: the GUI's logic in-crate, and
+`geopq-cli` through `tests/cli.rs`, which runs the built executable and
+reopens what it wrote.
 
 Test fixtures are generated, not committed: `./testdata/regenerate.sh`
 rebuilds them with the DuckDB CLI (fixture-dependent tests self-skip
