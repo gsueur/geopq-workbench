@@ -3082,7 +3082,6 @@ pub fn optimize(
             crs_value: crs_value.clone(),
             vendor_crs: vendor_crs.clone(),
             crs_explicit_null,
-            data_crs: data_crs.as_ref().ok_or("internal: pyramid without a CRS")?,
             units: cogp_units.unwrap_or(CogpUnits::Linear(1.0)),
             props: &make_props,
         };
@@ -3632,8 +3631,6 @@ struct OverviewCtx<'a> {
     crs_value: Option<Value>,
     vendor_crs: Option<Value>,
     crs_explicit_null: bool,
-    /// Layer CRS, for the centroid a dissolve groups by.
-    data_crs: &'a super::crs::Crs,
     units: CogpUnits,
     props: &'a dyn Fn() -> WriterProperties,
 }
@@ -3667,11 +3664,11 @@ fn build_overviews(
         // them. A leaf level that split adaptively has files at several
         // resolutions; `parent` answers for all of them at once, which is
         // why the source list carries cells rather than resolutions.
-        let mut groups: std::collections::HashMap<CellIndex, Vec<PathBuf>> =
+        let mut groups: std::collections::HashMap<CellIndex, Vec<(CellIndex, PathBuf)>> =
             std::collections::HashMap::new();
         for (cell, path) in &source {
             let parent = cell.parent(r).unwrap_or(*cell);
-            groups.entry(parent).or_default().push(path.clone());
+            groups.entry(parent).or_default().push((*cell, path.clone()));
         }
         let mut cells: Vec<CellIndex> = groups.keys().copied().collect();
         cells.sort_unstable_by_key(|c| u64::from(*c));
@@ -3711,7 +3708,7 @@ fn write_overview_cell(
     ctx: &OverviewCtx,
     cell: h3o::CellIndex,
     res: h3o::Resolution,
-    inputs: &[PathBuf],
+    inputs: &[(h3o::CellIndex, PathBuf)],
 ) -> Result<(u64, u64, PathBuf), String> {
     // Tolerance at the cell's own latitude: a geographic CRS converts
     // metres to degrees differently at the equator and at 60°N, and an
@@ -3783,7 +3780,7 @@ fn write_overview_cell(
 /// Simplify and/or prune one cell's inputs into the pass-through schema.
 fn derive_cell(
     ctx: &OverviewCtx,
-    inputs: &[PathBuf],
+    inputs: &[(h3o::CellIndex, PathBuf)],
     tol: f64,
 ) -> Result<RecordBatch, String> {
     let (mut geoms, attrs) = load_cell_inputs(ctx, inputs)?;
@@ -3802,15 +3799,19 @@ fn derive_cell(
     assemble_pass(ctx, &geoms, &attrs, &keep)
 }
 
+/// One overview cell's loaded inputs: a geometry per row, and the
+/// pass-through attribute columns in the level schema's order.
+type CellInputs = (Vec<Option<geo_types::Geometry<f64>>>, Vec<ArrayRef>);
+
 /// Read one overview cell's inputs: geometries decoded to `geo` types,
 /// and the pass-through attributes concatenated in schema order.
 fn load_cell_inputs(
     ctx: &OverviewCtx,
-    inputs: &[PathBuf],
-) -> Result<(Vec<Option<geo_types::Geometry<f64>>>, Vec<ArrayRef>), String> {
+    inputs: &[(h3o::CellIndex, PathBuf)],
+) -> Result<CellInputs, String> {
     let mut geoms: Vec<Option<geo_types::Geometry<f64>>> = Vec::new();
     let mut parts: Vec<Vec<ArrayRef>> = vec![Vec::new(); ctx.pass_attrs.len()];
-    for path in inputs {
+    for (_, path) in inputs {
         let part = read_part(path)?;
         let col = part.column_by(&part.primary)?;
         let gc = GeomCol::new(col.as_ref(), part.encoding)
@@ -3944,28 +3945,42 @@ fn assemble_pass(
         .map_err(|e| format!("overview batch assembly failed: {e}"))
 }
 
-/// Dissolve one cell: union the features by the child cell their centroid
-/// falls in, then simplify at the level's tolerance.
+/// Dissolve one cell: union the features by the child cell they belong
+/// to, then simplify at the level's tolerance.
+///
+/// The child cell comes from the *file* a feature is in, not from a
+/// fresh `to_cell` on its centroid. H3 resolutions do not nest
+/// geometrically — hexagons cannot — so a point's own r5 cell is not
+/// always the r5 parent of its r7 cell, and grouping by a fresh lookup
+/// put the same child cell in two different parent files. Truncating the
+/// source file's index is the same centroid assignment the leaf level
+/// made, propagated the one way that stays consistent: `parent` is a
+/// prefix of the index, so every group of this file is a child of this
+/// file's own cell, exactly once.
 fn dissolve_cell(
     ctx: &OverviewCtx,
-    inputs: &[PathBuf],
+    inputs: &[(h3o::CellIndex, PathBuf)],
     res: h3o::Resolution,
     tol: f64,
 ) -> Result<RecordBatch, String> {
-    use h3o::LatLng;
     use std::collections::HashMap;
 
     let child_res = res.succ().unwrap_or(res);
     /// What one child cell accumulates before it becomes a row.
+    #[derive(Default)]
     struct Group {
         polys: Vec<geo_types::MultiPolygon<f64>>,
         count: u64,
         area: f64,
         cats: HashMap<String, f64>,
     }
-    let mut groups: HashMap<u64, Group> = HashMap::new();
+    let mut groups: HashMap<h3o::CellIndex, Group> = HashMap::new();
 
-    for path in inputs {
+    for (cell, path) in inputs {
+        let key = cell.parent(child_res).unwrap_or(*cell);
+        // Degrees convert to metres at the child cell's own latitude;
+        // one cell is small enough that a single factor is right for it.
+        let lat = h3o::LatLng::from(key).lat();
         let part = read_part(path)?;
         let col = part.column_by(&part.primary)?;
         let gc = GeomCol::new(col.as_ref(), part.encoding)
@@ -3975,38 +3990,21 @@ fn dissolve_cell(
         let counts = part.opt_u64(DISSOLVE_COUNT)?;
         let areas = part.opt_f64(DISSOLVE_AREA)?;
         let cats = match &ctx.pyr.dissolve.majority_column {
-            Some(c) => part.opt_strings(&format!("{DISSOLVE_MAJORITY}{c}"))?.or(part.opt_strings(c)?),
+            Some(c) => {
+                let dissolved = part.opt_strings(&format!("{DISSOLVE_MAJORITY}{c}"))?;
+                match dissolved {
+                    Some(v) => Some(v),
+                    None => part.opt_strings(c)?,
+                }
+            }
             None => None,
         };
-        // Decoded once, then one centroid transform for the whole part:
-        // `centroids_in` reprojects a slice, and calling it per feature
-        // would be an allocation and a proj lookup each time.
-        let polys: Vec<Option<geo_types::MultiPolygon<f64>>> = (0..part.batch.num_rows())
-            .map(|i| gc.geometry(i).as_ref().and_then(as_multipolygon))
-            .collect();
-        let boxes: Vec<Option<[f64; 4]>> = polys
-            .iter()
-            .map(|p| p.as_ref().map(|p| geo_types::Geometry::MultiPolygon(p.clone())))
-            .map(|g| g.as_ref().and_then(bbox_of))
-            .collect();
-        let lonlat = super::partition::centroids_in(&boxes, ctx.data_crs, &super::crs::Crs::wgs84());
+        let e = groups.entry(key).or_default();
         for i in 0..part.batch.num_rows() {
+            let Some(g) = gc.geometry(i) else { continue };
             // Non-polygon rows have nothing to union. The method only
             // runs on polygon layers, so this is a stray in a mixed one.
-            let Some(mp) = polys[i].clone() else { continue };
-            let Some((lon, lat)) = lonlat[i] else { continue };
-            let Ok(ll) = LatLng::new(lat, lon) else { continue };
-            // Grouped by the centroid's child cell. A feature the level
-            // below already dissolved can have a centroid that drifts
-            // into a neighbour's child; it still lands in exactly one
-            // group of this file, which is what "no duplication" needs.
-            let key = u64::from(ll.to_cell(child_res));
-            let e = groups.entry(key).or_insert_with(|| Group {
-                polys: Vec::new(),
-                count: 0,
-                area: 0.0,
-                cats: HashMap::new(),
-            });
+            let Some(mp) = as_multipolygon(&g) else { continue };
             let n = counts.as_ref().map_or(1, |c| c[i]);
             e.count += n;
             e.area += match &areas {
@@ -4022,14 +4020,17 @@ fn dissolve_cell(
         }
     }
 
-    let mut keys: Vec<u64> = groups.keys().copied().collect();
-    keys.sort_unstable();
+    let mut keys: Vec<h3o::CellIndex> = groups.keys().copied().collect();
+    keys.sort_unstable_by_key(|c| u64::from(*c));
     let mut geoms: Vec<Option<geo_types::Geometry<f64>>> = Vec::with_capacity(keys.len());
     let mut counts: Vec<u64> = Vec::with_capacity(keys.len());
     let mut areas: Vec<f64> = Vec::with_capacity(keys.len());
     let mut majority: Vec<Option<String>> = Vec::with_capacity(keys.len());
     for k in &keys {
         let g = &groups[k];
+        if g.polys.is_empty() {
+            continue; // a file of non-polygons contributes no row
+        }
         let union = geo::algorithm::bool_ops::unary_union(g.polys.iter());
         let geom = simplify_geom(&geo_types::Geometry::MultiPolygon(union), tol);
         geoms.push(Some(geom));
@@ -4236,19 +4237,24 @@ fn as_multipolygon(g: &geo_types::Geometry<f64>) -> Option<geo_types::MultiPolyg
 /// Douglas-Peucker at `tol`, per geometry family. Z is already gone: the
 /// decoder hands out 2D geometry whatever the source stored.
 ///
-/// A polygon whose exterior simplifies below four coordinates has no
-/// outline left, and geo happily returns it. Such a feature keeps its
-/// bounding box as a rectangle instead: an overview that silently loses
-/// features is worse than one that draws a sub-pixel feature as a box,
-/// and at these zooms the box *is* the feature on screen.
+/// A polygon that simplifies away keeps its bounding box as a rectangle
+/// rather than vanishing from the level (see the guard below).
 fn simplify_geom(g: &geo_types::Geometry<f64>, tol: f64) -> geo_types::Geometry<f64> {
     use geo::Simplify;
     use geo_types::{Geometry, MultiPolygon, Polygon};
     if !(tol.is_finite() && tol > 0.0) {
         return g.clone();
     }
+    // geo's Douglas-Peucker floors a ring at four coordinates, so a
+    // polygon simplified past its own outline comes back as a
+    // zero-area sliver rather than as nothing. Either shape is a
+    // feature that vanished from the level, and an overview that
+    // silently loses features is worse than one drawing a sub-pixel
+    // feature as a box — at these zooms the box *is* the feature on
+    // screen. It keeps its bounding box instead.
+    use geo::{Area, BoundingRect};
     let fix = |p: &Polygon<f64>, out: Polygon<f64>| -> Polygon<f64> {
-        if out.exterior().0.len() >= 4 {
+        if out.exterior().0.len() >= 4 && out.unsigned_area() > 0.0 {
             return out;
         }
         match p.bounding_rect() {
@@ -4256,7 +4262,6 @@ fn simplify_geom(g: &geo_types::Geometry<f64>, tol: f64) -> geo_types::Geometry<
             None => out,
         }
     };
-    use geo::BoundingRect;
     match g {
         Geometry::LineString(l) => Geometry::LineString(l.simplify(tol)),
         Geometry::MultiLineString(m) => Geometry::MultiLineString(m.simplify(tol)),
@@ -7236,4 +7241,552 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- H3 pyramid -----------------------------------------------------
+
+    /// WKB polygon: a regular n-gon, so simplification has vertices to
+    /// drop and a dissolve has an area to conserve.
+    fn wkb_ngon(cx: f64, cy: f64, r: f64, n: usize) -> Vec<u8> {
+        let mut b = vec![1u8];
+        b.extend_from_slice(&3u32.to_le_bytes()); // Polygon
+        b.extend_from_slice(&1u32.to_le_bytes()); // one ring
+        b.extend_from_slice(&(n as u32 + 1).to_le_bytes());
+        for i in 0..=n {
+            let a = (i % n) as f64 / n as f64 * std::f64::consts::TAU;
+            b.extend_from_slice(&(cx + r * a.cos()).to_le_bytes());
+            b.extend_from_slice(&(cy + r * a.sin()).to_le_bytes());
+        }
+        b
+    }
+
+    /// The pyramid fixture: a 12×12 grid of 40-gons over a fifth of a
+    /// degree near Paris, radii strictly increasing with the id so
+    /// "largest" is unambiguous, plus an attribute to take a majority of
+    /// and one null-geometry row. Geographic, because H3 is.
+    fn pyramid_fixture(path: &Path) -> usize {
+        let mut wkbs: Vec<Option<Vec<u8>>> = Vec::new();
+        let mut ids: Vec<i64> = Vec::new();
+        let mut cats: Vec<&str> = Vec::new();
+        for i in 0..144usize {
+            let (gx, gy) = (i % 12, i / 12);
+            let cx = 2.30 + gx as f64 * 0.017;
+            let cy = 48.80 + gy as f64 * 0.017;
+            wkbs.push(Some(wkb_ngon(cx, cy, 0.002 + 0.000_018 * i as f64, 40)));
+            ids.push(i as i64);
+            cats.push(["oak", "pine", "birch"][gy % 3]);
+        }
+        // One null geometry: it belongs in the leaf null part and nowhere
+        // else, which is what the layout promises.
+        wkbs.push(None);
+        ids.push(-1);
+        cats.push("none");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, true),
+            Field::new("id", DataType::Int64, false),
+            Field::new("cat", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter(wkbs.iter().map(|w| w.as_deref()))),
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(arrow::array::StringArray::from(cats)),
+            ],
+        )
+        .unwrap();
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {"encoding": "WKB", "geometry_types": ["Polygon"]}},
+        });
+        let mut w = ArrowWriter::try_new(File::create(path).unwrap(), schema, None).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        144
+    }
+
+    fn pyramid_opts(method: MethodChoice) -> PyramidOptions {
+        PyramidOptions {
+            reference_res: 5,
+            adaptive: true,
+            max_res: 7,
+            target_rows: 20,
+            from_res: Some(3),
+            method,
+            ..Default::default()
+        }
+    }
+
+    fn read_descriptor(root: &Path) -> crate::data::pyramid::Descriptor {
+        let text = std::fs::read_to_string(root.join(crate::data::pyramid::DESCRIPTOR))
+            .expect("descriptor written");
+        crate::data::pyramid::Descriptor::parse(&text).unwrap()
+    }
+
+    /// Every parquet part under a pyramid root, as descriptor-relative paths.
+    fn pyramid_parts(root: &Path) -> Vec<String> {
+        let mut out: Vec<String> = walk_files(root)
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/"))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// One part's rows, decoded: ids and geometries.
+    fn part_contents(path: &Path) -> (Vec<i64>, Vec<Option<geo_types::Geometry<f64>>>) {
+        let part = read_part(path).unwrap();
+        let col = part.column_by(&part.primary).unwrap();
+        let gc = GeomCol::new(col.as_ref(), part.encoding).unwrap();
+        let geoms = (0..part.batch.num_rows()).map(|i| gc.geometry(i)).collect();
+        let ids = match part.batch.schema().index_of("id") {
+            Ok(i) => {
+                let a = part.batch.column(i).as_any().downcast_ref::<Int64Array>().unwrap();
+                (0..a.len()).map(|i| a.value(i)).collect()
+            }
+            Err(_) => Vec::new(),
+        };
+        (ids, geoms)
+    }
+
+    fn part_f64(path: &Path, name: &str) -> Vec<f64> {
+        read_part(path).unwrap().opt_f64(name).unwrap().unwrap_or_default()
+    }
+
+    fn part_u64(path: &Path, name: &str) -> Vec<u64> {
+        read_part(path).unwrap().opt_u64(name).unwrap().unwrap_or_default()
+    }
+
+    fn write_pyramid(dir: &Path, name: &str, pyr: PyramidOptions) -> (PathBuf, OptimizeReport) {
+        let src = dir.join("src.parquet");
+        if !src.exists() {
+            pyramid_fixture(&src);
+        }
+        let dst = dir.join(name);
+        let opts = OptimizeOptions { pyramid: Some(pyr), ..Default::default() };
+        let rep = optimize(&Source::Local(src), &dst, &opts, None, None, &|_, _| {}).unwrap();
+        (dst, rep)
+    }
+
+    /// The layout contract, once per method: every source feature in
+    /// exactly one leaf file, every overview file saying what it is, and
+    /// a descriptor that validates and names exactly the files on disk.
+    #[test]
+    fn pyramid_writes_a_valid_dataset_for_every_method() {
+        use crate::data::pyramid::{self, Descriptor};
+        let dir = std::env::temp_dir().join(format!("geopq_pyr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for method in [MethodChoice::Simplify, MethodChoice::Prune, MethodChoice::Dissolve] {
+            let (root, rep) =
+                write_pyramid(&dir, &format!("out_{}", method.label()), pyramid_opts(method));
+            let desc: Descriptor = read_descriptor(&root);
+            desc.validate().unwrap_or_else(|e| panic!("{}: {e}", method.label()));
+            assert_eq!(desc.leaf.res, 5);
+            assert_eq!(desc.leaf.adaptive_max_res, 7);
+            assert!(desc.leaf.null_part, "the fixture has a null geometry");
+            assert_eq!(desc.pixels_per_cell, pyramid::DEFAULT_PIXELS_PER_CELL);
+            assert_eq!(desc.rows, Some(145));
+
+            // The descriptor names exactly the files that were written.
+            let mut listed = desc.files();
+            listed.sort();
+            assert_eq!(listed, pyramid_parts(&root), "{}", method.label());
+            assert_eq!(rep.files, listed.len(), "{}", method.label());
+
+            // Two overview levels, coarse first, each with a method.
+            let ov: Vec<u8> = desc.overviews().map(|l| l.res).collect();
+            assert_eq!(ov, vec![3, 4], "{}", method.label());
+            assert!(desc.leaves().all(|l| l.method.is_none()));
+            assert!(desc.leaves().any(|l| l.res > 5), "dense cells split finer");
+
+            // Every source feature lands in exactly one leaf file, and
+            // the null-geometry row lands in the null part alone.
+            let mut leaf_ids: Vec<i64> = Vec::new();
+            for l in desc.leaves() {
+                for c in &l.cells {
+                    leaf_ids.extend(part_contents(&root.join(pyramid::part_path(l.res, c))).0);
+                }
+            }
+            leaf_ids.sort();
+            assert_eq!(leaf_ids, (0..144).collect::<Vec<i64>>(), "{}", method.label());
+            let null = root.join(pyramid::part_path(5, pyramid::NULL_PART));
+            assert_eq!(part_contents(&null).0, vec![-1], "{}", method.label());
+
+            // Every overview file says it is one, and carries its own bbox.
+            for l in desc.overviews() {
+                assert!(!l.cells.is_empty());
+                for c in &l.cells {
+                    let p = root.join(pyramid::part_path(l.res, c));
+                    let meta: pyramid::FileMeta = {
+                        let b = ParquetRecordBatchReaderBuilder::try_new(File::open(&p).unwrap())
+                            .unwrap();
+                        let kv = b
+                            .metadata()
+                            .file_metadata()
+                            .key_value_metadata()
+                            .unwrap()
+                            .iter()
+                            .find(|kv| kv.key == pyramid::FILE_KEY)
+                            .unwrap_or_else(|| panic!("{}: no {} key", p.display(), pyramid::FILE_KEY))
+                            .clone();
+                        serde_json::from_str(kv.value.as_deref().unwrap()).unwrap()
+                    };
+                    assert!(meta.derived);
+                    assert_eq!(meta.res, l.res);
+                    assert_eq!(meta.source_res, l.res + 1);
+                    assert_eq!(Some(meta.method), l.method);
+                    let geo = read_geo_meta(&p);
+                    let bbox = geo["columns"]["geometry"]["bbox"].as_array().expect("file bbox");
+                    assert_eq!(bbox.len(), 4, "{}", p.display());
+                    assert!(
+                        geo["columns"]["geometry"]["covering"].is_object(),
+                        "overviews keep the covering column"
+                    );
+                }
+            }
+
+            // The report accounts for every level, leaf included.
+            let levels: Vec<u8> = rep.pyramid_levels.iter().map(|l| l.res).collect();
+            assert_eq!(levels[0], 3, "coarse first: {levels:?}");
+            assert!(levels.windows(2).all(|w| w[0] < w[1]), "{levels:?}");
+            assert!(rep.pyramid_overhead_pct().unwrap() > 0.0);
+            assert!(rep.pyramid_note.is_none(), "{:?}", rep.pyramid_note);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Simplification keeps every feature and drops vertices. A polygon
+    /// that simplifies past its own outline comes back as its bounding
+    /// box rather than vanishing.
+    #[test]
+    fn pyramid_simplify_thins_without_dropping() {
+        use crate::data::pyramid::{self, Descriptor};
+        let dir = std::env::temp_dir().join(format!("geopq_pyr_simp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (root, _) = write_pyramid(&dir, "out", pyramid_opts(MethodChoice::Simplify));
+        let desc: Descriptor = read_descriptor(&root);
+
+        let vertices = |g: &geo_types::Geometry<f64>| -> usize {
+            use geo::CoordsIter;
+            g.coords_count()
+        };
+        let mut leaf: std::collections::HashMap<i64, usize> = Default::default();
+        for l in desc.leaves() {
+            for c in &l.cells {
+                let (ids, geoms) = part_contents(&root.join(pyramid::part_path(l.res, c)));
+                for (id, g) in ids.iter().zip(&geoms) {
+                    if let Some(g) = g {
+                        leaf.insert(*id, vertices(g));
+                    }
+                }
+            }
+        }
+        assert_eq!(leaf.len(), 144);
+
+        for l in desc.overviews() {
+            let mut ids: Vec<i64> = Vec::new();
+            let mut thinner = 0usize;
+            for c in &l.cells {
+                let (part_ids, geoms) = part_contents(&root.join(pyramid::part_path(l.res, c)));
+                for (id, g) in part_ids.iter().zip(&geoms) {
+                    let g = g.as_ref().unwrap_or_else(|| panic!("r{}: feature {id} vanished", l.res));
+                    // Nothing simplifies away: a 40-gon that collapses at
+                    // this tolerance comes back as its bounding box, which
+                    // still has an outline and still has area.
+                    use geo::Area;
+                    assert!(vertices(g) >= 4, "r{}: feature {id} has no outline", l.res);
+                    assert!(g.unsigned_area() > 0.0, "r{}: feature {id} has no area", l.res);
+                    if vertices(g) < leaf[id] {
+                        thinner += 1;
+                    }
+                    ids.push(*id);
+                }
+            }
+            ids.sort();
+            assert_eq!(ids, (0..144).collect::<Vec<i64>>(), "r{} keeps every feature", l.res);
+            assert_eq!(thinner, 144, "r{} thinned every 40-gon", l.res);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pruning keeps the largest by bbox diagonal, a quarter of each
+    /// level's input by default, and the biggest feature of all survives
+    /// every level.
+    #[test]
+    fn pyramid_prune_keeps_the_largest() {
+        use crate::data::pyramid::{self, Descriptor};
+        let dir = std::env::temp_dir().join(format!("geopq_pyr_prune_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (root, _) = write_pyramid(&dir, "out", pyramid_opts(MethodChoice::Prune));
+        let desc: Descriptor = read_descriptor(&root);
+
+        let mut prev = 144usize;
+        for l in desc.overviews().collect::<Vec<_>>().into_iter().rev() {
+            let mut ids: Vec<i64> = Vec::new();
+            for c in &l.cells {
+                ids.extend(part_contents(&root.join(pyramid::part_path(l.res, c))).0);
+            }
+            assert!(!ids.is_empty(), "r{} is not empty", l.res);
+            assert!(ids.len() < prev, "r{} thins its input ({} of {prev})", l.res, ids.len());
+            // The fixture's radii grow with the id, so the largest
+            // feature is 143 and it must survive at every level.
+            assert!(ids.contains(&143), "r{} kept the largest", l.res);
+            // A quarter of the input, per cell, rounded up.
+            assert!(
+                ids.len() <= prev.div_ceil(4) + l.cells.len(),
+                "r{}: {} of {prev} over {} cells",
+                l.res,
+                ids.len(),
+                l.cells.len()
+            );
+            prev = ids.len();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dissolving unions by child cell: one row per occupied child, the
+    /// counts adding up to the source, and the unioned geometry covering
+    /// the same ground as its inputs.
+    #[test]
+    fn pyramid_dissolve_unions_by_child_cell() {
+        use crate::data::pyramid::{self, Descriptor};
+        use h3o::Resolution;
+        let dir = std::env::temp_dir().join(format!("geopq_pyr_dis_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pyr = PyramidOptions {
+            // Not simplified at all, so the area comparison measures the
+            // union rather than the Douglas-Peucker after it. The
+            // dissolve-then-simplify path is covered by the layout test.
+            simplify_tolerance_factor: 0.0,
+            dissolve: DissolveOptions { majority_column: Some("cat".into()) },
+            ..pyramid_opts(MethodChoice::Dissolve)
+        };
+        let (root, _) = write_pyramid(&dir, "out", pyr);
+        let desc: Descriptor = read_descriptor(&root);
+
+        // The r5 cells the leaf level occupies: one dissolved row per
+        // occupied child is what the r4 level owes them. Taken from the
+        // leaf cells rather than from a fresh lookup, because that is
+        // the assignment the pyramid actually made.
+        let mut children: std::collections::HashSet<u64> = Default::default();
+        for l in desc.leaves() {
+            for c in &l.cells {
+                let cell: h3o::CellIndex = c.parse().unwrap();
+                children.insert(u64::from(cell.parent(Resolution::Five).unwrap()));
+            }
+        }
+        // Source area, measured the way a dissolved level reports it.
+        let src = dir.join("src.parquet");
+        let (_, src_geoms) = part_contents(&src);
+        let mut src_area = 0.0;
+        for g in src_geoms.iter().flatten() {
+            let b = bbox_of(g).unwrap();
+            src_area += geom_area(
+                &as_multipolygon(g).unwrap(),
+                CogpUnits::Degrees,
+                (b[1] + b[3]) * 0.5,
+            );
+        }
+
+        let level_of = |res: u8| -> (u64, f64, f64, Vec<Option<String>>) {
+            let l = desc.levels.iter().find(|l| l.res == res).unwrap();
+            let (mut count, mut area, mut union_area) = (0u64, 0.0, 0.0);
+            let mut cats: Vec<Option<String>> = Vec::new();
+            for c in &l.cells {
+                let p = root.join(pyramid::part_path(res, c));
+                count += part_u64(&p, "count").iter().sum::<u64>();
+                area += part_f64(&p, "area_sum").iter().sum::<f64>();
+                let (_, geoms) = part_contents(&p);
+                for g in geoms.iter().flatten() {
+                    let b = bbox_of(g).unwrap();
+                    union_area += geom_area(
+                        &as_multipolygon(g).unwrap(),
+                        CogpUnits::Degrees,
+                        (b[1] + b[3]) * 0.5,
+                    );
+                }
+                cats.extend(
+                    read_part(&p).unwrap().opt_strings("majority:cat").unwrap().unwrap(),
+                );
+            }
+            (count, area, union_area, cats)
+        };
+
+        let (count4, area4, union4, cats4) = level_of(4);
+        assert_eq!(cats4.len(), children.len(), "one row per occupied r5 child");
+        assert_eq!(count4, 144, "every source feature counted once");
+        // The writer converts degrees to metres at the child cell's
+        // latitude and this sum at each feature's, so they agree to a
+        // fraction of a percent rather than exactly.
+        assert!(
+            (area4 - src_area).abs() / src_area < 0.005,
+            "area_sum is the inputs' area: {area4} vs {src_area}"
+        );
+        assert!(
+            (union4 - src_area).abs() / src_area < 0.01,
+            "the union covers the inputs within 1%: {union4} vs {src_area}"
+        );
+        assert!(cats4.iter().all(|c| matches!(c.as_deref(), Some("oak" | "pine" | "birch"))));
+
+        // Coarsening again conserves both totals.
+        let (count3, area3, _, _) = level_of(3);
+        assert_eq!(count3, 144);
+        // Coarsening sums the level below's own totals, so no second
+        // conversion happens and r3 matches r4 exactly.
+        assert!((area3 - area4).abs() / area4 < 1e-9, "{area3} vs {area4}");
+        assert!((area3 - src_area).abs() / src_area < 0.005, "{area3} vs {src_area}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dissolve of a layer that has no polygons prunes instead, and
+    /// says so rather than writing empty files.
+    #[test]
+    fn pyramid_dissolve_on_lines_falls_back_to_prune() {
+        let dir = std::env::temp_dir().join(format!("geopq_pyr_lines_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("lines.parquet");
+        let rows: Vec<(Vec<u8>, i64, i64)> = (0..120)
+            .map(|i| {
+                let x = 2.30 + (i % 12) as f64 * 0.017;
+                let y = 48.80 + (i / 12) as f64 * 0.017;
+                (wkb_line(x, y, x + 0.004, y + 0.004), i, i)
+            })
+            .collect();
+        write_wgs84_fixture(&src, rows, &["LineString"]);
+        let opts = OptimizeOptions {
+            pyramid: Some(pyramid_opts(MethodChoice::Dissolve)),
+            ..Default::default()
+        };
+        let dst = dir.join("out");
+        let rep = optimize(&Source::Local(src), &dst, &opts, None, None, &|_, _| {}).unwrap();
+        let note = rep.pyramid_note.expect("the fallback is reported");
+        assert!(note.contains("dissolve") && note.contains("prune"), "got {note}");
+        let desc = read_descriptor(&dst);
+        desc.validate().unwrap();
+        assert!(desc.overviews().all(|l| l.method == Some(crate::data::pyramid::Method::Prune)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The leaf level on its own: no overviews, no overview levels in
+    /// the descriptor, and the reference resolution still declared.
+    #[test]
+    fn pyramid_without_overviews_is_just_the_leaf() {
+        let dir = std::env::temp_dir().join(format!("geopq_pyr_leaf_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pyr = PyramidOptions { from_res: None, ..pyramid_opts(MethodChoice::Auto) };
+        let (root, rep) = write_pyramid(&dir, "out", pyr);
+        let desc = read_descriptor(&root);
+        desc.validate().unwrap();
+        assert_eq!(desc.overviews().count(), 0);
+        assert!(desc.levels.iter().any(|l| l.res == 5));
+        assert_eq!(rep.pyramid_overhead_pct(), Some(0.0));
+        let mut listed = desc.files();
+        listed.sort();
+        assert_eq!(listed, pyramid_parts(&root));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pyramid_refuses_the_combinations_it_cannot_honour() {
+        let dir = std::env::temp_dir().join(format!("geopq_pyr_no_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.parquet");
+        pyramid_fixture(&src);
+        let dst = dir.join("out");
+        let run = |o: &OptimizeOptions| {
+            optimize(&Source::Local(src.clone()), &dst, o, None, None, &|_, _| {}).unwrap_err()
+        };
+
+        let hive = OptimizeOptions {
+            pyramid: Some(pyramid_opts(MethodChoice::Auto)),
+            partition: crate::data::partition::PartitionBy::Fields(vec!["cat".into()]),
+            ..Default::default()
+        };
+        assert!(run(&hive).contains("partitioned output"), "{}", run(&hive));
+
+        let cogp = OptimizeOptions {
+            pyramid: Some(pyramid_opts(MethodChoice::Auto)),
+            cogp: Some(crate::data::settings::cogp_defaults().clone()),
+            ..Default::default()
+        };
+        assert!(run(&cogp).contains("COGP levels"), "{}", run(&cogp));
+
+        // Overviews have to be coarser than the leaf.
+        let backwards = OptimizeOptions {
+            pyramid: Some(PyramidOptions {
+                from_res: Some(6),
+                ..pyramid_opts(MethodChoice::Auto)
+            }),
+            ..Default::default()
+        };
+        assert!(run(&backwards).contains("coarser"), "{}", run(&backwards));
+
+        // A knob naming a column the output does not carry fails before
+        // the passes rather than at the first overview.
+        let missing = OptimizeOptions {
+            pyramid: Some(PyramidOptions {
+                prune: PruneOptions {
+                    rank: Some(("nope".into(), RankOrder::Desc)),
+                    ..PruneOptions::default()
+                },
+                ..pyramid_opts(MethodChoice::Prune)
+            }),
+            ..Default::default()
+        };
+        assert!(run(&missing).contains("rank column 'nope'"), "{}", run(&missing));
+        assert!(!dst.exists(), "a refused run leaves nothing behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The level tolerance is metres on the ground, converted into the
+    /// layer's own units — degrees at the file's latitude, or the
+    /// projected CRS's linear unit.
+    #[test]
+    fn pyramid_tolerance_converts_to_the_layer_units() {
+        use crate::data::pyramid::{gsd_for_res, DEFAULT_PIXELS_PER_CELL};
+        use h3o::Resolution;
+        let r5 = Resolution::Five;
+        let metres = gsd_for_res(r5, DEFAULT_PIXELS_PER_CELL) * 0.5;
+        assert!((50.0..150.0).contains(&metres), "r5 half-gsd is {metres} m");
+
+        // Metres pass through; feet divide by the foot.
+        assert!((level_tolerance(r5, 0.5, CogpUnits::Linear(1.0), 45.0) - metres).abs() < 1e-9);
+        let feet = level_tolerance(r5, 0.5, CogpUnits::Linear(0.3048), 45.0);
+        assert!((feet * 0.3048 - metres).abs() < 1e-9, "{feet} ft is {metres} m");
+
+        // Degrees: under a hundredth of a degree, converted by whichever
+        // axis is longest in metres, so the tolerance never exceeds the
+        // ground distance asked for on either of them. At the equator
+        // that is longitude, and away from it latitude, once cos φ has
+        // shrunk the longitude degree past it.
+        let equator = level_tolerance(r5, 0.5, CogpUnits::Degrees, 0.0);
+        let north = level_tolerance(r5, 0.5, CogpUnits::Degrees, 60.0);
+        assert!((equator - metres / M_PER_DEG_LON).abs() < 1e-12, "{equator}");
+        assert!((north - metres / M_PER_DEG_LAT).abs() < 1e-12, "{north}");
+        assert!(equator < north && north < 0.01, "{equator} then {north} degrees");
+
+        // A zero factor means no simplification at all, and the guard in
+        // simplify_geom returns the geometry untouched.
+        let square = geo_types::Geometry::Polygon(
+            geo_types::Rect::new(
+                geo_types::coord! { x: 0.0, y: 0.0 },
+                geo_types::coord! { x: 1.0, y: 1.0 },
+            )
+            .to_polygon(),
+        );
+        assert_eq!(simplify_geom(&square, 0.0), square);
+    }
 }

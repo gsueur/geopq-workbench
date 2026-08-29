@@ -439,6 +439,10 @@ pub fn split_pyramid_leaf(
     Ok(out)
 }
 
+/// A balanced set of cells with the rows in each, and the rows that have
+/// no cell at any resolution because their geometry has no centroid.
+type AdaptiveSplit = (Vec<(CellIndex, Vec<u32>)>, Vec<u32>);
+
 /// The descent both H3 partitionings share: bucket rows by their centroid
 /// cell at `start_res`, then split any bucket over `target_rows` into its
 /// children until `max_res`. Rows whose centroid is missing come back
@@ -449,7 +453,7 @@ fn adaptive_cells(
     start_res: u8,
     target_rows: usize,
     max_res: u8,
-) -> Result<(Vec<(CellIndex, Vec<u32>)>, Vec<u32>), String> {
+) -> Result<AdaptiveSplit, String> {
     let max_res = Resolution::try_from(max_res).map_err(|e| format!("H3 resolution: {e}"))?;
     let start_res = Resolution::try_from(start_res).map_err(|e| format!("H3 resolution: {e}"))?;
     if start_res > max_res {
@@ -722,7 +726,7 @@ mod tests {
         // Two clusters an ocean apart cannot share a cell at any of these
         // resolutions, and the null row buys exactly one extra file.
         assert!(table[0].cells >= 2);
-        assert!(table.iter().all(|r| r.files >= r.cells + 1));
+        assert!(table.iter().all(|r| r.files > r.cells), "the null row is a file too");
 
         // Splitting off is one file per occupied cell, plus the null part.
         let flat = density_table(&lonlat, 250, 3).unwrap();
