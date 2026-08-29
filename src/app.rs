@@ -8020,10 +8020,6 @@ impl ViewerApp {
                 }
 
                 ui.add_enabled_ui(!o.running, |ui| {
-                    // COGP owns the file's layout, so the choices it cannot
-                    // honour are greyed out for as long as it is on rather
-                    // than failing at export time.
-                    let cogp_on = o.opts.cogp.is_some();
                     let label = |v: GpVersion, rec: GpVersion| {
                         if v == rec {
                             format!("{} — recommended", v.label())
@@ -8048,21 +8044,14 @@ impl ViewerApp {
                         o.opts.geoarrow_aux = false;
                     }
                     if ui
-                        .add_enabled(
-                            !cogp_on,
-                            egui::RadioButton::new(
-                                o.opts.version == GpVersion::V1_1GeoArrow,
-                                label(GpVersion::V1_1GeoArrow, o.recommended),
-                            ),
+                        .radio(
+                            o.opts.version == GpVersion::V1_1GeoArrow,
+                            label(GpVersion::V1_1GeoArrow, o.recommended),
                         )
                         .on_hover_text(
                             "Geometry as raw coordinate arrays: fastest decode, x/y column\n\
                              statistics prune for free. Needs a single geometry family\n\
                              (singles are promoted to their multi variant).",
-                        )
-                        .on_disabled_hover_text(
-                            "Cloud-optimized levels write WKB 1.1 or native 2.0; \
-                             untick them to export GeoArrow",
                         )
                         .clicked()
                     {
@@ -8160,6 +8149,7 @@ impl ViewerApp {
                     // Ordering is one choice, not two independent ticks:
                     // the coarse-to-fine layout *is* a sort order, and it
                     // still sorts by Hilbert inside each level.
+                    let cogp_on = o.opts.cogp.is_some();
                     ui.label(RichText::new("Ordering").strong());
                     if ui
                         .radio(!cogp_on, "Hilbert spatial sort")

@@ -2789,6 +2789,7 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
                     geo_meta.as_ref(),
                     &primary_name,
                     geom_leaf,
+                    encoding,
                     crs.is_latlong,
                 ),
             )
@@ -3307,8 +3308,7 @@ pub(crate) fn rg_bboxes_from_metadata(
 /// (SPEC §5.1). Runs the loader's own bbox sources one at a time so the
 /// answer names the source that exists rather than the one that won:
 /// `geom_leaf` None disables the native branch, `geo_meta` None the
-/// covering one, and WKB disables the GeoArrow coordinate fallback,
-/// which is a decode format rather than a declared spatial index.
+/// covering one, and a WKB `encoding` the GeoArrow coordinate leaves.
 ///
 /// Covering wins a tie because it is what the published profile asks
 /// for, so a file carrying both is plain COGP rather than an extension.
@@ -3317,15 +3317,26 @@ fn cogp_pruning_signal(
     geo_meta: Option<&Value>,
     primary: &str,
     geom_leaf: Option<usize>,
+    encoding: GeomEncoding,
     is_latlong: bool,
 ) -> Option<super::cogp::Pruning> {
+    use super::cogp::Pruning;
     if rg_bboxes_from_metadata(builder, geo_meta, None, primary, GeomEncoding::Wkb, is_latlong)
         .is_some()
     {
-        return Some(super::cogp::Pruning::Covering);
+        return Some(Pruning::Covering);
     }
-    rg_bboxes_from_metadata(builder, None, geom_leaf, primary, GeomEncoding::Wkb, is_latlong)
-        .map(|_| super::cogp::Pruning::NativeStats)
+    if rg_bboxes_from_metadata(builder, None, geom_leaf, primary, GeomEncoding::Wkb, is_latlong)
+        .is_some()
+    {
+        return Some(Pruning::NativeStats);
+    }
+    // Last, because it is the weakest claim of the three: the coordinate
+    // leaves are a decode format's side effect rather than a declared
+    // spatial index. They still bound every row group, which is all the
+    // levels ask of them.
+    rg_bboxes_from_metadata(builder, None, None, primary, encoding, is_latlong)
+        .map(|_| Pruning::GeoArrowLeaves)
 }
 
 /// Parquet geospatial statistics allow xmin > xmax for row groups that

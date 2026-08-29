@@ -40,6 +40,13 @@ pub enum Pruning {
     /// read as COGP and labelled as the extension it is, so nobody
     /// mistakes it for something the published profile covers.
     NativeStats,
+    /// The x/y coordinate leaves of a GeoArrow-encoded geometry column,
+    /// whose ordinary Parquet min/max statistics are a row-group bbox.
+    ///
+    /// Same reasoning as `NativeStats`, and the same caveat: the profile
+    /// says nothing about the encoding, so a file leaning on it is
+    /// labelled as this app's extension rather than as plain COGP.
+    GeoArrowLeaves,
 }
 
 impl Pruning {
@@ -47,6 +54,7 @@ impl Pruning {
         match self {
             Pruning::Covering => "covering column statistics",
             Pruning::NativeStats => "native geospatial statistics",
+            Pruning::GeoArrowLeaves => "GeoArrow coordinate statistics",
         }
     }
 }
@@ -132,8 +140,9 @@ impl CogpLevels {
             .collect::<Vec<_>>()
             .join("/");
         let form = match self.pruning {
-            Pruning::Covering => String::new(),
-            Pruning::NativeStats => " (2.0 extension)".to_string(),
+            Pruning::Covering => "",
+            Pruning::NativeStats => " (2.0 extension)",
+            Pruning::GeoArrowLeaves => " (GeoArrow extension)",
         };
         format!(
             "COGP {}{}: {} levels, gsd {} m, prefix row groups {}",

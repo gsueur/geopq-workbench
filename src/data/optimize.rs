@@ -617,9 +617,8 @@ pub struct OptimizeOptions {
     pub partition: super::partition::PartitionBy,
     /// Order the output coarse to fine and write the `cogp` level metadata
     /// (Cloud Optimized GeoParquet Profile). Implies the Hilbert sort and,
-    /// on 1.1, the covering column; cannot combine with partitioning
-    /// (levels and hive parts both want to own the file layout) or with the
-    /// GeoArrow flavour.
+    /// on 1.1 WKB, the covering column; cannot combine with partitioning
+    /// (levels and hive parts both want to own the file layout).
     pub cogp: Option<CogpOptions>,
     /// Source has no geometry column: synthesize WKB points from these
     /// coordinate columns (x/lon, y/lat) — materializes x/y layers into
@@ -1851,11 +1850,12 @@ pub fn optimize(
 
     // --- COGP levels ---
     // The profile owns the physical layout of the file, which is why it
-    // refuses to share it: hive parts would each need their own level list
-    // (the spec has no notion of a partitioned dataset), and the GeoArrow
-    // flavour is left out deliberately to keep the surface small. What it
-    // *takes over* rather than refuses is the sort and the covering column,
-    // both of which it requires.
+    // refuses to share it with hive parts: each would need its own level
+    // list, and the spec has no notion of a partitioned dataset. Every
+    // flavour this app writes is fair game otherwise — what the levels need
+    // is a bbox per row group, and all three offer one. What COGP *takes
+    // over* rather than refuses is the sort, and on 1.1 WKB the covering
+    // column it requires.
     let cogp_gsds: Option<Vec<f64>> = match &opts.cogp {
         None => None,
         Some(c) => {
@@ -1864,18 +1864,14 @@ pub fn optimize(
                             the profile describes one file's row groups"
                     .into());
             }
-            if opts.version == GpVersion::V1_1GeoArrow {
-                return Err("COGP needs the WKB 1.1 or the native 2.0 flavour, \
-                            not GeoArrow"
-                    .into());
-            }
             Some(c.gsds()?)
         }
     };
     let cogp_on = cogp_gsds.is_some();
     // COGP v0.1 requires the covering bbox with row-group statistics
     // (§5.1). On 2.0 the native GEOMETRY statistics are the pruning signal
-    // instead, so the covering column stays the user's choice there.
+    // and on GeoArrow the coordinate leaves' own min/max are, so the
+    // covering column stays the user's choice on both.
     let cogp_needs_covering = cogp_on && opts.version == GpVersion::V1_1;
     // §5.2 asks producers to cluster spatially within each level; the
     // Hilbert order is what this app has, so COGP simply switches it on.
@@ -5268,6 +5264,14 @@ mod tests {
     /// the file alone — so it validates the output rather than repeating
     /// the writer's bookkeeping.
     fn cogp_features(path: &Path) -> (crate::data::cogp::Cogp, Vec<CogpFeature>) {
+        cogp_features_as(path, GeomEncoding::Wkb)
+    }
+
+    /// Same, for an output whose geometry is not WKB.
+    fn cogp_features_as(
+        path: &Path,
+        encoding: GeomEncoding,
+    ) -> (crate::data::cogp::Cogp, Vec<CogpFeature>) {
         let (meta, n_rg) = read_cogp(path);
         meta.validate(n_rg).expect("cogp metadata conforms");
         let mut out = Vec::new();
@@ -5285,7 +5289,7 @@ mod tests {
                 .unwrap()
                 .clone();
             let (mut boxes, mut kinds, mut types) = (Vec::new(), Vec::new(), HashSet::new());
-            scan_bboxes(&geom, GeomEncoding::Wkb, &mut boxes, &mut types, Some(&mut kinds)).unwrap();
+            scan_bboxes(&geom, encoding, &mut boxes, &mut types, Some(&mut kinds)).unwrap();
             for i in 0..batch.num_rows() {
                 out.push((level, ids.value(i), boxes[i].unwrap(), kinds[i]));
             }
@@ -5354,6 +5358,28 @@ mod tests {
         n
     }
 
+    /// Polygons only, at the same three sizes as the mixed fixture — the
+    /// GeoArrow flavour stores one geometry family, so the case that
+    /// exercises it needs a layer that has one. Twenty per size, so every
+    /// level owns row groups of its own at the test's group size.
+    fn cogp_polygon_fixture(path: &Path) -> usize {
+        let mut rows: Vec<(Vec<u8>, i64, i64)> = Vec::new();
+        // Diagonals of 84853 m (level 0), 4243 m (level 1) and 14 m (last).
+        for (band, half) in [30_000.0, 1_500.0, 5.0].iter().enumerate() {
+            for k in 0..20 {
+                let x = k as f64 * half * 4.0;
+                let y = band as f64 * 500_000.0;
+                rows.push((wkb_square(x, y, *half), rows.len() as i64, 0));
+            }
+        }
+        let n = rows.len();
+        // Scramble, so nothing passes by accident of input order.
+        let stride = n / 2 + 1;
+        let scrambled: Vec<_> = (0..n).map(|i| rows[(i * stride) % n].clone()).collect();
+        write_metric_fixture(path, scrambled, &["Polygon"]);
+        n
+    }
+
     fn cogp_opts(gsds: &[f64]) -> CogpOptions {
         CogpOptions {
             gsd: GsdSource::Explicit(gsds.to_vec()),
@@ -5367,13 +5393,25 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("mixed.parquet");
         let n = cogp_mixed_fixture(&src);
+        let poly_src = dir.join("polygons.parquet");
+        let poly_n = cogp_polygon_fixture(&poly_src);
         let gsds = [10_000.0, 1_000.0, 100.0];
 
-        // Both flavours COGP is offered on: 1.1 with the covering column the
-        // profile requires, and 2.0 leaning on native geospatial statistics.
-        for (name, version, covering) in [
-            ("v11", GpVersion::V1_1, true),
-            ("v20", GpVersion::V2_0, false),
+        // Every flavour the app writes: 1.1 with the covering column the
+        // profile requires, 2.0 leaning on native geospatial statistics,
+        // and GeoArrow on its coordinate leaves' own min/max — from a
+        // single-family layer, which is what that encoding stores.
+        for (name, src, n, version, covering, encoding) in [
+            ("v11", &src, n, GpVersion::V1_1, true, GeomEncoding::Wkb),
+            ("v20", &src, n, GpVersion::V2_0, false, GeomEncoding::Wkb),
+            (
+                "geoarrow",
+                &poly_src,
+                poly_n,
+                GpVersion::V1_1GeoArrow,
+                false,
+                GeomEncoding::Polygon,
+            ),
         ] {
             let dst = dir.join(format!("{name}.parquet"));
             let opts = OptimizeOptions {
@@ -5388,7 +5426,7 @@ mod tests {
             let rep =
                 optimize(&Source::Local(src.clone()), &dst, &opts, None, None, &|_, _| {}).unwrap();
 
-            let (meta, feats) = cogp_features(&dst);
+            let (meta, feats) = cogp_features_as(&dst, encoding);
             let (_, n_rg) = read_cogp(&dst);
             assert_eq!(n_rg, rep.rg_after, "{name}: report agrees with the file");
             assert_eq!(
@@ -5396,6 +5434,10 @@ mod tests {
                 n_rg - 1,
                 "{name}: the last level owns the last row group"
             );
+            // Empty levels collapse, so this is also "each fixture feeds
+            // all three": a case that quietly wrote one level would prove
+            // nothing below.
+            assert_eq!(meta.levels.len(), gsds.len(), "{name}: every gsd used");
 
             // Every input row, exactly once.
             let mut ids: Vec<i64> = feats.iter().map(|f| f.1).collect();
@@ -5613,15 +5655,6 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("partitioned"), "got {err}");
 
-        let geoarrow = OptimizeOptions {
-            version: GpVersion::V1_1GeoArrow,
-            cogp: Some(cogp_opts(&[1_000.0, 100.0])),
-            ..Default::default()
-        };
-        let err = optimize(&Source::Local(src.clone()), &dst, &geoarrow, None, None, &|_, _| {})
-            .unwrap_err();
-        assert!(err.contains("GeoArrow"), "got {err}");
-
         // A gsd list that is not strictly decreasing is caught before any
         // file is touched.
         let bad = OptimizeOptions {
@@ -5728,9 +5761,24 @@ mod tests {
         n
     }
 
+    /// Squares only, in degrees, at the three sizes the round trip's gsds
+    /// separate — the single-family layer the GeoArrow flavour needs.
+    fn cogp_geographic_polygon_fixture(path: &Path) {
+        let mut rows: Vec<(Vec<u8>, i64, i64)> = Vec::new();
+        // Diagonals of ~94 km, ~9.4 km and ~0.9 km: levels 0, 1 and 2 at
+        // polygon factor 4.
+        for (band, half) in [0.3, 0.03, 0.003].iter().enumerate() {
+            for k in 0..8 {
+                let x = k as f64 * half * 4.0;
+                let y = band as f64 * 10.0;
+                rows.push((wkb_square(x, y, *half), rows.len() as i64, 0));
+            }
+        }
+        write_wgs84_fixture(path, rows, &["Polygon"]);
+    }
+
     /// The writer stamps `cogp`, the reader parses it: the two halves have
-    /// to agree about the same bytes, in both flavours the profile is
-    /// offered on.
+    /// to agree about the same bytes, in every flavour the app writes.
     #[test]
     fn cogp_round_trips_from_writer_to_reader() {
         use crate::data::cogp::Pruning;
@@ -5739,14 +5787,24 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("mixed_wgs84.parquet");
         cogp_geographic_fixture(&src);
+        let poly_src = dir.join("polygons_wgs84.parquet");
+        cogp_geographic_polygon_fixture(&poly_src);
         let gsds = [10_000.0, 1_000.0, 100.0];
 
         // 1.1 carries the covering column the published profile requires;
         // 2.0 with the covering opt-in off leans on native geospatial
-        // statistics instead, which is this app's labelled extension.
-        for (name, version, covering, want) in [
-            ("v11", GpVersion::V1_1, true, Pruning::Covering),
-            ("v20", GpVersion::V2_0, false, Pruning::NativeStats),
+        // statistics instead, and GeoArrow with it off on the coordinate
+        // leaves' own min/max — both this app's labelled extensions.
+        for (name, src, version, covering, want) in [
+            ("v11", &src, GpVersion::V1_1, true, Pruning::Covering),
+            ("v20", &src, GpVersion::V2_0, false, Pruning::NativeStats),
+            (
+                "geoarrow",
+                &poly_src,
+                GpVersion::V1_1GeoArrow,
+                false,
+                Pruning::GeoArrowLeaves,
+            ),
         ] {
             let dst = dir.join(format!("rt_{name}.parquet"));
             let opts = OptimizeOptions {
