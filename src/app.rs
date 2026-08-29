@@ -267,6 +267,8 @@ pub struct ViewerApp {
 
     tiles: TileCache,
     basemap: Option<usize>,
+    /// CARTO API key being typed in the basemap row (saved on apply).
+    carto_key_draft: String,
     /// Basemap opacity. It sits under the data, so fading it back is how
     /// you keep context without the data competing with it.
     basemap_opacity: f32,
@@ -1051,6 +1053,18 @@ struct FilterDialog {
 
 impl ViewerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<Source>) -> Self {
+        // CARTO tiles need an API key since 2026 (they come back
+        // watermarked without one); pick it up from the environment or the
+        // settings file, and default to OpenStreetMap when there is none.
+        crate::map::tiles::set_carto_api_key(load_carto_api_key());
+        let initial_basemap = if crate::map::tiles::carto_api_key().is_some() {
+            DEFAULT_BASEMAP
+        } else {
+            TILE_SOURCES
+                .iter()
+                .position(|s| s.name == "OpenStreetMap")
+                .unwrap_or(DEFAULT_BASEMAP)
+        };
         crate::theme::apply(&cc.egui_ctx);
         let rs = cc
             .wgpu_render_state
@@ -1102,9 +1116,10 @@ impl ViewerApp {
             coast_level: Default::default(),
             rg_overlays: HashMap::new(),
             tiles: TileCache::new(cc.egui_ctx.clone()),
-            basemap: Some(DEFAULT_BASEMAP),
+            basemap: Some(initial_basemap),
+            carto_key_draft: String::new(),
             basemap_opacity: 1.0,
-            last_basemap: DEFAULT_BASEMAP,
+            last_basemap: initial_basemap,
             last_basemap_plan: BasemapPlan::Off(None),
             load_tx,
             load_rx,
@@ -3430,9 +3445,15 @@ impl ViewerApp {
                         // scrolling past every source to find it.
                         ui.selectable_value(&mut self.basemap, None, NO_BASEMAP);
                         ui.separator();
+                        let no_key = crate::map::tiles::carto_api_key().is_none();
                         for (i, src) in TILE_SOURCES.iter().enumerate() {
+                            let label = if no_key && crate::map::tiles::is_carto(i) {
+                                format!("{} (needs API key)", src.name)
+                            } else {
+                                src.name.to_string()
+                            };
                             if ui
-                                .selectable_value(&mut self.basemap, Some(i), src.name)
+                                .selectable_value(&mut self.basemap, Some(i), label)
                                 .clicked()
                             {
                                 self.last_basemap = i;
@@ -3440,6 +3461,41 @@ impl ViewerApp {
                         }
                     });
             });
+            if let Some(i) = self.basemap
+                && crate::map::tiles::is_carto(i)
+                && crate::map::tiles::carto_api_key().is_none()
+            {
+                // CARTO watermarks every tile "API KEY REQUIRED" without a
+                // key. The key is free (5M tiles/month, non-commercial):
+                // paste it here once and it is saved to the settings file.
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("CARTO key").weak().small())
+                        .on_hover_text(
+                            "CARTO basemaps need a free API key since 2026. \
+                             Get one at carto.com/basemaps/apikey, or set \
+                             GEOPQ_CARTO_API_KEY in the environment.",
+                        );
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.carto_key_draft)
+                            .desired_width(120.0)
+                            .password(true)
+                            .hint_text("paste key"),
+                    );
+                    let apply = ui.small_button("Apply").clicked()
+                        || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                    if apply && !self.carto_key_draft.trim().is_empty() {
+                        let key = self.carto_key_draft.trim().to_string();
+                        crate::map::tiles::set_carto_api_key(Some(key.clone()));
+                        save_carto_api_key(&key);
+                        self.carto_key_draft.clear();
+                        self.tiles.clear();
+                    }
+                    ui.hyperlink_to(
+                        RichText::new("get one").small(),
+                        "https://carto.com/basemaps/apikey",
+                    );
+                });
+            }
             if self.basemap.is_some() {
                 ui.horizontal(|ui| {
                     ui.add(
@@ -12448,6 +12504,37 @@ fn current_year() -> i64 {
 pub(crate) fn settings_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
     Some(PathBuf::from(home).join(".geopq-workbench.json"))
+}
+
+/// The CARTO basemap API key: `GEOPQ_CARTO_API_KEY` wins over the
+/// `carto_api_key` entry of the settings file.
+fn load_carto_api_key() -> Option<String> {
+    if let Ok(k) = std::env::var("GEOPQ_CARTO_API_KEY")
+        && !k.trim().is_empty()
+    {
+        return Some(k);
+    }
+    let txt = std::fs::read_to_string(settings_path()?).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
+    v.get("carto_api_key")?
+        .as_str()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_string)
+}
+
+fn save_carto_api_key(key: &str) {
+    let Some(p) = settings_path() else { return };
+    let mut root = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    root["carto_api_key"] = serde_json::json!(key);
+    if let Ok(txt) = serde_json::to_string_pretty(&root)
+        && let Err(e) = std::fs::write(&p, txt)
+    {
+        log::warn!("could not save {}: {e}", p.display());
+    }
 }
 
 fn load_direct_files() -> HashSet<String> {
