@@ -5808,15 +5808,20 @@ mod tests {
             );
 
             // (4) C8 grades it, advisory and passing, naming the same
-            // statistics.
-            let c8 = info
-                .quality
-                .as_ref()
-                .expect("quality report")
-                .checks
-                .iter()
-                .find(|c| c.code == "C8")
-                .expect("C8");
+            // statistics — and the verdict itself passes, because C2
+            // measures clustering inside the levels rather than across
+            // a file whose levels overlap each other by construction.
+            let q = info.quality.as_ref().expect("quality report");
+            let c2 = q.checks.iter().find(|c| c.code == "C2").expect("C2");
+            assert_eq!(
+                c2.status,
+                crate::data::quality::Status::Pass,
+                "{name}: {}",
+                c2.detail
+            );
+            assert!(c2.detail.starts_with("within COGP levels:"), "{name}: {}", c2.detail);
+            assert!(q.indexable, "{name}: a COGP file we wrote must open ungated");
+            let c8 = q.checks.iter().find(|c| c.code == "C8").expect("C8");
             assert_eq!(c8.status, crate::data::quality::Status::Pass, "{name}: {}", c8.detail);
             assert!(!c8.gating, "{name}");
             assert!(c8.detail.contains("COGP 0.1.0"), "{name}: {}", c8.detail);

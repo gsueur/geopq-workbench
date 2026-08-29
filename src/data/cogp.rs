@@ -61,6 +61,15 @@ pub struct Level {
     pub gsd: f64,
 }
 
+/// A level as the quality checks measure it: where it ends, and how big
+/// it is. Clustering is judged inside a level, and a level small enough
+/// to decode whole is judged not at all.
+#[derive(Clone, Copy, Debug)]
+pub struct LevelRun {
+    pub row_group_end: usize,
+    pub rows: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct CogpLevels {
     pub version: String,
@@ -87,10 +96,19 @@ impl CogpLevels {
         self.levels[self.level_for_gsd(target_gsd)].row_group_end
     }
 
-    /// Rows in the coarsest level's prefix.
-    pub fn level0_rows(&self, rg_rows: &[u64]) -> u64 {
-        let end = self.levels[0].row_group_end;
-        rg_rows.iter().take(end + 1).sum()
+    /// Each level's last row group and row count, coarse to fine, from
+    /// the file's per-row-group row counts.
+    pub fn runs(&self, rg_rows: &[u64]) -> Vec<LevelRun> {
+        let mut out = Vec::with_capacity(self.levels.len());
+        let mut start = 0usize;
+        for l in &self.levels {
+            let rows = rg_rows
+                .get(start..=l.row_group_end)
+                .map_or(0, |r| r.iter().sum());
+            out.push(LevelRun { row_group_end: l.row_group_end, rows });
+            start = l.row_group_end + 1;
+        }
+        out
     }
 
     /// One line for the file info panel.
@@ -174,6 +192,28 @@ pub fn parse(
         levels: raw.levels,
         pruning,
     })
+}
+
+/// Inclusive row-group index range of each level, coarse to fine, from
+/// the levels' `row_group_end` values.
+///
+/// None when the ends do not describe exactly `row_groups` groups — a
+/// caller holding boxes that the levels do not account for has nothing
+/// level-shaped to measure and must fall back to the whole file.
+pub fn level_ranges(level_ends: &[usize], row_groups: usize) -> Option<Vec<(usize, usize)>> {
+    if row_groups == 0 || level_ends.last() != Some(&(row_groups - 1)) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(level_ends.len());
+    let mut start = 0usize;
+    for &end in level_ends {
+        if end < start {
+            return None;
+        }
+        out.push((start, end));
+        start = end + 1;
+    }
+    Some(out)
 }
 
 /// The `cogp` metadata object as written: the serialisable twin of
@@ -366,10 +406,25 @@ mod tests {
     }
 
     #[test]
-    fn level0_rows_counts_the_prefix() {
+    fn level_ranges_partition_the_row_groups() {
+        assert_eq!(
+            level_ranges(&[0, 3, 12], 13),
+            Some(vec![(0, 0), (1, 3), (4, 12)])
+        );
+        // Ends that do not account for the file describe nothing usable.
+        assert_eq!(level_ranges(&[0, 3], 13), None);
+        assert_eq!(level_ranges(&[0, 3, 12], 0), None);
+    }
+
+    /// Each level's run owns only its own row groups: the coarsest
+    /// level's is the prefix a first paint costs.
+    #[test]
+    fn runs_count_each_level_alone() {
         let c = valid();
         let rg_rows: Vec<u64> = vec![100; 13];
-        assert_eq!(c.level0_rows(&rg_rows), 100);
+        let runs = c.runs(&rg_rows);
+        assert_eq!(runs.iter().map(|r| r.rows).collect::<Vec<_>>(), vec![100, 300, 900]);
+        assert_eq!(runs.iter().map(|r| r.row_group_end).collect::<Vec<_>>(), vec![0, 3, 12]);
     }
 
     // --- writer-side type ---

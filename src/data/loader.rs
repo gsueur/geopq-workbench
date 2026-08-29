@@ -893,12 +893,19 @@ fn build_opened(
                         .then(|| ("computed at load".to_string(), rg_computed))
                 })
                 .map(|(source, boxes)| {
-                    let avg_overlap = bbox_overlap_metric(&boxes);
-                    RgBboxes {
+                    // Measured the way C2 measures it: on a COGP layer the
+                    // worst level, inside itself. A file-wide average
+                    // there reports a correct layout as poorly clustered
+                    // (see `quality::Clustering::worst`), and this is what
+                    // the info panel and the "consider Export…" hint read.
+                    let starts = store.rg_starts();
+                    let rg_rows: Vec<u64> =
+                        starts.windows(2).map(|w| w[1] - w[0]).collect();
+                    RgBboxes::new(
                         source,
                         boxes,
-                        avg_overlap,
-                    }
+                        store.cogp.as_ref().map(|c| c.runs(&rg_rows)).as_deref(),
+                    )
                 });
             let stats = LoadStats {
                 read_ms: 0,
@@ -1900,9 +1907,7 @@ fn open_store_with_view(
         r.as_ref()
             .map(|c| super::quality::CogpQuality {
                 version: c.version.clone(),
-                levels: c.levels.len(),
-                level0_groups: c.levels[0].row_group_end + 1,
-                level0_rows: c.level0_rows(&f.rg_rows),
+                levels: c.runs(&f.rg_rows),
                 total_rows: f.info.rows,
                 pruning: c.pruning.label(),
                 extension_2_0: c.pruning == super::cogp::Pruning::NativeStats,
@@ -7950,7 +7955,9 @@ mod cogp_tests {
             eprintln!("fixture missing, skipping");
             return;
         };
-        let (store, _crs, info, _rg) = open_store(&Source::Local(path)).unwrap();
+        let (store, _crs, info, rg) = open_store(&Source::Local(path)).unwrap();
+        let rg_rows: Vec<u64> =
+            store.rg_starts().windows(2).map(|w| w[1] - w[0]).collect();
         let levels = store.cogp.as_ref().expect("cogp metadata");
         assert_eq!(levels.version, "0.1.0");
         // The spec's own structural invariants, re-checked against what
@@ -7981,8 +7988,24 @@ mod cogp_tests {
         assert!(!line.contains("2.0 extension"), "{line}");
         assert!(line.contains("prefix row groups 1/"), "{line}");
 
-        // C8 grades it, advisory and passing.
+        // The gate must not condemn a correct COGP layout. Levels
+        // overlap each other by construction — measured as one file this
+        // fixture reads far past the C2 threshold — so C2 measures
+        // inside them (see `quality::Clustering::worst`).
         let q = info.quality.as_ref().unwrap();
+        let c2 = q.checks.iter().find(|c| c.code == "C2").unwrap();
+        assert_eq!(c2.status, crate::data::quality::Status::Pass, "{}", c2.detail);
+        assert!(c2.detail.starts_with("within COGP levels:"), "{}", c2.detail);
+        assert!(q.indexable, "a file the reference converter wrote must open ungated");
+        // …and the layer panel reads the same run, so it cannot call the
+        // same file poorly clustered.
+        let rg = rg.as_ref().expect("row-group boxes");
+        let boxes = crate::data::layer::RgBboxes::new(
+            rg.0.clone(),
+            rg.1.clone(),
+            store.cogp.as_ref().map(|c| c.runs(&rg_rows)).as_deref(),
+        );
+        assert!(!boxes.poorly_clustered(), "avg ×{:.1}", boxes.avg_overlap);
         let c8 = q.checks.iter().find(|c| c.code == "C8").unwrap();
         assert_eq!(c8.status, crate::data::quality::Status::Pass);
         assert!(!c8.gating);
