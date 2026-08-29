@@ -48,6 +48,18 @@ COPY (
   FROM range(20000)
 ) TO 'lines_20k_wgs84.parquet' (FORMAT PARQUET);"
 
+echo "== places.gpkg (single-table GeoPackage, for the geopq-cli tests) =="
+rm -f places.gpkg
+duckdb -c "
+SET geometry_always_xy = true;
+LOAD spatial;
+COPY (
+  SELECT ST_Point(2 + random(), 48 + random()) AS geom,
+         'place_' || row_number() OVER () AS name,
+         (random()*1000)::INT AS population
+  FROM range(200)
+) TO 'places.gpkg' (FORMAT GDAL, DRIVER 'GPKG', LAYER_NAME 'places', SRS 'EPSG:4326');"
+
 echo "== polygons_5k_l93.parquet (EPSG:2154, PROJJSON patched) =="
 duckdb -c "
 LOAD spatial;

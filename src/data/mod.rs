@@ -20,6 +20,7 @@ pub mod optimize;
 pub mod partition;
 pub mod quality;
 pub mod repo;
+pub mod settings;
 pub mod shp;
 pub mod source;
 pub mod stac;

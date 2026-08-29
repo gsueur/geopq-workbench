@@ -1056,7 +1056,7 @@ impl ViewerApp {
         crate::map::tiles::set_carto_api_key(load_carto_api_key());
         // Same file, read here so the export dialog never touches the disk
         // mid-frame for its COGP defaults.
-        let _ = cogp_defaults();
+        let _ = crate::data::settings::cogp_defaults();
         let initial_basemap = if crate::map::tiles::carto_api_key().is_some() {
             DEFAULT_BASEMAP
         } else {
@@ -8169,7 +8169,7 @@ impl ViewerApp {
                         )
                         .clicked()
                     {
-                        o.opts.cogp = Some(cogp_defaults().clone());
+                        o.opts.cogp = Some(crate::data::settings::cogp_defaults().clone());
                         // The profile decides the physical layout, so it
                         // takes over what it needs and clears what it
                         // cannot share the file with.
@@ -12293,14 +12293,6 @@ fn current_year() -> i64 {
     if doy >= 306 { y + 1 } else { y }
 }
 
-/// Settings sidecar for the quality gate's decline memory: one small
-/// JSON file in the home directory (the app has no other persistence).
-/// Unknown keys are preserved for forward compatibility.
-pub(crate) fn settings_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(".geopq-workbench.json"))
-}
-
 /// The CARTO basemap API key: `GEOPQ_CARTO_API_KEY` wins over the
 /// `carto_api_key` entry of the settings file.
 fn load_carto_api_key() -> Option<String> {
@@ -12309,7 +12301,7 @@ fn load_carto_api_key() -> Option<String> {
     {
         return Some(k);
     }
-    let txt = std::fs::read_to_string(settings_path()?).ok()?;
+    let txt = std::fs::read_to_string(crate::data::settings::settings_path()?).ok()?;
     let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
     v.get("carto_api_key")?
         .as_str()
@@ -12319,7 +12311,7 @@ fn load_carto_api_key() -> Option<String> {
 }
 
 fn save_carto_api_key(key: &str) {
-    let Some(p) = settings_path() else { return };
+    let Some(p) = crate::data::settings::settings_path() else { return };
     let mut root = std::fs::read_to_string(&p)
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
@@ -12332,70 +12324,9 @@ fn save_carto_api_key(key: &str) {
     }
 }
 
-/// The COGP knobs the Export dialog no longer shows: the reference
-/// converter's defaults unless the settings file carries a `cogp` object
-/// overriding them. Read once — these are a power user's levers, not a
-/// live setting, and an object that does not validate falls back whole
-/// rather than half-applying.
-fn cogp_defaults() -> &'static crate::data::optimize::CogpOptions {
-    use crate::data::optimize::{CogpOptions, GsdSource, RankOrder};
-    static DEFAULTS: std::sync::OnceLock<CogpOptions> = std::sync::OnceLock::new();
-    DEFAULTS.get_or_init(|| {
-        let read = || -> Option<CogpOptions> {
-            let txt = std::fs::read_to_string(settings_path()?).ok()?;
-            let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
-            let c = v.get("cogp")?;
-            let mut o = CogpOptions::default();
-            let u32_of = |k: &str| c.get(k).and_then(serde_json::Value::as_u64).map(|n| n as u32);
-            if let GsdSource::WebMercator {
-                minzoom,
-                maxzoom,
-                resolution,
-            } = &mut o.gsd
-            {
-                *minzoom = u32_of("minzoom").unwrap_or(*minzoom);
-                *maxzoom = u32_of("maxzoom").unwrap_or(*maxzoom);
-                *resolution = u32_of("resolution").unwrap_or(*resolution);
-            }
-            // An explicit list replaces the zoom pyramid outright, for
-            // renderers that are not a Web Mercator one.
-            if let Some(list) = c.get("gsds").and_then(serde_json::Value::as_array) {
-                o.gsd = GsdSource::Explicit(
-                    list.iter().filter_map(serde_json::Value::as_f64).collect(),
-                );
-            }
-            o.line_factor = u32_of("line_factor").unwrap_or(o.line_factor);
-            o.polygon_factor = u32_of("polygon_factor").unwrap_or(o.polygon_factor);
-            o.point_factor = u32_of("point_factor").unwrap_or(o.point_factor);
-            o.rank = c
-                .get("rank")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|n| !n.is_empty())
-                .map(|n| {
-                    let asc =
-                        c.get("rank_order").and_then(serde_json::Value::as_str) == Some("asc");
-                    let order = if asc { RankOrder::Asc } else { RankOrder::Desc };
-                    (n.to_string(), order)
-                });
-            Some(o)
-        };
-        match read() {
-            None => CogpOptions::default(),
-            Some(o) => match o.gsds() {
-                Ok(_) => o,
-                Err(e) => {
-                    log::warn!("settings `cogp`: {e} — using the defaults");
-                    CogpOptions::default()
-                }
-            },
-        }
-    })
-}
-
 fn load_direct_files() -> HashSet<String> {
     let read = || -> Option<HashSet<String>> {
-        let txt = std::fs::read_to_string(settings_path()?).ok()?;
+        let txt = std::fs::read_to_string(crate::data::settings::settings_path()?).ok()?;
         let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
         serde_json::from_value(v.get("direct_files")?.clone()).ok()
     };
@@ -12403,7 +12334,7 @@ fn load_direct_files() -> HashSet<String> {
 }
 
 fn save_direct_files(files: &HashSet<String>) {
-    let Some(p) = settings_path() else { return };
+    let Some(p) = crate::data::settings::settings_path() else { return };
     let mut root = std::fs::read_to_string(&p)
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())

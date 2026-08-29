@@ -1,5 +1,6 @@
 /target
 /testdata/*.parquet
+/testdata/*.gpkg
 .DS_Store
 
 # Generated locally by make_coastline_bin.py; hosted as a release asset

@@ -126,8 +126,12 @@ Any platform with stable Rust:
 ```bash
 git clone https://github.com/gsueur/geopq-workbench
 cd geopq-workbench
-cargo build --release   # binary in target/release/geopq-workbench
+cargo build --release --bins   # target/release/{geopq-workbench,geopq-cli}
 ```
+
+On Windows without administrator rights (no Visual Studio Build Tools),
+a portable MinGW-w64 toolchain builds both binaries — see
+[docs/WINDOWS_GNU_BUILD.md](docs/WINDOWS_GNU_BUILD.md).
 
 ## Quick start
 
@@ -554,11 +558,84 @@ Measured on real datasets, release build:
   geometry), not by file size, and the row budget (~2.5M rows per load)
   keeps worst-case files from exhausting RAM.
 
+## Command-line batch conversion (geopq-cli)
+
+For scripted pipelines — a monthly source refresh, a CI job, a cron
+task — the Import + Optimize flow is also available headless as a
+second binary, `geopq-cli`, built alongside the app from the same
+crate:
+
+```bash
+cargo build --release --bins
+target/release/geopq-cli --input roads.gpkg --list-layers
+target/release/geopq-cli --input roads.gpkg --layer roads \
+  --output roads.parquet --format geoarrow --h3 8
+```
+
+It wraps the same import (`data::gpkg`/`shp`/`geojson`) and optimize
+(`data::optimize`) machinery the GUI dialogs call, opens no window,
+and touches no GPU — `geopq-cli --help` lists every flag (format
+flavor, row group size and bytes, compression, Hilbert sort, covering
+column, H3 resolution, partitioning, COGP levels).
+
+Sources are the ones the Import dialog takes — `.gpkg`, `.shp`,
+`.geojson` — plus `.parquet`, which skips the import and goes straight
+to the optimize pass. That last one is how you re-optimize an existing
+file: change the flavor, retune the row groups, add a covering column
+to a file that has none.
+
+Partitioned output works the same way it does in the GUI's Export
+dialog — hive directories by field, or adaptive H3:
+
+```bash
+# hive: <output>/ISO3=FRA/part-0.parquet, one dir per value
+geopq-cli --input roads.gpkg --output by_country/ \
+  --format native2 --partition-by ISO3
+
+# multiple fields nest in order: ISO3=FRA/YEAR=2020/part-0.parquet
+geopq-cli --input roads.gpkg --output by_country_year/ \
+  --format native2 --partition-by ISO3,YEAR
+
+# adaptive H3: cells split until under --partition-h3-target-rows,
+# or until --partition-h3-max-res (default: --h3 if set, else 10)
+geopq-cli --input roads.gpkg --output by_h3/ \
+  --format native2 --partition-h3 --partition-h3-target-rows 100000
+```
+
+`--output` becomes a directory in either case, not a file path.
+
+`--cogp` writes [coarse-to-fine levels](#coarse-to-fine-levels-cogp)
+instead, reading its GSDs and thinning factors from the same
+`~/.geopq-workbench.json` block the Export dialog uses, so a file the
+CLI writes and one the app writes are the same file. Levels own the
+physical layout, so it cannot be combined with partitioning — the CLI
+says so before it reads anything rather than halfway through a write.
+
+Progress goes to stderr and the summary to stdout, one parseable line:
+
+```
+1274531 rows | row groups 3 -> 42 | 412.5 MB -> 388.1 MB | 1 file
+```
+
+A failure prints to stderr and exits non-zero, and nothing is left
+behind at `--output`: outputs are staged and renamed into place only
+once they are complete, so a cron job that dies mid-write never
+publishes a truncated file.
+
+Not yet exposed on the CLI: multi-layer merge, admin-attribution
+columns, S3 publish. All three work through the GUI today.
+
 ## Under the hood
 
 Pure-Rust stack end to end: parquet/arrow readers, proj4rs
 reprojection, rayon + lyon tessellation, custom wgpu render pipelines
 inside an egui shell. No GDAL, no web view, no server process.
+
+The crate is a `lib.rs` (everything below) plus two thin binaries:
+`main.rs` (the GUI) and `bin/geopq-cli.rs` (the headless converter).
+Both link the full dependency tree — `geopq-cli` never touches wgpu or
+eframe at runtime, but the binary still carries them, since nothing
+splits the CLI's dependencies out of the shared lib today.
 
 | Module | Role |
 |---|---|
@@ -572,6 +649,7 @@ inside an egui shell. No GDAL, no web view, no server process.
 | `map/` | wgpu pipelines, tiles, chunked f64-origin geometry for jitter-free deep zoom, SVG export of the frame |
 | `sql/` | DataFusion integration, ST_* UDFs, spatial pushdown, console UI |
 | `app.rs` | the egui application |
+| `bin/geopq-cli.rs` | headless import + optimize, no window, no GPU |
 
 Design notes live in [docs/OPEN_POLICY.md](docs/OPEN_POLICY.md) (file
 quality gate and display policy).
@@ -621,7 +699,12 @@ instead of refusing to open past a part count.
 ```bash
 cargo test          # 240+ tests, no fixtures needed for most
 cargo run --release testdata/points_1m_wgs84.parquet
+cargo run --release --bin geopq-cli -- --help
 ```
+
+`cargo test` covers both binaries: the GUI's logic in-crate, and
+`geopq-cli` through `tests/cli.rs`, which runs the built executable and
+reopens what it wrote.
 
 Test fixtures are generated, not committed: `./testdata/regenerate.sh`
 rebuilds them with the DuckDB CLI (fixture-dependent tests self-skip
