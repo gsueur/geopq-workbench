@@ -4278,6 +4278,123 @@ fn simplify_geom(g: &geo_types::Geometry<f64>, tol: f64) -> geo_types::Geometry<
     }
 }
 
+/// Feature centroids in lon/lat, for the density table the pyramid
+/// dialog shows before the user commits to a reference resolution.
+///
+/// Reads the covering bbox column when the file declares one — four
+/// float leaves rather than the geometry, which on a parcels file is the
+/// difference between a second and a minute — and decodes geometry only
+/// when there is none. Either way it is one projected scan: the answer
+/// is per feature, so there is no metadata shortcut.
+pub fn scan_centroids(
+    src: &Source,
+    epsg_hint: Option<u32>,
+) -> Result<Vec<Option<(f64, f64)>>, String> {
+    let reader = src.open()?;
+    let arrow_meta = ArrowReaderMetadata::load(&reader, Default::default())
+        .map_err(|e| format!("not a parquet file: {e}"))?;
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(reader, arrow_meta);
+    let schema = builder.schema().clone();
+    let meta = builder.metadata().clone();
+    let geo: Option<Value> = meta
+        .file_metadata()
+        .key_value_metadata()
+        .and_then(|kv| kv.iter().find(|k| k.key == "geo"))
+        .and_then(|k| k.value.as_ref())
+        .and_then(|v| serde_json::from_str(v).ok());
+    let primary = primary_of(&geo, &schema)?;
+    let col_meta = |k: &str| -> Option<Value> {
+        geo.as_ref()?.get("columns")?.get(&primary)?.get(k).cloned()
+    };
+    let encoding = col_meta("encoding")
+        .and_then(|e| e.as_str().and_then(GeomEncoding::parse))
+        .unwrap_or_default();
+    let crs_value: Option<Value> = col_meta("crs")
+        .filter(|v| !v.is_null())
+        .or_else(|| logical_type_crs(&meta, &primary))
+        .or_else(|| {
+            epsg_hint
+                .filter(|&e| e != 4326)
+                .map(|e| json!({"id": {"authority": "EPSG", "code": e}}))
+        });
+    let vendor_crs: Option<Value> = crs_value.is_none().then(|| col_meta("geopq:crs")).flatten();
+    let data_crs = match vendor_crs.as_ref().and_then(|v| {
+        let p4 = v.get("proj4")?.as_str()?;
+        super::crs::Crs::from_proj4(p4, None, "from .prj").ok()
+    }) {
+        Some(c) => c,
+        None => super::crs::Crs::from_geoparquet_crs(crs_value.as_ref())
+            .map_err(|e| format!("the density table needs a resolvable CRS: {e}"))?,
+    };
+
+    // The covering column when the file has one and it really is a bbox
+    // struct: its leaves are the answer with no geometry read at all.
+    let covering: Option<String> = col_meta("covering")
+        .and_then(|c| {
+            c.get("bbox")?.get("xmin")?.as_array()?.first()?.as_str().map(str::to_string)
+        })
+        .filter(|n| {
+            schema.index_of(n).is_ok_and(|i| is_covering_struct(schema.field(i).data_type()))
+        });
+
+    let name = covering.as_deref().unwrap_or(&primary);
+    let idx = schema.index_of(name).map_err(|_| format!("column '{name}' not found"))?;
+    let mask = ProjectionMask::roots(meta.file_metadata().schema_descr(), [idx]);
+    let rows: usize = meta.file_metadata().num_rows().max(0) as usize;
+    let mut bboxes: Vec<Option<[f64; 4]>> = Vec::with_capacity(rows);
+    let mut types: HashSet<String> = HashSet::new();
+    let reader = builder
+        .with_projection(mask)
+        .with_batch_size(READ_BATCH)
+        .build()
+        .map_err(|e| format!("parquet read: {e}"))?;
+    for batch in reader {
+        let batch = batch.map_err(|e| format!("parquet decode error: {e}"))?;
+        let col = batch.column(0);
+        match covering.is_some() {
+            true => push_covering_bboxes(col, &mut bboxes)?,
+            false => scan_bboxes(col, encoding, &mut bboxes, &mut types, None)?,
+        }
+    }
+    Ok(super::partition::centroids_in(&bboxes, &data_crs, &super::crs::Crs::wgs84()))
+}
+
+/// The primary geometry column of a file, from its `geo` metadata or by
+/// the usual names.
+fn primary_of(geo: &Option<Value>, schema: &Schema) -> Result<String, String> {
+    geo.as_ref()
+        .and_then(|m| m.get("primary_column")?.as_str())
+        .map(str::to_string)
+        .or_else(|| guess_geom_column(schema))
+        .ok_or_else(|| "no geometry column".to_string())
+}
+
+/// Append the bboxes a covering struct column already holds.
+fn push_covering_bboxes(col: &ArrayRef, out: &mut Vec<Option<[f64; 4]>>) -> Result<(), String> {
+    let st = col
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or("covering column is not a struct")?;
+    let leaf = |n: &str| -> Result<Float64Array, String> {
+        let c = st.column_by_name(n).ok_or_else(|| format!("covering has no {n}"))?;
+        arrow::compute::cast(c, &DataType::Float64)
+            .map_err(|e| format!("covering {n}: {e}"))
+            .map(|a| a.as_any().downcast_ref::<Float64Array>().unwrap().clone())
+    };
+    let (xmin, ymin, xmax, ymax) = (leaf("xmin")?, leaf("ymin")?, leaf("xmax")?, leaf("ymax")?);
+    for i in 0..st.len() {
+        let null = st.is_null(i)
+            || xmin.is_null(i)
+            || ymin.is_null(i)
+            || xmax.is_null(i)
+            || ymax.is_null(i);
+        out.push((!null).then(|| {
+            [xmin.value(i), ymin.value(i), xmax.value(i), ymax.value(i)]
+        }));
+    }
+    Ok(())
+}
+
 /// The descriptor's `methods` block: the parameters this run actually
 /// used, for a human reading the file and for a re-run that wants to
 /// match it. Only the method that ran is described — a prune fraction
