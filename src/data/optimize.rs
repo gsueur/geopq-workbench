@@ -416,10 +416,10 @@ fn cogp_units(crs: Option<&Value>, vendor_crs: Option<&Value>) -> CogpUnits {
             CogpUnits::Linear(proj4_meters_per_unit(&c.proj4))
         }
     };
-    if let Some(p4) = vendor_crs.and_then(|v| v.get("proj4")?.as_str()) {
-        if let Ok(c) = super::crs::Crs::from_proj4(p4, None, "vendor") {
-            return from_crs(&c);
-        }
+    if let Some(p4) = vendor_crs.and_then(|v| v.get("proj4")?.as_str())
+        && let Ok(c) = super::crs::Crs::from_proj4(p4, None, "vendor")
+    {
+        return from_crs(&c);
     }
     let Some(v) = crs else {
         return CogpUnits::Degrees; // absent crs means CRS84
@@ -5269,10 +5269,14 @@ mod tests {
             .collect()
     }
 
-    /// Every exported feature with the level it landed in: (level, id,
-    /// bbox, kind). Read back from the file alone, so it validates the
-    /// output rather than repeating the writer's bookkeeping.
-    fn cogp_features(path: &Path) -> (crate::data::cogp::Cogp, Vec<(usize, i64, [f64; 4], CogpKind)>) {
+    /// One exported feature: the level it landed in, its id, its bbox and
+    /// its geometry family.
+    type CogpFeature = (usize, i64, [f64; 4], CogpKind);
+
+    /// Every exported feature with the level it landed in, read back from
+    /// the file alone — so it validates the output rather than repeating
+    /// the writer's bookkeeping.
+    fn cogp_features(path: &Path) -> (crate::data::cogp::Cogp, Vec<CogpFeature>) {
         let (meta, n_rg) = read_cogp(path);
         meta.validate(n_rg).expect("cogp metadata conforms");
         let mut out = Vec::new();
