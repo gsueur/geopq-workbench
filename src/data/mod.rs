@@ -18,6 +18,7 @@ pub mod national;
 pub mod net;
 pub mod optimize;
 pub mod partition;
+pub mod pyramid;
 pub mod quality;
 pub mod repo;
 pub mod settings;
