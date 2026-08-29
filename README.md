@@ -405,6 +405,15 @@ the spec adopts it, which the info panel and quality check C8 both say.
   projection. The coastline is zoom-dependent: the embedded 1:50m
   version is swapped for the 1:10m one when you zoom in (fetched once,
   ~3 MB, cached on disk; the app quietly stays on 1:50m offline).
+- **CARTO API key**: CARTO's basemaps need a free API key since 2026
+  (without one the tiles come back stamped "API KEY REQUIRED"). Get one
+  at [carto.com/basemaps/apikey](https://carto.com/basemaps/apikey)
+  (5 M tiles a month, non-commercial use, keep the attribution), then
+  either set `GEOPQ_CARTO_API_KEY` in the environment or put it in
+  `~/.geopq-workbench.json` as `"carto_api_key": "..."`. Picking a
+  Carto source without a key shows a paste field in the basemap row
+  that saves it there for you. Without a key the app starts on
+  OpenStreetMap and the Carto entries read "(needs API key)".
 - **Tiles outside Mercator**: tiles are published in Web Mercator, so
   in any other display projection each one is drawn as a subdivided
   mesh with its vertices projected exactly. Geometry reprojects
