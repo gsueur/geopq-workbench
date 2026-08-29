@@ -5661,6 +5661,170 @@ mod tests {
         }
     }
 
+    /// Write a GeoParquet 1.0 fixture in degrees from (wkb, id, rank)
+    /// triples. `crs` is omitted, which per the spec means OGC:CRS84 — the
+    /// case a geographic layer usually arrives in.
+    fn write_wgs84_fixture(path: &Path, rows: Vec<(Vec<u8>, i64, i64)>, types: &[&str]) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("rank", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(rows.iter().map(|r| &r.0))),
+                Arc::new(Int64Array::from(rows.iter().map(|r| r.1).collect::<Vec<_>>())),
+                Arc::new(Int64Array::from(rows.iter().map(|r| r.2).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap();
+        let geo = serde_json::json!({
+            "version": "1.0.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {"encoding": "WKB", "geometry_types": types}},
+        });
+        let mut w = ArrowWriter::try_new(File::create(path).unwrap(), schema, None).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    /// The mixed fixture in degrees near the equator: points at three
+    /// densities, lines and squares at three sizes, each sized in metres
+    /// against gsds [10000, 1000, 100] so all three levels receive
+    /// something. Degrees make the writer convert and the reader's
+    /// `view_gsd` convert back, which is the half of the round trip that
+    /// a metric fixture cannot exercise.
+    fn cogp_geographic_fixture(path: &Path) -> usize {
+        // Sizes below are degrees at the equator, where one degree is
+        // ~111 km; the writer converts them the same way.
+        let mut rows: Vec<(Vec<u8>, i64, i64)> = Vec::new();
+        let mut id = 0i64;
+        let mut push = |rows: &mut Vec<_>, wkb: Vec<u8>| {
+            rows.push((wkb, id, id));
+            id += 1;
+        };
+        // Squares: diagonals of ~94 km, ~9.4 km and ~0.9 km, which at
+        // polygon factor 4 land in levels 0, 1 and 2 respectively.
+        for (i, half) in [0.3, 0.03, 0.003].iter().enumerate() {
+            push(&mut rows, wkb_square(i as f64 * 2.0, 0.0, *half));
+        }
+        // Lines: ~56 km, ~5.6 km and ~0.6 km long, factor 2.
+        for (i, len) in [0.5, 0.05, 0.005].iter().enumerate() {
+            let x = 10.0 + i as f64 * 2.0;
+            push(&mut rows, wkb_line(x, 1.0, x + len, 1.0));
+        }
+        // Points, three densities: a degree apart (one per 40 km cell),
+        // ~2 km apart, and ~55 m apart.
+        for k in 0..9 {
+            push(&mut rows, wkb_point(k as f64, 5.0));
+        }
+        for k in 0..12 {
+            push(&mut rows, wkb_point(20.0 + k as f64 * 0.02, 0.0));
+        }
+        for k in 0..24 {
+            push(&mut rows, wkb_point(30.0 + k as f64 * 0.000_5, 0.0));
+        }
+        let n = rows.len();
+        // Scramble, so nothing passes by accident of input order.
+        let stride = n / 2 + 1;
+        let scrambled: Vec<_> = (0..n).map(|i| rows[(i * stride) % n].clone()).collect();
+        write_wgs84_fixture(path, scrambled, &["Point", "LineString", "Polygon"]);
+        n
+    }
+
+    /// The writer stamps `cogp`, the reader parses it: the two halves have
+    /// to agree about the same bytes, in both flavours the profile is
+    /// offered on.
+    #[test]
+    fn cogp_round_trips_from_writer_to_reader() {
+        use crate::data::cogp::Pruning;
+
+        let dir = std::env::temp_dir().join(format!("geopq_cogp_rt_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("mixed_wgs84.parquet");
+        cogp_geographic_fixture(&src);
+        let gsds = [10_000.0, 1_000.0, 100.0];
+
+        // 1.1 carries the covering column the published profile requires;
+        // 2.0 with the covering opt-in off leans on native geospatial
+        // statistics instead, which is this app's labelled extension.
+        for (name, version, covering, want) in [
+            ("v11", GpVersion::V1_1, true, Pruning::Covering),
+            ("v20", GpVersion::V2_0, false, Pruning::NativeStats),
+        ] {
+            let dst = dir.join(format!("rt_{name}.parquet"));
+            let opts = OptimizeOptions {
+                version,
+                covering,
+                // Small groups, so each level owns several of them.
+                row_group_size: 16,
+                cogp: Some(cogp_opts(&gsds)),
+                ..Default::default()
+            };
+            let rep =
+                optimize(&Source::Local(src.clone()), &dst, &opts, None, None, &|_, _| {}).unwrap();
+
+            let (store, _crs, info, _rg) =
+                crate::data::loader::open_store_for_test(&dst).unwrap();
+
+            // (1) The reader recognises the profile and names the
+            // statistics this flavour actually offers.
+            let levels = store
+                .cogp
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: the reader found no COGP levels"));
+            assert_eq!(levels.pruning, want, "{name}");
+            assert_eq!(levels.version, crate::data::cogp::VERSION, "{name}");
+            let summary = info.geo.cogp.as_deref().expect("summary line");
+            assert_eq!(
+                summary.contains("(2.0 extension)"),
+                want == Pruning::NativeStats,
+                "{name}: {summary}"
+            );
+
+            // (2) Level for level, the numbers the writer reported.
+            assert_eq!(levels.levels.len(), gsds.len(), "{name}: every gsd used");
+            assert_eq!(levels.levels.len(), rep.cogp_levels.len(), "{name}");
+            for (i, (parsed, written)) in levels.levels.iter().zip(&rep.cogp_levels).enumerate() {
+                assert_eq!(parsed.row_group_end, written.rg_end, "{name}: level {i} end");
+                assert_eq!(parsed.gsd, written.gsd, "{name}: level {i} gsd");
+            }
+            let n_rg = store.rg_starts().len() - 1;
+            assert_eq!(levels.levels.last().unwrap().row_group_end, n_rg - 1, "{name}");
+
+            // (3) A view between the two coarsest levels reads level 0's
+            // prefix: the finest level whose gsd still covers it.
+            let between = (gsds[0] + gsds[1]) / 2.0;
+            assert_eq!(levels.level_for_gsd(between), 0, "{name}");
+            assert_eq!(
+                levels.row_group_end_for_gsd(between),
+                levels.levels[0].row_group_end,
+                "{name}"
+            );
+
+            // (4) C8 grades it, advisory and passing, naming the same
+            // statistics.
+            let c8 = info
+                .quality
+                .as_ref()
+                .expect("quality report")
+                .checks
+                .iter()
+                .find(|c| c.code == "C8")
+                .expect("C8");
+            assert_eq!(c8.status, crate::data::quality::Status::Pass, "{name}: {}", c8.detail);
+            assert!(!c8.gating, "{name}");
+            assert!(c8.detail.contains("COGP 0.1.0"), "{name}: {}", c8.detail);
+            assert!(c8.detail.contains(want.label()), "{name}: {}", c8.detail);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Degrees convert to metres per feature; a projected CRS in metres does
     /// not convert at all. Same layer, same shapes, same levels.
     #[test]

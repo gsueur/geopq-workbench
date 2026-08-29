@@ -12,7 +12,6 @@
 //! (SPEC.md v0.1.0, CC BY 4.0).
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 /// Parquet file-level key-value metadata key (spec §6).
 pub const KEY: &str = "cogp";
@@ -140,74 +139,27 @@ pub fn parse(
     row_groups: usize,
     pruning: Option<Pruning>,
 ) -> Result<CogpLevels, String> {
-    let v: Value = serde_json::from_str(json).map_err(|e| format!("not JSON: {e}"))?;
-    let obj = v.as_object().ok_or("not a JSON object")?;
+    let raw = Cogp::parse(json)?;
 
-    let version = obj
-        .get("version")
-        .and_then(Value::as_str)
-        .ok_or("no `version` string")?
-        .to_string();
-    let major: u64 = version
+    // §6.1: a major bump may redefine what the existing fields mean, so
+    // an unsupported one is not "read it anyway" — it is "this is not a
+    // profile this build can claim to implement".
+    let major: u64 = raw
+        .version
         .split('.')
         .next()
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| format!("version '{version}' is not MAJOR.MINOR.PATCH"))?;
+        .ok_or_else(|| format!("version '{}' is not MAJOR.MINOR.PATCH", raw.version))?;
     if major != SUPPORTED_MAJOR {
         return Err(format!(
-            "version {version}: this reader implements COGP {SUPPORTED_MAJOR}.x"
+            "version {}: this reader implements COGP {SUPPORTED_MAJOR}.x",
+            raw.version
         ));
     }
 
-    let raw = obj
-        .get("levels")
-        .and_then(Value::as_array)
-        .ok_or("no `levels` array")?;
-    if raw.is_empty() {
-        return Err("`levels` is empty".into());
-    }
-    let mut levels: Vec<Level> = Vec::with_capacity(raw.len());
-    for (i, l) in raw.iter().enumerate() {
-        let end = l
-            .get("row_group_end")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| format!("level {i}: `row_group_end` is not a non-negative integer"))?
-            as usize;
-        let gsd = l
-            .get("gsd")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| format!("level {i}: `gsd` is not a number"))?;
-        if !(gsd.is_finite() && gsd > 0.0) {
-            return Err(format!("level {i}: gsd {gsd} is not positive"));
-        }
-        if end >= row_groups {
-            return Err(format!(
-                "level {i}: row_group_end {end} is outside the file's {row_groups} row groups"
-            ));
-        }
-        if let Some(prev) = levels.last() {
-            if end <= prev.row_group_end {
-                return Err(format!(
-                    "level {i}: row_group_end {end} does not increase on {}",
-                    prev.row_group_end
-                ));
-            }
-            if gsd >= prev.gsd {
-                return Err(format!(
-                    "level {i}: gsd {gsd} does not decrease from {}",
-                    prev.gsd
-                ));
-            }
-        }
-        levels.push(Level { row_group_end: end, gsd });
-    }
-    let last = levels.last().unwrap().row_group_end;
-    if last + 1 != row_groups {
-        return Err(format!(
-            "the last level ends at row group {last}, not the file's last ({})",
-            row_groups.saturating_sub(1)
-        ));
-    }
+    // §5.3 lives in `Cogp::validate`, and only there: the writer and the
+    // reader must not be able to disagree about what conforms.
+    raw.validate(row_groups)?;
 
     // The levels are only useful if a viewport can prune within a
     // prefix, which is why the spec requires bbox statistics as part of
@@ -217,7 +169,11 @@ pub fn parse(
          nor native geospatial statistics",
     )?;
 
-    Ok(CogpLevels { version, levels, pruning })
+    Ok(CogpLevels {
+        version: raw.version,
+        levels: raw.levels,
+        pruning,
+    })
 }
 
 /// The `cogp` metadata object as written: the serialisable twin of
@@ -346,27 +302,29 @@ mod tests {
         assert!(e.contains("COGP 0.x"), "{e}");
     }
 
+    /// The structural rules of §5.3 are `Cogp::validate`'s, which is why
+    /// these expect its wording: one implementation, one set of messages.
     #[test]
     fn structural_rules_are_enforced() {
         let cases: Vec<(&str, usize, &str)> = vec![
-            (r#"[]"#, 1, "empty"),
+            (r#"[]"#, 1, "must not be empty"),
             // row_group_end must strictly increase…
             (
                 r#"[{"row_group_end":3,"gsd":100},{"row_group_end":3,"gsd":50}]"#,
                 4,
-                "does not increase",
+                "must strictly increase",
             ),
             // …gsd must strictly decrease…
             (
                 r#"[{"row_group_end":1,"gsd":100},{"row_group_end":3,"gsd":100}]"#,
                 4,
-                "does not decrease",
+                "must strictly decrease",
             ),
             // …gsd must be positive…
-            (r#"[{"row_group_end":0,"gsd":0}]"#, 1, "not positive"),
+            (r#"[{"row_group_end":0,"gsd":0}]"#, 1, "non-positive gsd"),
             // …and the last level must cover the file.
-            (r#"[{"row_group_end":0,"gsd":100}]"#, 4, "last level ends"),
-            (r#"[{"row_group_end":9,"gsd":100}]"#, 4, "outside the file"),
+            (r#"[{"row_group_end":0,"gsd":100}]"#, 4, "last row_group_end"),
+            (r#"[{"row_group_end":9,"gsd":100}]"#, 4, "but the file has"),
         ];
         for (levels, groups, want) in cases {
             let e = parse(&meta(levels), groups, Some(Pruning::Covering))
