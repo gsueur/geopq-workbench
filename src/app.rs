@@ -1295,6 +1295,7 @@ impl ViewerApp {
             self.display.clone(),
             color,
             self.last_view_world,
+            self.view_px_width(),
             auto_project,
             cancel,
             // Context-restored layers carry their styling into the first
@@ -1324,6 +1325,7 @@ impl ViewerApp {
             self.display.clone(),
             gate.color,
             self.last_view_world,
+            self.view_px_width(),
             gate.auto_project,
             cancel,
             None,
@@ -1533,6 +1535,7 @@ impl ViewerApp {
     fn reload_layers_to_viewport(&mut self, ctx: &egui::Context) {
         use std::sync::atomic::Ordering;
         self.clear_selection();
+        let view_px = self.view_px_width();
         for l in &mut self.layers {
             // Direct layers hold everything by design; a viewport reload
             // could not prune them (no usable spatial index) and would
@@ -1570,6 +1573,7 @@ impl ViewerApp {
                 l.rg_bboxes.as_ref().map(|r| r.boxes.clone()),
                 self.display.clone(),
                 self.last_view_world,
+                view_px,
                 fresh_cancel(&mut self.rebuild_cancel, l.id),
                 l.style.style_by.clone(),
             );
@@ -2814,6 +2818,12 @@ impl ViewerApp {
         }
     }
 
+    /// Viewport width in physical pixels. With `last_view_world` this is
+    /// the ground scale: camera scale is pixels per world unit.
+    fn view_px_width(&self) -> f64 {
+        ((self.last_view_world[2] - self.last_view_world[0]) * self.camera.scale()).max(1.0)
+    }
+
     fn refine_partial_layers(&mut self, ctx: &egui::Context) {
         use crate::data::layer::GroupLoad;
         use crate::data::loader::{complement_ranges, GroupSel};
@@ -2840,11 +2850,10 @@ impl ViewerApp {
             // past that, every viewport at that zoom refines, whether it
             // covers a city or a field. A density test instead would
             // refine one and refuse the other at the same zoom.
+            // Data-CRS units per screen pixel: the viewport's data width
+            // over its pixel width (camera scale is px per world unit).
+            let view_px = ((view[2] - view[0]) * self.camera.scale()).max(1.0);
             if l.box_layer {
-                // Data-CRS units per screen pixel: the viewport's data
-                // width over its pixel width (camera scale is px per
-                // world unit).
-                let view_px = ((view[2] - view[0]) * self.camera.scale()).max(1.0);
                 let px = (rect[2] - rect[0]) / view_px;
                 let span = l.feature_span();
                 if span > 0.0 && span < self.box_threshold_px * px {
@@ -2853,7 +2862,17 @@ impl ViewerApp {
             }
             let starts = l.store.rg_starts();
             let mut jobs: Vec<GroupSel> = Vec::new();
-            for g in loader::intersecting_rgs(&rg.boxes, rect) {
+            // A COGP layer refines within the level this scale calls for.
+            // Zooming in moves the level finer and the extra row groups
+            // arrive then; without this the first camera settle would
+            // pull in the whole file, which is exactly what the layout
+            // exists to avoid.
+            let cogp_end =
+                loader::cogp_prefix_end(&l.store, Some(rect), view_px, &l.crs);
+            for g in loader::intersecting_rgs(&rg.boxes, rect)
+                .into_iter()
+                .filter(|g| cogp_end.is_none_or(|e| *g <= e))
+            {
                 let gb = rg.boxes[g as usize];
                 // The part of the viewport this group can contribute to.
                 let need = [

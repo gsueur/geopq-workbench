@@ -254,6 +254,49 @@ pub(crate) const EMPTY_BBOX: [f64; 4] =
     [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
 
 /// Union of a set of bboxes, ignoring empty (inverted) sentinels.
+/// Ground sample distance of the current view: metres of ground per
+/// screen pixel, from the viewport's width in the data CRS and its width
+/// in physical pixels.
+///
+/// Geographic data converts at the viewport's centre latitude, because
+/// "metres of ground" for a rectangle on a globe is a function of where
+/// it sits. Projected CRSs are read as metres — the ones this matters
+/// for (COGP level choice) are, and being a few percent off on a
+/// foot-based grid picks the same level either way.
+pub fn view_gsd(rect: [f64; 4], view_px: f64, crs: &Crs) -> Option<f64> {
+    let width = rect[2] - rect[0];
+    if !(width.is_finite() && width > 0.0 && view_px.is_finite() && view_px >= 1.0) {
+        return None;
+    }
+    let per_px = width / view_px;
+    Some(if crs.is_latlong {
+        let lat = ((rect[1] + rect[3]) * 0.5).clamp(-89.9, 89.9);
+        per_px * 111_320.0 * lat.to_radians().cos().max(1e-6)
+    } else {
+        per_px
+    })
+}
+
+/// Last row group a COGP layer needs for this viewport: the finest level
+/// whose gsd still covers the view (SPEC §7.1). None for a layer with no
+/// COGP levels, or a view whose ground scale cannot be worked out — in
+/// both cases planning proceeds over every row group, as before.
+///
+/// This is not pruning. Row groups past the prefix hold features that
+/// are not independently meaningful at this scale; skipping them is the
+/// point of the layout, not a compromise, which is why a prefix that
+/// fits the build budget loads as exact geometry with no badge.
+pub fn cogp_prefix_end(
+    store: &FeatureStore,
+    rect: Option<[f64; 4]>,
+    view_px: f64,
+    crs: &Crs,
+) -> Option<u32> {
+    let levels = store.cogp.as_ref()?;
+    let gsd = view_gsd(rect?, view_px, crs)?;
+    Some(levels.row_group_end_for_gsd(gsd) as u32)
+}
+
 pub(crate) fn union_of(boxes: &[[f64; 4]]) -> Option<[f64; 4]> {
     boxes
         .iter()
@@ -579,6 +622,9 @@ pub fn spawn_load(
     display: DisplayCrs,
     color: eframe::egui::Color32,
     view_world: [f64; 4],
+    // Viewport width in physical pixels: with `view_world` it gives the
+    // ground scale a COGP layer picks its level from.
+    view_px: f64,
     auto_project: bool,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     style: Option<crate::data::layer::StyleBy>,
@@ -661,6 +707,7 @@ pub fn spawn_load(
                     display,
                     color,
                     view_world,
+                    view_px,
                     auto_project,
                     &cancel,
                     style,
@@ -688,6 +735,7 @@ pub fn spawn_load_gated(
     display: DisplayCrs,
     color: eframe::egui::Color32,
     view_world: [f64; 4],
+    view_px: f64,
     auto_project: bool,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     style: Option<crate::data::layer::StyleBy>,
@@ -702,6 +750,7 @@ pub fn spawn_load_gated(
             display,
             color,
             view_world,
+            view_px,
             auto_project,
             &cancel,
             style,
@@ -722,6 +771,7 @@ fn build_opened(
     display: DisplayCrs,
     color: eframe::egui::Color32,
     view_world: [f64; 4],
+    view_px: f64,
     auto_project: bool,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
     style: Option<crate::data::layer::StyleBy>,
@@ -796,6 +846,7 @@ fn build_opened(
             &store.source.label(),
             rg_meta.as_ref().map(|(_, b)| b.as_slice()),
             rect,
+            cogp_prefix_end(&store, rect, view_px, &crs),
             "initial load",
         )
     };
@@ -1625,10 +1676,27 @@ fn plan_viewport_selection(
     label: &str,
     boxes: Option<&[[f64; 4]]>,
     rect: Option<[f64; 4]>,
+    cogp_end: Option<u32>,
     caller: &str,
 ) -> Vec<GroupSel> {
     log::debug!("plan_viewport_selection from {caller}");
     let n_rg = store.rg_starts().len().saturating_sub(1);
+    if n_rg == 0 {
+        return Vec::new();
+    }
+    // COGP levels first, before any budget fallback: the prefix is the
+    // set of features that are independently meaningful at this scale,
+    // so a prefix that fits the budget is an exact load. Falling back to
+    // boxes or a stride over the whole file would trade real geometry
+    // for approximated geometry the user then sees badged as such.
+    let last_group = cogp_end.unwrap_or(u32::MAX).min(n_rg as u32 - 1);
+    if let Some(levels) = store.cogp.as_ref().filter(|_| cogp_end.is_some()) {
+        log::info!(
+            "{label}: COGP level ending at row group {last_group} of {n_rg} \
+             ({} levels available)",
+            levels.levels.len()
+        );
+    }
     // A dataset that will be drawn from covering boxes loads all of them,
     // whatever the camera is looking at. Boxes are four doubles a feature
     // and no geometry read at all, and pruning them to the opening
@@ -1637,28 +1705,29 @@ fn plan_viewport_selection(
     // stays unloaded, and zooming towards it finds no boxes to show.
     // Complete coverage from the first frame is the property that makes
     // this display mode worth having.
+    let prefix_rows = store.rg_starts()[last_group as usize + 1];
     let all_boxes = matches!(
         over_budget_plan(store.covering.is_some(), store.polygons_only),
         OverBudget::Boxes
     ) && preview_stride(
-        store.total_rows(),
-        (0..n_rg as u32).map(|g| store.rg_geom_bytes(g)).sum(),
+        prefix_rows,
+        (0..=last_group).map(|g| store.rg_geom_bytes(g)).sum(),
     )
     .is_some();
     if all_boxes {
         log::info!(
-            "{label}: {} rows of polygons with a covering column: drawing \
-             every feature from its bounding box",
-            store.total_rows()
+            "{label}: {prefix_rows} rows of polygons with a covering column: \
+             drawing every feature from its bounding box"
         );
-        return (0..n_rg as u32)
+        return (0..=last_group)
             .map(|group| GroupSel::Boxes { group, rect: None })
             .collect();
     }
-    let groups: Vec<u32> = match (boxes, rect) {
+    let mut groups: Vec<u32> = match (boxes, rect) {
         (Some(b), Some(r)) => intersecting_rgs(b, r),
-        _ => (0..n_rg as u32).collect(),
+        _ => (0..=last_group).collect(),
     };
+    groups.retain(|&g| g <= last_group);
     if groups.len() < n_rg {
         log::info!("{label}: row-group pruning {n_rg} -> {} groups", groups.len());
     }
@@ -1746,6 +1815,7 @@ pub fn spawn_reload(
     boxes: Option<Vec<[f64; 4]>>,
     display: DisplayCrs,
     view_world: [f64; 4],
+    view_px: f64,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     style: Option<crate::data::layer::StyleBy>,
 ) {
@@ -1759,6 +1829,7 @@ pub fn spawn_reload(
             &store.source.label(),
             boxes.as_deref(),
             rect,
+            cogp_prefix_end(&store, rect, view_px, &crs),
             "viewport reload",
         );
         let style_sel = style.as_ref().and_then(|sb| resolve_style(&store, sb));
@@ -5196,6 +5267,7 @@ mod pruning_tests {
             "t",
             Some(&boxes),
             Some(elsewhere),
+            None,
             "test",
         );
         assert_eq!(sel.len(), n_rg, "every group is planned, not just visible ones");
@@ -5803,6 +5875,7 @@ mod pruning_tests {
             display,
             eframe::egui::Color32::RED,
             [0.0, 0.0, 1.0, 1.0],
+            1024.0,
             true,
             &Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
@@ -6839,7 +6912,7 @@ mod native_2_0_tests {
         assert_eq!(selected, 64, "{ranges:?}");
         // And the planner uses Rect for a sub-extent viewport.
         let boxes = vec![[2.0, 48.0, 2.15, 48.15], [2.0, 48.0, 2.15, 48.15]];
-        let sel = plan_viewport_selection(&store, "t", Some(&boxes), Some(rect), "test");
+        let sel = plan_viewport_selection(&store, "t", Some(&boxes), Some(rect), None, "test");
         assert!(
             sel.iter().all(|s| matches!(s, GroupSel::Rect(_, _))),
             "{sel:?}"
@@ -6951,15 +7024,22 @@ mod reload_plan_tests {
             "t",
             Some(&boxes),
             Some([9.5, -1.0, 12.0, 2.0]),
+            None,
             "test",
         );
         assert!(matches!(sel.as_slice(), [GroupSel::Rect(1, _)]), "{sel:?}");
         // Disjoint rect: nothing to read.
-        let sel =
-            plan_viewport_selection(&store, "t", Some(&boxes), Some([50.0, 0.0, 60.0, 1.0]), "test");
+        let sel = plan_viewport_selection(
+            &store,
+            "t",
+            Some(&boxes),
+            Some([50.0, 0.0, 60.0, 1.0]),
+            None,
+            "test",
+        );
         assert!(sel.is_empty(), "{sel:?}");
         // No rect: everything.
-        let sel = plan_viewport_selection(&store, "t", Some(&boxes), None, "test");
+        let sel = plan_viewport_selection(&store, "t", Some(&boxes), None, None, "test");
         assert_eq!(sel.len(), 3);
         assert!(matches!(sel[0], GroupSel::All(0)));
         assert!(matches!(sel[2], GroupSel::All(2)));
