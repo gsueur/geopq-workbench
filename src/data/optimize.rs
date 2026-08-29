@@ -184,15 +184,6 @@ pub enum RankOrder {
     Asc,
 }
 
-impl RankOrder {
-    pub fn label(&self) -> &'static str {
-        match self {
-            RankOrder::Desc => "largest wins",
-            RankOrder::Asc => "smallest wins",
-        }
-    }
-}
-
 /// Cloud Optimized GeoParquet Profile levels (see `super::cogp`).
 ///
 /// The heuristic reproduces the reference converter's, so a file this app

@@ -179,9 +179,6 @@ struct OptimizeState {
     replace_remote: bool,
     /// Finished as-is publish: destination and bytes uploaded.
     report_as_is: Option<(S3Dest, u64)>,
-    /// COGP: the custom gsd list as typed, kept while it is mid-edit and
-    /// not yet a parseable list of numbers.
-    cogp_gsd_text: String,
 }
 
 /// Where an optimized output was published, for the report and the
@@ -1057,6 +1054,9 @@ impl ViewerApp {
         // watermarked without one); pick it up from the environment or the
         // settings file, and default to OpenStreetMap when there is none.
         crate::map::tiles::set_carto_api_key(load_carto_api_key());
+        // Same file, read here so the export dialog never touches the disk
+        // mid-frame for its COGP defaults.
+        let _ = cogp_defaults();
         let initial_basemap = if crate::map::tiles::carto_api_key().is_some() {
             DEFAULT_BASEMAP
         } else {
@@ -4393,7 +4393,6 @@ impl ViewerApp {
                         merge_source_col: true,
                         upload_as_is: false,
                         report_as_is: None,
-                        cogp_gsd_text: String::new(),
                     });
                 }
             }
@@ -7772,9 +7771,7 @@ impl ViewerApp {
 
     fn optimize_window(&mut self, ctx: &egui::Context) {
         let floating_area = self.floating_area(ctx);
-        use crate::data::optimize::{
-            BloomMode, Codec, CogpOptions, GpVersion, GsdSource, RankOrder,
-        };
+        use crate::data::optimize::{BloomMode, Codec, GpVersion};
         // Gathered before the dialog borrow: partition-field candidates of
         // the exported layer and polygon layers usable for admin joins.
         let (candidates, other_layers) = match &self.optimize {
@@ -7980,17 +7977,26 @@ impl ViewerApp {
                             },
                         );
                         row(ui, "elapsed", format!("{} ms", rep.elapsed_ms));
-                        for (i, l) in rep.cogp_levels.iter().enumerate() {
+                        if !rep.cogp_levels.is_empty() {
+                            // One row rather than one per level: a zoom
+                            // pyramid is easily seventeen of them, and what
+                            // the numbers show is the taper.
                             row(
                                 ui,
-                                &format!("COGP level {i}"),
-                                format!(
-                                    "gsd {} — {} features, row groups {}–{}",
-                                    fmt_gsd(l.gsd),
-                                    fmt_count(l.rows as usize),
-                                    l.rg_start,
-                                    l.rg_end
-                                ),
+                                "COGP levels",
+                                rep.cogp_levels
+                                    .iter()
+                                    .map(|l| {
+                                        format!(
+                                            "{} {} (rg {}–{})",
+                                            fmt_gsd(l.gsd),
+                                            fmt_count(l.rows as usize),
+                                            l.rg_start,
+                                            l.rg_end
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
                             );
                         }
                     });
@@ -8151,8 +8157,41 @@ impl ViewerApp {
                             });
                         ui.end_row();
                     });
-                    ui.checkbox(&mut o.opts.hilbert_sort, "Hilbert spatial sort")
-                        .on_hover_text("Reorder features along a Hilbert curve over bbox centers");
+                    // Ordering is one choice, not two independent ticks:
+                    // the coarse-to-fine layout *is* a sort order, and it
+                    // still sorts by Hilbert inside each level.
+                    ui.label(RichText::new("Ordering").strong());
+                    if ui
+                        .radio(!cogp_on, "Hilbert spatial sort")
+                        .on_hover_text("Reorder features along a Hilbert curve over bbox centers")
+                        .clicked()
+                    {
+                        o.opts.cogp = None;
+                    }
+                    if ui
+                        .radio(cogp_on, "Coarse-to-fine levels (COGP v0.1, experimental)")
+                        .on_hover_text(
+                            "Orders features so simple readers can stream large layers by \
+                             zoom (large features first). Experimental; readers that know \
+                             COGP can use it, every other reader sees an ordinary \
+                             GeoParquet. Coverages such as parcels or land cover will look \
+                             sparse when zoomed out.",
+                        )
+                        .clicked()
+                    {
+                        o.opts.cogp = Some(cogp_defaults().clone());
+                        // The profile decides the physical layout, so it
+                        // takes over what it needs and clears what it
+                        // cannot share the file with.
+                        if o.opts.version == GpVersion::V1_1 {
+                            o.opts.covering = true;
+                        }
+                        o.part_mode = PartMode::None;
+                        o.part_fields.clear();
+                    }
+                    // Re-read after the choice: the sections below key off
+                    // it in the same frame.
+                    let cogp_on = o.opts.cogp.is_some();
                     ui.checkbox(&mut o.opts.covering, "bbox covering column")
                         .on_hover_text(
                             "A spatial index: per-feature bboxes drive exact viewport \
@@ -8165,240 +8204,6 @@ impl ViewerApp {
                         .on_hover_text(
                             "Export only features intersecting the current map viewport",
                         );
-
-                    // --- cloud-optimized levels (COGP) ---
-                    ui.separator();
-                    let mut on = o.opts.cogp.is_some();
-                    if ui
-                        .checkbox(&mut on, "Cloud-optimized levels (COGP)")
-                        .on_hover_text(
-                            "Order the file coarse to fine and record where each detail\n\
-                             level ends, so a map reader fetches only the leading row\n\
-                             groups its zoom needs. Nothing is simplified or duplicated:\n\
-                             every feature appears exactly once, whole, and a reader that\n\
-                             knows nothing about COGP sees an ordinary GeoParquet file.\n\
-                             \n\
-                             COGP v0.1 specifies GeoParquet 1.1 with a bbox covering. The\n\
-                             2.0 form here is this workbench's extension, leaning on the\n\
-                             native geospatial statistics instead; the spec's reference\n\
-                             tools will not recognise it until the profile adopts it.",
-                        )
-                        .changed()
-                    {
-                        o.opts.cogp = on.then(CogpOptions::default);
-                        if on {
-                            // The profile decides the physical layout, so it
-                            // takes over what it needs and clears what it
-                            // cannot share the file with.
-                            o.opts.hilbert_sort = true;
-                            if o.opts.version == GpVersion::V1_1GeoArrow {
-                                o.opts.version = GpVersion::V1_1;
-                            }
-                            if o.opts.version == GpVersion::V1_1 {
-                                o.opts.covering = true;
-                            }
-                            o.part_mode = PartMode::None;
-                            o.part_fields.clear();
-                        }
-                    }
-                    // Edited on a copy: the widgets below also touch other
-                    // fields of the dialog state, and one borrow at a time
-                    // keeps that readable.
-                    if let Some(mut c) = o.opts.cogp.clone() {
-                        ui.indent("cogp_opts", |ui| {
-                            let webmerc = matches!(c.gsd, GsdSource::WebMercator { .. });
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .selectable_label(webmerc, "Web Mercator zooms")
-                                    .on_hover_text(
-                                        "One level per zoom: gsd = 40 075 016 / \
-                                         (resolution × 2^z) metres",
-                                    )
-                                    .clicked()
-                                    && !webmerc
-                                {
-                                    c.gsd = CogpOptions::default().gsd;
-                                }
-                                if ui
-                                    .selectable_label(!webmerc, "custom gsd list")
-                                    .on_hover_text(
-                                        "Ground sample distances in metres, coarse to \
-                                         fine — for renderers that are not a Web \
-                                         Mercator pyramid",
-                                    )
-                                    .clicked()
-                                    && webmerc
-                                {
-                                    o.cogp_gsd_text = c
-                                        .gsds()
-                                        .unwrap_or_default()
-                                        .iter()
-                                        .map(|g| format!("{g:.0}"))
-                                        .collect::<Vec<_>>()
-                                        .join(", ");
-                                    c.gsd = GsdSource::Explicit(Vec::new());
-                                }
-                            });
-                            egui::Grid::new("opt_cogp").num_columns(2).show(ui, |ui| {
-                                match &mut c.gsd {
-                                    GsdSource::WebMercator {
-                                        minzoom,
-                                        maxzoom,
-                                        resolution,
-                                    } => {
-                                        ui.label("Zoom range");
-                                        ui.horizontal(|ui| {
-                                            ui.add(
-                                                egui::DragValue::new(minzoom).range(0..=30),
-                                            );
-                                            ui.label("to");
-                                            ui.add(
-                                                egui::DragValue::new(maxzoom).range(0..=30),
-                                            );
-                                        });
-                                        ui.end_row();
-                                        ui.label("Resolution")
-                                            .on_hover_text(
-                                                "Base units per tile side. 1024 is ~4× a \
-                                                 256 px tile, so features collapsing \
-                                                 within a few subpixels defer to a \
-                                                 finer level.",
-                                            );
-                                        ui.add(
-                                            egui::DragValue::new(resolution)
-                                                .range(1..=16_384)
-                                                .speed(16),
-                                        );
-                                        ui.end_row();
-                                    }
-                                    GsdSource::Explicit(list) => {
-                                        ui.label("gsd list (m)");
-                                        if ui
-                                            .add(
-                                                egui::TextEdit::singleline(&mut o.cogp_gsd_text)
-                                                    .hint_text("1000, 500, 100")
-                                                    .desired_width(200.0),
-                                            )
-                                            .changed()
-                                            || list.is_empty()
-                                        {
-                                            *list = o
-                                                .cogp_gsd_text
-                                                .split(&[',', ' '][..])
-                                                .filter(|t| !t.trim().is_empty())
-                                                .filter_map(|t| t.trim().parse::<f64>().ok())
-                                                .collect();
-                                        }
-                                        ui.end_row();
-                                    }
-                                }
-                                ui.label("Line factor").on_hover_text(
-                                    "A line joins a level once its bbox diagonal reaches \
-                                     this many gsd. A diagonal of one gsd is a hairline.",
-                                );
-                                ui.add(egui::DragValue::new(&mut c.line_factor).range(1..=64));
-                                ui.end_row();
-                                ui.label("Polygon factor").on_hover_text(
-                                    "Same for polygons, higher by default: a shape under \
-                                     ~4 cells across is not a shape yet.",
-                                );
-                                ui.add(egui::DragValue::new(&mut c.polygon_factor).range(1..=64));
-                                ui.end_row();
-                                ui.label("Point thinning").on_hover_text(
-                                    "Points have no extent, so they are thinned instead: \
-                                     one survivor per grid cell of this many gsd per \
-                                     level, the rest deferred to finer levels.",
-                                );
-                                ui.add(egui::DragValue::new(&mut c.point_factor).range(1..=64));
-                                ui.end_row();
-                                ui.label("Cell winner").on_hover_text(
-                                    "Which point survives when several fall in one cell. \
-                                     Without a column it is the largest bbox, then a \
-                                     stable hash of the row.",
-                                );
-                                ui.horizontal(|ui| {
-                                    let picked =
-                                        c.rank.as_ref().map(|(n, _)| n.clone()).unwrap_or_default();
-                                    egui::ComboBox::from_id_salt("opt_cogp_rank")
-                                        .selected_text(if picked.is_empty() {
-                                            "any (largest bbox)".to_string()
-                                        } else {
-                                            picked.clone()
-                                        })
-                                        .width(150.0)
-                                        .show_ui(ui, |ui| {
-                                            if ui
-                                                .selectable_label(
-                                                    picked.is_empty(),
-                                                    "any (largest bbox)",
-                                                )
-                                                .clicked()
-                                            {
-                                                c.rank = None;
-                                            }
-                                            for cand in &candidates {
-                                                if ui
-                                                    .selectable_label(&picked == cand, cand)
-                                                    .clicked()
-                                                {
-                                                    let ord = c
-                                                        .rank
-                                                        .as_ref()
-                                                        .map(|(_, o)| *o)
-                                                        .unwrap_or(RankOrder::Desc);
-                                                    c.rank = Some((cand.clone(), ord));
-                                                }
-                                            }
-                                        });
-                                    if let Some((_, ord)) = &mut c.rank {
-                                        egui::ComboBox::from_id_salt("opt_cogp_order")
-                                            .selected_text(ord.label())
-                                            .width(120.0)
-                                            .show_ui(ui, |ui| {
-                                                for cand in [RankOrder::Desc, RankOrder::Asc] {
-                                                    ui.selectable_value(
-                                                        ord,
-                                                        cand,
-                                                        cand.label(),
-                                                    );
-                                                }
-                                            });
-                                    }
-                                });
-                                ui.end_row();
-                            });
-                            match c.gsds() {
-                                Ok(g) => {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{} levels: {}",
-                                            g.len(),
-                                            fmt_gsd_list(&g)
-                                        ))
-                                        .weak()
-                                        .small(),
-                                    );
-                                }
-                                Err(e) => {
-                                    ui.label(
-                                        RichText::new(e).color(Color32::from_rgb(230, 130, 60)),
-                                    );
-                                }
-                            }
-                            ui.label(
-                                RichText::new(
-                                    "Thresholds are metres on the ground: a geographic \
-                                     layer converts at each feature's latitude, a \
-                                     projected one is read from its CRS units (metres \
-                                     when it cannot say).",
-                                )
-                                .weak()
-                                .small(),
-                            );
-                        });
-                        o.opts.cogp = Some(c);
-                    }
-
 
                     // --- merge with other layers ---
                     if !merge_candidates.is_empty() {
@@ -8657,7 +8462,8 @@ impl ViewerApp {
                     if cogp_on {
                         ui.label(
                             RichText::new(
-                                "Cloud-optimized levels describe one file's row                                  groups, so the output stays single.",
+                                "Coarse-to-fine levels describe one file's row groups, \
+                                 so the output stays single.",
                             )
                             .weak()
                             .small(),
@@ -10131,7 +9937,6 @@ impl ViewerApp {
                         merge_source_col: true,
                         upload_as_is: false,
                         report_as_is: None,
-                        cogp_gsd_text: String::new(),
                     });
                 }
                 self.drop_gated(&gate, ctx);
@@ -12537,6 +12342,67 @@ fn save_carto_api_key(key: &str) {
     }
 }
 
+/// The COGP knobs the Export dialog no longer shows: the reference
+/// converter's defaults unless the settings file carries a `cogp` object
+/// overriding them. Read once — these are a power user's levers, not a
+/// live setting, and an object that does not validate falls back whole
+/// rather than half-applying.
+fn cogp_defaults() -> &'static crate::data::optimize::CogpOptions {
+    use crate::data::optimize::{CogpOptions, GsdSource, RankOrder};
+    static DEFAULTS: std::sync::OnceLock<CogpOptions> = std::sync::OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        let read = || -> Option<CogpOptions> {
+            let txt = std::fs::read_to_string(settings_path()?).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
+            let c = v.get("cogp")?;
+            let mut o = CogpOptions::default();
+            let u32_of = |k: &str| c.get(k).and_then(serde_json::Value::as_u64).map(|n| n as u32);
+            if let GsdSource::WebMercator {
+                minzoom,
+                maxzoom,
+                resolution,
+            } = &mut o.gsd
+            {
+                *minzoom = u32_of("minzoom").unwrap_or(*minzoom);
+                *maxzoom = u32_of("maxzoom").unwrap_or(*maxzoom);
+                *resolution = u32_of("resolution").unwrap_or(*resolution);
+            }
+            // An explicit list replaces the zoom pyramid outright, for
+            // renderers that are not a Web Mercator one.
+            if let Some(list) = c.get("gsds").and_then(serde_json::Value::as_array) {
+                o.gsd = GsdSource::Explicit(
+                    list.iter().filter_map(serde_json::Value::as_f64).collect(),
+                );
+            }
+            o.line_factor = u32_of("line_factor").unwrap_or(o.line_factor);
+            o.polygon_factor = u32_of("polygon_factor").unwrap_or(o.polygon_factor);
+            o.point_factor = u32_of("point_factor").unwrap_or(o.point_factor);
+            o.rank = c
+                .get("rank")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(|n| {
+                    let asc =
+                        c.get("rank_order").and_then(serde_json::Value::as_str) == Some("asc");
+                    let order = if asc { RankOrder::Asc } else { RankOrder::Desc };
+                    (n.to_string(), order)
+                });
+            Some(o)
+        };
+        match read() {
+            None => CogpOptions::default(),
+            Some(o) => match o.gsds() {
+                Ok(_) => o,
+                Err(e) => {
+                    log::warn!("settings `cogp`: {e} — using the defaults");
+                    CogpOptions::default()
+                }
+            },
+        }
+    })
+}
+
 fn load_direct_files() -> HashSet<String> {
     let read = || -> Option<HashSet<String>> {
         let txt = std::fs::read_to_string(settings_path()?).ok()?;
@@ -12568,15 +12434,6 @@ fn fmt_gsd(m: f64) -> String {
         format!("{m:.0} m")
     } else {
         format!("{m:.2} m")
-    }
-}
-
-/// The level list as a preview: coarsest, finest, and how many between.
-fn fmt_gsd_list(g: &[f64]) -> String {
-    match g {
-        [] => String::new(),
-        [one] => fmt_gsd(*one),
-        [first, .., last] => format!("{} → {}", fmt_gsd(*first), fmt_gsd(*last)),
     }
 }
 
