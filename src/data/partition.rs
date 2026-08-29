@@ -520,6 +520,11 @@ pub struct DensityRow {
     pub max_rows: usize,
     /// Files after adaptive splitting at `target_rows`, plus the null part
     /// when there is one. Equals `cells` (+1) when splitting is off.
+    ///
+    /// An estimate to within a file or two: it descends from the r10
+    /// cells this table is built on, and H3 resolutions do not nest
+    /// geometrically, so a run that stops splitting above r10 can place
+    /// a handful of boundary features one cell over.
     pub files: usize,
 }
 
@@ -575,15 +580,26 @@ pub fn density_table(
 }
 
 /// Runs of a resolution-sorted cell array that share a parent at `res`.
+///
+/// Compared on the index bits rather than through `parent()`: an H3
+/// index lays out the base cell and then one three-bit digit per
+/// resolution in descending bit order, so cells sharing a parent at
+/// `res` are exactly those that agree above bit `45 - 3·res`. Every
+/// cell here is at the same resolution, so the resolution field agrees
+/// too and the shift is the whole comparison. `parent()` validates and
+/// rebuilds an index on every call, and over eight resolutions of 2.5M
+/// rows that was most of the table's cost.
 fn runs_by_parent(cells: &[CellIndex], res: Resolution) -> impl Iterator<Item = &[CellIndex]> {
+    let shift = 45 - 3 * u32::from(u8::from(res));
+    let key = move |c: &CellIndex| u64::from(*c) >> shift;
     let mut i = 0usize;
     std::iter::from_fn(move || {
         if i >= cells.len() {
             return None;
         }
-        let p = cells[i].parent(res);
+        let p = key(&cells[i]);
         let lo = i;
-        while i < cells.len() && cells[i].parent(res) == p {
+        while i < cells.len() && key(&cells[i]) == p {
             i += 1;
         }
         Some(&cells[lo..i])
@@ -736,8 +752,39 @@ mod tests {
         assert!(table[0].files > flat[0].files, "{:?} vs {:?}", table[0], flat[0]);
     }
 
+    /// The bit-shift grouping the density table runs on has to mean the
+    /// same thing as `parent()`, which is what the writer partitions
+    /// with. Checked across every resolution the table covers.
+    #[test]
+    fn run_grouping_agrees_with_parent() {
+        let mut cells: Vec<CellIndex> = Vec::new();
+        for i in 0..2000 {
+            let (dx, dy) = ((i % 50) as f64 * 0.01, (i / 50) as f64 * 0.01);
+            for (lon, lat) in [(2.35 + dx, 48.85 + dy), (-71.06 + dx, 42.36 - dy)] {
+                cells.push(LatLng::new(lat, lon).unwrap().to_cell(Resolution::Ten));
+            }
+        }
+        cells.sort_unstable_by_key(|&c| u64::from(c));
+        for r in DENSITY_RES {
+            let res = Resolution::try_from(r).unwrap();
+            let mut seen = 0usize;
+            for run in runs_by_parent(&cells, res) {
+                let p = run[0].parent(res).unwrap();
+                assert!(run.iter().all(|c| c.parent(res) == Some(p)), "r{r}");
+                seen += run.len();
+            }
+            assert_eq!(seen, cells.len(), "r{r} covers every cell exactly once");
+            // And the runs are maximal: as many runs as distinct parents.
+            let distinct: std::collections::HashSet<CellIndex> =
+                cells.iter().map(|c| c.parent(res).unwrap()).collect();
+            assert_eq!(runs_by_parent(&cells, res).count(), distinct.len(), "r{r}");
+        }
+    }
+
     /// The file count the table promises is the file count the writer
-    /// produces — the whole point of showing it before the run.
+    /// produces — the whole point of showing it before the run. Exact
+    /// when the split may reach the resolution the table is built on;
+    /// see `DensityRow::files` for why it is an estimate below that.
     #[test]
     fn density_files_match_the_leaf_split() {
         let mut lonlat: Vec<Option<(f64, f64)>> = Vec::new();

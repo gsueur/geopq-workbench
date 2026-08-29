@@ -7868,6 +7868,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Measured run on a real layer, opt-in through the environment:
+    /// `GEOPQ_PYR_FILE` is the source, `GEOPQ_PYR_OUT` the pyramid root,
+    /// and `GEOPQ_PYR_METHOD` / `_REF` / `_FROM` / `_TARGET` pick the
+    /// options. Prints the density table and the per-level cost.
+    #[test]
+    #[ignore = "needs a real file; set GEOPQ_PYR_FILE"]
+    fn pyramid_real_file() {
+        let Ok(src) = std::env::var("GEOPQ_PYR_FILE") else { return };
+        let src = PathBuf::from(src);
+        let dst = PathBuf::from(
+            std::env::var("GEOPQ_PYR_OUT").unwrap_or_else(|_| {
+                std::env::temp_dir().join("geopq_pyramid_real").to_string_lossy().into_owned()
+            }),
+        );
+        let num = |k: &str, d: usize| -> usize {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let target = num("GEOPQ_PYR_TARGET", 250_000);
+
+        let t = std::time::Instant::now();
+        let centroids = scan_centroids(&Source::Local(src.clone()), None).unwrap();
+        eprintln!("scan_centroids: {} rows in {:?}", centroids.len(), t.elapsed());
+
+        let t = std::time::Instant::now();
+        let table = crate::data::partition::density_table(&centroids, target, 10).unwrap();
+        eprintln!("density_table: {:?}", t.elapsed());
+        for r in &table {
+            eprintln!(
+                "  r{:<2} cells {:>7} median {:>8} max {:>9} files {:>7}",
+                r.res, r.cells, r.median_rows, r.max_rows, r.files
+            );
+        }
+
+        let reference_res = num("GEOPQ_PYR_REF", 0) as u8;
+        let reference_res = if reference_res > 0 {
+            reference_res
+        } else {
+            table.iter().find(|r| r.max_rows <= target).map_or(8, |r| r.res)
+        };
+        let method = match std::env::var("GEOPQ_PYR_METHOD").as_deref() {
+            Ok("simplify") => MethodChoice::Simplify,
+            Ok("prune") => MethodChoice::Prune,
+            Ok("dissolve") => MethodChoice::Dissolve,
+            _ => MethodChoice::Auto,
+        };
+        let opts = OptimizeOptions {
+            pyramid: Some(PyramidOptions {
+                reference_res,
+                adaptive: true,
+                max_res: (reference_res + 2).min(10),
+                target_rows: target,
+                from_res: Some(num("GEOPQ_PYR_FROM", reference_res.saturating_sub(3) as usize) as u8),
+                method,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        eprintln!("pyramid: {:?}", opts.pyramid);
+        let t = std::time::Instant::now();
+        let rep = optimize(
+            &Source::Local(src),
+            &dst,
+            &opts,
+            None,
+            None,
+            &|f, s| eprintln!("  {:>3.0}% {s}", f * 100.0),
+        )
+        .unwrap();
+        eprintln!("wrote {} files in {:?}", rep.files, t.elapsed());
+        for l in &rep.pyramid_levels {
+            eprintln!(
+                "  r{} {:<9} files {:>6} rows {:>9} bytes {:>12}",
+                l.res,
+                l.method.map(|m| m.label()).unwrap_or("source"),
+                l.files,
+                l.rows,
+                l.bytes
+            );
+        }
+        eprintln!(
+            "overview overhead: {:.1}% of the leaf; total {} bytes",
+            rep.pyramid_overhead_pct().unwrap_or(0.0),
+            rep.size_after
+        );
+        read_descriptor(&dst).validate().unwrap();
+    }
+
     /// The level tolerance is metres on the ground, converted into the
     /// layer's own units — degrees at the file's latitude, or the
     /// projected CRS's linear unit.

@@ -8815,6 +8815,11 @@ impl ViewerApp {
                                                 }
                                             }
                                         });
+                                    if let Some((_, order)) = &mut p.opts.prune.rank {
+                                        use crate::data::optimize::RankOrder;
+                                        ui.selectable_value(order, RankOrder::Desc, "highest");
+                                        ui.selectable_value(order, RankOrder::Asc, "lowest");
+                                    }
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("dissolve majority column:");
