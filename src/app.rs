@@ -9844,6 +9844,9 @@ impl ViewerApp {
                         if let Some(e) = &info.geo.edges {
                             row(ui, "edges", e.clone());
                         }
+                        if let Some(c) = &info.geo.cogp {
+                            row(ui, "cloud-optimized", c.clone());
+                        }
                         if let Some(rg) = &layer.rg_bboxes {
                             row(
                                 ui,

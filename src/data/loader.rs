@@ -1579,6 +1579,9 @@ struct FileOpen {
     /// The geometry column holds base64 text, not WKB bytes: `schema`
     /// already says Binary and the store decodes on read.
     base64_wkb: bool,
+    /// Parsed `cogp` block, or why it was rejected. A rejected block
+    /// leaves the file perfectly openable — it is simply not COGP.
+    cogp: Option<Result<super::cogp::CogpLevels, String>>,
 }
 
 /// Quality analysis over an opened file / merged dataset (footer facts
@@ -1840,6 +1843,7 @@ fn open_store_with_view(
     store.hidden_wkb = f.hidden_wkb;
     store.spherical_edges = f.spherical_edges;
     store.base64_wkb = f.base64_wkb;
+    store.cogp = f.cogp.clone().and_then(Result::ok);
     // Declared types only: an undeclared file stays out of the bbox
     // path rather than guessing from the first feature it decodes.
     store.polygons_only = !f.info.geo.geometry_types.is_empty()
@@ -2356,6 +2360,10 @@ fn open_multi_store(
     let rg_boxes = boxes
         .filter(|b| !b.is_empty())
         .map(|b| (box_source.unwrap_or_else(|| "mixed".into()), b));
+    // COGP row-group indices are per file, and this store renumbers them
+    // across fragments: a per-part `cogp` block says nothing about the
+    // dataset, so it is not carried over.
+    info.geo.cogp = None;
     info.quality = Some(quality_report(
         &info,
         rg_boxes.as_ref(),
@@ -2670,6 +2678,28 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
     };
     let covering = covering_column(geo_meta.as_ref(), &primary_name, &schema);
 
+    // COGP: a prefix of row groups per rendering scale (docs at
+    // src/data/cogp.rs). Validated here, from the footer, and a block
+    // that fails validation is recorded and otherwise ignored — the file
+    // is still an ordinary GeoParquet and must still open.
+    let cogp = kv
+        .iter()
+        .find(|kv| kv.key == "cogp")
+        .and_then(|kv| kv.value.clone())
+        .map(|v| {
+            super::cogp::parse(
+                &v,
+                rg_rows.len(),
+                cogp_pruning_signal(
+                    &builder,
+                    geo_meta.as_ref(),
+                    &primary_name,
+                    geom_leaf,
+                    crs.is_latlong,
+                ),
+            )
+        });
+
     let mut info = info;
     if hidden_wkb.is_some() {
         info.geo.encoding = format!("{} + GeoArrow column (used for display)", info.geo.encoding);
@@ -2677,6 +2707,11 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
     if base64_wkb {
         info.geo.encoding = "WKB, base64 text (decoded on read)".into();
     }
+    info.geo.cogp = match &cogp {
+        Some(Ok(c)) => Some(c.summary()),
+        Some(Err(e)) => Some(format!("`cogp` metadata present but not usable: {e}")),
+        None => None,
+    };
     if let Some((xi, yi)) = xy {
         info.geo.version_label = "none (points synthesized from coordinate columns)".into();
         info.geo.primary_column = "geometry (virtual)".into();
@@ -2730,6 +2765,7 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
         hidden_wkb,
         spherical_edges,
         base64_wkb,
+        cogp,
     })
 }
 
@@ -3171,6 +3207,31 @@ pub(crate) fn rg_bboxes_from_metadata(
     boxes
         .filter(|b| !b.is_empty())
         .map(|b| ("coordinate column statistics (GeoArrow)".into(), b))
+}
+
+/// Which row-group bbox statistics this file offers, as COGP requires
+/// (SPEC §5.1). Runs the loader's own bbox sources one at a time so the
+/// answer names the source that exists rather than the one that won:
+/// `geom_leaf` None disables the native branch, `geo_meta` None the
+/// covering one, and WKB disables the GeoArrow coordinate fallback,
+/// which is a decode format rather than a declared spatial index.
+///
+/// Covering wins a tie because it is what the published profile asks
+/// for, so a file carrying both is plain COGP rather than an extension.
+fn cogp_pruning_signal(
+    builder: &ParquetRecordBatchReaderBuilder<super::source::SourceReader>,
+    geo_meta: Option<&Value>,
+    primary: &str,
+    geom_leaf: Option<usize>,
+    is_latlong: bool,
+) -> Option<super::cogp::Pruning> {
+    if rg_bboxes_from_metadata(builder, geo_meta, None, primary, GeomEncoding::Wkb, is_latlong)
+        .is_some()
+    {
+        return Some(super::cogp::Pruning::Covering);
+    }
+    rg_bboxes_from_metadata(builder, None, geom_leaf, primary, GeomEncoding::Wkb, is_latlong)
+        .map(|_| super::cogp::Pruning::NativeStats)
 }
 
 /// Parquet geospatial statistics allow xmin > xmax for row groups that

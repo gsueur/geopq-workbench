@@ -81,6 +81,11 @@ pub struct FeatureStore {
     /// nothing downstream — display, picking, SQL, the optimizer — has to
     /// know the file spelled its geometry as a string.
     pub base64_wkb: bool,
+    /// Validated COGP levels, when the file carries them: which prefix of
+    /// row groups the viewport planner needs at a given ground scale.
+    /// Single-file stores only — row-group indices in `cogp` are per
+    /// file, and a multi-fragment store renumbers them globally.
+    pub cogp: Option<super::cogp::CogpLevels>,
     /// The `geo` metadata declares polygons only. A polygon is the one
     /// geometry its bounding box can stand in for on screen; a line's
     /// box is a rectangle the line does not follow, and a point is its
@@ -193,6 +198,7 @@ impl FeatureStore {
             hidden_wkb: None,
             spherical_edges: false,
             base64_wkb: false,
+            cogp: None,
             polygons_only: false,
             rg_rows,
             rg_starts,
