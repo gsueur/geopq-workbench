@@ -8,16 +8,16 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use geopq_workbench::data::import::ImportFormat;
 use geopq_workbench::data::info::fmt_bytes;
-use geopq_workbench::data::optimize::{self, Codec, GpVersion, OptimizeOptions};
+use geopq_workbench::data::optimize::{self, Codec, GpVersion, OptimizeOptions, OptimizeReport};
 use geopq_workbench::data::partition::PartitionBy;
 use geopq_workbench::data::source::Source;
-use geopq_workbench::data::{geojson, gpkg, shp};
+use geopq_workbench::data::{geojson, gpkg, settings, shp};
 
 /// Convert a vector source (GeoPackage, Shapefile, GeoJSON, or an
 /// existing GeoParquet file) into an optimized GeoParquet: spatially
 /// sorted, tuned row groups, covering bbox column.
 #[derive(Parser)]
-#[command(name = "geopq-cli", version, about)]
+#[command(name = "geopq-cli", version)]
 struct Cli {
     /// Source path: a .gpkg/.shp/.geojson file, or an existing .parquet
     /// file (skipped straight to the optimize step).
@@ -73,8 +73,8 @@ struct Cli {
 
     /// Partition output into adaptive H3 cells instead of fields: cells
     /// over --partition-h3-target-rows split into children until
-    /// balanced or --h3 (used as the max resolution here) is reached.
-    /// Requires --h3. Mutually exclusive with --partition-by.
+    /// balanced or the max resolution is reached. Mutually exclusive
+    /// with --partition-by.
     #[arg(long)]
     partition_h3: bool,
 
@@ -82,7 +82,20 @@ struct Cli {
     #[arg(long, default_value_t = 100_000)]
     partition_h3_target_rows: usize,
 
-    /// List the layers/tables in --input and exit, instead of converting.
+    /// Finest resolution the adaptive-H3 split may reach (0-15).
+    /// Defaults to --h3 when that is set, otherwise 10.
+    #[arg(long)]
+    partition_h3_max_res: Option<u8>,
+
+    /// Order the output coarse to fine and write the COGP v0.1 level
+    /// metadata (experimental). Implies the Hilbert sort and, on the
+    /// 1.1 WKB flavor, the covering column; cannot be combined with
+    /// partitioning. Level GSDs and thinning factors come from the
+    /// `cogp` block of ~/.geopq-workbench.json, same as the GUI's.
+    #[arg(long)]
+    cogp: bool,
+
+    /// List the tables in --input and exit, instead of converting.
     #[arg(long)]
     list_layers: bool,
 }
@@ -119,6 +132,11 @@ fn run() -> Result<(), String> {
         .as_deref()
         .ok_or("--output is required (or pass --list-layers)")?;
 
+    // Every flag combination is settled before the import runs: an
+    // unrunnable request should cost a millisecond, not the minutes it
+    // takes to write the intermediate first.
+    let opts = options(&cli)?;
+
     let is_parquet = cli
         .input
         .extension()
@@ -135,15 +153,46 @@ fn run() -> Result<(), String> {
             .ok_or_else(|| format!("unsupported input: {}", cli.input.display()))?;
         let tmp = std::env::temp_dir()
             .join(format!("geopq-cli-import-{}.parquet", std::process::id()));
-        import(fmt, &cli.input, cli.layer.as_deref(), &tmp)?;
+        let r = import(fmt, &cli.input, cli.layer.as_deref(), &tmp);
+        if r.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        r?;
         (tmp, true)
     };
 
+    let progress = Progress::default();
+    let result = optimize::optimize(
+        &Source::Local(intermediate.clone()),
+        output,
+        &opts,
+        None,
+        None,
+        &|frac, stage| progress.report(frac, stage),
+    );
+    progress.finish();
+
+    if is_temp {
+        let _ = std::fs::remove_file(&intermediate);
+    }
+
+    println!("{}", summary(&result?));
+    Ok(())
+}
+
+/// The `OptimizeOptions` the flags add up to, or why they don't.
+fn options(cli: &Cli) -> Result<OptimizeOptions, String> {
     if !cli.partition_by.is_empty() && cli.partition_h3 {
         return Err("--partition-by and --partition-h3 are mutually exclusive".into());
     }
     let partition = if cli.partition_h3 {
-        let max_res = cli.h3.ok_or("--partition-h3 requires --h3 (used as the max resolution)")?;
+        // The adaptive split needs a floor to stop at. --h3 is the natural
+        // one when the run already asks for a cell column at that
+        // resolution; 10 (~0.015 km² cells) otherwise.
+        let max_res = cli.partition_h3_max_res.or(cli.h3).unwrap_or(10);
+        if cli.partition_h3_target_rows == 0 {
+            return Err("--partition-h3-target-rows must be positive".into());
+        }
         PartitionBy::AdaptiveH3 { target_rows: cli.partition_h3_target_rows, max_res }
     } else if !cli.partition_by.is_empty() {
         PartitionBy::Fields(cli.partition_by.clone())
@@ -151,12 +200,43 @@ fn run() -> Result<(), String> {
         PartitionBy::None
     };
 
-    let opts = OptimizeOptions {
-        version: match cli.format {
-            FormatArg::Wkb => GpVersion::V1_1,
-            FormatArg::Geoarrow => GpVersion::V1_1GeoArrow,
-            FormatArg::Native2 => GpVersion::V2_0,
-        },
+    let version = match cli.format {
+        FormatArg::Wkb => GpVersion::V1_1,
+        FormatArg::Geoarrow => GpVersion::V1_1GeoArrow,
+        FormatArg::Native2 => GpVersion::V2_0,
+    };
+
+    // COGP decides the physical layout, so it takes over what it needs
+    // and refuses what it cannot share the file with — the same rules the
+    // Export dialog applies when the ordering radio is switched to it.
+    let cogp = if cli.cogp {
+        if partition != PartitionBy::None {
+            return Err("--cogp cannot be combined with partitioning: \
+                        levels and hive parts both own the file layout"
+                .into());
+        }
+        if cli.no_hilbert {
+            return Err("--cogp implies the Hilbert sort; drop --no-hilbert".into());
+        }
+        if cli.no_covering && version == GpVersion::V1_1 {
+            return Err("--cogp on the wkb flavor implies the covering column; \
+                        drop --no-covering"
+                .into());
+        }
+        Some(settings::cogp_defaults().clone())
+    } else {
+        None
+    };
+
+    if cli.row_group_size == 0 {
+        return Err("--row-group-size must be positive".into());
+    }
+    if cli.row_group_mib == 0 {
+        return Err("--row-group-mib must be positive".into());
+    }
+
+    Ok(OptimizeOptions {
+        version,
         row_group_size: cli.row_group_size,
         row_group_bytes: cli.row_group_mib << 20,
         codec: match cli.compression {
@@ -168,34 +248,59 @@ fn run() -> Result<(), String> {
         covering: !cli.no_covering,
         h3_resolution: cli.h3,
         partition,
+        cogp,
         ..Default::default()
-    };
+    })
+}
 
-    let result = optimize::optimize(
-        &Source::Local(intermediate.clone()),
-        output,
-        &opts,
-        None,
-        None,
-        &|frac, stage| eprint!("\r{stage}: {:>5.1}%   ", frac * 100.0),
+/// The one line stdout gets on success, so a shell pipeline has something
+/// stable to read while the progress noise goes to stderr.
+fn summary(r: &OptimizeReport) -> String {
+    let mut out = format!(
+        "{} rows | row groups {} -> {} | {} -> {} | {} file{}",
+        r.rows,
+        r.rg_before,
+        r.rg_after,
+        fmt_bytes(r.size_before),
+        fmt_bytes(r.size_after),
+        r.files,
+        if r.files == 1 { "" } else { "s" },
     );
-    eprintln!();
+    if !r.cogp_levels.is_empty() {
+        out.push_str(&format!(" | {} COGP levels", r.cogp_levels.len()));
+    }
+    out
+}
 
-    if is_temp {
-        let _ = std::fs::remove_file(&intermediate);
+/// Progress on stderr, rewritten in place. The optimizer calls back far
+/// more often than a terminal can usefully repaint (and far more often
+/// than a redirected log wants a line), so a repaint only happens when
+/// the stage changes or the percentage moves by a tenth of a point.
+#[derive(Default)]
+struct Progress {
+    last: std::cell::RefCell<(String, i32)>,
+}
+
+impl Progress {
+    fn report(&self, frac: f32, stage: &str) {
+        let tenths = (frac.clamp(0.0, 1.0) * 1000.0) as i32;
+        let mut last = self.last.borrow_mut();
+        if last.0 == stage && last.1 == tenths {
+            return;
+        }
+        if last.0 != stage {
+            last.0 = stage.to_string();
+        }
+        last.1 = tenths;
+        eprint!("\r{stage}: {:>5.1}%   ", tenths as f32 / 10.0);
     }
 
-    let report = result?;
-    let files = if report.files > 1 { format!(" | {} partition files", report.files) } else { String::new() };
-    println!(
-        "{} rows | row groups {} -> {} | {} -> {}{files}",
-        report.rows,
-        report.rg_before,
-        report.rg_after,
-        fmt_bytes(report.size_before),
-        fmt_bytes(report.size_after),
-    );
-    Ok(())
+    /// Close the in-place line, once, and only if something was drawn on it.
+    fn finish(&self) {
+        if !self.last.borrow().0.is_empty() {
+            eprintln!();
+        }
+    }
 }
 
 fn import(fmt: ImportFormat, input: &Path, layer: Option<&str>, dst: &Path) -> Result<(), String> {

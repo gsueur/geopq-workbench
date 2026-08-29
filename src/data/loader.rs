@@ -1604,7 +1604,7 @@ fn prepare_refinement_jobs(
 }
 
 /// Parse file metadata: geometry column, CRS, row-group layout. Reads no data.
-type StoreOpen = (
+pub type StoreOpen = (
     FeatureStore,
     Crs,
     FileInfo,
@@ -1878,9 +1878,10 @@ pub fn spawn_reload(
     });
 }
 
-/// Un-gated open with no viewport, used by the test helpers below.
-#[cfg(test)]
-fn open_store(source: &Source) -> Result<StoreOpen, String> {
+/// Un-gated open with no viewport: what the in-crate tests and the
+/// `geopq-cli` integration tests read a written file back with. The app
+/// itself always goes through `open_store_with_view`.
+pub fn open_store(source: &Source) -> Result<StoreOpen, String> {
     open_store_with_view(source, None)
 }
 

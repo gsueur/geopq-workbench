@@ -154,7 +154,7 @@ const HISTORY_CAP: usize = 50;
 
 fn load_history() -> Vec<String> {
     let read = || -> Option<Vec<String>> {
-        let txt = std::fs::read_to_string(crate::app::settings_path()?).ok()?;
+        let txt = std::fs::read_to_string(crate::data::settings::settings_path()?).ok()?;
         let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
         serde_json::from_value(v.get("sql_history")?.clone()).ok()
     };
@@ -162,7 +162,7 @@ fn load_history() -> Vec<String> {
 }
 
 fn save_history(history: &[String]) {
-    let Some(p) = crate::app::settings_path() else { return };
+    let Some(p) = crate::data::settings::settings_path() else { return };
     let mut root = std::fs::read_to_string(&p)
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
