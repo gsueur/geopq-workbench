@@ -7841,7 +7841,16 @@ impl ViewerApp {
             .id(egui::Id::new("optimize_dialog"))
             .open(&mut open)
             .default_width(400.0)
-            .constrain_to(floating_area).show(ctx, |ui| {
+            // Bounded, not auto-sized: the COGP sub-panel makes the body taller
+            // than the map area, and an auto-height window runs past the
+            // screen with the Export button under the border. Bounding the
+            // window makes the scroll area below real.
+            .max_height((floating_area.height() - 24.0).max(240.0))
+            .constrain_to(floating_area)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
                 if let Some((d, size)) = &o.report_as_is {
                     use crate::data::info::fmt_bytes;
                     ui.label(RichText::new(format!("Published: {}", d.uri)).strong());
@@ -8804,6 +8813,7 @@ impl ViewerApp {
                     ui.add_space(4.0);
                     ui.colored_label(Color32::from_rgb(230, 80, 80), e);
                 }
+                    });
             });
         // Count distinct values of the partition candidates (one scan, on
         // a worker thread) the first time "by fields" is selected.
