@@ -1,5 +1,6 @@
 [package]
 name = "geopq-workbench"
+default-run = "geopq-workbench"
 version = "0.8.2"
 edition = "2024"
 description = "GeoPQ Workbench: a fast native technical workbench for GeoParquet data"
