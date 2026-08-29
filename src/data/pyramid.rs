@@ -239,6 +239,25 @@ impl Descriptor {
         chosen.min(self.leaf.res)
     }
 
+    /// Every part path the descriptor names, coarse to fine and in the
+    /// cell order each level lists, with the leaf null part last.
+    ///
+    /// Discovery does not need this — a reader derives file names from
+    /// cell ids — but a caller that wants the whole dataset (a copy, an
+    /// upload, a completeness check) would otherwise have to re-implement
+    /// the layout, and there is exactly one place the layout is defined.
+    pub fn files(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .levels
+            .iter()
+            .flat_map(|l| l.cells.iter().map(|c| part_path(l.res, c)))
+            .collect();
+        if self.leaf.null_part {
+            out.push(part_path(self.leaf.res, NULL_PART));
+        }
+        out
+    }
+
     /// Overview levels, coarse to fine.
     pub fn overviews(&self) -> impl Iterator<Item = &Level> {
         self.levels.iter().filter(|l| l.res < self.leaf.res)
@@ -337,6 +356,36 @@ mod tests {
         assert_eq!(d.res_for_gsd(10_000.0), 5);
         // Adaptive children never come back as a level choice.
         assert_eq!(d.res_for_gsd(0.01), 8);
+    }
+
+    #[test]
+    fn files_lists_every_part_once() {
+        let mut d = desc();
+        d.levels[1].cells = vec!["862a30667ffffff".into()];
+        d.levels[3].cells = vec!["882a3066d1fffff".into(), "882a3066d3fffff".into()];
+        d.levels[4].cells = vec!["892a3066d13ffff".into()];
+        let files = d.files();
+        assert_eq!(
+            files,
+            vec![
+                "r5/852a3067fffffff.parquet",
+                "r6/862a30667ffffff.parquet",
+                "r8/882a3066d1fffff.parquet",
+                "r8/882a3066d3fffff.parquet",
+                "r9/892a3066d13ffff.parquet",
+                "r8/__HIVE_DEFAULT_PARTITION__.parquet",
+            ]
+        );
+        let uniq: std::collections::HashSet<&String> = files.iter().collect();
+        assert_eq!(uniq.len(), files.len(), "no path is listed twice");
+
+        // No null part means no null entry, and an empty pyramid lists nothing.
+        d.leaf.null_part = false;
+        assert_eq!(d.files().len(), 5);
+        for l in &mut d.levels {
+            l.cells.clear();
+        }
+        assert!(d.files().is_empty());
     }
 
     #[test]
