@@ -1040,6 +1040,16 @@ impl VectorLayer {
         self.loaded.iter().filter(|g| g.is_full()).count()
     }
 
+    /// Every count the layers panel shows about the load state, in one
+    /// pass over `loaded`.
+    ///
+    /// The panel used to ask for them one at a time — full, partial,
+    /// preview, boxes, rows — which is five scans of a vector with one
+    /// entry per row group, per layer, on every frame the panel is up.
+    pub fn load_summary(&self) -> LoadSummary {
+        load_summary(&self.loaded, self.store.rg_starts())
+    }
+
     /// Row groups with per-feature (viewport rect) selection only.
     pub fn partial_rgs(&self) -> usize {
         self.loaded
@@ -1102,27 +1112,63 @@ impl VectorLayer {
     /// Rows currently decoded into the map (drives the "classes may be
     /// stale" hint for data-classified styling).
     pub fn loaded_rows(&self) -> u64 {
-        let starts = self.store.rg_starts();
-        self.loaded
-            .iter()
-            .enumerate()
-            .map(|(g, st)| match st {
-                GroupLoad::Full => starts[g + 1] - starts[g],
-                GroupLoad::Rows { ranges, .. } => {
-                    ranges.iter().map(|&(s, e)| (e - s) as u64).sum()
-                }
-                // Rect-filtered previews load fewer rows; this upper bound
-                // only drives the staleness hint.
-                GroupLoad::Preview { stride, .. } => {
-                    (starts[g + 1] - starts[g]).div_ceil(*stride as u64)
-                }
-                // Boxes carry every feature of the group, so the count is
-                // the group's; only their shape is approximate.
-                GroupLoad::Boxes { .. } => starts[g + 1] - starts[g],
-                GroupLoad::None => 0,
-            })
-            .sum()
+        self.load_summary().rows
     }
+}
+
+/// `VectorLayer::load_summary` over the parts it needs, so the counting
+/// can be tested without a store behind it.
+pub fn load_summary(loaded: &[GroupLoad], starts: &[u64]) -> LoadSummary {
+    let mut s = LoadSummary { total: loaded.len(), ..Default::default() };
+    for (g, st) in loaded.iter().enumerate() {
+        // A store replaced under an in-flight job can leave `loaded`
+        // longer than the row groups it describes for a frame; count
+        // what is there and read no rows for the rest.
+        let group_rows = match (starts.get(g), starts.get(g + 1)) {
+            (Some(a), Some(b)) => b - a,
+            _ => 0,
+        };
+        match st {
+            GroupLoad::Full => {
+                s.full += 1;
+                s.rows += group_rows;
+            }
+            GroupLoad::Rows { ranges, .. } => {
+                s.partial += 1;
+                s.rows += ranges.iter().map(|&(a, b)| (b - a) as u64).sum::<u64>();
+            }
+            // Rect-filtered previews load fewer rows; this upper bound
+            // only drives the staleness hint.
+            GroupLoad::Preview { stride, .. } => {
+                s.preview += 1;
+                s.rows += group_rows.div_ceil(*stride as u64);
+            }
+            // Boxes carry every feature of the group, so the count is
+            // the group's; only their shape is approximate.
+            GroupLoad::Boxes { .. } => {
+                s.boxes += 1;
+                s.rows += group_rows;
+            }
+            GroupLoad::None => {}
+        }
+    }
+    s
+}
+
+/// What one pass over a layer's `loaded` state says about it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoadSummary {
+    /// Row groups the layer has state for (`loaded.len()`).
+    pub total: usize,
+    pub full: usize,
+    /// Row groups with per-feature (viewport rect) selection only.
+    pub partial: usize,
+    /// Row groups holding a decimated preview.
+    pub preview: usize,
+    /// Row groups drawn from covering boxes rather than geometry.
+    pub boxes: usize,
+    /// Rows currently decoded into the map.
+    pub rows: u64,
 }
 
 #[cfg(test)]
@@ -1377,5 +1423,38 @@ mod class_tests {
         assert_eq!(bin(1.0), 1);
         assert_eq!(bin(15.5), 15);
         assert_eq!(bin(99.0), 15);
+    }
+}
+
+#[cfg(test)]
+mod load_state_tests {
+    use super::*;
+
+    /// One pass answers every count the layers panel asks for, and it
+    /// survives a `loaded` that describes more row groups than the store
+    /// has.
+    ///
+    /// The panel used to ask five separate scans and `loaded_rows`
+    /// indexed `rg_starts[g + 1]` directly, which panicked in exactly the
+    /// case a pyramid level switch creates: the store shrinks under a
+    /// layer whose decode state is still the old level's.
+    #[test]
+    fn load_summary_counts_in_one_pass_and_survives_a_shrunken_store() {
+        let loaded = vec![
+            GroupLoad::Full,
+            GroupLoad::Rows { ranges: vec![(0, 3), (7, 10)], rect: [0.0; 4] },
+            GroupLoad::Preview { stride: 4, rect: None },
+            GroupLoad::Boxes { rect: None },
+            GroupLoad::None,
+        ];
+        let starts = [0u64, 10, 20, 30, 40, 50];
+        let s = load_summary(&loaded, &starts);
+        assert_eq!((s.total, s.full, s.partial, s.preview, s.boxes), (5, 1, 1, 1, 1));
+        // 10 full + 6 selected + ceil(10 / 4) preview + 10 boxes.
+        assert_eq!(s.rows, 10 + 6 + 3 + 10);
+        // The store is now one row group; the state has not caught up.
+        let shrunk = load_summary(&loaded, &[0, 10]);
+        assert_eq!(shrunk.total, 5);
+        assert_eq!(shrunk.rows, 10 + 6, "groups the store no longer has read no rows");
     }
 }

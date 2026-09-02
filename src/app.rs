@@ -355,8 +355,8 @@ pub struct ViewerApp {
     /// the original full-world viewport" is what first-layer adoption
     /// checks before fitting to the layer.
     camera_moved: bool,
-    /// Cancel flags of in-flight appends (layer id -> flag).
-    append_cancel: HashMap<u64, Arc<std::sync::atomic::AtomicBool>>,
+    /// In-flight appends (layer id -> job).
+    append_cancel: HashMap<u64, AppendJob>,
     /// Cancel flags of in-flight rebuilds (layer id -> flag). Spawning a
     /// new rebuild for a layer cancels the previous one (projection
     /// flip-flops), removal cancels outright.
@@ -405,6 +405,9 @@ pub struct ViewerApp {
     /// Files dropped while an import dialog was already open; imported
     /// one after another as each dialog closes.
     import_queue: Vec<PathBuf>,
+    /// Attribute tables asked for while one was still being read or its
+    /// import dialog was up, drained by `poll_attrs`.
+    attr_queue: Vec<(Source, String)>,
     /// Inline layer rename in the layers panel: (layer id, draft label).
     rename_layer: Option<(u64, String)>,
     about_open: bool,
@@ -436,6 +439,8 @@ pub struct ViewerApp {
     /// Map panel rect (points) of the last frame, for cropping the
     /// Export image… screenshot to map content only.
     map_rect: egui::Rect,
+    /// A captured screenshot waiting for the file panel to be free.
+    pending_screenshot: Option<Box<egui::ColorImage>>,
     /// Loads paused at the quality gate, waiting for the user's answer
     /// (docs/OPEN_POLICY.md). The dialog shows the front entry.
     quality_gates: Vec<QualityGateState>,
@@ -488,10 +493,24 @@ pub struct ViewerApp {
     filter_rx: Receiver<crate::sql::engine::FilterMsg>,
     /// Layers with a filter computation in flight.
     filter_pending: HashSet<u64>,
+    /// The store a filter (or filter test) was computed against, as
+    /// (store address, row-group count): the result is indexed by row
+    /// group and must not be applied to a store that changed shape
+    /// underneath it.
+    filter_shape: HashMap<u64, (usize, usize)>,
     /// Filter-dialog "Test" runs (separate channel: results go to the
     /// dialog, not to the layer).
     test_tx: Sender<crate::sql::engine::FilterMsg>,
     test_rx: Receiver<crate::sql::engine::FilterMsg>,
+    /// Lists the export dialog offers, with the layer set stamp and the
+    /// layer id they were built for.
+    export_lists: Option<(u64, u64, ExportLists)>,
+    /// Style-by columns of the style dialog's layer, with the store they
+    /// were read from.
+    style_cols: Option<(usize, Vec<(String, bool)>)>,
+    /// Autocomplete vocabulary of the open filter dialog, with the layer
+    /// it was built for.
+    filter_dict: Option<(u64, crate::sql::console::CompletionDict)>,
     /// Filters to apply once a context-restored layer finishes loading.
     pending_filters: HashMap<u64, String>,
     /// Async feature picking (remote layers turn picks into network reads,
@@ -542,6 +561,15 @@ struct RepoBrowser {
     sel_snapshot: usize,
     /// None = discovery in flight.
     datasets: Option<Result<Vec<crate::data::repo::Dataset>, String>>,
+    /// Owned (index, name, code, path) view of `datasets`, and the
+    /// distinct `country=` values in it. Both are built when the
+    /// discovery lands: the list widget mutates the browser while it
+    /// iterates, so it needs an owned copy, and cloning three strings per
+    /// dataset (plus sorting the country list) per frame was the cost of
+    /// having this window open. Shared so a frame can hold one while the
+    /// widgets below write to the browser.
+    ds_rows: Arc<Vec<(usize, String, String, String)>>,
+    countries: Arc<Vec<String>>,
     filter: String,
     /// Country filter over the dataset list; empty = all.
     country: String,
@@ -581,6 +609,10 @@ struct CatalogBrowser {
     dcat: Option<Result<crate::data::repo::DcatCatalog, String>>,
     /// Portal datasets ticked for opening, by index into the catalog.
     dcat_checked: std::collections::HashSet<usize>,
+    /// One lowercased title + description + keywords string per dataset,
+    /// index-aligned with the catalog: the search box reads these instead
+    /// of lowercasing every field of every dataset on every frame.
+    haystacks: Vec<String>,
     /// Search over the dataset list.
     filter: String,
     /// Hide datasets whose only openable format is CSV: an attribute
@@ -663,11 +695,37 @@ struct Download {
     id: u64,
     /// Dataset title, for the status bar.
     label: String,
+    /// Where it lands: two fetches of one destination would interleave.
+    dst: PathBuf,
     got: u64,
     /// Only when the server states a Content-Length: portal endpoints
     /// that generate the export on the fly do not.
     total: Option<u64>,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The layer-derived lists the export dialog offers, cached behind the
+/// layer set they were built from (see `App::build_export_lists`).
+#[derive(Default)]
+struct ExportLists {
+    /// Partition-field candidates of the exported layer.
+    candidates: Vec<String>,
+    /// Polygon layers usable for an admin join: (id, name, text columns).
+    other_layers: Vec<(u64, String, Vec<String>)>,
+    /// Merge candidates: (id, name, rows, shared columns, conflicts).
+    merge_candidates: Vec<(u64, String, u64, usize, usize)>,
+    /// Whether the exported layer's scorecard calls it indexable.
+    primary_indexable: Option<bool>,
+}
+
+/// A row-append job in flight, and who asked for it.
+struct AppendJob {
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// The user pressed "Load all": the whole layer was asked for, so a
+    /// camera move must not quietly stop it half way — only the ✖ beside
+    /// the layer does. Viewport refinements, which the camera implies,
+    /// are cancelled freely.
+    user: bool,
 }
 
 enum DlMsg {
@@ -693,6 +751,10 @@ struct ImportState {
     running: bool,
     progress: f32,
     error: Option<String>,
+    /// The error is terminal: there is nothing in the form to retry with
+    /// (no readable tables, an unsupported file). A conversion that
+    /// failed is not terminal — the Import button runs it again.
+    fatal: bool,
     rx: Option<std::sync::mpsc::Receiver<ImportMsg>>,
 }
 
@@ -740,6 +802,64 @@ enum ImportMsg {
     Progress(f32),
     Done(PathBuf),
     Failed(String),
+}
+
+/// The layer's extent in its own CRS, for sanity checks that have to
+/// compare a user-typed size against the data.
+///
+/// The row-group boxes are the honest answer when they exist (they are in
+/// the data CRS by construction); the file's stated bbox is the fallback.
+fn layer_data_extent(l: &crate::data::layer::VectorLayer) -> Option<[f64; 4]> {
+    if let Some(rg) = &l.rg_bboxes {
+        let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        for x in rg.boxes.iter().filter(|x| x[0] <= x[2] && x[1] <= x[3]) {
+            b[0] = b[0].min(x[0]);
+            b[1] = b[1].min(x[1]);
+            b[2] = b[2].max(x[2]);
+            b[3] = b[3].max(x[3]);
+        }
+        if b[0].is_finite() && b[2] > b[0] {
+            return Some(b);
+        }
+    }
+    l.info.geo.bbox.filter(|b| b[2] > b[0] && b[3] > b[1])
+}
+
+/// Turn a filter's per-row-group row ranges into per-group load state,
+/// or `None` when they do not describe the store they are applied to.
+///
+/// A filter runs on a worker while the layer's store can be replaced
+/// under it (pyramid level switch, STAC part append). The result is
+/// indexed by row group, so applying it to a store of a different shape
+/// either panics on `rg_starts[g + 1]` (fewer groups now) or leaves
+/// `loaded` shorter than the row-group boxes (more groups now), which
+/// refinement and the layers panel then index off the end. Refusing the
+/// result costs one recomputed filter; applying it crashes the app.
+fn filter_group_loads(
+    per_group: &[Vec<(u32, u32)>],
+    starts: &[u64],
+) -> Option<Vec<crate::data::layer::GroupLoad>> {
+    const INF: [f64; 4] = [f64::NEG_INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::INFINITY];
+    if starts.is_empty() || per_group.len() != starts.len() - 1 {
+        return None;
+    }
+    Some(
+        per_group
+            .iter()
+            .enumerate()
+            .map(|(g, ranges)| {
+                let n = (starts[g + 1] - starts[g]) as u32;
+                if ranges.len() == 1 && ranges[0] == (0, n) {
+                    crate::data::layer::GroupLoad::Full
+                } else {
+                    crate::data::layer::GroupLoad::Rows {
+                        ranges: ranges.clone(),
+                        rect: INF,
+                    }
+                }
+            })
+            .collect(),
+    )
 }
 
 /// What a native file dialog was opened for, so its answer can be routed
@@ -814,6 +934,15 @@ enum AttrMsg {
         crate::data::attrs::GeometryPlan,
         Result<Box<crate::data::attrs::AttrData>, String>,
     ),
+    /// The columns re-read after a delimiter or header change.
+    Reinspected(Source, Result<Box<crate::data::attrs::Preview>, String>),
+    /// Bad-value counts recomputed after a type change, tagged with the
+    /// request they answer: (source, sequence, columns).
+    Rechecked(
+        Source,
+        u64,
+        Result<Vec<crate::data::attrs::ColumnPreview>, String>,
+    ),
 }
 
 /// An attribute file being set up for import.
@@ -824,6 +953,17 @@ struct AttrImport {
     /// Set when the delimiter or header setting changed and the columns
     /// have to be worked out again.
     reread: bool,
+    /// A re-read or a re-check is running on the attribute worker. Both
+    /// read the file — over the network for a portal CSV — which is why
+    /// neither may run in the frame.
+    busy: bool,
+    /// A type change waiting out its debounce, as the frame time it
+    /// happened at: dragging through the type combo would otherwise ask
+    /// for one re-read per entry passed.
+    retype_at: Option<f64>,
+    /// Sequence of the last re-check asked for; an answer carrying an
+    /// older one describes types the dialog has moved on from.
+    retype_seq: u64,
 }
 
 /// A native file dialog in flight on its own thread. See `spawn_pick`.
@@ -1175,6 +1315,7 @@ impl ViewerApp {
             layers_open: true,
             grid_n: 0,
             import_queue: Vec::new(),
+            attr_queue: Vec::new(),
             rename_layer: None,
             loading: HashMap::new(),
             pending_styles: HashMap::new(),
@@ -1216,6 +1357,7 @@ impl ViewerApp {
             cookbook_open: false,
             about_icon: None,
             map_rect: egui::Rect::ZERO,
+            pending_screenshot: None,
             quality_gates: Vec::new(),
             direct_files: load_direct_files(),
             svg_export: None,
@@ -1243,6 +1385,10 @@ impl ViewerApp {
             filter_tx,
             filter_rx,
             filter_pending: HashSet::new(),
+            filter_shape: HashMap::new(),
+            filter_dict: None,
+            export_lists: None,
+            style_cols: None,
             test_tx,
             test_rx,
             pending_filters: HashMap::new(),
@@ -1367,15 +1513,21 @@ impl ViewerApp {
     }
 
     /// Resume a quality-gated load in Direct mode (decode everything).
-    fn resume_gated(&mut self, gate: QualityGateState, ctx: &egui::Context) {
-        let cancel = self
-            .loading
-            .get(&gate.job)
-            .map(|j| Arc::clone(&j.cancel))
-            .unwrap_or_default();
-        if let Some(j) = self.loading.get_mut(&gate.job) {
-            j.stage = "loading all rows".into();
-        }
+    ///
+    /// `false` when the job it belongs to is gone (Load context replaced
+    /// the session under the dialog): resuming then would build the
+    /// abandoned file into the session that took its place, with a fresh
+    /// cancel flag nothing holds and no progress entry to stop it by.
+    fn resume_gated(&mut self, gate: QualityGateState, ctx: &egui::Context) -> bool {
+        let Some(job) = self.loading.get_mut(&gate.job) else {
+            log::warn!(
+                "{}: the load this quality gate belonged to is gone; not resuming it",
+                gate.opened.store.source.name()
+            );
+            return false;
+        };
+        job.stage = "loading all rows".into();
+        let cancel = Arc::clone(&job.cancel);
         loader::spawn_load_gated(
             LoaderHandle {
                 tx: self.load_tx.clone(),
@@ -1393,6 +1545,7 @@ impl ViewerApp {
             None,
             true,
         );
+        true
     }
 
     /// Abandon a quality-gated load (dialog Cancel, or Optimize taking
@@ -1492,6 +1645,7 @@ impl ViewerApp {
         let Some(sql_layer) = self.sql_layer_of(layer_id) else {
             return;
         };
+        self.record_filter_shape(layer_id);
         self.filter_pending.insert(layer_id);
         let egui_ctx = ctx.clone();
         crate::sql::engine::spawn_row_filter(
@@ -1533,6 +1687,18 @@ impl ViewerApp {
         }
     }
 
+    /// Remember which store a filter computation was started against, so
+    /// its result can be dropped if the store changed underneath it.
+    fn record_filter_shape(&mut self, layer_id: u64) {
+        if let Some(l) = self.layers.iter().find(|l| l.id == layer_id) {
+            let shape = (
+                Arc::as_ptr(&l.store) as usize,
+                l.store.rg_starts().len().saturating_sub(1),
+            );
+            self.filter_shape.insert(layer_id, shape);
+        }
+    }
+
     /// Make computed filter rows the layer's working subset and rebuild.
     fn apply_filter_rows(
         &mut self,
@@ -1542,28 +1708,35 @@ impl ViewerApp {
         ctx: &egui::Context,
     ) {
         let display = self.display.clone();
+        let spawned_against = self.filter_shape.remove(&layer_id);
         let Some(l) = self.layers.iter_mut().find(|l| l.id == layer_id) else {
             return;
         };
-        const INF: [f64; 4] =
-            [f64::NEG_INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::INFINITY];
-        let starts = l.store.rg_starts();
-        l.loaded = rows
-            .per_group
-            .iter()
-            .enumerate()
-            .map(|(g, ranges)| {
-                let n = (starts[g + 1] - starts[g]) as u32;
-                if ranges.len() == 1 && ranges[0] == (0, n) {
-                    crate::data::layer::GroupLoad::Full
-                } else {
-                    crate::data::layer::GroupLoad::Rows {
-                        ranges: ranges.clone(),
-                        rect: INF,
-                    }
-                }
-            })
-            .collect();
+        // The store can be replaced while the filter runs: a pyramid level
+        // switch swaps it for another level's files, a STAC part append
+        // grows it. Both leave `per_group` sized for a file that is no
+        // longer there — a shrink panicked indexing `rg_starts`, a growth
+        // left `loaded` shorter than the row-group boxes and the layers
+        // panel indexed off the end. Neither bumps `generation`, so the
+        // store itself is the identity to check.
+        let now = (
+            Arc::as_ptr(&l.store) as usize,
+            l.store.rg_starts().len().saturating_sub(1),
+        );
+        let Some(loads) = filter_group_loads(&rows.per_group, l.store.rg_starts())
+            .filter(|_| spawned_against.is_none_or(|s| s == now))
+        else {
+            log::warn!(
+                "{}: filter rows describe {} row group(s), the layer now holds {}; \
+                 dropping them",
+                l.name,
+                rows.per_group.len(),
+                now.1,
+            );
+            return;
+        };
+        l.loaded = loads;
+        debug_assert_eq!(l.loaded.len(), l.store.rg_starts().len() - 1);
         l.filter = Some(crate::data::layer::LayerFilter {
             sql: predicate,
             matched: rows.matched,
@@ -1607,8 +1780,8 @@ impl ViewerApp {
             }
             // A reload supersedes any in-flight refinement.
             self.appending.remove(&l.id);
-            if let Some(c) = self.append_cancel.remove(&l.id) {
-                c.store(true, Ordering::Relaxed);
+            if let Some(j) = self.append_cancel.remove(&l.id) {
+                j.cancel.store(true, Ordering::Relaxed);
             }
             self.refine_hold.remove(&l.id);
             self.part_hold.remove(&l.id);
@@ -1678,45 +1851,56 @@ impl ViewerApp {
             return;
         };
         let Some(layer) = self.layers.iter().find(|l| l.id == layer_id) else {
-            self.filter_dialog = None;
+            self.close_filter_dialog();
             return;
         };
         let layer_name = layer.name.clone();
         let has_filter = layer.filter.is_some();
-        // Columns of this layer + ST_* functions + a few predicate keywords.
-        let mut dict: Vec<String> = layer
-            .store
-            .schema
-            .fields()
-            .iter()
-            .map(|f| f.name().to_lowercase())
-            .collect();
-        dict.extend(
-            crate::sql::udf::NAMES
+        // The completion dictionary is a property of the layer, not of the
+        // frame: built once when the dialog opens on it. Rebuilding it
+        // every frame (lowercasing every field name of a wide file) ran
+        // even while the window was collapsed.
+        if self.filter_dict.as_ref().is_none_or(|(id, _)| *id != layer_id) {
+            // Columns of this layer + ST_* functions + a few predicate
+            // keywords.
+            let mut dict: Vec<String> = layer
+                .store
+                .schema
+                .fields()
                 .iter()
-                .chain(crate::sql::agg::NAMES)
-                .map(|s| s.to_string()),
-        );
-        for k in ["and", "or", "not", "like", "between", "in", "is null", "is not null"] {
-            dict.push(k.into());
+                .map(|f| f.name().to_lowercase())
+                .collect();
+            dict.extend(
+                crate::sql::udf::NAMES
+                    .iter()
+                    .chain(crate::sql::agg::NAMES)
+                    .map(|s| s.to_string()),
+            );
+            for k in ["and", "or", "not", "like", "between", "in", "is null", "is not null"] {
+                dict.push(k.into());
+            }
+            // A filter predicate has no FROM clause; no table names to offer.
+            self.filter_dict = Some((
+                layer_id,
+                crate::sql::console::CompletionDict {
+                    tables: Vec::new(),
+                    all: dict,
+                    // A filter predicate names one layer's columns bare;
+                    // there is no alias to qualify them with.
+                    columns: Default::default(),
+                },
+            ));
         }
-        // A filter predicate has no FROM clause; no table names to offer.
-        let dict = crate::sql::console::CompletionDict {
-            tables: Vec::new(),
-            all: dict,
-            // A filter predicate names one layer's columns bare; there is
-            // no alias to qualify them with.
-            columns: Default::default(),
+        let Some((_, dict)) = &self.filter_dict else {
+            return;
         };
-        let sql_layer = self.sql_layer_of(layer_id);
-        let test_tx = self.test_tx.clone();
-
         let Some(dialog) = &mut self.filter_dialog else {
             return;
         };
         let mut open = true;
         let mut apply = false;
         let mut clear = false;
+        let mut test = false;
         egui::Window::new(format!("Filter — {layer_name}"))
             .id(egui::Id::new("layer_filter"))
             .open(&mut open)
@@ -1737,7 +1921,7 @@ impl ViewerApp {
                     id,
                     &mut dialog.text,
                     &mut dialog.ac,
-                    &dict,
+                    dict,
                     |text| {
                         egui::TextEdit::multiline(text)
                             .id(id)
@@ -1749,7 +1933,6 @@ impl ViewerApp {
                             )
                     },
                 );
-                let mut test = false;
                 ui.horizontal(|ui| {
                     let busy = self.filter_pending.contains(&layer_id) || dialog.testing;
                     let has_text = !dialog.text.trim().is_empty();
@@ -1790,22 +1973,33 @@ impl ViewerApp {
                         }
                     }
                 }
-                if test {
-                    dialog.test_pred = dialog.text.trim().to_string();
-                    dialog.testing = true;
-                    dialog.test = None;
-                    if let Some(sql_layer) = sql_layer.clone() {
-                        let egui_ctx = ctx.clone();
-                        crate::sql::engine::spawn_row_filter(
-                            layer_id,
-                            sql_layer,
-                            dialog.test_pred.clone(),
-                            test_tx.clone(),
-                            move || egui_ctx.request_repaint(),
-                        );
-                    }
-                }
             });
+        // Registering the layer for SQL clones its row-group bbox list, so
+        // it happens when a test actually runs — not on every frame the
+        // dialog is on screen.
+        if test {
+            let predicate = self
+                .filter_dialog
+                .as_ref()
+                .map(|d| d.text.trim().to_string())
+                .unwrap_or_default();
+            if let Some(sql_layer) = self.sql_layer_of(layer_id) {
+                self.record_filter_shape(layer_id);
+                let egui_ctx = ctx.clone();
+                crate::sql::engine::spawn_row_filter(
+                    layer_id,
+                    sql_layer,
+                    predicate.clone(),
+                    self.test_tx.clone(),
+                    move || egui_ctx.request_repaint(),
+                );
+                if let Some(d) = &mut self.filter_dialog {
+                    d.test_pred = predicate;
+                    d.testing = true;
+                    d.test = None;
+                }
+            }
+        }
         if apply {
             let predicate = self
                 .filter_dialog
@@ -1824,13 +2018,19 @@ impl ViewerApp {
                 Some(rows) => self.apply_filter_rows(layer_id, predicate, rows, ctx),
                 None => self.start_layer_filter(layer_id, predicate, ctx),
             }
-            self.filter_dialog = None;
+            self.close_filter_dialog();
         } else if clear {
             self.clear_layer_filter(layer_id, ctx);
-            self.filter_dialog = None;
+            self.close_filter_dialog();
         } else if !open {
-            self.filter_dialog = None;
+            self.close_filter_dialog();
         }
+    }
+
+    /// Close the filter dialog and drop the vocabulary built for it.
+    fn close_filter_dialog(&mut self) {
+        self.filter_dialog = None;
+        self.filter_dict = None;
     }
 
     /// Zoom the map to a data-CRS bbox (e.g. a feature clicked in the SQL
@@ -2057,6 +2257,7 @@ impl ViewerApp {
                             l.sections = vec![geometry];
                             l.draw_gen += 1;
                             l.loaded = loaded;
+                            debug_assert_eq!(l.loaded.len(), l.store.rg_starts().len() - 1);
                             l.feature_count = rows;
                             l.stats.build_ms = build_ms;
                             l.stats.bad_geoms = bad_geoms;
@@ -2183,6 +2384,7 @@ impl ViewerApp {
                             l.store = store;
                             l.loaded
                                 .resize(groups, crate::data::layer::GroupLoad::None);
+                            debug_assert_eq!(l.loaded.len(), l.store.rg_starts().len() - 1);
                             if let Some(rg) = &mut l.rg_bboxes {
                                 if added_boxes.len() == added_groups {
                                     rg.boxes.extend(added_boxes);
@@ -2242,6 +2444,7 @@ impl ViewerApp {
                         l.sections = vec![geometry];
                         l.draw_gen += 1;
                         l.loaded = loaded;
+                        debug_assert_eq!(l.loaded.len(), l.store.rg_starts().len() - 1);
                         l.feature_count = rows;
                         // A row filter selected rows of the level
                         // that just went away.
@@ -2315,7 +2518,7 @@ impl ViewerApp {
                     };
                     if self.direct_files.contains(&gate.key()) {
                         // Standing "load all" answer for this file.
-                        self.resume_gated(gate, ctx);
+                        let _ = self.resume_gated(gate, ctx);
                     } else {
                         if let Some(j) = self.loading.get_mut(&job) {
                             j.stage = "file not optimized — waiting for your answer".into();
@@ -2385,8 +2588,8 @@ impl ViewerApp {
             j.cancel.store(true, Ordering::Relaxed);
         }
         self.loading.clear();
-        for c in self.append_cancel.values() {
-            c.store(true, Ordering::Relaxed);
+        for j in self.append_cancel.values() {
+            j.cancel.store(true, Ordering::Relaxed);
         }
         self.append_cancel.clear();
         for c in self.rebuild_cancel.values() {
@@ -2394,6 +2597,9 @@ impl ViewerApp {
         }
         self.rebuild_cancel.clear();
         self.projection_decider = None;
+        // The dialog of a gate whose job just went away would still offer
+        // "Load all", and the load would land in the replaced session.
+        self.quality_gates.clear();
         self.deferred_loads.clear();
         self.pending_styles.clear();
         self.pending_filters.clear();
@@ -2421,10 +2627,12 @@ impl ViewerApp {
         self.refine_deferred.clear();
         self.refine_epoch.clear();
         self.filter_pending.clear();
+        self.filter_shape.clear();
         self.cat_pending.clear();
         self.stripped.clear();
         self.rg_overlays.clear();
         self.import_queue.clear();
+        self.attr_queue.clear();
         self.quality_gates.clear();
         self.errors.clear();
         self.show_errors = false;
@@ -2432,10 +2640,15 @@ impl ViewerApp {
         self.sql_highlight_chunks = None;
         self.sql_highlight_generation += 1;
         // Dialogs and panels keyed to a layer that no longer exists.
-        self.filter_dialog = None;
+        self.close_filter_dialog();
         self.style_dialog = None;
         self.grid_dialog = None;
-        self.optimize = None;
+        // An export in flight owns clones of everything it needs and will
+        // still answer: dropping its state here discarded the Done/Failed
+        // that followed, leaving a finished export with nowhere to land.
+        if self.optimize.as_ref().is_none_or(|o| !o.running) {
+            self.optimize = None;
+        }
         self.rename_layer = None;
         self.info_open = None;
         self.url_input = None;
@@ -2570,8 +2783,11 @@ impl ViewerApp {
     /// the plan is approved: inference is a guess, and a column silently
     /// typed wrong is found much later and in the wrong place.
     fn open_attr_table_named(&mut self, source: Source, name: String) {
-        if self.attr_busy.is_some() {
-            self.push_error("another table is still being read".into());
+        if self.attr_busy.is_some() || self.attr_import.is_some() {
+            // Queued, not refused: both callers hand over a batch (a
+            // multi-file pick, "Open N datasets"), and every table after
+            // the first used to answer with an error.
+            self.attr_queue.push((source, name));
             return;
         }
         self.attr_busy = Some(format!("reading {name}"));
@@ -2606,7 +2822,12 @@ impl ViewerApp {
 
     fn poll_attrs(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.attr_rx.try_recv() {
-            self.attr_busy = None;
+            // Only the messages that END the named job clear the busy
+            // flag. A late `Sampled` used to clear it mid-import, which
+            // let a second table start reading over the first.
+            if matches!(msg, AttrMsg::Inspected(..) | AttrMsg::Imported(..)) {
+                self.attr_busy = None;
+            }
             match msg {
                 AttrMsg::Inspected(name, source, Ok(preview)) => {
                     // Up immediately with names and types; the values
@@ -2619,6 +2840,9 @@ impl ViewerApp {
                         name,
                         preview: *preview,
                         reread: false,
+                        busy: false,
+                        retype_at: None,
+                        retype_seq: 0,
                     });
                 }
                 AttrMsg::Sampled(source, result) => {
@@ -2655,7 +2879,52 @@ impl ViewerApp {
                 AttrMsg::Imported(name, _, _, Err(e)) => {
                     self.push_error(format!("{name}: {e}"))
                 }
+                AttrMsg::Reinspected(source, result) => {
+                    let Some(job) = &mut self.attr_import else { continue };
+                    if job.source.label() != source.label() {
+                        continue; // the dialog moved on to another file
+                    }
+                    job.busy = false;
+                    match result {
+                        Ok(p) => job.preview = *p,
+                        Err(e) => self.push_error(e),
+                    }
+                }
+                AttrMsg::Rechecked(source, seq, result) => {
+                    let Some(job) = &mut self.attr_import else { continue };
+                    if job.source.label() != source.label() {
+                        continue;
+                    }
+                    job.busy = false;
+                    match result {
+                        // A stale answer describes types the dialog has
+                        // moved on from; the run for the current ones is
+                        // already queued.
+                        Ok(cols)
+                            if seq == job.retype_seq
+                                && cols.len() == job.preview.columns.len() =>
+                        {
+                            for (c, n) in job.preview.columns.iter_mut().zip(cols) {
+                                c.bad = n.bad;
+                                c.bad_examples = n.bad_examples;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => self.push_error(e),
+                    }
+                }
             }
+        }
+        // A table asked for while another was being read waits here
+        // rather than being refused: multi-select and "Open N datasets"
+        // both hand over several at once. One dialog at a time, so the
+        // next one starts when the current has been dealt with.
+        if self.attr_busy.is_none()
+            && self.attr_import.is_none()
+            && !self.attr_queue.is_empty()
+        {
+            let (source, name) = self.attr_queue.remove(0);
+            self.open_attr_table_named(source, name);
         }
     }
 
@@ -2904,7 +3173,10 @@ impl ViewerApp {
             self.part_appending.insert(l.id);
             self.refine_epoch.insert(l.id, self.cam_epoch);
             let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            self.append_cancel.insert(l.id, Arc::clone(&cancel));
+            self.append_cancel.insert(
+                l.id,
+                AppendJob { cancel: Arc::clone(&cancel), user: false },
+            );
             loader::spawn_part_append(
                 LoaderHandle {
                     tx: self.load_tx.clone(),
@@ -2958,7 +3230,10 @@ impl ViewerApp {
             self.part_appending.insert(l.id);
             self.refine_epoch.insert(l.id, self.cam_epoch);
             let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            self.append_cancel.insert(l.id, Arc::clone(&cancel));
+            self.append_cancel.insert(
+                l.id,
+                AppendJob { cancel: Arc::clone(&cancel), user: false },
+            );
             loader::spawn_pyramid_level(
                 LoaderHandle {
                     tx: self.load_tx.clone(),
@@ -3035,7 +3310,15 @@ impl ViewerApp {
                     rect[2].min(gb[2]),
                     rect[3].min(gb[3]),
                 ];
-                match &l.loaded[g as usize] {
+                // `loaded` and the row-group boxes are both indexed by
+                // global row group, but a store replaced under an
+                // in-flight job can leave them out of step for a frame:
+                // skip what this layer has no state for rather than
+                // panicking on it.
+                let Some(state) = l.loaded.get(g as usize) else {
+                    continue;
+                };
+                match state {
                     GroupLoad::Full => {}
                     // Preview refines like an unseen group: the in-rect
                     // sampled rows re-decode (a ~1/stride duplicate
@@ -3057,7 +3340,12 @@ impl ViewerApp {
                                 // follows drops the duplicates.
                                 jobs.push(GroupSel::Rect(g, rect));
                             } else {
-                                let n = (starts[g as usize + 1] - starts[g as usize]) as u32;
+                                let Some(n) = starts
+                                    .get(g as usize + 1)
+                                    .map(|e| (e - starts[g as usize]) as u32)
+                                else {
+                                    continue;
+                                };
                                 jobs.push(GroupSel::Ranges(g, complement_ranges(ranges, n)));
                             }
                         }
@@ -3073,7 +3361,10 @@ impl ViewerApp {
             self.appending.insert(l.id);
             self.refine_epoch.insert(l.id, self.cam_epoch);
             let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            self.append_cancel.insert(l.id, Arc::clone(&cancel));
+            self.append_cancel.insert(
+                l.id,
+                AppendJob { cancel: Arc::clone(&cancel), user: false },
+            );
             loader::spawn_append(
                 LoaderHandle {
                     tx: self.load_tx.clone(),
@@ -4215,7 +4506,12 @@ impl ViewerApp {
                     }
                     // Data-classified styling goes stale when the loaded
                     // rows drift (classification never reads beyond them).
-                    let (layer_id, loaded_rows) = (l.id, l.loaded_rows());
+                    // One pass over the load state for every count this
+                    // row shows: full / partial / preview / boxes / rows
+                    // used to be five scans of one entry per row group,
+                    // per layer, per frame.
+                    let load = l.load_summary();
+                    let (layer_id, loaded_rows) = (l.id, load.rows);
                     let (kind, fill_on, fill_opacity, opacity) = (
                         l.kind(),
                         l.style.fill_on,
@@ -4306,10 +4602,9 @@ impl ViewerApp {
                              Zoom in and the layer reads the leaf level.",
                         );
                     }
-                    if l.is_partial() && l.filter.is_none() {
+                    if load.full < load.total && l.filter.is_none() {
                         ui.horizontal(|ui| {
-                            let preview = l.preview_rgs();
-                            let partial = l.partial_rgs();
+                            let (preview, partial) = (load.preview, load.partial);
                             // Does the CURRENT viewport still show preview /
                             // missing rows? Off-screen groups staying
                             // decimated is normal and must not keep nagging
@@ -4333,12 +4628,18 @@ impl ViewerApp {
                                                     rect[2].min(gb[2]),
                                                     rect[3].min(gb[3]),
                                                 ];
-                                                match &l.loaded[g as usize] {
-                                                    GroupLoad::Full => false,
-                                                    GroupLoad::None
-                                                    | GroupLoad::Preview { .. }
-                                                    | GroupLoad::Boxes { .. } => true,
-                                                    st @ GroupLoad::Rows { .. } => {
+                                                // Missing state means a
+                                                // store swapped under an
+                                                // in-flight job: unknown,
+                                                // not pending.
+                                                match l.loaded.get(g as usize) {
+                                                    Some(GroupLoad::Full) | None => false,
+                                                    Some(
+                                                        GroupLoad::None
+                                                        | GroupLoad::Preview { .. }
+                                                        | GroupLoad::Boxes { .. },
+                                                    ) => true,
+                                                    Some(st @ GroupLoad::Rows { .. }) => {
                                                         !st.covers(need)
                                                     }
                                                 }
@@ -4347,7 +4648,7 @@ impl ViewerApp {
                                     _ => true,
                                 }
                             };
-                            let boxes = l.boxes_rgs();
+                            let boxes = load.boxes;
                             // At a scale where a feature is a couple of
                             // pixels, its box is its outline: say so
                             // plainly rather than asking for a zoom that
@@ -4381,7 +4682,7 @@ impl ViewerApp {
                                     format!(
                                         "all features drawn from their bounding\nboxes ({} of {} row groups)\nzoom in for real geometry",
                                         boxes,
-                                        l.total_rgs()
+                                        load.total
                                     ),
                                     true,
                                 )
@@ -4390,7 +4691,7 @@ impl ViewerApp {
                                     format!(
                                         "viewport loaded\n{} of {} row groups still drawn as\nbounding boxes off-screen",
                                         boxes,
-                                        l.total_rgs()
+                                        load.total
                                     ),
                                     false,
                                 )
@@ -4399,7 +4700,7 @@ impl ViewerApp {
                                     format!(
                                         "preview: {} of {} row groups decimated\nzoom in to load real rows",
                                         preview,
-                                        l.total_rgs()
+                                        load.total
                                     ),
                                     true,
                                 )
@@ -4408,7 +4709,7 @@ impl ViewerApp {
                                     format!(
                                         "viewport loaded\n{} of {} row groups still decimated\noff-screen",
                                         preview,
-                                        l.total_rgs()
+                                        load.total
                                     ),
                                     false,
                                 )
@@ -4417,8 +4718,8 @@ impl ViewerApp {
                                     format!(
                                         "partial: {}/{} row groups full, {} \
                                          viewport-filtered",
-                                        l.full_rgs(),
-                                        l.total_rgs(),
+                                        load.full,
+                                        load.total,
                                         partial
                                     ),
                                     true,
@@ -4427,8 +4728,8 @@ impl ViewerApp {
                                 (
                                     format!(
                                         "partial: {}/{} row groups loaded",
-                                        l.full_rgs(),
-                                        l.total_rgs()
+                                        load.full,
+                                        load.total
                                     ),
                                     true,
                                 )
@@ -4451,8 +4752,8 @@ impl ViewerApp {
                                     )
                                     .clicked()
                                 {
-                                    if let Some(c) = self.append_cancel.get(&l.id) {
-                                        c.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    if let Some(j) = self.append_cancel.get(&l.id) {
+                                        j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 }
                             }
@@ -4488,8 +4789,8 @@ impl ViewerApp {
             self.refine_deferred.remove(&id);
             // Stop the removed layer's in-flight workers instead of letting
             // them stream/rebuild into the void.
-            if let Some(c) = self.append_cancel.remove(&id) {
-                c.store(true, Ordering::Relaxed);
+            if let Some(j) = self.append_cancel.remove(&id) {
+                j.cancel.store(true, Ordering::Relaxed);
             }
             if let Some(c) = self.rebuild_cancel.remove(&id) {
                 c.store(true, Ordering::Relaxed);
@@ -4611,7 +4912,10 @@ impl ViewerApp {
                     if !missing.is_empty() {
                         self.appending.insert(id);
                         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        self.append_cancel.insert(id, Arc::clone(&cancel));
+                        self.append_cancel.insert(
+                            id,
+                            AppendJob { cancel: Arc::clone(&cancel), user: true },
+                        );
                         loader::spawn_append(
                             LoaderHandle {
                                 tx: self.load_tx.clone(),
@@ -4761,6 +5065,8 @@ impl ViewerApp {
             snapshots: vec![crate::data::repo::Snapshot::latest()],
             sel_snapshot: 0,
             datasets: None,
+            ds_rows: Arc::new(Vec::new()),
+            countries: Arc::new(Vec::new()),
             filter: String::new(),
             country: String::new(),
             selected: None,
@@ -4781,6 +5087,7 @@ impl ViewerApp {
             add_url: String::new(),
             dcat: None,
             dcat_checked: Default::default(),
+            haystacks: Vec::new(),
             filter: String::new(),
             geo_only: false,
             generation: 0,
@@ -4828,6 +5135,7 @@ impl ViewerApp {
         b.generation += 1;
         b.dcat = None;
         b.dcat_checked.clear();
+        b.haystacks.clear();
         let Some(url) = b.selected_catalog().map(|c| c.url.clone()) else { return };
         let generation = b.generation;
         let tx = self.dcat_tx.clone();
@@ -4851,6 +5159,10 @@ impl ViewerApp {
                     c.name = t.clone();
                 }
             }
+            b.haystacks = match &res {
+                Ok(cat) => cat.datasets.iter().map(dcat_haystack).collect(),
+                Err(_) => Vec::new(),
+            };
             b.dcat = Some(res);
             b.dcat_checked.clear();
         }
@@ -4863,6 +5175,8 @@ impl ViewerApp {
         let Some(b) = &mut self.repo_browser else { return };
         b.generation += 1;
         b.datasets = None;
+        b.ds_rows = Arc::new(Vec::new());
+        b.countries = Arc::new(Vec::new());
         b.selected = None;
         b.checked.clear();
         b.cache_age = None;
@@ -5000,6 +5314,31 @@ impl ViewerApp {
                     }
                 }
                 RepoMsg::Datasets(g, res, cached_at) if g == b.generation => {
+                    let (rows, countries) = match &res {
+                        Ok(ds) => {
+                            let rows: Vec<(usize, String, String, String)> = ds
+                                .iter()
+                                .enumerate()
+                                .map(|(i, d)| {
+                                    (i, d.name.clone(), d.code.clone(), d.path.clone())
+                                })
+                                .collect();
+                            let mut countries: Vec<String> = rows
+                                .iter()
+                                .filter_map(|(_, _, _, path)| {
+                                    path.split('/')
+                                        .find_map(|s| s.strip_prefix("country="))
+                                        .map(str::to_string)
+                                })
+                                .collect();
+                            countries.sort_unstable();
+                            countries.dedup();
+                            (rows, countries)
+                        }
+                        Err(_) => (Vec::new(), Vec::new()),
+                    };
+                    b.ds_rows = Arc::new(rows);
+                    b.countries = Arc::new(countries);
                     b.datasets = Some(res);
                     b.cache_age = cached_at;
                 }
@@ -5097,12 +5436,21 @@ impl ViewerApp {
             self.begin_import(dst, ctx);
             return;
         }
+        // Already coming: "Open N datasets" over a selection that names
+        // the same file twice, or a second click while the first fetch
+        // runs. Two writers on one destination interleave into a corrupt
+        // file, and the second Done would import it twice.
+        if self.downloads.iter().any(|d| d.dst == dst) {
+            log::info!("{}: already downloading", ds.title);
+            return;
+        }
         let id = self.dl_next;
         self.dl_next += 1;
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
         self.downloads.push(Download {
             id,
             label: ds.title.clone(),
+            dst: dst.clone(),
             got: 0,
             total: None,
             cancel: cancel.clone(),
@@ -5198,18 +5546,13 @@ impl ViewerApp {
                     // --- datasets (left) + themes (right) ---
                     // Owned views of the async state, so the widgets below
                     // can mutate the browser (filters, checkboxes) freely.
-                    let ds_view: Option<Result<Vec<(usize, String, String, String)>, String>> =
+                    let ds_view: Option<Result<Arc<Vec<(usize, String, String, String)>>, String>> =
                         match &b.datasets {
                             None => None,
                             Some(Err(e)) => Some(Err(e.clone())),
-                            Some(Ok(ds)) => Some(Ok(ds
-                                .iter()
-                                .enumerate()
-                                .map(|(i, d)| {
-                                    (i, d.name.clone(), d.code.clone(), d.path.clone())
-                                })
-                                .collect())),
+                            Some(Ok(_)) => Some(Ok(Arc::clone(&b.ds_rows))),
                         };
+                    let countries = Arc::clone(&b.countries);
                     let sel_view: Option<(
                         String,
                         String,
@@ -5243,17 +5586,9 @@ impl ViewerApp {
                                 }
                                 Some(Ok(ds)) => {
                                     // Country selector, derived from the
-                                    // dataset paths (hidden when the repo
-                                    // has no country= level).
-                                    let mut countries: Vec<&str> = ds
-                                        .iter()
-                                        .filter_map(|(_, _, _, path)| {
-                                            path.split('/')
-                                                .find_map(|s| s.strip_prefix("country="))
-                                        })
-                                        .collect();
-                                    countries.sort_unstable();
-                                    countries.dedup();
+                                    // dataset paths when the discovery
+                                    // landed (hidden when the repo has no
+                                    // country= level).
                                     ui.horizontal(|ui| {
                                         let country_before = b.country.clone();
                                         if countries.len() > 1 {
@@ -5270,11 +5605,11 @@ impl ViewerApp {
                                                         String::new(),
                                                         "All",
                                                     );
-                                                    for c in &countries {
+                                                    for c in countries.iter() {
                                                         ui.selectable_value(
                                                             &mut b.country,
-                                                            c.to_string(),
-                                                            *c,
+                                                            c.clone(),
+                                                            c.as_str(),
                                                         );
                                                     }
                                                 });
@@ -5303,7 +5638,7 @@ impl ViewerApp {
                                     egui::ScrollArea::vertical()
                                         .max_height(320.0)
                                         .show(ui, |ui| {
-                                            for (i, name, code, path) in ds {
+                                            for (i, name, code, path) in ds.iter() {
                                                 if !b.country.is_empty()
                                                     && !path.contains(&country)
                                                 {
@@ -5849,6 +6184,7 @@ impl ViewerApp {
                             Some((s, j)) if s == in_saved && j == i => {
                                 b.sel = None;
                                 b.dcat = None;
+                                b.haystacks.clear();
                             }
                             Some((s, j)) if s == in_saved && j > i => {
                                 b.sel = Some((s, j - 1));
@@ -6360,6 +6696,28 @@ impl ViewerApp {
                 1 => CellSystem::H3 { res: st.h3_res },
                 _ => CellSystem::A5 { res: st.a5_res },
             };
+            // The size control knows nothing about the layer: 1 m over a
+            // continent is a raster of 40 million cells a side, which is
+            // not a slow computation but an impossible one. Refuse it
+            // here, where the extent is known, instead of letting the
+            // scan start and the allocation decide.
+            if let (CellSystem::Square { sx, sy }, Some(ext)) = (system, layer_data_extent(l)) {
+                const MAX_CELLS_PER_AXIS: f64 = 10e6;
+                let nx = (ext[2] - ext[0]).abs() / sx.max(f64::MIN_POSITIVE);
+                let ny = (ext[3] - ext[1]).abs() / sy.max(f64::MIN_POSITIVE);
+                if nx.max(ny) > MAX_CELLS_PER_AXIS {
+                    st.error = Some(format!(
+                        "a {} cell over this layer's extent is {} cells across —                          pick a larger size (or H3 / A5 for a whole continent)",
+                        if st.latlong {
+                            format!("{} m", st.size)
+                        } else {
+                            format!("{}", st.size)
+                        },
+                        fmt_count(nx.max(ny) as usize),
+                    ));
+                    return;
+                }
+            }
             let output = if st.contours && st.system == 0 {
                 GridOutput::Contours {
                     levels: st.levels as usize,
@@ -6641,7 +6999,17 @@ impl ViewerApp {
             return;
         };
         let layer_name = self.layers[layer_idx].name.clone();
-        let cols = Self::style_columns(&self.layers[layer_idx].store);
+        // Read from the store once, not per frame: on a wide file this
+        // walks thousands of fields to fill one combo box that only
+        // changes when the layer's store does.
+        let store_key = Arc::as_ptr(&self.layers[layer_idx].store) as usize;
+        if self.style_cols.as_ref().is_none_or(|(k, _)| *k != store_key) {
+            let cols = Self::style_columns(&self.layers[layer_idx].store);
+            self.style_cols = Some((store_key, cols));
+        }
+        let Some((_, cols)) = &self.style_cols else {
+            return;
+        };
         // Set when the generic palette is on screen with no values yet:
         // the scan is started only for the path that actually needs it.
         let mut want_categories = false;
@@ -6672,7 +7040,7 @@ impl ViewerApp {
                             .width(200.0)
                             .selected_text(&d.column)
                             .show_ui(ui, |ui| {
-                                for (name, numeric) in &cols {
+                                for (name, numeric) in cols.iter() {
                                     ui.selectable_value(
                                         &mut d.column,
                                         name.clone(),
@@ -7372,6 +7740,7 @@ impl ViewerApp {
             selected: 0,
             running: false,
             progress: 0.0,
+            fatal: error.is_some(),
             error,
             rx: None,
         };
@@ -7417,6 +7786,8 @@ impl ViewerApp {
         st.rx = Some(rx);
         st.running = true;
         st.progress = 0.0;
+        // The failure being retried is not this run's outcome.
+        st.error = None;
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
             let tx_prog = tx.clone();
@@ -7507,7 +7878,12 @@ impl ViewerApp {
                 ui.label(RichText::new(st.src.display().to_string()).weak().small());
                 if let Some(e) = &st.error {
                     ui.colored_label(egui::Color32::from_rgb(220, 60, 60), e);
-                    return;
+                    // A conversion that failed leaves the form up: the
+                    // Import button is how it is retried, and returning
+                    // here hid it for good.
+                    if st.fatal {
+                        return;
+                    }
                 }
                 let table = if st.format == ImportFormat::Gpkg {
                     ui.add_enabled_ui(!st.running, |ui| {
@@ -7939,113 +8315,152 @@ impl ViewerApp {
         });
     }
 
-    fn optimize_window(&mut self, ctx: &egui::Context) {
-        let floating_area = self.floating_area(ctx);
-        use crate::data::optimize::{BloomMode, Codec, GpVersion};
-        // Gathered before the dialog borrow: partition-field candidates of
-        // the exported layer and polygon layers usable for admin joins.
-        let (candidates, other_layers) = match &self.optimize {
-            Some(o) => {
-                let candidates: Vec<String> = self
-                    .layers
+    /// A cheap stamp of the layer set: identity, name, geometry family
+    /// and store of every layer, in order. Dialog lists derived from the
+    /// layers are rebuilt when it changes, which is the only time they
+    /// can differ.
+    fn layers_stamp(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for l in &self.layers {
+            l.id.hash(&mut h);
+            l.name.hash(&mut h);
+            std::mem::discriminant(&l.kind()).hash(&mut h);
+            (Arc::as_ptr(&l.store) as usize).hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// The lists the export dialog offers for the layer being exported:
+    /// partition-field candidates, polygon layers usable for an admin
+    /// join, layers that can be merged in, and the primary's scorecard
+    /// verdict.
+    ///
+    /// Built when the dialog opens and whenever the layer set changes
+    /// (`layers_stamp`), not per frame: every one of them walks the
+    /// schema of every layer, which on a wide file is thousands of fields
+    /// scanned to draw a combo box that did not change.
+    fn build_export_lists(&self, layer_id: u64) -> ExportLists {
+        // Partition-field candidates of the exported layer.
+        let candidates: Vec<String> = self
+            .layers
+            .iter()
+            .find(|l| l.id == layer_id)
+            .map(|l| {
+                l.store
+                    .schema
+                    .fields()
                     .iter()
-                    .find(|l| l.id == o.layer_id)
-                    .map(|l| {
-                        l.store
-                            .schema
-                            .fields()
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, f)| {
-                                *i != l.store.geom_col
-                                    && f.name() != "bbox"
-                                    && matches!(
-                                        f.data_type(),
-                                        arrow::datatypes::DataType::Utf8
-                                            | arrow::datatypes::DataType::LargeUtf8
-                                            | arrow::datatypes::DataType::Utf8View
-                                            | arrow::datatypes::DataType::Boolean
-                                            | arrow::datatypes::DataType::Int8
-                                            | arrow::datatypes::DataType::Int16
-                                            | arrow::datatypes::DataType::Int32
-                                            | arrow::datatypes::DataType::Int64
-                                            | arrow::datatypes::DataType::UInt8
-                                            | arrow::datatypes::DataType::UInt16
-                                            | arrow::datatypes::DataType::UInt32
-                                            | arrow::datatypes::DataType::UInt64
-                                            | arrow::datatypes::DataType::Date32
-                                            | arrow::datatypes::DataType::Date64
-                                    )
-                            })
-                            .map(|(_, f)| f.name().clone())
-                            .collect()
+                    .enumerate()
+                    .filter(|(i, f)| {
+                        *i != l.store.geom_col
+                            && f.name() != "bbox"
+                            && matches!(
+                                f.data_type(),
+                                arrow::datatypes::DataType::Utf8
+                                    | arrow::datatypes::DataType::LargeUtf8
+                                    | arrow::datatypes::DataType::Utf8View
+                                    | arrow::datatypes::DataType::Boolean
+                                    | arrow::datatypes::DataType::Int8
+                                    | arrow::datatypes::DataType::Int16
+                                    | arrow::datatypes::DataType::Int32
+                                    | arrow::datatypes::DataType::Int64
+                                    | arrow::datatypes::DataType::UInt8
+                                    | arrow::datatypes::DataType::UInt16
+                                    | arrow::datatypes::DataType::UInt32
+                                    | arrow::datatypes::DataType::UInt64
+                                    | arrow::datatypes::DataType::Date32
+                                    | arrow::datatypes::DataType::Date64
+                            )
                     })
-                    .unwrap_or_default();
-                let others: Vec<(u64, String, Vec<String>)> = self
-                    .layers
+                    .map(|(_, f)| f.name().clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Polygon layers usable for admin joins.
+        let other_layers: Vec<(u64, String, Vec<String>)> = self
+            .layers
+            .iter()
+            .filter(|l| {
+                l.id != layer_id
+                    && matches!(l.kind(), crate::data::geometry::GeomKind::Polygon)
+            })
+            .map(|l| {
+                let cols = l
+                    .store
+                    .schema
+                    .fields()
                     .iter()
-                    .filter(|l| {
-                        l.id != o.layer_id
-                            && matches!(l.kind(), crate::data::geometry::GeomKind::Polygon)
+                    .filter(|f| {
+                        matches!(
+                            f.data_type(),
+                            arrow::datatypes::DataType::Utf8
+                                | arrow::datatypes::DataType::LargeUtf8
+                                | arrow::datatypes::DataType::Utf8View
+                        )
                     })
-                    .map(|l| {
-                        let cols = l
-                            .store
-                            .schema
-                            .fields()
-                            .iter()
-                            .filter(|f| {
-                                matches!(
-                                    f.data_type(),
-                                    arrow::datatypes::DataType::Utf8
-                                        | arrow::datatypes::DataType::LargeUtf8
-                                        | arrow::datatypes::DataType::Utf8View
-                                )
-                            })
-                            .map(|f| f.name().clone())
-                            .collect();
-                        (l.id, l.name.clone(), cols)
-                    })
+                    .map(|f| f.name().clone())
                     .collect();
-                (candidates, others)
-            }
-            None => (Vec::new(), Vec::new()),
-        };
+                (l.id, l.name.clone(), cols)
+            })
+            .collect();
         // Layers offered for "Merge with…": other vector layers of the
         // SAME geometry family as the primary (merging points into a
         // polygon export is never what anyone means, and the filter
         // keeps the list short), with shared/conflicting column counts.
-        let merge_candidates: Vec<(u64, String, u64, usize, usize)> = match &self.optimize {
-            Some(o) => {
-                let primary = self.layers.iter().find(|l| l.id == o.layer_id);
-                let primary_kind = primary.map(|l| l.kind());
-                self.layers
-                    .iter()
-                    .filter(|l| l.id != o.layer_id && Some(l.kind()) == primary_kind)
-                    .map(|l| {
-                        let (mut shared, mut conflicts) = (0usize, 0usize);
-                        if let Some(p) = primary {
-                            for f in p.store.schema.fields() {
-                                match l.store.schema.field_with_name(f.name()) {
-                                    Ok(g) if g.data_type() == f.data_type() => shared += 1,
-                                    Ok(_) => conflicts += 1,
-                                    Err(_) => {}
-                                }
-                            }
+        let primary = self.layers.iter().find(|l| l.id == layer_id);
+        let primary_kind = primary.map(|l| l.kind());
+        let merge_candidates: Vec<(u64, String, u64, usize, usize)> = self
+            .layers
+            .iter()
+            .filter(|l| l.id != layer_id && Some(l.kind()) == primary_kind)
+            .map(|l| {
+                let (mut shared, mut conflicts) = (0usize, 0usize);
+                if let Some(p) = primary {
+                    for f in p.store.schema.fields() {
+                        match l.store.schema.field_with_name(f.name()) {
+                            Ok(g) if g.data_type() == f.data_type() => shared += 1,
+                            Ok(_) => conflicts += 1,
+                            Err(_) => {}
                         }
-                        (l.id, l.name.clone(), l.store.total_rows(), shared, conflicts)
-                    })
-                    .collect()
-            }
-            None => Vec::new(),
+                    }
+                }
+                (l.id, l.name.clone(), l.store.total_rows(), shared, conflicts)
+            })
+            .collect();
+        ExportLists {
+            candidates,
+            other_layers,
+            merge_candidates,
+            // Scorecard verdict of the primary layer, for the as-is nudge.
+            primary_indexable: primary
+                .and_then(|l| l.info.quality.as_ref().map(|q| q.indexable)),
+        }
+    }
+
+    fn optimize_window(&mut self, ctx: &egui::Context) {
+        let floating_area = self.floating_area(ctx);
+        use crate::data::optimize::{BloomMode, Codec, GpVersion};
+        let Some(export_of) = self.optimize.as_ref().map(|o| o.layer_id) else {
+            return;
         };
-        // Scorecard verdict of the primary layer, for the as-is nudge.
-        let primary_indexable: Option<bool> = self.optimize.as_ref().and_then(|o| {
-            self.layers
-                .iter()
-                .find(|l| l.id == o.layer_id)
-                .and_then(|l| l.info.quality.as_ref().map(|q| q.indexable))
-        });
+        // Gathered before the dialog borrow, and only when the layer set
+        // they describe has changed.
+        let stamp = self.layers_stamp();
+        if self
+            .export_lists
+            .as_ref()
+            .is_none_or(|(s, id, _)| *s != stamp || *id != export_of)
+        {
+            let lists = self.build_export_lists(export_of);
+            self.export_lists = Some((stamp, export_of, lists));
+        }
+        let Some((_, _, lists)) = &self.export_lists else {
+            return;
+        };
+        let (candidates, other_layers, merge_candidates) =
+            (&lists.candidates, &lists.other_layers, &lists.merge_candidates);
+        let primary_indexable = lists.primary_indexable;
         let Some(o) = &mut self.optimize else { return };
         let layer_id = o.layer_id;
         let (o_src, o_epsg) = (o.src.clone(), o.epsg);
@@ -8412,7 +8827,7 @@ impl ViewerApp {
                             .max_height(132.0)
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
-                                for (id, name, rows, shared, conflicts) in &merge_candidates {
+                                for (id, name, rows, shared, conflicts) in merge_candidates.iter() {
                                     let mut on = o.merge_with.contains(id);
                                     let label =
                                         format!("{name} — {}", fmt_count(*rows as usize));
@@ -8506,7 +8921,7 @@ impl ViewerApp {
                                 {
                                     o.admin_layer = None;
                                 }
-                                for (id, name, _) in &other_layers {
+                                for (id, name, _) in other_layers.iter() {
                                     if ui
                                         .selectable_label(o.admin_layer == Some(*id), name)
                                         .clicked()
@@ -8913,7 +9328,7 @@ impl ViewerApp {
                                             {
                                                 p.opts.prune.rank = None;
                                             }
-                                            for c in &candidates {
+                                            for c in candidates.iter() {
                                                 let on = p
                                                     .opts
                                                     .prune
@@ -8951,7 +9366,7 @@ impl ViewerApp {
                                                 None,
                                                 "(none)",
                                             );
-                                            for c in &candidates {
+                                            for c in candidates.iter() {
                                                 ui.selectable_value(
                                                     &mut p.opts.dissolve.majority_column,
                                                     Some(c.clone()),
@@ -9343,7 +9758,13 @@ impl ViewerApp {
             .show(ctx, |ui| {
                 crate::theme::compact(ui);
                 ui.horizontal(|ui| {
-                    if job.preview.sampled {
+                    if job.busy {
+                        // The re-read runs on the attribute worker; the
+                        // numbers on screen are the previous ones until
+                        // it answers.
+                        ui.spinner();
+                        ui.label(RichText::new("re-reading the file…").weak().small());
+                    } else if job.preview.sampled {
                         ui.label(
                             RichText::new(format!(
                                 "{} columns, {} rows sampled",
@@ -9635,7 +10056,10 @@ impl ViewerApp {
                         (ph::TABLE, "Import")
                     };
                     if ui
-                        .add_enabled(any && !blocked, egui::Button::new(format!("{icon} {what}")))
+                        .add_enabled(
+                            any && !blocked && !job.busy,
+                            egui::Button::new(format!("{icon} {what}")),
+                        )
                         .clicked()
                     {
                         go = true;
@@ -9665,23 +10089,45 @@ impl ViewerApp {
                 });
             });
 
-        // Re-reading rebuilds the column list, so it cannot happen while
-        // the rows above are borrowed.
-        if job.reread {
+        // Both of these re-read the file — a portal CSV over HTTPS — so
+        // they go to the attribute worker rather than holding the frame.
+        // Re-reading also rebuilds the column list, so it cannot happen
+        // while the rows above are borrowed.
+        let now = ctx.input(|i| i.time);
+        if retype {
+            job.retype_at = Some(now);
+        }
+        if job.reread && !job.busy {
             job.reread = false;
+            job.busy = true;
             let (src, d, h) = (
                 job.source.clone(),
                 job.preview.plan.delimiter,
                 job.preview.plan.has_header,
             );
-            match attrs::reinspect(&src, d, h) {
-                Ok(p) => job.preview = p,
-                Err(e) => self.push_error(e),
-            }
-        } else if retype {
-            let src = job.source.clone();
-            if let Err(e) = attrs::recheck(&src, &mut job.preview) {
-                self.push_error(e);
+            let (tx, egui_ctx) = (self.attr_tx.clone(), self.egui_ctx.clone());
+            std::thread::spawn(move || {
+                let out = attrs::reinspect(&src, d, h).map(Box::new);
+                let _ = tx.send(AttrMsg::Reinspected(src, out));
+                egui_ctx.request_repaint();
+            });
+        } else if let Some(at) = job.retype_at {
+            // One re-check after the last change, not one per change:
+            // dragging through the type list is a stream of them.
+            if job.busy || now - at < 0.3 {
+                ctx.request_repaint_after(std::time::Duration::from_millis(120));
+            } else {
+                job.retype_at = None;
+                job.retype_seq += 1;
+                job.busy = true;
+                let (src, seq) = (job.source.clone(), job.retype_seq);
+                let mut preview = job.preview.clone();
+                let (tx, egui_ctx) = (self.attr_tx.clone(), self.egui_ctx.clone());
+                std::thread::spawn(move || {
+                    let out = attrs::recheck(&src, &mut preview).map(|()| preview.columns);
+                    let _ = tx.send(AttrMsg::Rechecked(src, seq, out));
+                    egui_ctx.request_repaint();
+                });
             }
         }
 
@@ -9775,9 +10221,13 @@ impl ViewerApp {
     fn poll_join(&mut self, ctx: &egui::Context) {
         use crate::sql::engine::SqlDone;
         while let Ok(msg) = self.join_rx.try_recv() {
+            // Only the job the dialog is waiting on speaks for it. A
+            // superseded probe answering with an error used to be taken
+            // as this job's answer while a join ran: it cleared
+            // `running`, and the button it re-enabled started the join a
+            // second time.
             let expected = self.join_dialog.as_ref().and_then(|d| d.pending);
-            let is_running = self.join_dialog.as_ref().is_some_and(|d| d.running);
-            if expected != Some(msg.id) && !is_running {
+            if expected != Some(msg.id) {
                 continue;
             }
             match msg.result {
@@ -9807,6 +10257,7 @@ impl ViewerApp {
                         self.push_error(format!("join failed: {e}"));
                         if let Some(d) = &mut self.join_dialog {
                             d.running = false;
+                            d.pending = None;
                         }
                     } else if let Some(d) = &mut self.join_dialog {
                         d.pending = None;
@@ -10155,15 +10606,28 @@ impl ViewerApp {
                 _ => None,
             })
         });
-        let Some(img) = shot else { return };
-        let img = if self.map_rect.width() >= 1.0 {
-            img.region(&self.map_rect, Some(ctx.pixels_per_point()))
-        } else {
-            (*img).clone()
+        if let Some(img) = shot {
+            let img = if self.map_rect.width() >= 1.0 {
+                img.region(&self.map_rect, Some(ctx.pixels_per_point()))
+            } else {
+                (*img).clone()
+            };
+            self.pending_screenshot = Some(Box::new(img));
+        }
+        // The capture waits for the file panel rather than being dropped
+        // on the floor: `spawn_pick` refuses a second panel, and the
+        // event carrying the pixels is gone by the next frame.
+        let Some(img) = self.pending_screenshot.take() else {
+            return;
         };
+        if self.pick_dialog.is_some() {
+            self.pending_screenshot = Some(img);
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
         // The frame is already captured, so it travels with the request:
         // by the time a path comes back the event carrying it is long gone.
-        self.spawn_pick(PickFor::Screenshot(Box::new(img)), ctx, |d| {
+        self.spawn_pick(PickFor::Screenshot(img), ctx, |d| {
             awaited_path(
                 d.set_file_name("geopq-map.png")
                     .add_filter("PNG image", &["png"])
@@ -10405,9 +10869,14 @@ impl ViewerApp {
             Action::None => {}
             Action::LoadAll => {
                 let gate = self.quality_gates.remove(0);
-                self.direct_files.insert(gate.key());
-                save_direct_files(&self.direct_files);
-                self.resume_gated(gate, ctx);
+                let key = gate.key();
+                // Remembered only if the load really restarts: a gate
+                // whose job is gone would otherwise teach the app to open
+                // that file fully, from a click that loaded nothing.
+                if self.resume_gated(gate, ctx) {
+                    self.direct_files.insert(key);
+                    save_direct_files(&self.direct_files);
+                }
             }
             Action::Cancel => {
                 let gate = self.quality_gates.remove(0);
@@ -10947,6 +11416,9 @@ impl ViewerApp {
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        // Set by the ✖ of a job paused at the quality gate; acted on once
+        // the bar has released its borrow of `self.loading`.
+        let mut stop_gated: Option<u64> = None;
         ui.horizontal(|ui| {
             if let Some(w) = self.cursor_world {
                 if let Some((lon, lat)) = world_to_lonlat(&self.display, w) {
@@ -11016,14 +11488,23 @@ impl ViewerApp {
                         egui::ProgressBar::new(frac).desired_width(220.0).text(text),
                     );
                 }
-                for job in self.loading.values_mut() {
+                // A job waiting at the quality gate has no loader thread
+                // left to poison: the loader returned after sending the
+                // gate. Stopping it means dropping the gate, or the bar
+                // and the dialog both stay up for a load nobody is doing.
+                let gated: Vec<u64> = self.quality_gates.iter().map(|g| g.job).collect();
+                for (id, job) in self.loading.iter_mut() {
                     if ui
                         .small_button("✖")
                         .on_hover_text("Stop loading this file")
                         .clicked()
                     {
-                        job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                        job.stage = "cancelling".into();
+                        if gated.contains(id) {
+                            stop_gated = Some(*id);
+                        } else {
+                            job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                            job.stage = "cancelling".into();
+                        }
                     }
                     ui.add(
                         egui::ProgressBar::new(job.frac)
@@ -11038,6 +11519,13 @@ impl ViewerApp {
                 }
             });
         });
+        if let Some(i) = stop_gated
+            .and_then(|job| self.quality_gates.iter().position(|g| g.job == job))
+        {
+            let gate = self.quality_gates.remove(i);
+            let ctx = ui.ctx().clone();
+            self.drop_gated(&gate, &ctx);
+        }
     }
 
     fn map_panel(&mut self, ui: &mut egui::Ui) {
@@ -11129,8 +11617,11 @@ impl ViewerApp {
                 // cancel them so the new view's check starts at settle
                 // instead of queueing behind downloads for a viewport
                 // nobody is looking at. Batches already landed stay.
-                for c in self.append_cancel.values() {
-                    c.store(true, std::sync::atomic::Ordering::Relaxed);
+                // A user-initiated "Load all" is not about the viewport
+                // and survives: any pan used to abandon it silently, and
+                // it never resumed on its own.
+                for j in self.append_cancel.values().filter(|j| !j.user) {
+                    j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             } else if now - self.cam_changed_at > 0.35 {
                 self.refine_partial_layers(&ctx);
@@ -11478,77 +11969,106 @@ fn dcat_pane(ui: &mut egui::Ui, b: &mut CatalogBrowser, open: &mut Vec<usize>) {
     });
     let needle = b.filter.to_lowercase();
     let geo_only = b.geo_only;
-    let matches = |d: &crate::data::repo::DcatDataset| {
+    // The searchable text is precomputed per dataset when the catalog
+    // lands (`haystacks`); the live fallback only runs if the two ever
+    // got out of step.
+    let haystacks = &b.haystacks;
+    let matches = |i: usize, d: &crate::data::repo::DcatDataset| {
         let text = needle.is_empty()
-            || d.title.to_lowercase().contains(&needle)
-            || d.description.to_lowercase().contains(&needle)
-            || d.keywords.iter().any(|k| k.to_lowercase().contains(&needle));
+            || match haystacks.get(i) {
+                Some(h) => h.contains(&needle),
+                None => dcat_haystack(d).contains(&needle),
+            };
         let geo = !geo_only
             || d.distributions
                 .iter()
                 .any(|x| x.format != crate::data::repo::DcatFormat::Csv);
         text && geo
     };
-    let mut shown = 0usize;
+    // The filtered list is computed once per frame and the rows are built
+    // only for the visible slice: a portal catalog runs to thousands of
+    // datasets, and formatting every one of them per frame (badges, the
+    // description line, a ~700-byte tooltip string) was the whole cost of
+    // having this pane open.
+    let shown: Vec<usize> = cat
+        .datasets
+        .iter()
+        .enumerate()
+        .filter(|(i, d)| matches(*i, d))
+        .map(|(i, _)| i)
+        .collect();
     // Whatever height is left, minus room for the Open row and the
     // hidden-count line below: they must never slip under the border.
     let list_height = (ui.available_height() - 84.0).clamp(140.0, 340.0);
+    // Fixed-height rows, which is what lets only the visible ones be
+    // built: the description line is always allocated (blank when the
+    // dataset has none) so every row is the same height as the one the
+    // scroll area is told about. Measured from the theme rather than
+    // guessed, or the rows and the scroll offset drift apart.
+    let row_h = ui.spacing().interact_size.y
+        + ui.text_style_height(&egui::TextStyle::Small)
+        + ui.spacing().item_spacing.y;
     egui::ScrollArea::vertical()
         .id_salt("dcat_datasets")
         .max_height(list_height)
-        .show(ui, |ui| {
-            for (i, d) in cat.datasets.iter().enumerate() {
-                if !matches(d) {
-                    continue;
-                }
-                shown += 1;
-                ui.horizontal(|ui| {
-                    let mut on = b.dcat_checked.contains(&i);
-                    if ui.checkbox(&mut on, &d.title).changed() {
-                        if on {
-                            b.dcat_checked.insert(i);
-                        } else {
-                            b.dcat_checked.remove(&i);
-                        }
-                    }
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if let Some(m) = &d.modified {
-                                ui.label(RichText::new(m).weak().small());
+        .show_rows(ui, row_h, shown.len(), |ui, range| {
+            for &i in &shown[range] {
+                let d = &cat.datasets[i];
+                ui.allocate_ui(egui::vec2(ui.available_width(), row_h), |ui| {
+                    ui.horizontal(|ui| {
+                        let mut on = b.dcat_checked.contains(&i);
+                        if ui.checkbox(&mut on, &d.title).changed() {
+                            if on {
+                                b.dcat_checked.insert(i);
+                            } else {
+                                b.dcat_checked.remove(&i);
                             }
-                            let badges: Vec<&str> =
-                                d.distributions.iter().map(|x| x.format.label()).collect();
-                            ui.label(RichText::new(badges.join(" · ")).weak().small())
-                                .on_hover_text(format!(
-                                    "opens as {} — {}",
-                                    d.distributions[0].format.label(),
-                                    d.distributions[0].url,
-                                ));
-                        },
-                    );
-                })
-                .response
-                .on_hover_text(dcat_hover(d));
-                // One line of description under the title; the row's
-                // hover carries the rest. Size stays unshown on purpose:
-                // portals state no byteSize — the export is generated
-                // when asked for — and inventing one would be worse.
-                let desc = d.description.trim();
-                if !desc.is_empty() {
-                    let mut line: String = desc.chars().take(110).collect();
-                    if desc.chars().count() > 110 {
-                        line.push('…');
-                    }
+                        }
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if let Some(m) = &d.modified {
+                                    ui.label(RichText::new(m).weak().small());
+                                }
+                                let badges: Vec<&str> =
+                                    d.distributions.iter().map(|x| x.format.label()).collect();
+                                ui.label(RichText::new(badges.join(" · ")).weak().small())
+                                    .on_hover_text(format!(
+                                        "opens as {} — {}",
+                                        d.distributions[0].format.label(),
+                                        d.distributions[0].url,
+                                    ));
+                            },
+                        );
+                    })
+                    .response
+                    // Built when the pointer is actually on the row.
+                    .on_hover_ui(|ui| {
+                        ui.label(dcat_hover(d));
+                    });
+                    // One line of description under the title; the row's
+                    // hover carries the rest. Size stays unshown on
+                    // purpose: portals state no byteSize — the export is
+                    // generated when asked for — and inventing one would
+                    // be worse.
+                    let desc = d.description.trim();
+                    let line: String = if desc.is_empty() {
+                        String::new()
+                    } else {
+                        let mut line: String = desc.chars().take(110).collect();
+                        if desc.chars().count() > 110 {
+                            line.push('…');
+                        }
+                        line
+                    };
                     ui.horizontal(|ui| {
                         ui.add_space(18.0);
                         ui.label(RichText::new(line).weak().small());
                     });
-                }
-                ui.add_space(2.0);
+                });
             }
         });
-    if shown == 0 {
+    if shown.is_empty() {
         ui.label(RichText::new("no dataset matches the search").weak());
     }
     ui.horizontal(|ui| {
@@ -11594,6 +12114,20 @@ fn dcat_pane(ui: &mut egui::Ui, b: &mut CatalogBrowser, open: &mut Vec<usize>) {
              zipped shapefile. Nothing in this app extracts archives yet.",
         );
     }
+}
+
+/// The lowercased text the dataset list searches: title, description and
+/// keywords in one string, built once per catalog.
+fn dcat_haystack(d: &crate::data::repo::DcatDataset) -> String {
+    let mut out = String::with_capacity(d.title.len() + d.description.len() + 32);
+    out.push_str(&d.title);
+    out.push('\n');
+    out.push_str(&d.description);
+    for k in &d.keywords {
+        out.push('\n');
+        out.push_str(k);
+    }
+    out.to_lowercase()
 }
 
 /// Everything a portal dataset says about itself, for the row's tooltip.
