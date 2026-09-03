@@ -20,7 +20,10 @@ use parquet::arrow::ArrowWriter;
 use serde_json::{json, Value};
 use shapefile::dbase;
 
-use super::import::{bbox_field, BboxBuilder, to_wkb, AttrBuilder, Cell, GeomStats, IMPORT_WRITE_ROWS};
+use super::import::{
+    covering_field, to_wkb, AttrBuilder, BboxBuilder, Cell, GeomStats, IMPORT_BATCH_BYTES,
+    IMPORT_WRITE_ROWS,
+};
 
 /// Find a shapefile sidecar (`dbf`, `shx`, `prj`, `cpg`) next to the
 /// .shp, matching stem and extension case-insensitively — real-world
@@ -88,7 +91,8 @@ pub fn convert(src: &Path, dst: &Path, progress: &dyn Fn(f32)) -> Result<u64, St
     };
     let mut fields: Vec<Field> = vec![Field::new(&geom_name, DataType::Binary, true)];
     fields.extend(cols.iter().map(|(n, dt)| Field::new(n, dt.clone(), true)));
-    fields.push(bbox_field());
+    let (cov_name, cov_field) = covering_field(&fields);
+    fields.push(cov_field);
     let schema = Arc::new(Schema::new(fields));
 
     let out = std::fs::File::create(dst).map_err(|e| format!("cannot create output: {e}"))?;
@@ -103,6 +107,7 @@ pub fn convert(src: &Path, dst: &Path, progress: &dyn Fn(f32)) -> Result<u64, St
         bbox_b: BboxBuilder::default(),
         attr_b: cols.iter().map(|(_, dt)| AttrBuilder::new(dt)).collect(),
         in_batch: 0,
+        batch_bytes: 0,
         written: 0,
     };
 
@@ -127,37 +132,45 @@ pub fn convert(src: &Path, dst: &Path, progress: &dyn Fn(f32)) -> Result<u64, St
         let total = reader.shape_count().unwrap_or(0).max(1);
         for pair in reader.iter_shapes_and_records() {
             let (shape, record) = pair.map_err(|e| format!("read failed: {e}"))?;
-            push_shape(shape, &mut stats, &mut out.geom_b, &mut out.bbox_b);
+            let bytes = push_shape(shape, &mut stats, &mut out.geom_b, &mut out.bbox_b);
             for ((name, _), b) in cols.iter().zip(&mut out.attr_b) {
                 b.push(match record.get(name) {
                     Some(v) => cell(v),
                     None => Cell::Null,
                 });
             }
-            if out.bump()? {
+            if out.bump(bytes)? {
                 progress((out.written as f32 / total as f32).min(1.0));
             }
         }
     } else {
         let mut reader = shape_reader;
         for shape in reader.iter_shapes() {
-            push_shape(
+            let bytes = push_shape(
                 shape.map_err(|e| format!("read failed: {e}"))?,
                 &mut stats,
                 &mut out.geom_b,
                 &mut out.bbox_b,
             );
-            out.bump()?;
+            out.bump(bytes)?;
         }
     }
     out.flush()?;
     let written = out.written;
     drop(out);
 
+    if stats.skipped > 0 {
+        log::warn!(
+            "shapefile import: {} of {written} features had unreadable geometry \
+             and were written as null",
+            stats.skipped
+        );
+    }
+
     let (crs, proj4) = prj_crs(sidecar(src, "prj").as_deref());
     writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
         "geo".to_string(),
-        super::import::geo_meta_with_proj4(&geom_name, &stats, crs, proj4).to_string(),
+        super::import::geo_meta_with_proj4(&geom_name, &cov_name, &stats, crs, proj4).to_string(),
     ));
     writer.close().map_err(|e| format!("finalize failed: {e}"))?;
     Ok(written)
@@ -171,15 +184,24 @@ struct Out<'a> {
     bbox_b: BboxBuilder,
     attr_b: Vec<AttrBuilder>,
     in_batch: usize,
+    /// Geometry bytes buffered since the last flush.
+    batch_bytes: usize,
     written: u64,
 }
 
 impl Out<'_> {
     /// Count the row just pushed; flush on a full batch. Returns whether
     /// a flush happened (progress checkpoint).
-    fn bump(&mut self) -> Result<bool, String> {
+    ///
+    /// Rows alone do not bound a batch: 8192 land-cover or cadastral
+    /// polygons are hundreds of megabytes, and the row group cannot
+    /// close mid-batch, so the byte cap is what keeps the written groups
+    /// inside the quality scorecard's limit (the GeoPackage importer has
+    /// always had it; this is the same cap).
+    fn bump(&mut self, bytes: usize) -> Result<bool, String> {
         self.in_batch += 1;
-        if self.in_batch == IMPORT_WRITE_ROWS {
+        self.batch_bytes += bytes;
+        if self.in_batch == IMPORT_WRITE_ROWS || self.batch_bytes >= IMPORT_BATCH_BYTES {
             self.flush()?;
             return Ok(true);
         }
@@ -198,34 +220,51 @@ impl Out<'_> {
         self.writer.write(&batch).map_err(|e| format!("write failed: {e}"))?;
         self.written += self.in_batch as u64;
         self.in_batch = 0;
+        self.batch_bytes = 0;
         Ok(())
     }
 }
 
+/// Push one shape and return the geometry bytes it added, for the byte
+/// cap on the batch.
+///
+/// A shape that will not convert or will not encode is written as null
+/// and counted: a null geometry is indistinguishable from a NullShape,
+/// which is a legitimate record, so without the count a corrupt file
+/// imports as a quiet field of empty rows.
 fn push_shape(
     shape: shapefile::Shape,
     stats: &mut GeomStats,
     geom_b: &mut BinaryBuilder,
     bbox_b: &mut BboxBuilder,
-) {
+) -> usize {
+    let null_shape = matches!(shape, shapefile::Shape::NullShape);
     match geo_types::Geometry::<f64>::try_from(shape) {
         Ok(g) => {
             let env = stats.add(&g);
             match to_wkb(&g) {
                 Ok(w) => {
+                    let n = w.len();
                     geom_b.append_value(w);
                     bbox_b.push(env);
+                    n
                 }
                 Err(_) => {
+                    stats.skipped += 1;
                     geom_b.append_null();
                     bbox_b.push(None);
+                    0
                 }
             }
         }
         Err(_) => {
-            // NullShape
+            // NullShape is a record with no geometry, not a failure.
+            if !null_shape {
+                stats.skipped += 1;
+            }
             geom_b.append_null();
             bbox_b.push(None);
+            0
         }
     }
 }
@@ -518,5 +557,83 @@ mod tests {
         let sc = batch.schema();
         assert_eq!(sc.field_with_name("name").unwrap().data_type(), &DataType::Utf8);
         assert_eq!(sc.field_with_name("area").unwrap().data_type(), &DataType::Float64);
+    }
+
+    /// A .dbf field genuinely called `bbox` is data. The covering column
+    /// used to be appended under that name whatever the attributes were.
+    #[test]
+    fn a_dbf_field_named_bbox_keeps_its_name() {
+        let dir = std::env::temp_dir().join("geopq_shp_bbox_attr");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("attr.shp");
+        let dst = dir.join("attr.parquet");
+
+        let table =
+            TableWriterBuilder::new().add_character_field("bbox".try_into().unwrap(), 20);
+        let mut w = shapefile::Writer::from_path(&src, table).unwrap();
+        let square = Polygon::new(PolygonRing::Outer(vec![
+            Point::new(0.0, 0.0),
+            Point::new(0.0, 1.0),
+            Point::new(1.0, 1.0),
+            Point::new(1.0, 0.0),
+            Point::new(0.0, 0.0),
+        ]));
+        let mut rec = Record::default();
+        rec.insert("bbox".into(), FieldValue::Character(Some("the attribute".into())));
+        w.write_shape_and_record(&square, &rec).unwrap();
+        drop(w);
+
+        assert_eq!(convert(&src, &dst, &|_| {}).unwrap(), 1);
+        let (store, _crs, info, _rg) =
+            crate::data::loader::open_store_for_test(&dst).unwrap();
+        let sc = store.schema.clone();
+        assert_eq!(sc.field_with_name("bbox").unwrap().data_type(), &DataType::Utf8);
+        assert!(sc.field_with_name("bbox_1").is_ok(), "covering renamed around it");
+        let covering = info.geo.covering.expect("covering declared");
+        assert!(covering.contains("\"bbox_1\""), "{covering}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Heavy polygons: the batch has to be bounded by its bytes, not
+    /// only by its 8192-row cap, or one write hands the parquet writer
+    /// a row group it can no longer split.
+    #[test]
+    fn heavy_polygons_close_row_groups_by_bytes() {
+        let dir = std::env::temp_dir().join("geopq_shp_heavy");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("heavy.shp");
+        let dst = dir.join("heavy.parquet");
+
+        let table = TableWriterBuilder::new().add_integer_field("k".try_into().unwrap());
+        let mut w = shapefile::Writer::from_path(&src, table).unwrap();
+        // Jittered radii, so the coordinates do not compress into a
+        // group the writer would have kept whole anyway.
+        let mut seed = 12345u64;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for k in 0..1000i32 {
+            let (cx, cy) = (k as f64 * 10.0, 0.0);
+            let mut pts: Vec<Point> = (0..2000)
+                .map(|i| {
+                    let a = i as f64 / 2000.0 * std::f64::consts::TAU;
+                    let r = 1.0 + next();
+                    Point::new(cx + r * a.cos(), cy + r * a.sin())
+                })
+                .collect();
+            pts.push(Point::new(cx + 1.0, cy));
+            let mut rec = Record::default();
+            rec.insert("k".into(), FieldValue::Integer(k));
+            w.write_shape_and_record(&Polygon::new(PolygonRing::Outer(pts)), &rec)
+                .unwrap();
+        }
+        drop(w);
+
+        assert_eq!(convert(&src, &dst, &|_| {}).unwrap(), 1000);
+        crate::data::import::tests::assert_row_groups_bounded(&dst);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

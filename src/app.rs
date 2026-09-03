@@ -7787,10 +7787,11 @@ impl ViewerApp {
             // optimize pass on the staged file takes the rest.
             let mut src = src;
             let mut opts = opts;
-            let mut staging: Option<PathBuf> = None;
+            // Removes itself whatever ends this thread.
+            let mut staging: Option<crate::data::merge::Staged> = None;
             if merge_inputs.len() > 1 {
-                let stage = std::env::temp_dir()
-                    .join(format!("geopq_merge_{}.parquet", std::process::id()));
+                let staged = crate::data::merge::Staged::new("geopq_merge");
+                let stage = staged.path().to_path_buf();
                 match crate::data::merge::merge(
                     &merge_inputs,
                     &stage,
@@ -7802,7 +7803,7 @@ impl ViewerApp {
                         // The staged file is plain WKB: coordinate-column
                         // synthesis from the primary no longer applies.
                         opts.xy_geom = None;
-                        staging = Some(stage);
+                        staging = Some(staged);
                     }
                     Err(e) => {
                         let _ = tx.send(OptMsg::Failed(format!("merge failed: {e}")));
@@ -7814,7 +7815,10 @@ impl ViewerApp {
             let scale = if staging.is_some() { 0.35 } else { 0.0 };
             let progress =
                 |f: f32, s: &str| progress(scale + f * (1.0 - scale), s);
-            let msg = match crate::data::optimize::optimize(&src, &dst, &opts, epsg, admin.as_ref(), &progress) {
+            // No cancel button on the optimize progress window yet; the
+            // flag is what the rewrite checks, so it gets a fresh one.
+            let opt_cancel = std::sync::atomic::AtomicBool::new(false);
+            let msg = match crate::data::optimize::optimize(&src, &dst, &opts, epsg, admin.as_ref(), &progress, &opt_cancel) {
                 Ok(r) => match &dest {
                     None => OptMsg::Done(Box::new(r), dst, None),
                     Some(d) => {
@@ -7931,9 +7935,7 @@ impl ViewerApp {
                 },
                 Err(e) => OptMsg::Failed(e),
             };
-            if let Some(s) = &staging {
-                let _ = std::fs::remove_file(s);
-            }
+            drop(staging);
             let _ = tx.send(msg);
             ctx.request_repaint();
         });

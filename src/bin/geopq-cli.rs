@@ -169,6 +169,8 @@ fn run() -> Result<(), String> {
         None,
         None,
         &|frac, stage| progress.report(frac, stage),
+        // Nothing cancels a CLI run but the signal that ends it.
+        &std::sync::atomic::AtomicBool::new(false),
     );
     progress.finish();
 

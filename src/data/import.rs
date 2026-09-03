@@ -80,8 +80,12 @@ pub(crate) fn writer_props() -> WriterProperties {
 /// turn a file that must be decoded whole into one that can be read by
 /// viewport.
 pub(crate) fn bbox_field() -> Field {
+    covering_field_named("bbox")
+}
+
+fn covering_field_named(name: &str) -> Field {
     Field::new(
-        "bbox",
+        name,
         DataType::Struct(
             vec![
                 Field::new("xmin", DataType::Float64, true),
@@ -95,6 +99,28 @@ pub(crate) fn bbox_field() -> Field {
     )
 }
 
+/// The covering column's name and field, dodging the attribute names
+/// already in `taken`.
+///
+/// A source attribute genuinely called `bbox` is data and must survive
+/// the import: appending a second field of that name produced a file
+/// whose two `bbox` columns no reader could tell apart, and whose
+/// `covering` metadata pointed at whichever one the reader resolved
+/// first. Optimize has always renamed around the collision; the
+/// importers pushed `bbox` unconditionally, so this is the same rule in
+/// one place. The chosen name has to reach `geo_meta`, which is why it
+/// comes back beside the field rather than being re-derived there.
+pub(crate) fn covering_field(taken: &[Field]) -> (String, Field) {
+    let mut name = "bbox".to_string();
+    let mut k = 0usize;
+    while taken.iter().any(|f| f.name() == &name) {
+        k += 1;
+        name = format!("bbox_{k}");
+    }
+    let field = covering_field_named(&name);
+    (name, field)
+}
+
 /// Per-feature bbox accumulator, finished into the struct column.
 #[derive(Default)]
 pub(crate) struct BboxBuilder {
@@ -104,9 +130,21 @@ pub(crate) struct BboxBuilder {
     ymax: Vec<Option<f64>>,
 }
 
+/// A bbox only if every corner is finite.
+///
+/// NaN and infinity are legal in a double column and meaningless in a
+/// covering one: `xmin` statistics that include a NaN make a row group
+/// unprunable, and an infinite corner claims the whole plane, so one bad
+/// vertex in a source file silently disables spatial pruning for
+/// everything beside it. A null covering value says "no box", which is
+/// what a reader knows how to handle.
+pub(crate) fn finite_bbox(b: [f64; 4]) -> Option<[f64; 4]> {
+    b.iter().all(|v| v.is_finite()).then_some(b)
+}
+
 impl BboxBuilder {
     pub fn push(&mut self, env: Option<[f64; 4]>) {
-        let e = env.filter(|e| e.iter().all(|v| v.is_finite()));
+        let e = env.and_then(finite_bbox);
         self.xmin.push(e.map(|e| e[0]));
         self.ymin.push(e.map(|e| e[1]));
         self.xmax.push(e.map(|e| e[2]));
@@ -131,8 +169,13 @@ impl BboxBuilder {
 /// GeoParquet 1.1 `geo` metadata for an import. `crs`: `None` omits the
 /// key entirely (CRS84 per spec — right for GeoJSON), `Some(Value::Null)`
 /// records an explicitly unknown CRS, anything else is written verbatim.
-pub(crate) fn geo_meta(primary: &str, stats: &GeomStats, crs: Option<Value>) -> Value {
-    geo_meta_with_proj4(primary, stats, crs, None)
+pub(crate) fn geo_meta(
+    primary: &str,
+    covering: &str,
+    stats: &GeomStats,
+    crs: Option<Value>,
+) -> Value {
+    geo_meta_with_proj4(primary, covering, stats, crs, None)
 }
 
 /// `geo_meta` with an optional vendor CRS: when the source CRS has no
@@ -142,6 +185,9 @@ pub(crate) fn geo_meta(primary: &str, stats: &GeomStats, crs: Option<Value>) -> 
 /// for correct display. Other readers ignore it.
 pub(crate) fn geo_meta_with_proj4(
     primary: &str,
+    // The covering column's actual name: `bbox` unless an attribute of
+    // that name kept it (see `covering_field`).
+    covering: &str,
     stats: &GeomStats,
     crs: Option<Value>,
     proj4: Option<(String, String)>,
@@ -160,15 +206,20 @@ pub(crate) fn geo_meta_with_proj4(
     if b[0].is_finite() && b[2].is_finite() {
         col["bbox"] = json!([b[0], b[1], b[2], b[3]]);
     }
-    col["covering"] = json!({"bbox": {
-        "xmin": ["bbox", "xmin"], "ymin": ["bbox", "ymin"],
-        "xmax": ["bbox", "xmax"], "ymax": ["bbox", "ymax"],
-    }});
+    col["covering"] = covering_json(covering);
     json!({
         "version": "1.1.0",
         "primary_column": primary,
         "columns": { primary: col },
     })
+}
+
+/// The `covering` block naming one column's four bbox leaves.
+pub(crate) fn covering_json(covering: &str) -> Value {
+    json!({"bbox": {
+        "xmin": [covering, "xmin"], "ymin": [covering, "ymin"],
+        "xmax": [covering, "xmax"], "ymax": [covering, "ymax"],
+    }})
 }
 
 /// Geometry bookkeeping every importer needs: observed geometry types
@@ -177,6 +228,12 @@ pub(crate) fn geo_meta_with_proj4(
 pub(crate) struct GeomStats {
     pub types: BTreeSet<String>,
     pub bbox: [f64; 4],
+    /// Features whose geometry could not be read or encoded and were
+    /// therefore written as null. A silent null is indistinguishable
+    /// from a source row that genuinely had no geometry, so the count
+    /// is what lets the import result say "5 of 200k skipped" instead
+    /// of nothing at all.
+    pub skipped: u64,
 }
 
 impl GeomStats {
@@ -184,6 +241,7 @@ impl GeomStats {
         Self {
             types: BTreeSet::new(),
             bbox: [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
+            skipped: 0,
         }
     }
 
@@ -292,5 +350,37 @@ impl AttrBuilder {
             Self::Text(b) => Arc::new(b.finish()),
             Self::Blob(b) => Arc::new(b.finish()),
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::path::Path;
+
+    /// Every row group of an import stays inside the byte cap the
+    /// writer was given, plus the one batch the cap cannot cut inside.
+    ///
+    /// The quality scorecard's own ceiling (`quality::RG_BYTES_MAX`,
+    /// 128 MB) is the number that matters to a reader, but asserting on
+    /// it needs a fixture larger than a unit test should write; the
+    /// importer's own 16 MB target catches the same bug an order of
+    /// magnitude sooner, so both are checked.
+    pub(crate) fn assert_row_groups_bounded(path: &Path) {
+        use parquet::file::reader::FileReader;
+        let f = std::fs::File::open(path).unwrap();
+        let r = parquet::file::reader::SerializedFileReader::new(f).unwrap();
+        let sizes: Vec<i64> =
+            r.metadata().row_groups().iter().map(|g| g.total_byte_size()).collect();
+        let max = sizes.iter().copied().max().unwrap_or(0) as usize;
+        let ceiling = super::IMPORT_ROW_GROUP_BYTES + super::IMPORT_BATCH_BYTES;
+        assert!(
+            max <= ceiling,
+            "largest row group {max} B over the {ceiling} B ceiling ({} groups: {sizes:?})",
+            sizes.len()
+        );
+        assert!(
+            max as u64 <= crate::data::quality::RG_BYTES_MAX,
+            "largest row group {max} B over the scorecard's ceiling"
+        );
     }
 }

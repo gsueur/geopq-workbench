@@ -6,7 +6,7 @@
 //! pass runs on it, so "Merge with…" in the Optimize dialog gets every
 //! Optimize capability for free.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{new_null_array, ArrayRef, BinaryBuilder, StringArray};
@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use super::crs::{transform_point, Crs};
 use super::import::{
-    bbox_field, geo_meta_with_proj4, to_wkb, writer_props, BboxBuilder, GeomStats,
+    covering_field, geo_meta_with_proj4, to_wkb, writer_props, BboxBuilder, GeomStats,
     IMPORT_WRITE_ROWS,
 };
 use super::store::FeatureStore;
@@ -80,6 +80,38 @@ pub fn union_schema(inputs: &[MergeInput]) -> (Vec<Field>, Vec<String>) {
     (fields, dropped)
 }
 
+/// A staging file that removes itself.
+///
+/// The merged file is written for the optimize pass that reads it and
+/// has no life after that, but the cleanup used to be a line at the end
+/// of the worker: a panic or an early return between the two left a
+/// multi-gigabyte file in the temp directory. The name carries a
+/// counter as well as the pid, because a name keyed on the pid alone is
+/// reused by the next run of a recycled pid.
+pub struct Staged(PathBuf);
+
+impl Staged {
+    pub fn new(tag: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        Self(std::env::temp_dir().join(format!(
+            "{tag}_{}_{n}.parquet",
+            std::process::id()
+        )))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Merge `inputs` (first = primary: its CRS is the target) into a raw
 /// WKB GeoParquet at `dst`. `source_col` adds a text column naming the
 /// layer each row came from. Returns rows written.
@@ -119,8 +151,10 @@ pub fn merge(
     if source_col {
         fields.push(Field::new(&src_name, DataType::Utf8, true));
     }
-    // The metadata declares a covering column, so one gets written.
-    fields.push(bbox_field());
+    // The metadata declares a covering column, so one gets written —
+    // under a name no merged attribute has already claimed.
+    let (cov_name, cov_field) = covering_field(&fields);
+    fields.push(cov_field);
     let schema = Arc::new(Schema::new(fields));
 
     let out = std::fs::File::create(dst).map_err(|e| format!("cannot create output: {e}"))?;
@@ -134,13 +168,16 @@ pub fn merge(
     for input in inputs {
         let reproject = !input.crs.same_as(target);
         // Where each union column lives in this layer (by exact name).
+        // The layer's own field list is built once: rebuilding it inside
+        // the lookup cloned every field of every layer once per union
+        // column, which on a wide merge is the schema squared.
+        let own = attr_fields(&input.store);
         let col_of: Vec<Option<usize>> = attrs
             .iter()
             .map(|u| {
-                attr_fields(&input.store)
-                    .into_iter()
+                own.iter()
                     .find(|(_, f)| f.name() == u.name())
-                    .map(|(i, _)| i)
+                    .map(|(i, _)| *i)
             })
             .collect();
         let fetch_cols: Vec<usize> = col_of.iter().filter_map(|c| *c).collect();
@@ -172,7 +209,13 @@ pub fn merge(
                                 geom_b.append_value(w);
                                 bbox_b.push(env);
                             }
+                            // A geometry that will not encode is one
+                            // dropped feature, not a failed merge — but
+                            // it is counted, or a reprojection that
+                            // fails for a whole layer merges as a field
+                            // of silent nulls.
                             Err(_) => {
+                                stats.skipped += 1;
                                 geom_b.append_null();
                                 bbox_b.push(None);
                             }
@@ -231,10 +274,18 @@ pub fn merge(
         }
     }
 
+    if stats.skipped > 0 {
+        log::warn!(
+            "merge: {} of {written} features could not be encoded and were \
+             written as null",
+            stats.skipped
+        );
+    }
+
     let (crs, proj4) = crs_to_geo(target);
     writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
         "geo".to_string(),
-        geo_meta_with_proj4(&geom_name, &stats, crs, proj4).to_string(),
+        geo_meta_with_proj4(&geom_name, &cov_name, &stats, crs, proj4).to_string(),
     ));
     writer.close().map_err(|e| format!("finalize failed: {e}"))?;
     Ok(written)
@@ -390,6 +441,63 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    /// A merged layer carrying an attribute called `bbox`: the covering
+    /// column steps aside instead of colliding with it, and the geo
+    /// metadata points at the one that holds boxes.
+    #[test]
+    fn an_attribute_named_bbox_survives_the_merge() {
+        use arrow::array::Int64Array;
+
+        let dir = std::env::temp_dir().join("geopq_merge_bbox_attr");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let write = |path: &Path, x: f64, y: f64, v: i64| {
+            let mut geom = BinaryBuilder::new();
+            let g = geo_types::Geometry::Point(geo_types::Point::new(x, y));
+            geom.append_value(to_wkb(&g).unwrap());
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("geometry", DataType::Binary, true),
+                Field::new("bbox", DataType::Int64, true),
+            ]));
+            let arrays: Vec<ArrayRef> =
+                vec![Arc::new(geom.finish()), Arc::new(Int64Array::from(vec![v]))];
+            let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+            let f = std::fs::File::create(path).unwrap();
+            let mut w = ArrowWriter::try_new(f, schema, Some(writer_props())).unwrap();
+            w.write(&batch).unwrap();
+            w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+                "geo".to_string(),
+                json!({"version": "1.1.0", "primary_column": "geometry",
+                       "columns": {"geometry": {"encoding": "WKB",
+                       "geometry_types": ["Point"], "crs": null}}})
+                .to_string(),
+            ));
+            w.close().unwrap();
+        };
+        let a = dir.join("a.parquet");
+        let b = dir.join("b.parquet");
+        write(&a, 2.0, 48.0, 1);
+        write(&b, 3.0, 49.0, 2);
+
+        let (sa, ca, ..) = open_store_for_test(&a).unwrap();
+        let (sb, cb, ..) = open_store_for_test(&b).unwrap();
+        let inputs = vec![
+            MergeInput { store: Arc::new(sa), crs: ca, name: "alpha".into() },
+            MergeInput { store: Arc::new(sb), crs: cb, name: "beta".into() },
+        ];
+        let dst = dir.join("merged.parquet");
+        assert_eq!(merge(&inputs, &dst, false, &|_, _| {}).unwrap(), 2);
+
+        let (store, _crs, info, _) = open_store_for_test(&dst).unwrap();
+        let sc = store.schema.clone();
+        assert_eq!(sc.field_with_name("bbox").unwrap().data_type(), &DataType::Int64);
+        assert!(sc.field_with_name("bbox_1").is_ok(), "covering renamed around it");
+        let covering = info.geo.covering.expect("covering declared");
+        assert!(covering.contains("\"bbox_1\""), "{covering}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -330,30 +330,44 @@ pub fn split_by_field_codes(
             Ok((encode_hive_component(&f.name), values))
         })
         .collect::<Result<_, _>>()?;
-    let mut parts: HashMap<String, Vec<u32>> = HashMap::new();
+    // Bucketed on the dictionary codes, not on the formatted path: the
+    // path is the same string for every row of a partition, and building
+    // it per row cost a `Vec`, a `String` per field and a join — five
+    // allocations a row — to produce one of at most `MAX_PARTITIONS`
+    // distinct answers. The codes are a fixed-width key, so each
+    // directory name is formatted once, when its bucket is created.
+    let mut parts: HashMap<Vec<u32>, (String, Vec<u32>)> = HashMap::new();
+    // Reused across rows; only a new bucket ever clones it.
+    let mut key: Vec<u32> = Vec::with_capacity(fields.len());
     for &r in order {
-        let dir = fields
-            .iter()
-            .zip(&encoded)
-            .map(|(f, (name, values))| {
-                let v = f
-                    .codes
-                    .get(r as usize)
-                    .and_then(|&c| values.get(c as usize))
-                    .map(String::as_str)
-                    .unwrap_or(NULL_PARTITION);
-                format!("{name}={v}")
-            })
-            .collect::<Vec<_>>()
-            .join("/");
-        parts.entry(dir).or_default().push(r);
-        if parts.len() > MAX_PARTITIONS {
-            return Err(format!(
-                "more than {MAX_PARTITIONS} partitions — pick lower-cardinality fields"
-            ));
+        key.clear();
+        key.extend(
+            fields
+                .iter()
+                .map(|f| f.codes.get(r as usize).copied().unwrap_or(u32::MAX)),
+        );
+        match parts.get_mut(key.as_slice()) {
+            Some((_, rows)) => rows.push(r),
+            None => {
+                let dir = key
+                    .iter()
+                    .zip(&encoded)
+                    .map(|(&c, (name, values))| {
+                        let v = values.get(c as usize).map(String::as_str).unwrap_or(NULL_PARTITION);
+                        format!("{name}={v}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/");
+                parts.insert(key.clone(), (dir, vec![r]));
+                if parts.len() > MAX_PARTITIONS {
+                    return Err(format!(
+                        "more than {MAX_PARTITIONS} partitions — pick lower-cardinality fields"
+                    ));
+                }
+            }
         }
     }
-    let mut out: Vec<(String, Vec<u32>)> = parts.into_iter().collect();
+    let mut out: Vec<(String, Vec<u32>)> = parts.into_values().collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
@@ -475,6 +489,22 @@ fn adaptive_cells(
                 work.entry(coarse).or_default().push(r);
             }
         }
+    }
+
+    // The ceiling applies to the bucketing as well as to the splitting.
+    // It used to live inside the split branch only, which reads as a
+    // guard on the whole descent and is not one: `split_pyramid_leaf`
+    // starts at the reference resolution, so a layer already spread over
+    // fifty thousand cells there produced fifty thousand leaves without
+    // ever splitting anything — a file each, and a sweep of the sorted
+    // order per thirty-two of them.
+    if work.len() > MAX_PARTITIONS {
+        return Err(format!(
+            "the layer covers {} cells at r{} — more than the {MAX_PARTITIONS} files \
+             this build writes; choose a coarser resolution",
+            work.len(),
+            u8::from(start_res)
+        ));
     }
 
     let mut done: Vec<(CellIndex, Vec<u32>)> = Vec::new();

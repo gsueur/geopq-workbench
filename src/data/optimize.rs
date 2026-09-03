@@ -29,6 +29,7 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Float64Array, StructArray, UInt32Array};
@@ -60,6 +61,28 @@ const DECODE_BUDGET_BYTES: usize = 768 << 20;
 /// pays on top of the decode budget; more partitions than this are written
 /// in several sweeps of the sorted order.
 const MAX_OPEN_WRITERS: usize = 32;
+/// Decode work this build is willing to do in the gather pass: sweeps of
+/// the sorted order times the source's uncompressed size. Each sweep
+/// re-reads every selected source row group through the gather cache,
+/// so the cost is that product, not the file count: 4096 parts over a
+/// 200 MB source is 25 GB of decode and finishes; the same plan over a
+/// 20 GB source is 2.5 TB and does not. Refusing with both numbers in
+/// the message is more use than a progress bar that reaches 3% in ten
+/// minutes.
+const MAX_SWEEP_BYTES: u64 = 32 << 30;
+
+/// The decode budget in force: the constant, unless a test lowered it to
+/// exercise the refusal on a fixture that fits in a few kilobytes.
+fn sweep_budget() -> u64 {
+    #[cfg(test)]
+    {
+        let o = tests::SWEEP_BUDGET_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if o > 0 {
+            return o;
+        }
+    }
+    MAX_SWEEP_BYTES
+}
 /// Ceiling on the key pass's side tables. They are the one thing left that
 /// grows with the input, so this is where a rewrite that cannot fit says so
 /// instead of being OS-killed halfway through.
@@ -358,16 +381,28 @@ impl CogpUnits {
     /// latitude does not, and would let a cluster spanning a boundary keep
     /// two winners at the same level.
     fn cell(self, b: &[f64; 4], pitch: f64) -> (i64, i64) {
+        cell_of(self.centre_m(b), pitch)
+    }
+
+    /// A bbox centre in metres, in whatever plane `cell` grids on. Split
+    /// out because the level assignment re-grids the same points at
+    /// every level: the projection is worth doing once per point, the
+    /// division once per point per level.
+    fn centre_m(self, b: &[f64; 4]) -> (f64, f64) {
         let (cx, cy) = ((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5);
-        let (mx, my) = match self {
+        match self {
             CogpUnits::Linear(f) => (cx * f, cy * f),
             CogpUnits::Degrees => (
                 cx * M_PER_DEG_LON * cy.to_radians().cos(),
                 cy * M_PER_DEG_LAT,
             ),
-        };
-        ((mx / pitch).floor() as i64, (my / pitch).floor() as i64)
+        }
     }
+}
+
+/// The grid cell a metre position falls in at `pitch` metres.
+fn cell_of((mx, my): (f64, f64), pitch: f64) -> (i64, i64) {
+    ((mx / pitch).floor() as i64, (my / pitch).floor() as i64)
 }
 
 /// Metres per linear unit of a proj string (`+to_meter`, or the unit names
@@ -522,17 +557,19 @@ fn assign_cogp_levels(
         }
     }
     // Points already placed, re-projected onto each new level's grid to
-    // block its cells.
-    let mut placed_points: Vec<u32> = Vec::new();
+    // block its cells. Held as metre positions rather than row indices:
+    // the projection is the same at every level (only the pitch
+    // changes), and recomputing it meant a cosine and a bbox lookup per
+    // placed point per level — seventeen levels' worth of trigonometry
+    // over a growing set.
+    let mut placed_m: Vec<(f64, f64)> = Vec::new();
     for (li, gsd) in gsds.iter().enumerate() {
         if remaining.is_empty() {
             break;
         }
         let pitch = gsd * opts.point_factor as f64;
-        let blocked: HashSet<(i64, i64)> = placed_points
-            .iter()
-            .map(|&r| units.cell(&bboxes[r as usize].unwrap(), pitch))
-            .collect();
+        let mut blocked: HashSet<(i64, i64)> = HashSet::with_capacity(placed_m.len());
+        blocked.extend(placed_m.iter().map(|&m| cell_of(m, pitch)));
         let mut best: HashMap<(i64, i64), u32> = HashMap::new();
         let mut picked: Vec<u32> = Vec::new();
         for &r in &remaining {
@@ -565,7 +602,11 @@ fn assign_cogp_levels(
             }
         }
         let winners: Vec<u32> = best.into_values().collect();
-        placed_points.extend(winners.iter().copied());
+        placed_m.extend(
+            winners
+                .iter()
+                .map(|&r| units.centre_m(&bboxes[r as usize].unwrap())),
+        );
         picked.extend(winners);
         if picked.is_empty() {
             continue;
@@ -1009,15 +1050,28 @@ fn scan_batch(batch: &RecordBatch, plan: &ScanPlan, out: &mut ScanOut) -> Result
     }
 
     use arrow::util::display::{ArrayFormatter, FormatOptions};
+    use std::fmt::Write as _;
     let fopts = FormatOptions::default().with_display_error(true);
+    // One buffer for the whole batch. `to_string()` per row allocated a
+    // `String` for every row of every partition field only to hand a
+    // `&str` to the interner, which keeps at most one copy per distinct
+    // value: on a partitioned export of a large layer that was millions
+    // of allocations with a ~100% free rate.
+    let mut buf = String::new();
     for (slot, &(field, col_idx)) in plan.part_src.iter().enumerate() {
         let name = &plan.part_names[field];
         let col = batch.column(plan.map.pos(col_idx));
         let f = ArrayFormatter::try_new(col.as_ref(), &fopts)
             .map_err(|e| format!("partition field '{name}': {e}"))?;
         for &i in &keep {
-            let v = (!col.is_null(i)).then(|| f.value(i).to_string());
-            out.interners[slot].push(v.as_deref())?;
+            if col.is_null(i) {
+                out.interners[slot].push(None)?;
+                continue;
+            }
+            buf.clear();
+            write!(buf, "{}", f.value(i))
+                .map_err(|e| format!("partition field '{name}': {e}"))?;
+            out.interners[slot].push(Some(buf.as_str()))?;
         }
     }
     out.scanned += batch.num_rows() as u64;
@@ -1098,24 +1152,59 @@ struct StagedOutputs {
     partitioned: bool,
     /// What has been written, for the flush that precedes the rename.
     files: Vec<PathBuf>,
+    /// A previous dataset moved out of the way and not yet disposed of.
+    /// Set only between the two renames of a partitioned commit, so
+    /// anything that ends the run in between can put it back.
+    aside: Option<PathBuf>,
     committed: bool,
+}
+
+/// A number no other aside in this process reuses. Paired with the pid,
+/// which is all that separates one process's leftovers from another's.
+fn aside_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    t.wrapping_mul(1000).wrapping_add(n)
+}
+
+/// Flush the directory entry a just-published name lives in. The rename
+/// is the moment the output exists; a crash before its parent directory
+/// reaches the device loses the name and leaves the bytes orphaned.
+fn sync_parent(path: &Path) {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+        && let Ok(d) = File::open(parent)
+    {
+        let _ = d.sync_all();
+    }
 }
 
 impl StagedOutputs {
     fn new(dst: &Path, partitioned: bool) -> Result<Self, String> {
         let staging = partial_path(dst)?;
+        // A staging leftover from a dead process is not this run's work
+        // and must never be published as if it were. Both shapes get the
+        // same treatment: the single-file branch skipped it, and while
+        // `File::create` does truncate the stale file, a run that fails
+        // before writing anything would otherwise have published the
+        // previous run's abandoned prefix.
         if partitioned {
-            // A staging tree left by a dead process is not this run's work
-            // and must never be published as if it were.
             let _ = std::fs::remove_dir_all(&staging);
             std::fs::create_dir_all(&staging)
                 .map_err(|e| format!("cannot create {}: {e}", staging.display()))?;
+        } else {
+            let _ = std::fs::remove_file(&staging);
         }
         Ok(Self {
             staging,
             dst: dst.to_path_buf(),
             partitioned,
             files: Vec::new(),
+            aside: None,
             committed: false,
         })
     }
@@ -1172,14 +1261,31 @@ impl StagedOutputs {
         // A rename is metadata. Publishing a name that points at unsynced
         // bytes is a worse failure than the truncation this replaced, so
         // all the real I/O happens here, before anything is published.
-        for p in &self.files {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(p)
-                .and_then(|f| f.sync_all())
-                .map_err(|e| format!("cannot flush {}: {e}", p.display()))?;
-        }
-        for dir in self.files.iter().filter_map(|p| p.parent()).collect::<HashSet<_>>() {
+        //
+        // In parallel: a `fsync` is a device round trip that spends its
+        // time waiting, and a pyramid publishes thousands of parts, so
+        // one after another made the flush the longest step of the whole
+        // export on a network filesystem.
+        use rayon::prelude::*;
+        self.files
+            .par_iter()
+            .try_for_each(|p| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(p)
+                    .and_then(|f| f.sync_all())
+                    .map_err(|e| format!("cannot flush {}: {e}", p.display()))
+            })?;
+        // Then the directories the names live in, the staging root
+        // included: a directory entry is itself unsynced metadata, and
+        // the root is what the rename below moves.
+        for dir in self
+            .files
+            .iter()
+            .filter_map(|p| p.parent())
+            .chain(std::iter::once(self.staging.as_path()))
+            .collect::<HashSet<_>>()
+        {
             if let Ok(d) = File::open(dir) {
                 let _ = d.sync_all();
             }
@@ -1191,38 +1297,70 @@ impl StagedOutputs {
             std::fs::rename(&self.staging, &self.dst)
                 .map_err(|e| format!("cannot finalize {}: {e}", self.dst.display()))?;
             self.committed = true;
+            sync_parent(&self.dst);
             return Ok(vec![self.dst.clone()]);
         }
         // A directory rename cannot replace a directory, so an existing
         // dataset steps aside first — removed once the new one is in
         // place, put back if it never gets there.
+        //
+        // The aside name carries a counter as well as the pid: a name
+        // keyed on the pid alone collides with what a previous run of
+        // the same pid left behind, and the collision is silent — the
+        // rename succeeds onto the leftover and the dataset it was
+        // holding is gone.
         let aside = self.dst.with_file_name(format!(
-            "{}.replaced-{}",
+            "{}.replaced-{}-{}",
             self.dst.file_name().unwrap_or_default().to_string_lossy(),
-            std::process::id()
+            std::process::id(),
+            aside_seq()
         ));
-        let displaced = self.dst.exists();
-        if displaced {
+        // What is there decides how it is removed later: `remove_dir_all`
+        // on a file fails, and the error was discarded, so replacing a
+        // single-file output with a dataset left a `<name>.replaced-<pid>`
+        // file behind for good.
+        let displaced = std::fs::symlink_metadata(&self.dst).ok();
+        if displaced.is_some() {
             std::fs::rename(&self.dst, &aside)
                 .map_err(|e| format!("cannot replace {}: {e}", self.dst.display()))?;
+            // From here until the forward rename lands, the user's data
+            // exists only under the aside name. Recording it is what
+            // lets `Drop` put it back when the second rename never runs
+            // — an injected failure, a cancel, an error in between.
+            self.aside = Some(aside.clone());
         }
+        fail_commit(1)?;
         if let Err(e) = std::fs::rename(&self.staging, &self.dst) {
-            if displaced && std::fs::rename(&aside, &self.dst).is_err() {
-                // The forward rename and the restore failed the same way;
-                // the previous dataset is intact, but the error must say
-                // where, or the user cannot find their own data.
-                return Err(format!(
-                    "cannot finalize {}: {e}\n(the previous dataset is at {})",
-                    self.dst.display(),
-                    aside.display()
-                ));
+            if displaced.is_some() {
+                match std::fs::rename(&aside, &self.dst) {
+                    Ok(()) => self.aside = None,
+                    // The forward rename and the restore failed the same
+                    // way; the previous dataset is intact, but the error
+                    // must say where, or the user cannot find their own
+                    // data.
+                    Err(_) => {
+                        return Err(format!(
+                            "cannot finalize {}: {e}\n(the previous dataset is at {})",
+                            self.dst.display(),
+                            aside.display()
+                        ))
+                    }
+                }
             }
             return Err(format!("cannot finalize {}: {e}", self.dst.display()));
         }
         self.committed = true;
-        if displaced {
-            let _ = std::fs::remove_dir_all(&aside);
+        self.aside = None;
+        match displaced {
+            Some(md) if md.is_dir() => {
+                let _ = std::fs::remove_dir_all(&aside);
+            }
+            Some(_) => {
+                let _ = std::fs::remove_file(&aside);
+            }
+            None => {}
         }
+        sync_parent(&self.dst);
         let staging = self.staging.clone();
         Ok(self
             .files
@@ -1243,6 +1381,19 @@ impl Drop for StagedOutputs {
             let _ = std::fs::remove_dir_all(&self.staging);
         } else {
             let _ = std::fs::remove_file(&self.staging);
+        }
+        // A previous dataset that stepped aside and was never replaced
+        // goes back where the user left it. Without this, a failure
+        // between the two renames published nothing and took the old
+        // dataset with it, leaving it under a name nobody looks for.
+        if let Some(aside) = self.aside.take()
+            && let Err(e) = std::fs::rename(&aside, &self.dst)
+        {
+            log::error!(
+                "could not restore {} from {}: {e}",
+                self.dst.display(),
+                aside.display()
+            );
         }
     }
 }
@@ -1459,6 +1610,11 @@ impl GroupCache {
         self.budget.saturating_sub(self.bytes) + unpinned
     }
 
+    /// Record a peak of decoded source bytes reachable at once.
+    fn note_live(&mut self, live: usize) {
+        self.live_high_water = self.live_high_water.max(live);
+    }
+
     /// Evict unpinned entries, least recently used first, until `want`
     /// bytes are free or nothing else can go. Returns the bytes free.
     fn reserve(&mut self, want: usize) -> usize {
@@ -1604,6 +1760,13 @@ impl<'a> Gatherer<'a> {
         .with_row_groups(vec![self.groups[gi]])
         .with_batch_size(batch_size);
         if let Some(rows) = rows {
+            // The run builder below subtracts positions, so an unsorted
+            // or repeated row would produce a negative skip and panic in
+            // release with an unrelated message.
+            debug_assert!(
+                rows.windows(2).all(|w| w[0] < w[1]),
+                "read_masked wants ascending, unique rows"
+            );
             // Runs, not one selector per row: a gather chunk is usually a
             // handful of contiguous stretches, and the reader skips a run
             // far more cheaply than it skips a thousand single rows.
@@ -1694,6 +1857,10 @@ impl<'a> Gatherer<'a> {
         for res in reader {
             let b = res.map_err(|e| format!("parquet decode error: {e}"))?;
             bytes += b.get_array_memory_size();
+            // Charged as it is read, not once at the end: what a decode
+            // holds is every batch it has taken so far, and a decode
+            // that gives up at the limit still held them.
+            self.cache.note_live(self.cache.bytes + bytes);
             if bytes > limit {
                 // Wider than its metadata predicted. Record what it has
                 // already shown, doubled for the part not yet read, so the
@@ -1703,8 +1870,15 @@ impl<'a> Gatherer<'a> {
             }
             batches.push(b);
         }
+        let concatenated = batches.len() > 1;
         let one = self.join(batches, cols)?;
-        self.measured.insert(gi, one.get_array_memory_size());
+        let size = one.get_array_memory_size();
+        if concatenated {
+            // `concat_batches` holds its inputs and its output at once;
+            // that transient double is the real peak of this decode.
+            self.cache.note_live(self.cache.bytes + bytes + size);
+        }
+        self.measured.insert(gi, size);
         Ok(Some(one))
     }
 
@@ -1721,24 +1895,45 @@ impl<'a> Gatherer<'a> {
     }
 
     /// Decode a whole group for the key pass, keeping it for the gather
-    /// pass when the budget allows. The scan needs the batch either way,
-    /// and this path only runs when the whole selection was measured to
-    /// fit, so the decode itself is not speculative.
-    fn decode_for_scan(&mut self, gi: usize) -> Result<Arc<RecordBatch>, String> {
-        let batch = self
-            .decode_group(gi, usize::MAX)?
-            .ok_or("row group decoded to nothing")?;
+    /// pass when the budget allows. `None` means the group's arrow form
+    /// did not fit and the caller must read it in batches instead.
+    ///
+    /// The limit matters more here than anywhere: the decision to take
+    /// this path is made from the *parquet* uncompressed size, and a
+    /// column of dictionary-encoded text expands by two orders of
+    /// magnitude on the way into arrow. Passing `usize::MAX` meant a
+    /// group deemed resident on 40 MB of footer arithmetic decoded into
+    /// sixteen batches and then concatenated — twice its arrow size,
+    /// live, before anything measured it.
+    fn decode_for_scan(&mut self, gi: usize) -> Result<Option<Arc<RecordBatch>>, String> {
+        // Half, because the concatenation at the end of the decode holds
+        // the batches and their join at the same time.
+        let limit = self.cache.free_ceiling() / 2;
+        let Some(batch) = self.decode_group(gi, limit)? else {
+            return Ok(None);
+        };
         let size = batch.get_array_memory_size();
         let batch = Arc::new(batch);
         if self.cache.reserve(size) >= size {
             self.cache.admit(gi, Arc::clone(&batch), size);
             self.cache.release();
         }
-        Ok(batch)
+        Ok(Some(batch))
     }
 
     /// The given source rows, in the given (output) order, as one batch.
+    ///
+    /// The pins the gather takes are released whatever happens: they are
+    /// scoped to one chunk, and a decode that fails halfway used to
+    /// leave them set, so every later gather saw part of the cache as
+    /// permanently unevictable and re-decoded around it.
     fn gather(&mut self, rows: &[u32]) -> Result<RecordBatch, String> {
+        let out = self.gather_pinned(rows);
+        self.cache.release();
+        out
+    }
+
+    fn gather_pinned(&mut self, rows: &[u32]) -> Result<RecordBatch, String> {
         let of: Vec<usize> = rows.iter().map(|&r| self.group_of(r)).collect();
         let mut distinct = of.clone();
         distinct.sort_unstable();
@@ -1792,7 +1987,7 @@ impl<'a> Gatherer<'a> {
         // under a live `Arc`, with the metric reporting nothing wrong.
         let live = residents.iter().map(Resident::bytes).sum::<usize>()
             + self.cache.bytes.saturating_sub(self.cache.pinned_slot_bytes());
-        self.cache.live_high_water = self.cache.live_high_water.max(live);
+        self.cache.note_live(live);
 
         let indices: Vec<(usize, usize)> = rows
             .iter()
@@ -1806,8 +2001,21 @@ impl<'a> Gatherer<'a> {
         let out = interleave_record_batch(&refs, &indices)
             .map_err(|e| format!("gather failed: {e}"))?;
         drop(residents);
-        self.cache.release();
         Ok(out)
+    }
+}
+
+/// `Err(CANCELLED)` once the caller has asked to stop.
+///
+/// Checked in the three loops that own the run's minutes rather than
+/// polled by the caller, because stopping has to unwind through
+/// `StagedOutputs::drop`: that is what removes the half-written staging
+/// tree. Killing the process instead leaves a `<dst>.partial` behind —
+/// which is why the next run removes a stale one.
+fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
+    match cancel.load(Ordering::Relaxed) {
+        true => Err(super::loader::CANCELLED.to_string()),
+        false => Ok(()),
     }
 }
 
@@ -1818,6 +2026,7 @@ pub fn optimize(
     epsg_hint: Option<u32>,
     admin: Option<&super::partition::AdminJoinSpec>,
     progress: &dyn Fn(f32, &str),
+    cancel: &AtomicBool,
 ) -> Result<OptimizeReport, String> {
     let t0 = std::time::Instant::now();
     progress(0.0, "reading metadata");
@@ -2242,14 +2451,24 @@ pub fn optimize(
     };
     let key_plan = ScanPlan { map: &key_map, ..base_plan };
     for gi in 0..keep_groups.len() {
+        check_cancel(cancel)?;
         scan.group_box = None;
-        if resident {
-            let batch = gather.decode_for_scan(gi)?;
-            scan_batch(&batch, &base_plan, &mut scan)?;
-        } else {
-            for res in gather.read_masked(gi, None, &key_mask, READ_BATCH)? {
-                let batch = res.map_err(|e| format!("parquet decode error: {e}"))?;
-                scan_batch(&batch, &key_plan, &mut scan)?;
+        // `resident` is a guess made from the footer; the decode is what
+        // finds out. A group that does not fit falls back to the
+        // streaming key pass for itself alone — the same read the
+        // non-resident branch does, and the only difference downstream
+        // is that the gather pass will have to re-read it.
+        let whole = match resident {
+            true => gather.decode_for_scan(gi)?,
+            false => None,
+        };
+        match whole {
+            Some(batch) => scan_batch(&batch, &base_plan, &mut scan)?,
+            None => {
+                for res in gather.read_masked(gi, None, &key_mask, READ_BATCH)? {
+                    let batch = res.map_err(|e| format!("parquet decode error: {e}"))?;
+                    scan_batch(&batch, &key_plan, &mut scan)?;
+                }
             }
         }
         rg_boxes_before.extend(scan.group_box);
@@ -2690,6 +2909,24 @@ pub fn optimize(
             *max_res,
         )?,
     };
+    // Said here rather than discovered at sweep three: the plan is
+    // complete, nothing has been written, and the cost of the plan is
+    // arithmetic on its file count.
+    let sweeps = parts.len().div_ceil(MAX_OPEN_WRITERS) as u64;
+    let sweep_bytes = sweeps.saturating_mul(uncompressed);
+    let budget = sweep_budget();
+    if sweep_bytes > budget {
+        return Err(format!(
+            "{} output files would need {sweeps} passes over the source \
+             ({MAX_OPEN_WRITERS} files are written per pass), about {} of \
+             decoding against the {} this build allows — raise the \
+             rows-per-file target, choose a coarser resolution, or partition \
+             on a lower-cardinality field",
+            parts.len(),
+            crate::data::info::fmt_bytes(sweep_bytes),
+            crate::data::info::fmt_bytes(budget),
+        ));
+    }
 
     // --- gather pass: re-read the source in sorted order and write ---
     progress(0.45, "writing");
@@ -2766,6 +3003,9 @@ pub fn optimize(
         _ => 0.55,
     };
     let mut staged = StagedOutputs::new(dst, partitioned)?;
+    // Pyramid leaf files, in `parts` order (which is `leaf_parts`
+    // order): filled by the writer loop below.
+    let mut leaf_paths: Vec<PathBuf> = Vec::new();
     let mut rg_after_boxes: Vec<[f64; 4]> = Vec::new();
     let mut rg_after = 0usize;
     let mut written = 0usize;
@@ -2781,7 +3021,16 @@ pub fn optimize(
             // A pyramid part is a file named by its cell; a hive part is
             // a directory the conventional `part-0.parquet` goes in.
             let out_file = match &pyramid {
-                Some(_) => staged.create_at(rel)?.0,
+                Some(_) => {
+                    // Kept as the part is created rather than read back
+                    // out of `staged.files` afterwards: that list also
+                    // holds the descriptor and anything else staged,
+                    // and pairing it with `leaf_parts` by position was
+                    // an assumption nothing enforced.
+                    let (f, path) = staged.create_at(rel)?;
+                    leaf_paths.push(path);
+                    f
+                }
                 None => staged.create(rel)?,
             };
             let mut writer =
@@ -2846,6 +3095,7 @@ pub fn optimize(
             }
         }
         for (range, at_level_end) in chunks {
+            check_cancel(cancel)?;
             let chunk = &sweep[range];
             let src_rows: Vec<u32> = chunk.iter().map(|&r| kept[r as usize]).collect();
             let gathered = gather.gather(&src_rows)?;
@@ -2977,8 +3227,6 @@ pub fn optimize(
     let mut pyramid_note: Option<String> = None;
     if let Some(p) = &pyramid {
         use super::pyramid as pyr;
-        // Leaf files, in creation order, which is `leaf_parts` order.
-        let leaf_paths: Vec<PathBuf> = staged.files.clone();
         // Per-resolution leaf totals: cells, rows, bytes, files.
         let mut leaf_levels: std::collections::BTreeMap<
             u8,
@@ -3015,7 +3263,6 @@ pub fn optimize(
         // geometry (overviews are derived data, written in the most
         // portable flavour) and no auxiliary GeoArrow twin.
         let mut ov_fields: Vec<Field> = Vec::new();
-        let mut pass_attrs: Vec<String> = Vec::new();
         for f in out_schema.fields() {
             if f.name() == &primary {
                 ov_fields.push(Field::new(&primary, DataType::Binary, true));
@@ -3024,7 +3271,6 @@ pub fn optimize(
             {
                 continue; // the covering is rebuilt from the derived geometry
             } else {
-                pass_attrs.push(f.name().clone());
                 ov_fields.push(f.as_ref().clone());
             }
         }
@@ -3067,7 +3313,6 @@ pub fn optimize(
             reference_res: p.reference_res,
             pass_schema,
             dissolve_schema,
-            pass_attrs,
             primary: primary.clone(),
             covering_name: covering_name.clone(),
             write_covering,
@@ -3084,6 +3329,7 @@ pub fn optimize(
             crs_explicit_null,
             units: cogp_units.unwrap_or(CogpUnits::Linear(1.0)),
             props: &make_props,
+            cancel,
         };
         let overviews = match p.from_res {
             Some(_) => build_overviews(&mut staged, &ctx, &sources, progress, (0.85, 0.99))?,
@@ -3258,19 +3504,24 @@ fn transcode_geometry(
         }
         GeomOut::ToWkb => {
             let opts = wkb::writer::WriteOptions::default();
+            // Straight into the builder's own buffer. The reused `buf`
+            // was defeated by cloning it per feature, and the resulting
+            // `Vec<Option<Vec<u8>>>` was then copied a second time into
+            // the array — two allocations and two copies per geometry on
+            // the hottest loop of a transcoding rewrite.
+            let mut b = arrow::array::BinaryBuilder::with_capacity(col.len(), col.len() * 64);
             let mut buf: Vec<u8> = Vec::new();
-            let values: Vec<Option<Vec<u8>>> = (0..col.len())
-                .map(|i| -> Result<Option<Vec<u8>>, String> {
-                    let Some(g) = geoms.geometry(i) else {
-                        return Ok(None);
-                    };
-                    buf.clear();
-                    wkb::writer::write_geometry(&mut buf, &g, &opts)
-                        .map_err(|e| format!("WKB encode: {e}"))?;
-                    Ok(Some(buf.clone()))
-                })
-                .collect::<Result<_, _>>()?;
-            Ok(Arc::new(arrow::array::BinaryArray::from_iter(values)))
+            for i in 0..col.len() {
+                let Some(g) = geoms.geometry(i) else {
+                    b.append_null();
+                    continue;
+                };
+                buf.clear();
+                wkb::writer::write_geometry(&mut buf, &g, &opts)
+                    .map_err(|e| format!("WKB encode: {e}"))?;
+                b.append_value(&buf);
+            }
+            Ok(Arc::new(b.finish()))
         }
     }
 }
@@ -3456,10 +3707,18 @@ fn scan_bboxes(
                 if let Some(k) = kinds.as_deref_mut() {
                     k.push(CogpKind::from_type_name(name));
                 }
-                out.push(geom.bounding_rect().map(|r| {
-                    let (min, max) = (r.min(), r.max());
-                    [min.x, min.y, max.x, max.y]
-                }));
+                // Same finiteness rule as the point branch above and as
+                // the importers' `BboxBuilder`: a NaN vertex must not
+                // reach the covering column, where it would make the
+                // row group's statistics unusable rather than absent.
+                out.push(
+                    geom.bounding_rect()
+                        .map(|r| {
+                            let (min, max) = (r.min(), r.max());
+                            [min.x, min.y, max.x, max.y]
+                        })
+                        .and_then(super::import::finite_bbox),
+                );
             }
             None => {
                 out.push(None);
@@ -3507,17 +3766,18 @@ fn build_bbox_column(
     row_bboxes: &[Option<[f64; 4]>],
     bbox_fields: &Fields,
 ) -> ArrayRef {
+    // Re-checked here rather than trusted from the scan: the overview
+    // levels build their boxes from derived geometry (`bbox_of`), and a
+    // simplification that collapses onto a NaN coordinate would put it
+    // in the covering column of every level above it.
+    let at = |r: u32| row_bboxes[r as usize].and_then(super::import::finite_bbox);
     let get = |k: usize| -> ArrayRef {
         Arc::new(Float64Array::from(
-            rows.iter()
-                .map(|&r| row_bboxes[r as usize].map(|b| b[k]))
-                .collect::<Vec<_>>(),
+            rows.iter().map(|&r| at(r).map(|b| b[k])).collect::<Vec<_>>(),
         ))
     };
     let validity = NullBuffer::from(
-        rows.iter()
-            .map(|&r| row_bboxes[r as usize].is_some())
-            .collect::<Vec<_>>(),
+        rows.iter().map(|&r| at(r).is_some()).collect::<Vec<_>>(),
     );
     Arc::new(StructArray::new(
         bbox_fields.clone(),
@@ -3618,9 +3878,6 @@ struct OverviewCtx<'a> {
     pass_schema: SchemaRef,
     /// Schema of a dissolved level.
     dissolve_schema: SchemaRef,
-    /// Attribute fields of `pass_schema` (everything but the geometry
-    /// and the covering column), in schema order.
-    pass_attrs: Vec<String>,
     primary: String,
     covering_name: String,
     write_covering: bool,
@@ -3633,6 +3890,9 @@ struct OverviewCtx<'a> {
     crs_explicit_null: bool,
     units: CogpUnits,
     props: &'a dyn Fn() -> WriterProperties,
+    /// Checked once per overview cell: a deep pyramid spends most of
+    /// its time here, long after the leaf pass stopped looking.
+    cancel: &'a AtomicBool,
 }
 
 /// One overview level, as written.
@@ -3676,6 +3936,7 @@ fn build_overviews(
         let mut written: Vec<(CellIndex, PathBuf)> = Vec::with_capacity(cells.len());
         let (mut rows, mut bytes) = (0u64, 0u64);
         for (i, cell) in cells.iter().enumerate() {
+            check_cancel(ctx.cancel)?;
             let inputs = &groups[cell];
             let (n, b, path) = write_overview_cell(staged, ctx, *cell, r, inputs)?;
             rows += n;
@@ -3701,8 +3962,38 @@ fn build_overviews(
     Ok(levels)
 }
 
+/// What an overview file's metadata needs, accumulated feature by
+/// feature as the level is written.
+///
+/// The level used to be built as one `RecordBatch` and measured
+/// afterwards, which is why a cell's whole input had to be in memory at
+/// once. Nothing here grows with the cell: a type name set, a union of
+/// boxes and a count.
+#[derive(Default)]
+struct OverviewAcc {
+    types: HashSet<String>,
+    bbox: Option<[f64; 4]>,
+    rows: u64,
+}
+
+impl OverviewAcc {
+    fn add_geom(&mut self, g: &geo_types::Geometry<f64>) {
+        self.types.insert(geom_type_name(g).to_string());
+        if let Some(b) = bbox_of(g) {
+            self.bbox = union_bboxes(self.bbox.iter().chain(std::iter::once(&b)));
+        }
+    }
+}
+
 /// Derive and write `r<res>/<cell>.parquet` from the files under it.
 /// Returns rows, bytes and the staged path (the next level reads it).
+///
+/// The writer is opened first and the level streams into it. The `geo`
+/// metadata it needs (types, bbox) is accumulated on the way past
+/// rather than measured on a finished batch, because the finished batch
+/// was the problem: at `from_res = reference_res - 3` a single coarse
+/// cell covers 343 reference cells, and with `Simplify` — which drops
+/// no feature — that cell's batch is the whole dataset.
 fn write_overview_cell(
     staged: &mut StagedOutputs,
     ctx: &OverviewCtx,
@@ -3715,33 +4006,26 @@ fn write_overview_cell(
     // overview file covers one cell, so there is a right answer here.
     let centre = h3o::LatLng::from(cell).lat();
     let tol = level_tolerance(res, ctx.pyr.simplify_tolerance_factor, ctx.units, centre);
-    let (batch, schema) = match ctx.vertical {
-        Vertical::Dissolve => (dissolve_cell(ctx, inputs, res, tol)?, &ctx.dissolve_schema),
-        _ => (derive_cell(ctx, inputs, tol)?, &ctx.pass_schema),
+    let schema = match ctx.vertical {
+        Vertical::Dissolve => &ctx.dissolve_schema,
+        _ => &ctx.pass_schema,
     };
-
-    let geom_pos = schema
-        .index_of(&ctx.primary)
-        .map_err(|_| "internal: overview schema has no geometry column".to_string())?;
-    let mut types: HashSet<String> = HashSet::new();
-    let mut boxes: Vec<[f64; 4]> = Vec::with_capacity(batch.num_rows());
-    {
-        let col = batch.column(geom_pos);
-        let geoms = GeomCol::new(col.as_ref(), GeomEncoding::Wkb)
-            .ok_or("internal: overview geometry is not WKB")?;
-        for i in 0..batch.num_rows() {
-            if let Some(g) = geoms.geometry(i) {
-                types.insert(geom_type_name(&g).to_string());
-                boxes.extend(bbox_of(&g));
-            }
-        }
-    }
-    let file_bbox = union_bboxes(boxes.iter());
 
     let rel = super::pyramid::part_path(u8::from(res), &cell.to_string());
     let (file, path) = staged.create_at(&rel)?;
     let mut writer = ArrowWriter::try_new(file, schema.clone(), Some((ctx.props)()))
         .map_err(|e| format!("writer init: {e}"))?;
+    let mut acc = OverviewAcc::default();
+    match ctx.vertical {
+        Vertical::Dissolve => {
+            let batch = dissolve_cell(ctx, inputs, res, tol, &mut acc)?;
+            if batch.num_rows() > 0 {
+                writer.write(&batch).map_err(|e| format!("write failed: {e}"))?;
+            }
+        }
+        _ => derive_cell(ctx, inputs, tol, &mut writer, &mut acc)?,
+    }
+
     writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
         "geo".to_string(),
         build_geo_meta(
@@ -3750,9 +4034,9 @@ fn write_overview_cell(
             ctx.crs_value.as_ref(),
             ctx.vendor_crs.as_ref(),
             ctx.crs_explicit_null,
-            &types,
+            &acc.types,
             GeomEncoding::Wkb,
-            file_bbox,
+            acc.bbox,
             &ctx.covering_name,
             ctx.write_covering,
         )
@@ -3769,172 +4053,96 @@ fn write_overview_cell(
         super::pyramid::FILE_KEY.to_string(),
         serde_json::to_string(&meta).map_err(|e| e.to_string())?,
     ));
-    if batch.num_rows() > 0 {
-        writer.write(&batch).map_err(|e| format!("write failed: {e}"))?;
-    }
     writer.close().map_err(|e| format!("finalize failed: {e}"))?;
     let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    Ok((batch.num_rows() as u64, bytes, path))
+    Ok((acc.rows, bytes, path))
 }
 
-/// Simplify and/or prune one cell's inputs into the pass-through schema.
+/// Simplify and/or prune one cell's inputs into the pass-through
+/// schema, one input file at a time.
+///
+/// The writer accumulates row groups across `write` calls, so streaming
+/// per input file costs nothing in the file that comes out; what it
+/// saves is holding every child cell's features at once. Pruning is the
+/// one thing that cannot be decided a file at a time — it picks the
+/// largest features of the *cell* — so it takes a scoring pass first,
+/// which keeps one f64 per input row and no geometry.
 fn derive_cell(
     ctx: &OverviewCtx,
     inputs: &[(h3o::CellIndex, PathBuf)],
     tol: f64,
-) -> Result<RecordBatch, String> {
-    let (mut geoms, attrs) = load_cell_inputs(ctx, inputs)?;
-    if ctx.vertical.simplifies() {
-        for g in geoms.iter_mut() {
-            if let Some(geom) = g.take() {
-                *g = Some(simplify_geom(&geom, tol));
-            }
-        }
-    }
-    let keep = if ctx.vertical.prunes() {
-        prune_rows(ctx, &geoms, &attrs)?
-    } else {
-        (0..geoms.len() as u32).collect()
+    writer: &mut ArrowWriter<File>,
+    acc: &mut OverviewAcc,
+) -> Result<(), String> {
+    let keep: Option<Vec<u32>> = match ctx.vertical.prunes() {
+        true => Some(plan_prune(ctx, inputs, tol)?),
+        false => None,
     };
-    assemble_pass(ctx, &geoms, &attrs, &keep)
-}
-
-/// One overview cell's loaded inputs: a geometry per row, and the
-/// pass-through attribute columns in the level schema's order.
-type CellInputs = (Vec<Option<geo_types::Geometry<f64>>>, Vec<ArrayRef>);
-
-/// Read one overview cell's inputs: geometries decoded to `geo` types,
-/// and the pass-through attributes concatenated in schema order.
-fn load_cell_inputs(
-    ctx: &OverviewCtx,
-    inputs: &[(h3o::CellIndex, PathBuf)],
-) -> Result<CellInputs, String> {
-    let mut geoms: Vec<Option<geo_types::Geometry<f64>>> = Vec::new();
-    let mut parts: Vec<Vec<ArrayRef>> = vec![Vec::new(); ctx.pass_attrs.len()];
+    // Where this input file starts in the cell's global row numbering,
+    // and how far the (ascending) keep list has been consumed.
+    let mut offset = 0u32;
+    let mut cursor = 0usize;
     for (_, path) in inputs {
         let part = read_part(path)?;
-        let col = part.column_by(&part.primary)?;
-        let gc = GeomCol::new(col.as_ref(), part.encoding)
-            .ok_or_else(|| format!("{}: geometry does not match its encoding", path.display()))?;
-        for i in 0..part.batch.num_rows() {
-            geoms.push(gc.geometry(i));
-        }
-        for (slot, name) in ctx.pass_attrs.iter().enumerate() {
-            parts[slot].push(part.column_by(name)?);
-        }
-    }
-    let attrs: Vec<ArrayRef> = parts
-        .into_iter()
-        .map(|cols| {
-            let refs: Vec<&dyn Array> = cols.iter().map(|c| c.as_ref()).collect();
-            arrow::compute::concat(&refs).map_err(|e| format!("overview attributes: {e}"))
-        })
-        .collect::<Result<_, _>>()?;
-    Ok((geoms, attrs))
-}
-
-/// Rows a pruned level keeps, as indices into the loaded inputs.
-fn prune_rows(
-    ctx: &OverviewCtx,
-    geoms: &[Option<geo_types::Geometry<f64>>],
-    attrs: &[ArrayRef],
-) -> Result<Vec<u32>, String> {
-    let n = geoms.len();
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    match ctx.pyr.prune.mode {
-        // One in x is its own keep fraction: the caller asked for a
-        // stride, not for a share, and honouring both would be two
-        // thinnings on top of each other.
-        PruneMode::OneIn(x) => {
-            let x = x.max(1) as usize;
-            Ok((0..n as u32).step_by(x).collect())
-        }
-        PruneMode::Largest => {
-            let keep = ((n as f64 * ctx.pyr.prune.keep_fraction.clamp(0.0, 1.0)).ceil() as usize)
-                .clamp(1, n);
-            // The rank column, when set, replaces the bbox diagonal —
-            // the same idea as the COGP rank, read back from the level's
-            // own files rather than carried from the key pass.
-            let scores: Vec<f64> = match &ctx.pyr.prune.rank {
-                Some((name, order)) => {
-                    let slot = ctx
-                        .pass_attrs
-                        .iter()
-                        .position(|a| a == name)
-                        .ok_or_else(|| format!("prune rank column '{name}' is not in the output"))?;
-                    let col = arrow::compute::cast(&attrs[slot], &DataType::Float64)
-                        .map_err(|e| format!("prune rank column '{name}': {e}"))?;
-                    let col = col.as_any().downcast_ref::<Float64Array>().unwrap();
-                    (0..n)
-                        .map(|i| {
-                            if col.is_null(i) {
-                                f64::NEG_INFINITY
-                            } else if *order == RankOrder::Desc {
-                                col.value(i)
-                            } else {
-                                -col.value(i)
-                            }
-                        })
-                        .collect()
+        let n = part.batch.num_rows() as u32;
+        let local: Vec<u32> = match &keep {
+            None => (0..n).collect(),
+            Some(k) => {
+                let start = cursor;
+                while cursor < k.len() && k[cursor] < offset + n {
+                    cursor += 1;
                 }
-                None => geoms
-                    .iter()
-                    .map(|g| {
-                        g.as_ref()
-                            .and_then(bbox_of)
-                            .map(|b| {
-                                let (w, h) = (b[2] - b[0], b[3] - b[1]);
-                                (w * w + h * h).sqrt()
-                            })
-                            .unwrap_or(f64::NEG_INFINITY)
-                    })
-                    .collect(),
-            };
-            let mut idx: Vec<u32> = (0..n as u32).collect();
-            // Descending by score, index breaking ties, so two runs of the
-            // same input keep the same features.
-            idx.sort_by(|&a, &b| {
-                scores[b as usize]
-                    .partial_cmp(&scores[a as usize])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(a.cmp(&b))
-            });
-            idx.truncate(keep);
-            // Back into the level's spatial order: the file stays
-            // Hilbert-ordered, which is what its row-group bboxes need.
-            idx.sort_unstable();
-            Ok(idx)
+                k[start..cursor].iter().map(|&g| g - offset).collect()
+            }
+        };
+        offset += n;
+        if local.is_empty() {
+            continue;
         }
+        let batch = pass_batch(ctx, &part, &local, tol, acc)?;
+        writer.write(&batch).map_err(|e| format!("write failed: {e}"))?;
     }
+    Ok(())
 }
 
-/// Build the output batch of a simplified / pruned level.
-fn assemble_pass(
+/// One input file's kept rows as a batch of the pass-through schema.
+fn pass_batch(
     ctx: &OverviewCtx,
-    geoms: &[Option<geo_types::Geometry<f64>>],
-    attrs: &[ArrayRef],
+    part: &Part,
     keep: &[u32],
+    tol: f64,
+    acc: &mut OverviewAcc,
 ) -> Result<RecordBatch, String> {
+    let col = part.column_by(&part.primary)?;
+    let gc = GeomCol::new(col.as_ref(), part.encoding)
+        .ok_or("pyramid level file: geometry does not match its encoding")?;
+    let geoms: Vec<Option<geo_types::Geometry<f64>>> = keep
+        .iter()
+        .map(|&i| {
+            let g = gc.geometry(i as usize);
+            match ctx.vertical.simplifies() {
+                true => g.map(|g| simplify_geom(&g, tol)),
+                false => g,
+            }
+        })
+        .collect();
+    for g in geoms.iter().flatten() {
+        acc.add_geom(g);
+    }
+    acc.rows += geoms.len() as u64;
+
     let idx = UInt32Array::from(keep.to_vec());
     let mut cols: Vec<ArrayRef> = Vec::with_capacity(ctx.pass_schema.fields().len());
-    let mut attr_slot = 0usize;
     for f in ctx.pass_schema.fields() {
         if f.name() == &ctx.primary {
-            cols.push(wkb_array(keep.iter().map(|&r| geoms[r as usize].as_ref()))?);
+            cols.push(wkb_array(geoms.iter().map(Option::as_ref))?);
         } else if ctx.write_covering && f.name() == &ctx.covering_name {
-            let boxes: Vec<Option<[f64; 4]>> = keep
-                .iter()
-                .map(|&r| geoms[r as usize].as_ref().and_then(bbox_of))
-                .collect();
+            let boxes: Vec<Option<[f64; 4]>> =
+                geoms.iter().map(|g| g.as_ref().and_then(bbox_of)).collect();
             let rows: Vec<u32> = (0..boxes.len() as u32).collect();
             cols.push(build_bbox_column(&rows, &boxes, &ctx.bbox_fields));
         } else {
-            let col = attrs
-                .get(attr_slot)
-                .ok_or("internal: overview attribute count mismatch")?;
-            attr_slot += 1;
+            let col = part.column_by(f.name())?;
             cols.push(
                 arrow::compute::take(col.as_ref(), &idx, None)
                     .map_err(|e| format!("overview attributes: {e}"))?,
@@ -3943,6 +4151,106 @@ fn assemble_pass(
     }
     RecordBatch::try_new(ctx.pass_schema.clone(), cols)
         .map_err(|e| format!("overview batch assembly failed: {e}"))
+}
+
+/// Rows a pruned level keeps, as ascending indices into the cell's
+/// inputs read end to end.
+///
+/// The score of a feature is the same one the single-batch version
+/// computed — the diagonal of its *simplified* bbox when the level
+/// simplifies too — so a level with a rank column never touches
+/// geometry here, and one without pays a second simplification of each
+/// feature to avoid holding all of them.
+fn plan_prune(
+    ctx: &OverviewCtx,
+    inputs: &[(h3o::CellIndex, PathBuf)],
+    tol: f64,
+) -> Result<Vec<u32>, String> {
+    // A stride needs nothing but the row count, which the footers have.
+    if let PruneMode::OneIn(x) = ctx.pyr.prune.mode {
+        let x = (x.max(1)) as usize;
+        let mut n = 0usize;
+        for (_, path) in inputs {
+            n += part_rows(path)?;
+        }
+        return Ok((0..n as u32).step_by(x).collect());
+    }
+
+    let mut scores: Vec<f64> = Vec::new();
+    for (_, path) in inputs {
+        let part = read_part(path)?;
+        match &ctx.pyr.prune.rank {
+            Some((name, order)) => {
+                let col = part.column_by(name).map_err(|_| {
+                    format!("prune rank column '{name}' is not in the output")
+                })?;
+                let col = arrow::compute::cast(&col, &DataType::Float64)
+                    .map_err(|e| format!("prune rank column '{name}': {e}"))?;
+                let col = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                scores.extend((0..col.len()).map(|i| {
+                    if col.is_null(i) {
+                        f64::NEG_INFINITY
+                    } else if *order == RankOrder::Desc {
+                        col.value(i)
+                    } else {
+                        -col.value(i)
+                    }
+                }));
+            }
+            None => {
+                let col = part.column_by(&part.primary)?;
+                let gc = GeomCol::new(col.as_ref(), part.encoding)
+                    .ok_or("pyramid level file: geometry does not match its encoding")?;
+                scores.extend((0..part.batch.num_rows()).map(|i| {
+                    let g = gc.geometry(i);
+                    let g = match ctx.vertical.simplifies() {
+                        true => g.map(|g| simplify_geom(&g, tol)),
+                        false => g,
+                    };
+                    g.as_ref()
+                        .and_then(bbox_of)
+                        .map(|b| {
+                            let (w, h) = (b[2] - b[0], b[3] - b[1]);
+                            (w * w + h * h).sqrt()
+                        })
+                        .unwrap_or(f64::NEG_INFINITY)
+                }));
+            }
+        }
+    }
+    Ok(prune_pick(ctx, &scores))
+}
+
+/// The rows a `Largest` prune keeps, ascending.
+fn prune_pick(ctx: &OverviewCtx, scores: &[f64]) -> Vec<u32> {
+    let n = scores.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let keep =
+        ((n as f64 * ctx.pyr.prune.keep_fraction.clamp(0.0, 1.0)).ceil() as usize).clamp(1, n);
+    let mut idx: Vec<u32> = (0..n as u32).collect();
+    // Descending by score, index breaking ties, so two runs of the
+    // same input keep the same features.
+    idx.sort_by(|&a, &b| {
+        scores[b as usize]
+            .partial_cmp(&scores[a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    idx.truncate(keep);
+    // Back into the level's spatial order: the file stays
+    // Hilbert-ordered, which is what its row-group bboxes need.
+    idx.sort_unstable();
+    idx
+}
+
+/// Rows of a staged part, from its footer alone.
+fn part_rows(path: &Path) -> Result<usize, String> {
+    let file = File::open(path).map_err(|e| format!("cannot reopen {}: {e}", path.display()))?;
+    let b = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(b.metadata().file_metadata().num_rows().max(0) as usize)
 }
 
 /// Dissolve one cell: union the features by the child cell they belong
@@ -3957,11 +4265,18 @@ fn assemble_pass(
 /// made, propagated the one way that stays consistent: `parent` is a
 /// prefix of the index, so every group of this file is a child of this
 /// file's own cell, exactly once.
+///
+/// The union is folded one input file at a time rather than collected
+/// and unioned at the end: the running result is the level's own
+/// geometry, which has to exist anyway, whereas the collected inputs
+/// were every polygon of every child cell held at once — on a cadastral
+/// layer at `reference_res - 3`, the whole layer.
 fn dissolve_cell(
     ctx: &OverviewCtx,
     inputs: &[(h3o::CellIndex, PathBuf)],
     res: h3o::Resolution,
     tol: f64,
+    acc: &mut OverviewAcc,
 ) -> Result<RecordBatch, String> {
     use std::collections::HashMap;
 
@@ -3969,7 +4284,8 @@ fn dissolve_cell(
     /// What one child cell accumulates before it becomes a row.
     #[derive(Default)]
     struct Group {
-        polys: Vec<geo_types::MultiPolygon<f64>>,
+        /// The union so far; `None` until the first polygon arrives.
+        union: Option<geo_types::MultiPolygon<f64>>,
         count: u64,
         area: f64,
         cats: HashMap<String, f64>,
@@ -4000,6 +4316,9 @@ fn dissolve_cell(
             None => None,
         };
         let e = groups.entry(key).or_default();
+        // This file's polygons only; folded into the group's running
+        // union before the next file is opened.
+        let mut polys: Vec<geo_types::MultiPolygon<f64>> = Vec::new();
         for i in 0..part.batch.num_rows() {
             let Some(g) = gc.geometry(i) else { continue };
             // Non-polygon rows have nothing to union. The method only
@@ -4016,7 +4335,10 @@ fn dissolve_cell(
             {
                 *e.cats.entry(v.clone()).or_insert(0.0) += n as f64;
             }
-            e.polys.push(mp);
+            polys.push(mp);
+        }
+        if !polys.is_empty() {
+            e.union = Some(dissolve_fold(e.union.take(), &polys, tol));
         }
     }
 
@@ -4028,11 +4350,13 @@ fn dissolve_cell(
     let mut majority: Vec<Option<String>> = Vec::with_capacity(keys.len());
     for k in &keys {
         let g = &groups[k];
-        if g.polys.is_empty() {
+        let Some(u) = &g.union else {
             continue; // a file of non-polygons contributes no row
-        }
-        let union = dissolve_union(&g.polys, tol);
-        geoms.push(Some(geo_types::Geometry::MultiPolygon(union)));
+        };
+        let union = geo_types::Geometry::MultiPolygon(u.clone());
+        acc.add_geom(&union);
+        acc.rows += 1;
+        geoms.push(Some(union));
         counts.push(g.count);
         areas.push(g.area);
         // Ties break on the value itself, so two runs write the same file.
@@ -4069,7 +4393,8 @@ fn dissolve_cell(
 /// extract, large enough that a dense cell is not a thousand passes.
 const DISSOLVE_BATCH: usize = 256;
 
-/// Union many polygons into the level's geometry.
+/// Union many polygons into the level's geometry (`dissolve_fold` from
+/// nothing).
 ///
 /// `unary_union` over a whole cell at once did not finish on 2.5M
 /// Massachusetts parcels: i_overlay spends its time in OGC extraction,
@@ -4085,18 +4410,24 @@ const DISSOLVE_BATCH: usize = 256;
 /// dropped rather than kept as boxes the way `simplify_geom` keeps a
 /// collapsed *feature* — here the level's feature is the union, and a
 /// fragment of it is not one.
-fn dissolve_union(polys: &[geo_types::MultiPolygon<f64>], tol: f64) -> geo_types::MultiPolygon<f64> {
+/// The same fold, continued from a running result (`None` = nothing
+/// unioned yet). This is what lets a cell's inputs be folded one file
+/// at a time instead of collected first.
+fn dissolve_fold(
+    acc: Option<geo_types::MultiPolygon<f64>>,
+    polys: &[geo_types::MultiPolygon<f64>],
+    tol: f64,
+) -> geo_types::MultiPolygon<f64> {
     use geo::algorithm::bool_ops::unary_union;
-    let mut acc = geo_types::MultiPolygon::new(Vec::new());
-    for (i, chunk) in polys.chunks(DISSOLVE_BATCH).enumerate() {
-        let union = if i == 0 {
-            unary_union(chunk.iter())
-        } else {
-            unary_union(chunk.iter().chain(std::iter::once(&acc)))
+    let mut acc = acc;
+    for chunk in polys.chunks(DISSOLVE_BATCH) {
+        let union = match &acc {
+            Some(a) => unary_union(chunk.iter().chain(std::iter::once(a))),
+            None => unary_union(chunk.iter()),
         };
-        acc = generalize(union, tol);
+        acc = Some(generalize(union, tol));
     }
-    acc
+    acc.unwrap_or_else(|| geo_types::MultiPolygon::new(Vec::new()))
 }
 
 /// Simplify a dissolved union and drop what it simplifies away: pieces
@@ -4227,17 +4558,23 @@ fn wkb_array<'a>(
     geoms: impl Iterator<Item = Option<&'a geo_types::Geometry<f64>>>,
 ) -> Result<ArrayRef, String> {
     let opts = wkb::writer::WriteOptions::default();
+    // Encoded once, into the array's own buffer: an overview level's
+    // geometries are dissolved unions, and cloning each one into an
+    // intermediate `Vec` doubled the peak of the level's assembly.
+    let (lo, _) = geoms.size_hint();
+    let mut b = arrow::array::BinaryBuilder::with_capacity(lo, lo * 64);
     let mut buf: Vec<u8> = Vec::new();
-    let values: Vec<Option<Vec<u8>>> = geoms
-        .map(|g| -> Result<Option<Vec<u8>>, String> {
-            let Some(g) = g else { return Ok(None) };
-            buf.clear();
-            wkb::writer::write_geometry(&mut buf, g, &opts)
-                .map_err(|e| format!("WKB encode: {e}"))?;
-            Ok(Some(buf.clone()))
-        })
-        .collect::<Result<_, _>>()?;
-    Ok(Arc::new(arrow::array::BinaryArray::from_iter(values)))
+    for g in geoms {
+        let Some(g) = g else {
+            b.append_null();
+            continue;
+        };
+        buf.clear();
+        wkb::writer::write_geometry(&mut buf, g, &opts)
+            .map_err(|e| format!("WKB encode: {e}"))?;
+        b.append_value(&buf);
+    }
+    Ok(Arc::new(b.finish()))
 }
 
 fn bbox_of(g: &geo_types::Geometry<f64>) -> Option<[f64; 4]> {
@@ -4456,9 +4793,14 @@ fn push_covering_bboxes(col: &ArrayRef, out: &mut Vec<Option<[f64; 4]>>) -> Resu
             || ymin.is_null(i)
             || xmax.is_null(i)
             || ymax.is_null(i);
-        out.push((!null).then(|| {
-            [xmin.value(i), ymin.value(i), xmax.value(i), ymax.value(i)]
-        }));
+        // A covering column written by someone else can hold anything;
+        // a non-finite corner here would reach the pyramid's density
+        // table and place a feature at an H3 cell that does not exist.
+        out.push(
+            (!null)
+                .then(|| [xmin.value(i), ymin.value(i), xmax.value(i), ymax.value(i)])
+                .and_then(super::import::finite_bbox),
+        );
     }
     Ok(())
 }
@@ -4541,8 +4883,27 @@ fn hilbert_xy2d(order: u32, mut x: u32, mut y: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lets `a_plan_too_large_to_write_is_refused_before_writing` trip the
+    /// gather-work refusal on a kilobyte fixture; 0 means the real budget.
+    pub(super) static SWEEP_BUDGET_OVERRIDE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
     use arrow::array::{BinaryArray, Int64Array, StringArray};
     use parquet::file::properties::WriterProperties;
+
+    /// The rewrite under a flag that is never set. Cancellation is one
+    /// test's subject and noise in the other fifty, which pass this
+    /// shim's six arguments rather than repeating `&AtomicBool::new`.
+    fn optimize(
+        src: &Source,
+        dst: &Path,
+        opts: &OptimizeOptions,
+        epsg_hint: Option<u32>,
+        admin: Option<&super::super::partition::AdminJoinSpec>,
+        progress: &dyn Fn(f32, &str),
+    ) -> Result<OptimizeReport, String> {
+        super::optimize(src, dst, opts, epsg_hint, admin, progress, &AtomicBool::new(false))
+    }
 
     /// A source whose CRS exists only as the `geopq:crs` proj4 vendor
     /// key (ESRI .prj import without an EPSG authority): the rewrite
@@ -8165,11 +8526,11 @@ mod tests {
         let polys: Vec<MultiPolygon<f64>> =
             (0..n).map(|i| rect(i as f64, i as f64 + 1.0)).collect();
         let expected: f64 = n as f64;
-        let batched = dissolve_union(&polys, 0.0);
+        let batched = dissolve_fold(None, &polys, 0.0);
         assert_eq!(batched.0.len(), 1, "touching squares union into one piece");
         assert!((batched.unsigned_area() - expected).abs() < 1e-9);
         // The same at a tolerance that cannot touch a unit square.
-        let generalized = dissolve_union(&polys, 0.1);
+        let generalized = dissolve_fold(None, &polys, 0.1);
         assert_eq!(generalized.0.len(), 1);
         assert!((generalized.unsigned_area() - expected).abs() < 1e-6);
 
@@ -8181,12 +8542,12 @@ mod tests {
             vec![ring(&[(10.0, 10.0), (10.0, 90.0), (10.1, 90.0), (10.1, 10.0), (10.0, 10.0)])],
         )]);
         assert_eq!(holed.0[0].interiors().len(), 1);
-        let cleaned = dissolve_union(std::slice::from_ref(&holed), 1.0);
+        let cleaned = dissolve_fold(None, std::slice::from_ref(&holed), 1.0);
         assert_eq!(cleaned.0.len(), 1);
         assert!(cleaned.0[0].interiors().is_empty(), "the sliver hole is generalized away");
         assert!((cleaned.unsigned_area() - 10_000.0).abs() < 1.0);
         // At a tolerance finer than the sliver it survives.
-        let kept = dissolve_union(std::slice::from_ref(&holed), 0.01);
+        let kept = dissolve_fold(None, std::slice::from_ref(&holed), 0.01);
         assert_eq!(kept.0[0].interiors().len(), 1);
     }
 
@@ -8227,5 +8588,445 @@ mod tests {
             .to_polygon(),
         );
         assert_eq!(simplify_geom(&square, 0.0), square);
+    }
+
+    /// A points fixture on a lon/lat grid, one row group, with a `zone`
+    /// attribute of `zones` distinct values. Returns the source path.
+    fn write_grid_fixture(dir: &Path, name: &str, rows: usize, zones: usize, step: f64) -> PathBuf {
+        let side = (rows as f64).sqrt().ceil() as usize;
+        let (mut wkbs, mut ids, mut zs) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..rows {
+            wkbs.push(wkb_point(
+                2.0 + (i % side) as f64 * step,
+                48.0 + (i / side) as f64 * step,
+            ));
+            ids.push(i as i64);
+            zs.push(format!("z{:04}", i % zones.max(1)));
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("zone", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(wkbs.iter())),
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(zs)),
+            ],
+        )
+        .unwrap();
+        let src = dir.join(name);
+        let mut w = ArrowWriter::try_new(File::create(&src).unwrap(), schema, None).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            serde_json::json!({
+                "version": "1.1.0", "primary_column": "geometry",
+                "columns": {"geometry": {
+                    "encoding": "WKB", "geometry_types": ["Point"],
+                    "crs": {"id": {"authority": "OGC", "code": "CRS84"}},
+                }},
+            })
+            .to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        src
+    }
+
+    /// A plan that cannot be written is refused before anything is,
+    /// with the size of the problem in the message.
+    ///
+    /// Both ceilings used to be missable: `MAX_PARTITIONS` was checked
+    /// only inside the adaptive split branch, so a leaf level already
+    /// spread over more cells than that at its own reference resolution
+    /// produced a file each without ever splitting; and nothing at all
+    /// bounded the number of sweeps of the sorted order, each of which
+    /// re-reads the source.
+    #[test]
+    fn a_plan_too_large_to_write_is_refused_before_writing() {
+        use crate::data::partition::PartitionBy;
+        let dir = std::env::temp_dir().join("geopq_optimize_too_many_parts");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 4200 points 0.01° apart: at r9 (~170 m across) every one of
+        // them is in a cell of its own, past the 4096-file ceiling.
+        let src = write_grid_fixture(&dir, "spread.parquet", 4200, 1, 0.01);
+        let dst = dir.join("pyramid");
+        let opts = OptimizeOptions {
+            pyramid: Some(PyramidOptions {
+                reference_res: 9,
+                adaptive: false,
+                max_res: 9,
+                target_rows: 100,
+                from_res: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = optimize(&Source::Local(src), &dst, &opts, None, None, &|_, _| {}).unwrap_err();
+        assert!(err.contains("cells at r9"), "{err}");
+        assert!(!dst.exists(), "refused plans write nothing");
+        assert!(partials_under(&dir).is_empty(), "no staging left behind");
+
+        // And a hive plan whose passes over the source cost more decode
+        // work than the build allows: the fixture is kilobytes, so the
+        // budget is lowered to what ten sweeps of it would cost.
+        let src = write_grid_fixture(&dir, "zones.parquet", 600, 300, 0.001);
+        SWEEP_BUDGET_OVERRIDE.store(1, std::sync::atomic::Ordering::Relaxed);
+        let dst = dir.join("by_zone");
+        let opts = OptimizeOptions {
+            partition: PartitionBy::Fields(vec!["zone".into()]),
+            ..Default::default()
+        };
+        let err = optimize(&Source::Local(src), &dst, &opts, None, None, &|_, _| {}).unwrap_err();
+        assert!(err.contains("passes over the source"), "{err}");
+        assert!(err.contains("300 output files"), "{err}");
+        assert!(!dst.exists(), "refused plans write nothing");
+        SWEEP_BUDGET_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A NaN vertex must not reach the covering column.
+    ///
+    /// The point branch of the scan filtered non-finite coordinates and
+    /// the general branch did not, so a single corrupt vertex put a NaN
+    /// in `bbox.xmin` — where it does not make the row unprunable, it
+    /// makes the whole *row group* unprunable, silently, for every
+    /// reader that trusts the statistics.
+    #[test]
+    fn a_nan_vertex_writes_a_null_covering_box() {
+        let dir = std::env::temp_dir().join("geopq_optimize_nan_bbox");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let line = |pts: [(f64, f64); 2]| {
+            let mut b = vec![1u8];
+            b.extend(2u32.to_le_bytes()); // LineString
+            b.extend(2u32.to_le_bytes()); // two points
+            for (x, y) in pts {
+                b.extend(x.to_le_bytes());
+                b.extend(y.to_le_bytes());
+            }
+            b
+        };
+        // An infinite corner and an all-NaN geometry: `bounding_rect`
+        // passes the first through unchanged and the second comes back
+        // as NaN, and both used to be copied into the column.
+        let inf_line = line([(2.0, 48.0), (2.1, f64::INFINITY)]);
+        let nan_line = line([(f64::NAN, f64::NAN), (f64::NAN, f64::NAN)]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values([
+                    wkb_point(2.0, 48.0),
+                    inf_line,
+                    nan_line,
+                ])),
+                Arc::new(Int64Array::from(vec![0i64, 1, 2])),
+            ],
+        )
+        .unwrap();
+        let src = dir.join("nan.parquet");
+        let mut w = ArrowWriter::try_new(File::create(&src).unwrap(), schema, None).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            serde_json::json!({
+                "version": "1.1.0", "primary_column": "geometry",
+                "columns": {"geometry": {"encoding": "WKB",
+                    "geometry_types": ["Point", "LineString"]}},
+            })
+            .to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let dst = dir.join("out.parquet");
+        optimize(
+            &Source::Local(src),
+            &dst,
+            &OptimizeOptions::default(),
+            None,
+            None,
+            &|_, _| {},
+        )
+        .unwrap();
+
+        let out = read_all(&dst);
+        let bbox = out.column(out.schema().index_of("bbox").unwrap());
+        let st = bbox.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(st.len(), 3);
+        let nulls = (0..st.len()).filter(|&i| st.is_null(i)).count();
+        assert_eq!(nulls, 2, "the two broken features have no box, the point does");
+        for leaf in ["xmin", "ymin", "xmax", "ymax"] {
+            let c = st.column_by_name(leaf).unwrap();
+            let f = c.as_any().downcast_ref::<Float64Array>().unwrap();
+            for i in 0..f.len() {
+                assert!(
+                    f.is_null(i) || f.value(i).is_finite(),
+                    "{leaf}[{i}] = {}",
+                    f.value(i)
+                );
+            }
+        }
+        // The file's declared extent is finite too: a NaN corner there
+        // claims everything and nothing at once.
+        let geo = read_geo_meta(&dst);
+        let b = geo["columns"]["geometry"]["bbox"].as_array().unwrap();
+        assert!(b.iter().all(|v| v.as_f64().is_some_and(f64::is_finite)), "{b:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A row group whose parquet footer says it is small and whose arrow
+    /// form is not: dictionary-encoded text expands by two orders of
+    /// magnitude on the way in, and `resident` is decided on the footer.
+    ///
+    /// The key pass used to decode such a group with no limit at all
+    /// (`usize::MAX`), so it materialized sixteen batches and then
+    /// concatenated them — twice its arrow size, live, before anything
+    /// measured it. It must give up at the budget and stream instead,
+    /// and the high-water mark must include what the key pass held.
+    #[test]
+    fn a_group_that_looks_resident_but_is_not_stays_inside_the_budget() {
+        let dir = std::env::temp_dir().join("geopq_optimize_fat_group");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 64k rows sharing one 240-byte label: a few hundred bytes of
+        // dictionary in the file, ~16 MB of arrow.
+        let n = 64 * 1024usize;
+        let label = "x".repeat(240);
+        let mut wkbs = Vec::with_capacity(n);
+        for i in 0..n {
+            wkbs.push(wkb_point((i % 256) as f64 * 0.01, (i / 256) as f64 * 0.01));
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(wkbs.iter())),
+                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(vec![label.as_str(); n])),
+            ],
+        )
+        .unwrap();
+        let src = dir.join("fat.parquet");
+        let mut w = ArrowWriter::try_new(File::create(&src).unwrap(), schema, None).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            serde_json::json!({
+                "version": "1.1.0", "primary_column": "geometry",
+                "columns": {"geometry": {"encoding": "WKB", "geometry_types": ["Point"]}},
+            })
+            .to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        // The footer's own numbers: the run must take the resident path
+        // on them, which is the premise of the bug.
+        let uncompressed: i64 = {
+            let f = File::open(&src).unwrap();
+            let b = ParquetRecordBatchReaderBuilder::try_new(f).unwrap();
+            b.metadata().row_groups().iter().map(|g| g.total_byte_size()).sum()
+        };
+        let budget = 8 << 20;
+        assert!(
+            (uncompressed as usize) * 2 <= budget,
+            "fixture must look resident: {uncompressed} B uncompressed"
+        );
+
+        let dst = dir.join("out.parquet");
+        let opts = OptimizeOptions { row_group_size: 8192, ..Default::default() };
+        with_budget(budget, || {
+            optimize(&Source::Local(src.clone()), &dst, &opts, None, None, &|_, _| {}).unwrap()
+        });
+        let (live, decodes) = gather_stats();
+        assert!(decodes > 0, "nothing was decoded");
+        assert!(
+            live <= budget * 2,
+            "held {live} B live against a {budget} B budget"
+        );
+        // The arrow form really is far past the budget, so the number
+        // above is a limit that bit rather than one nothing reached.
+        assert!(
+            live * 2 < n * label.len(),
+            "the whole group ({} B of arrow text) was held: {live} B",
+            n * label.len()
+        );
+
+        // Same file, unbudgeted: byte for byte the same output.
+        let free = dir.join("free.parquet");
+        optimize(&Source::Local(src), &free, &opts, None, None, &|_, _| {}).unwrap();
+        assert_same_output(&free, &dst);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cancelled rewrite publishes nothing and leaves no staging.
+    ///
+    /// The flag is checked in the loops that own the run's minutes, and
+    /// the error unwinds through `StagedOutputs::drop` — which is the
+    /// part that matters: killing the process instead leaves a
+    /// `.partial` tree behind.
+    #[test]
+    fn a_cancelled_rewrite_publishes_nothing() {
+        use crate::data::partition::PartitionBy;
+        let dir = std::env::temp_dir().join("geopq_optimize_cancel");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = write_grid_fixture(&dir, "cancel_src.parquet", 4_000, 8, 0.001);
+
+        // Cancelled from the progress callback, well into the writing
+        // pass, so the staging tree exists when the flag is read.
+        let cancel = AtomicBool::new(false);
+        let dst = dir.join("by_zone");
+        let opts = OptimizeOptions {
+            row_group_size: 128,
+            partition: PartitionBy::Fields(vec!["zone".into()]),
+            ..Default::default()
+        };
+        let err = super::optimize(
+            &Source::Local(src.clone()),
+            &dst,
+            &opts,
+            None,
+            None,
+            &|f, _| {
+                if f > 0.5 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+            &cancel,
+        )
+        .unwrap_err();
+        assert_eq!(err, crate::data::loader::CANCELLED);
+        assert!(walk_files(&dst).is_empty(), "cancelled runs publish nothing");
+        assert!(partials_under(&dir).is_empty(), "staging cleaned up");
+
+        // The same flag set before the run stops it in the key pass.
+        let armed = AtomicBool::new(true);
+        let err = super::optimize(
+            &Source::Local(src),
+            &dst,
+            &opts,
+            None,
+            None,
+            &|_, _| {},
+            &armed,
+        )
+        .unwrap_err();
+        assert_eq!(err, crate::data::loader::CANCELLED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A replace interrupted between the two renames puts the previous
+    /// dataset back.
+    ///
+    /// A directory rename cannot replace a directory, so the old dataset
+    /// moves aside first. Nothing recorded that it had: a failure in the
+    /// gap published nothing *and* took the user's dataset with it,
+    /// leaving it under a `.replaced-<pid>` name nobody looks for.
+    #[test]
+    fn an_interrupted_replace_puts_the_previous_dataset_back() {
+        use crate::data::partition::PartitionBy;
+        let dir = std::env::temp_dir().join("geopq_optimize_replace");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = write_grid_fixture(&dir, "replace_src.parquet", 400, 4, 0.001);
+        let dst = dir.join("by_zone");
+        let opts = OptimizeOptions {
+            partition: PartitionBy::Fields(vec!["zone".into()]),
+            ..Default::default()
+        };
+
+        optimize(&Source::Local(src.clone()), &dst, &opts, None, None, &|_, _| {}).unwrap();
+        let mut before = walk_files(&dst);
+        before.sort();
+        assert!(!before.is_empty());
+        let sizes: Vec<u64> = before
+            .iter()
+            .map(|p| std::fs::metadata(p).unwrap().len())
+            .collect();
+
+        // Step 1 is the gap: the old dataset has stepped aside and the
+        // new one has not landed.
+        FAIL_AT_COMMIT.with(|c| c.set(1));
+        let err =
+            optimize(&Source::Local(src), &dst, &opts, None, None, &|_, _| {}).unwrap_err();
+        FAIL_AT_COMMIT.with(|c| c.set(usize::MAX));
+        assert!(err.contains("injected"), "{err}");
+
+        let mut after = walk_files(&dst);
+        after.sort();
+        assert_eq!(after, before, "the previous dataset came back");
+        let after_sizes: Vec<u64> = after
+            .iter()
+            .map(|p| std::fs::metadata(p).unwrap().len())
+            .collect();
+        assert_eq!(after_sizes, sizes);
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".replaced-"))
+            .collect();
+        assert!(leftovers.is_empty(), "aside copy left behind: {leftovers:?}");
+        assert!(partials_under(&dir).is_empty(), "staging cleaned up");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An overview cell fed by several leaf files keeps every feature,
+    /// once, in input order.
+    ///
+    /// The level is written one input file at a time now — it used to
+    /// be one `RecordBatch` of the whole cell — so the alignment
+    /// between a file's geometries and its attribute columns, and
+    /// between the global prune choice and each file's rows, is what
+    /// this pins.
+    #[test]
+    fn an_overview_level_streams_its_inputs_in_order() {
+        use crate::data::pyramid::{self, Descriptor};
+        let dir = std::env::temp_dir().join("geopq_pyr_stream");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (root, _) = write_pyramid(&dir, "out", pyramid_opts(MethodChoice::Simplify));
+        let desc: Descriptor = read_descriptor(&root);
+
+        // The coarsest overview really is fed by several files, or the
+        // streaming this test is about never happens.
+        let leaf_files: usize = desc.leaves().map(|l| l.cells.len()).sum();
+        assert!(leaf_files > 1, "fixture needs several leaf files");
+
+        for l in desc.overviews() {
+            let mut seen: Vec<i64> = Vec::new();
+            for c in &l.cells {
+                let (ids, geoms) = part_contents(&root.join(pyramid::part_path(l.res, c)));
+                assert_eq!(ids.len(), geoms.len());
+                // Attributes travel with their own geometry: a shifted
+                // take would still produce the right row count.
+                for (id, g) in ids.iter().zip(&geoms) {
+                    let g = g.as_ref().expect("simplify drops nothing");
+                    let b = bbox_of(g).expect("a box");
+                    let (cx, cy) = ((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5);
+                    let (gx, gy) = ((*id as usize) % 12, (*id as usize) / 12);
+                    assert!((cx - (2.30 + gx as f64 * 0.017)).abs() < 0.01, "id {id}: {cx}");
+                    assert!((cy - (48.80 + gy as f64 * 0.017)).abs() < 0.01, "id {id}: {cy}");
+                }
+                seen.extend(ids);
+            }
+            seen.sort();
+            assert_eq!(seen, (0..144).collect::<Vec<i64>>(), "r{}", l.res);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

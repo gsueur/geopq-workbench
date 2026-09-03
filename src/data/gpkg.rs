@@ -15,7 +15,8 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::json;
 
 use super::import::{
-    bbox_field, AttrBuilder, BboxBuilder, Cell, IMPORT_WRITE_ROWS as BATCH_ROWS,
+    covering_field, covering_json, AttrBuilder, BboxBuilder, Cell,
+    IMPORT_WRITE_ROWS as BATCH_ROWS,
 };
 
 /// One feature table of a GeoPackage.
@@ -195,7 +196,8 @@ pub fn convert(
     fields.extend(cols.iter().map(|(n, dt)| Field::new(n, dt.clone(), true)));
     // Covering bbox last, so attribute column order still mirrors the
     // source table.
-    fields.push(bbox_field());
+    let (cov_name, cov_field) = covering_field(&fields);
+    fields.push(cov_field);
     let schema = Arc::new(Schema::new(fields));
 
     let select: String = {
@@ -220,48 +222,58 @@ pub fn convert(
     let mut attr_b: Vec<AttrBuilder> = cols.iter().map(|(_, dt)| AttrBuilder::new(dt)).collect();
     let mut in_batch = 0usize;
     let mut batch_bytes = 0usize;
+    // Features whose blob would not parse, written as null.
+    let mut skipped = 0u64;
     loop {
         let row = rows.next().map_err(|e| e.to_string())?;
         let done = row.is_none();
         if let Some(row) = row {
-            match row.get_ref(0).map_err(|e| e.to_string())? {
-                ValueRef::Blob(blob) => match gpkg_wkb(blob)? {
-                    Some((wkb, env)) => {
-                        geom_b.append_value(wkb);
-                        batch_bytes += wkb.len();
-                        if let Some(n) = wkb_type_name(wkb) {
-                            geom_types.insert(n);
-                        }
-                        // The GeoPackage header usually carries the
-                        // envelope already; parse the WKB only when it
-                        // does not.
-                        let e = match env {
-                            Some(e) => Some(e),
-                            None => {
-                                let mut one = [
-                                    f64::INFINITY,
-                                    f64::INFINITY,
-                                    f64::NEG_INFINITY,
-                                    f64::NEG_INFINITY,
-                                ];
-                                crate::data::loader::grow_wkb_envelope(wkb, &mut one)
-                                    .map(|()| one)
-                            }
-                        };
-                        if let Some(e) = e {
-                            bbox[0] = bbox[0].min(e[0]);
-                            bbox[1] = bbox[1].min(e[1]);
-                            bbox[2] = bbox[2].max(e[2]);
-                            bbox[3] = bbox[3].max(e[3]);
-                        }
-                        bbox_b.push(e);
+            // A blob this cannot parse is one bad feature, not a bad
+            // file: aborting the conversion at row 400k of 500k threw
+            // away everything that had read fine, which is the worse
+            // answer for a format whose exporters do produce the odd
+            // truncated blob. It is written null and counted instead.
+            let geom = match row.get_ref(0).map_err(|e| e.to_string())? {
+                ValueRef::Blob(blob) => gpkg_wkb(blob).unwrap_or_else(|e| {
+                    if skipped == 0 {
+                        log::warn!("GeoPackage import: {e} (feature written as null)");
                     }
-                    None => {
-                        geom_b.append_null();
-                        bbox_b.push(None);
+                    skipped += 1;
+                    None
+                }),
+                _ => None,
+            };
+            match geom {
+                Some((wkb, env)) => {
+                    geom_b.append_value(wkb);
+                    batch_bytes += wkb.len();
+                    if let Some(n) = wkb_type_name(wkb) {
+                        geom_types.insert(n);
                     }
-                },
-                _ => {
+                    // The GeoPackage header usually carries the
+                    // envelope already; parse the WKB only when it
+                    // does not.
+                    let e = match env {
+                        Some(e) => Some(e),
+                        None => {
+                            let mut one = [
+                                f64::INFINITY,
+                                f64::INFINITY,
+                                f64::NEG_INFINITY,
+                                f64::NEG_INFINITY,
+                            ];
+                            crate::data::loader::grow_wkb_envelope(wkb, &mut one).map(|()| one)
+                        }
+                    };
+                    if let Some(e) = e {
+                        bbox[0] = bbox[0].min(e[0]);
+                        bbox[1] = bbox[1].min(e[1]);
+                        bbox[2] = bbox[2].max(e[2]);
+                        bbox[3] = bbox[3].max(e[3]);
+                    }
+                    bbox_b.push(e);
+                }
+                None => {
                     geom_b.append_null();
                     bbox_b.push(None);
                 }
@@ -320,10 +332,13 @@ pub fn convert(
     if bbox[0].is_finite() && bbox[2].is_finite() {
         col["bbox"] = json!([bbox[0], bbox[1], bbox[2], bbox[3]]);
     }
-    col["covering"] = json!({"bbox": {
-        "xmin": ["bbox", "xmin"], "ymin": ["bbox", "ymin"],
-        "xmax": ["bbox", "xmax"], "ymax": ["bbox", "ymax"],
-    }});
+    col["covering"] = covering_json(&cov_name);
+    if skipped > 0 {
+        log::warn!(
+            "GeoPackage import: {skipped} of {written} features had an unreadable \
+             geometry blob and were written as null"
+        );
+    }
     let geo = json!({
         "version": "1.1.0",
         "primary_column": table.geom_col,
@@ -546,5 +561,81 @@ pub(crate) mod tests {
         // the spec would read as CRS84 lon/lat.
         let col = geo_col(&dst);
         assert!(col.get("crs").is_some_and(|c| c.is_null()), "{col}");
+    }
+
+    /// A GeoPackage whose feature table has a column genuinely called
+    /// `bbox`, and one unreadable geometry blob among the good ones.
+    ///
+    /// The column must survive under its own name (the covering renames
+    /// around it), and the bad blob must cost one feature rather than
+    /// the whole conversion — a truncated blob at row 400k of 500k used
+    /// to throw away everything that had already read fine.
+    #[test]
+    fn a_bbox_column_survives_and_a_bad_blob_costs_one_row() {
+        let dir = std::env::temp_dir().join("geopq_gpkg_bbox_attr");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("attr.gpkg");
+
+        let db = Connection::open(&src).unwrap();
+        db.execute_batch(
+            "PRAGMA application_id = 0x47504B47;
+             CREATE TABLE gpkg_spatial_ref_sys (srs_name TEXT, srs_id INTEGER PRIMARY KEY,
+               organization TEXT, organization_coordsys_id INTEGER, definition TEXT);
+             INSERT INTO gpkg_spatial_ref_sys VALUES ('WGS 84', 4326, 'EPSG', 4326, 'undefined');
+             CREATE TABLE gpkg_contents (table_name TEXT PRIMARY KEY, data_type TEXT,
+               identifier TEXT, srs_id INTEGER);
+             INSERT INTO gpkg_contents VALUES ('pts', 'features', 'pts', 4326);
+             CREATE TABLE gpkg_geometry_columns (table_name TEXT PRIMARY KEY,
+               column_name TEXT, geometry_type_name TEXT, srs_id INTEGER, z INTEGER, m INTEGER);
+             INSERT INTO gpkg_geometry_columns VALUES ('pts', 'geom', 'POINT', 4326, 0, 0);
+             CREATE TABLE pts (fid INTEGER PRIMARY KEY, geom BLOB, bbox TEXT);",
+        )
+        .unwrap();
+        let blob = |x: f64, y: f64| -> Vec<u8> {
+            let mut b: Vec<u8> = vec![b'G', b'P', 0, 0b0000_0011];
+            b.extend(4326i32.to_le_bytes());
+            for v in [x, x, y, y] {
+                b.extend(v.to_le_bytes());
+            }
+            b.push(1);
+            b.extend(1u32.to_le_bytes());
+            b.extend(x.to_le_bytes());
+            b.extend(y.to_le_bytes());
+            b
+        };
+        let mut ins = db
+            .prepare("INSERT INTO pts (geom, bbox) VALUES (?1, ?2)")
+            .unwrap();
+        ins.execute(rusqlite::params![blob(2.0, 48.0), "first"]).unwrap();
+        // Not a GeoPackage blob at all: the header magic is missing.
+        ins.execute(rusqlite::params![vec![0u8, 1, 2, 3], "corrupt"]).unwrap();
+        ins.execute(rusqlite::params![blob(3.0, 49.0), "third"]).unwrap();
+        drop(ins);
+        drop(db);
+
+        let t = &list_tables(&src).unwrap()[0];
+        let dst = dir.join("attr.parquet");
+        assert_eq!(
+            convert(&src, t, &dst, &|_| {}).unwrap(),
+            3,
+            "the bad blob must not abort the conversion"
+        );
+
+        let (store, _crs, info, _rg) =
+            crate::data::loader::open_store_for_test(&dst).unwrap();
+        let sc = store.schema.clone();
+        assert_eq!(sc.field_with_name("bbox").unwrap().data_type(), &DataType::Utf8);
+        assert!(sc.field_with_name("bbox_1").is_ok(), "covering renamed around it");
+        let covering = info.geo.covering.expect("covering declared");
+        assert!(covering.contains("\"bbox_1\""), "{covering}");
+
+        // The unreadable feature is a null geometry; its neighbours are
+        // intact and in order.
+        let geoms = store.fetch_geoms(&[0, 1, 2]).unwrap();
+        assert!(matches!(geoms[0].1, Some(geo_types::Geometry::Point(_))));
+        assert!(geoms[1].1.is_none(), "the bad blob is a null row");
+        assert!(matches!(geoms[2].1, Some(geo_types::Geometry::Point(_))));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
