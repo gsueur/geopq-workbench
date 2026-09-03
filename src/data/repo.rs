@@ -282,7 +282,9 @@ pub fn default_state_catalogs() -> Vec<Catalog> {
         added_on: None,
     };
     vec![
-        c("Alaska Geoportal", "https://gis.data.alaska.gov"),
+        // Moved from gis.data.alaska.gov (2026-09), which now redirects
+        // every path to the new home page.
+        c("Alaska Geoportal", "https://akgeoportal.alaska.gov"),
         c("Arizona AZGeo", "https://azgeo-open-data-agic.hub.arcgis.com"),
         c("California State Geoportal", "https://gis.data.ca.gov"),
         c("Colorado GeoData", "https://geodata.colorado.gov"),
@@ -1479,7 +1481,21 @@ pub fn fetch_dcat(base: &str) -> Result<DcatCatalog, String> {
         ok => ok,
     }
     .map_err(|e| format!("cannot reach {url}: {e}"))?;
+    // A portal that moved redirects every path to its new home page,
+    // and a home page is HTML: say so, rather than "invalid JSON at
+    // line 1 column 1" about a document that was never a catalog.
+    let html = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|t| t.to_ascii_lowercase().contains("text/html"));
     let body = match res.status().as_u16() {
+        200 if html => {
+            return Err(format!(
+                "{url}: the portal answered with a web page, not a catalog — \
+                 it may have moved; open the site and look for its new address"
+            ))
+        }
         200 => res
             .into_body()
             .read_to_string()
