@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::map::camera::Camera;
@@ -7,7 +7,16 @@ use crate::map::warp::{self, TileMesh, Warp, WarpPlan};
 
 #[allow(dead_code)]
 pub const TILE_PX: u32 = 256;
-const MAX_CACHED: usize = 600;
+/// Decoded-pixel budget for the cache, in bytes.
+///
+/// Counting tiles was the wrong unit: a 256² tile carries a full mip
+/// chain, so it is ~350 kB of pixels, and 600 of them is over 200 MB of
+/// host memory with a matching set of GPU textures behind it. ~64 MB is
+/// around 190 tiles, still several viewports' worth at any zoom.
+const MAX_CACHED_BYTES: usize = 64 << 20;
+/// Slack before eviction runs, in bytes: evicting a handful at a time
+/// would sort the whole cache on most frames.
+const EVICT_SLACK_BYTES: usize = 4 << 20;
 const FETCH_THREADS: usize = 4;
 /// CARTO's basemaps need a (free) API key since 2026: without one the
 /// tiles come back watermarked "API KEY REQUIRED". The key is read once at
@@ -216,6 +225,9 @@ const TILE_RETRY_MAX: u32 = 4;
 struct CacheEntry {
     state: TileState,
     last_used: u64,
+    /// Decoded size of the mip chain, once the tile is Ready (0 while it
+    /// is pending or failed, which is what makes those free to keep).
+    bytes: usize,
 }
 
 /// One level of a tile's mip chain, RGBA8 in sRGB storage.
@@ -317,6 +329,8 @@ pub struct TileDrawCmd {
 
 struct FetchResult {
     key: TileKey,
+    /// Cache generation the fetch was issued under (see `Queue`).
+    generation: u64,
     mips: Option<Vec<MipLevel>>,
 }
 
@@ -337,7 +351,16 @@ struct Queue {
     /// Tiles the current view wants, most useful first.
     want: VecDeque<TileKey>,
     /// Handed to a worker and not yet finished; never queued twice.
+    ///
+    /// A key stays here until `poll` takes its result off the channel, not
+    /// until the worker stops reading: in between there was a window of a
+    /// frame or two where the tile was neither in flight nor known-good,
+    /// and the next frame queued a second fetch for it.
     in_flight: HashSet<TileKey>,
+    /// Bumped by `clear`. Workers stamp it on the result they send, so a
+    /// fetch issued before the cache was emptied can be recognised and
+    /// dropped rather than reinstated as a fresh entry.
+    generation: u64,
     /// Set when the cache is dropped, so workers stop waiting and exit.
     stop: bool,
 }
@@ -347,6 +370,10 @@ type Shared = Arc<(Mutex<Queue>, Condvar)>;
 pub struct TileCache {
     entries: HashMap<TileKey, CacheEntry>,
     queue: Shared,
+    /// Kept so the channel stays open even if every worker exits, and so
+    /// tests can hand `poll` a result without a network.
+    #[allow(dead_code)]
+    res_tx: Sender<FetchResult>,
     res_rx: Receiver<FetchResult>,
     pending_uploads: Vec<TileUpload>,
     frame: u64,
@@ -355,7 +382,10 @@ pub struct TileCache {
     /// and thrown away when the projection changes.
     warp_meshes: HashMap<TileId, Option<Arc<TileMesh>>>,
     warp_epoch: u64,
+    /// Bumped by `clear`, stamped on every fetch (see `Queue`).
+    generation: u64,
 }
+
 
 /// Warped meshes kept across frames. Well above any one viewport, so panning
 /// back and forth never rebuilds; cleared wholesale on a projection change.
@@ -370,7 +400,7 @@ impl TileCache {
             let tx = res_tx.clone();
             let ctx = egui_ctx.clone();
             std::thread::spawn(move || loop {
-                let key = {
+                let (key, generation) = {
                     let (lock, cv) = &*q;
                     let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
                     loop {
@@ -379,17 +409,22 @@ impl TileCache {
                         }
                         if let Some(k) = g.want.pop_front() {
                             g.in_flight.insert(k);
-                            break k;
+                            break (k, g.generation);
                         }
                         g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
                     }
                 };
                 let mips = fetch_tile(key);
+                // `in_flight` is cleared by `poll`, once the result is
+                // actually in hand.
+                if tx
+                    .send(FetchResult {
+                        key,
+                        generation,
+                        mips,
+                    })
+                    .is_err()
                 {
-                    let mut g = q.0.lock().unwrap_or_else(|e| e.into_inner());
-                    g.in_flight.remove(&key);
-                }
-                if tx.send(FetchResult { key, mips }).is_err() {
                     return;
                 }
                 ctx.request_repaint();
@@ -398,11 +433,13 @@ impl TileCache {
         Self {
             entries: HashMap::new(),
             queue,
+            res_tx,
             res_rx,
             pending_uploads: Vec::new(),
             frame: 0,
             warp_meshes: HashMap::new(),
             warp_epoch: 0,
+            generation: 0,
         }
     }
 
@@ -423,8 +460,21 @@ impl TileCache {
     /// Drain results from fetch threads; call once per frame.
     pub fn poll(&mut self) {
         while let Ok(res) = self.res_rx.try_recv() {
+            {
+                let mut g = self.queue.0.lock().unwrap_or_else(|e| e.into_inner());
+                g.in_flight.remove(&res.key);
+            }
+            // Fetched for a cache that has since been emptied (the CARTO
+            // key changed, say): the pixels are the ones `clear` was
+            // called to get rid of, and reinstating them here would put
+            // the watermarked tile straight back on screen.
+            if res.generation != self.generation {
+                continue;
+            }
+            let mut bytes = 0usize;
             let state = match res.mips {
                 Some(mips) => {
+                    bytes = mips.iter().map(|m| m.px.len()).sum();
                     self.pending_uploads.push(TileUpload { key: res.key, mips });
                     TileState::Ready
                 }
@@ -442,12 +492,14 @@ impl TileCache {
             };
             if let Some(e) = self.entries.get_mut(&res.key) {
                 e.state = state;
+                e.bytes = bytes;
             } else {
                 self.entries.insert(
                     res.key,
                     CacheEntry {
                         state,
                         last_used: self.frame,
+                        bytes,
                     },
                 );
             }
@@ -464,11 +516,21 @@ impl TileCache {
     /// would otherwise stay on screen until they scrolled out of view.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.generation += 1;
         if let Ok(mut g) = self.queue.0.lock() {
             g.want.clear();
+            g.generation = self.generation;
         }
     }
 
+    /// Keys the renderer must keep a GPU texture for.
+    ///
+    /// Exactly the Ready entries, and that is a contract rather than a
+    /// convenience: the decoded pixels are handed to the renderer once
+    /// and dropped, so a tile the GPU forgets while the cache still calls
+    /// it Ready is never uploaded again and stays blank for as long as
+    /// the entry lives. What bounds VRAM is therefore the cache's own
+    /// byte budget (see `evict`), which the texture set follows.
     pub fn alive_keys(&self) -> HashSet<TileKey> {
         self.entries
             .iter()
@@ -491,8 +553,12 @@ impl TileCache {
 
         let tl = camera.screen_to_world([0.0, 0.0], viewport_px);
         let br = camera.screen_to_world(viewport_px, viewport_px);
-        let x0 = ((tl[0] * n as f64).floor() as i64).max(0);
-        let x1 = ((br[0] * n as f64).ceil() as i64).min(n as i64);
+        // Longitude wraps: a view panned past the antimeridian sits at
+        // world x > 1, where clamping the column range left the basemap
+        // ending in a hard edge. The index wraps into the pyramid and the
+        // quad is put back on the right side of the seam below.
+        let x0 = (tl[0] * n as f64).floor() as i64;
+        let x1 = ((br[0] * n as f64).ceil() as i64).min(x0 + n as i64);
         let y0 = ((tl[1] * n as f64).floor() as i64).max(0);
         let y1 = ((br[1] * n as f64).ceil() as i64).min(n as i64);
 
@@ -501,7 +567,7 @@ impl TileCache {
             for y in y0..y1 {
                 wanted.push(TileId {
                     z,
-                    x: x as u32,
+                    x: x.rem_euclid(n as i64) as u32,
                     y: y as u32,
                 });
             }
@@ -510,7 +576,18 @@ impl TileCache {
         if wanted.len() > 512 {
             wanted.truncate(512);
         }
-        self.resolve(source_idx, wanted)
+        let mut draws = self.resolve(source_idx, wanted);
+        // A tile id wraps at the seam; the quad it draws must not. Put
+        // every tile in the copy of the world nearest the view centre.
+        let cx = camera.center[0];
+        for d in &mut draws {
+            let shift = (cx - (d.world_rect[0] + d.world_rect[2]) * 0.5).round();
+            if shift != 0.0 {
+                d.world_rect[0] += shift;
+                d.world_rect[2] += shift;
+            }
+        }
+        draws
     }
 
     /// Compute the draw list for a non-Mercator view: same cache and same
@@ -597,6 +674,7 @@ impl TileCache {
                         CacheEntry {
                             state: TileState::Pending { attempts: 0 },
                             last_used: self.frame,
+                            bytes: 0,
                         },
                     );
                     want.push(key);
@@ -647,8 +725,11 @@ impl TileCache {
         all
     }
 
+    /// Drop least-recently-used tiles until the cache is back under
+    /// budget. Only runs once the overshoot is worth a full sort.
     fn evict(&mut self) {
-        if self.entries.len() <= MAX_CACHED {
+        let mut used: usize = self.entries.values().map(|e| e.bytes).sum();
+        if used <= MAX_CACHED_BYTES + EVICT_SLACK_BYTES {
             return;
         }
         let mut by_age: VecDeque<(u64, TileKey)> = self
@@ -657,9 +738,13 @@ impl TileCache {
             .map(|(k, e)| (e.last_used, *k))
             .collect();
         by_age.make_contiguous().sort();
-        let excess = self.entries.len() - MAX_CACHED;
-        for (_, key) in by_age.iter().take(excess) {
-            self.entries.remove(key);
+        for (_, key) in by_age.iter() {
+            if used <= MAX_CACHED_BYTES {
+                break;
+            }
+            if let Some(e) = self.entries.remove(key) {
+                used -= e.bytes;
+            }
         }
     }
 
@@ -687,10 +772,34 @@ pub fn fetch_tile_blocking(key: TileKey) -> Option<Vec<MipLevel>> {
     fetch_tile(key)
 }
 
+/// Shared agent for tile fetches: connection pooling across the four
+/// worker threads (a basemap pan is hundreds of requests to one host, and
+/// a fresh agent per tile means a fresh TLS handshake per tile), and
+/// timeouts, because a stalled read on a worker blocks that quarter of
+/// the fetch capacity for as long as the OS lets it. Modelled on
+/// `source::http_agent`, but tighter: a tile is ~50 kB and worth
+/// abandoning early — the retry backoff will come back to it.
+///
+/// `http_status_as_error` keeps its default, so a 404 or a 429 arrives as
+/// `Err` and lands in that same backoff.
+fn tile_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .timeout_resolve(Some(std::time::Duration::from_secs(10)))
+            .timeout_connect(Some(std::time::Duration::from_secs(10)))
+            .timeout_recv_response(Some(std::time::Duration::from_secs(15)))
+            .timeout_recv_body(Some(std::time::Duration::from_secs(30)))
+            .build()
+            .into()
+    })
+}
+
 fn fetch_tile(key: TileKey) -> Option<Vec<MipLevel>> {
     let source = &TILE_SOURCES[key.source as usize];
     let url = tile_url(source, key.id);
-    let mut res = ureq::get(&url)
+    let mut res = tile_agent()
+        .get(&url)
         .header("User-Agent", USER_AGENT)
         .call()
         .ok()?;
@@ -829,6 +938,7 @@ mod tests {
                 attempts,
             },
             last_used: 0,
+            bytes: 0,
         };
 
         // Three failures, long past its 8 s backoff: retried, count kept.
@@ -853,6 +963,212 @@ mod tests {
         cache.entries.insert(key, failed(6000, TILE_RETRY_MAX));
         cache.resolve(0, vec![id]);
         assert_eq!(cache.pending_count(), 0, "retried past the attempt limit");
+    }
+
+    /// Tile fetches go through one pooled agent with timeouts. A fresh
+    /// agent per tile means a TLS handshake per tile, and no timeout at
+    /// all means one stalled read holds a quarter of the fetch capacity
+    /// for as long as the OS allows.
+    #[test]
+    fn tile_fetches_share_an_agent_with_timeouts() {
+        let t = tile_agent().config().timeouts();
+        assert_eq!(t.resolve, Some(std::time::Duration::from_secs(10)));
+        assert_eq!(t.connect, Some(std::time::Duration::from_secs(10)));
+        assert_eq!(t.recv_response, Some(std::time::Duration::from_secs(15)));
+        assert_eq!(t.recv_body, Some(std::time::Duration::from_secs(30)));
+        // Same agent every time, or the pooling is pointless.
+        assert!(std::ptr::eq(tile_agent(), tile_agent()));
+        // 404 and 429 must still arrive as errors, so the retry backoff
+        // sees them.
+        assert!(tile_agent().config().http_status_as_error());
+    }
+
+    /// A view panned across the antimeridian must get tiles on both
+    /// sides of the seam: the column index wraps into the pyramid, and
+    /// the quad each tile draws is put in the copy of the world the view
+    /// is actually looking at.
+    #[test]
+    fn a_view_across_the_antimeridian_gets_tiles_on_both_sides() {
+        let ctx = eframe::egui::Context::default();
+        let mut cache = TileCache::new(ctx);
+        {
+            let mut g = cache.queue.0.lock().unwrap();
+            g.stop = true;
+        }
+        let cam = Camera { center: [0.999, 0.5], zoom: 3.0 };
+        let vp = [512.0, 256.0];
+        cache.draws(0, &cam, vp);
+        let want: Vec<TileKey> = {
+            let g = cache.queue.0.lock().unwrap();
+            g.want.iter().copied().collect()
+        };
+        let n = 1u32 << 3;
+        assert!(
+            want.iter().any(|k| k.id.x == n - 1),
+            "nothing west of the seam: {:?}",
+            want.iter().map(|k| k.id.x).collect::<Vec<_>>()
+        );
+        assert!(
+            want.iter().any(|k| k.id.x == 0),
+            "nothing east of the seam: {:?}",
+            want.iter().map(|k| k.id.x).collect::<Vec<_>>()
+        );
+
+        for k in &want {
+            cache.entries.insert(
+                *k,
+                CacheEntry { state: TileState::Ready, last_used: 0, bytes: 0 },
+            );
+        }
+        let draws = cache.draws(0, &cam, vp);
+        assert!(
+            draws.iter().any(|d| d.world_rect[0] >= 1.0),
+            "every quad landed west of the seam: {:?}",
+            draws.iter().map(|d| d.world_rect[0]).collect::<Vec<_>>()
+        );
+    }
+
+    /// The cache is bounded by decoded bytes, not by a tile count: a
+    /// 256² tile with its mip chain is ~350 kB, so a count that looked
+    /// modest was hundreds of megabytes of pixels.
+    #[test]
+    fn eviction_follows_a_byte_budget() {
+        let ctx = eframe::egui::Context::default();
+        let mut cache = TileCache::new(ctx);
+        let per = 350_000usize;
+        let count = (MAX_CACHED_BYTES + EVICT_SLACK_BYTES) / per + 20;
+        for i in 0..count {
+            cache.entries.insert(
+                TileKey { source: 0, id: TileId { z: 10, x: i as u32, y: 0 } },
+                CacheEntry {
+                    state: TileState::Ready,
+                    last_used: i as u64,
+                    bytes: per,
+                },
+            );
+        }
+        cache.evict();
+        let used: usize = cache.entries.values().map(|e| e.bytes).sum();
+        assert!(used <= MAX_CACHED_BYTES, "still {used} bytes cached");
+        assert!(used > MAX_CACHED_BYTES / 2, "evicted far too much: {used}");
+        // The oldest go first.
+        assert!(!cache.entries.contains_key(&TileKey {
+            source: 0,
+            id: TileId { z: 10, x: 0, y: 0 }
+        }));
+        assert!(cache.entries.contains_key(&TileKey {
+            source: 0,
+            id: TileId { z: 10, x: count as u32 - 1, y: 0 }
+        }));
+    }
+
+    /// The GPU holds a texture per Ready entry and the pixels behind it
+    /// are gone after the upload, so the texture set has to track the
+    /// cache exactly — and the cache's byte budget is what bounds both.
+    /// Under the old tile count that came to ~210 MB of VRAM.
+    #[test]
+    fn the_gpu_texture_set_follows_the_byte_budget() {
+        let ctx = eframe::egui::Context::default();
+        let mut cache = TileCache::new(ctx);
+        let per = 350_000usize;
+        for i in 0..600u32 {
+            cache.entries.insert(
+                TileKey { source: 0, id: TileId { z: 10, x: i, y: 0 } },
+                CacheEntry {
+                    state: TileState::Ready,
+                    last_used: i as u64,
+                    bytes: per,
+                },
+            );
+        }
+        cache.evict();
+        let alive = cache.alive_keys();
+        assert_eq!(alive.len(), cache.entries.len(), "a Ready tile lost its texture");
+        assert!(
+            alive.len() * per <= MAX_CACHED_BYTES,
+            "{} textures is over budget",
+            alive.len()
+        );
+        assert!(alive.len() > 100, "far too little cached: {}", alive.len());
+    }
+
+    /// `clear` exists to get rid of what is on screen (the CARTO key
+    /// changed, and every cached tile is watermarked). Fetches already in
+    /// flight carry the pixels it is throwing away, so their results have
+    /// to be recognised and dropped instead of reinstated.
+    #[test]
+    fn clearing_the_cache_drops_fetches_already_in_flight() {
+        let ctx = eframe::egui::Context::default();
+        let mut cache = TileCache::new(ctx);
+        {
+            let mut g = cache.queue.0.lock().unwrap();
+            g.stop = true;
+        }
+        let key = TileKey { source: 0, id: TileId { z: 4, x: 3, y: 2 } };
+        let generation = {
+            let mut g = cache.queue.0.lock().unwrap();
+            g.in_flight.insert(key);
+            g.generation
+        };
+        cache.clear();
+        cache
+            .res_tx
+            .send(FetchResult {
+                key,
+                generation,
+                mips: Some(mip_chain(&[9u8; 4 * 4 * 4], 4, 4)),
+            })
+            .unwrap();
+        cache.poll();
+        assert!(cache.entries.is_empty(), "a stale fetch came back to life");
+        assert!(cache.take_uploads().is_empty(), "stale pixels were uploaded");
+        assert_eq!(cache.pending_count(), 0, "the claim outlived the result");
+    }
+
+    /// A tile stays claimed until its result is actually taken off the
+    /// channel. The worker used to release it before sending, which left
+    /// a window of a frame or two where the tile was neither in flight
+    /// nor cached — and the next frame issued a second fetch for it.
+    #[test]
+    fn a_finished_fetch_stays_claimed_until_it_is_polled() {
+        let ctx = eframe::egui::Context::default();
+        let mut cache = TileCache::new(ctx);
+        {
+            let mut g = cache.queue.0.lock().unwrap();
+            g.stop = true;
+        }
+        let id = TileId { z: 5, x: 1, y: 1 };
+        let key = TileKey { source: 0, id };
+        cache.resolve(0, vec![id]);
+        // A worker takes it and finishes, but nothing has polled yet.
+        let generation = {
+            let mut g = cache.queue.0.lock().unwrap();
+            let k = g.want.pop_front().unwrap();
+            g.in_flight.insert(k);
+            g.generation
+        };
+        cache
+            .res_tx
+            .send(FetchResult {
+                key,
+                generation,
+                mips: Some(mip_chain(&[9u8; 4 * 4 * 4], 4, 4)),
+            })
+            .unwrap();
+        cache.resolve(0, vec![id]);
+        {
+            let g = cache.queue.0.lock().unwrap();
+            assert!(!g.want.contains(&key), "the same tile was fetched twice");
+        }
+        cache.poll();
+        {
+            let g = cache.queue.0.lock().unwrap();
+            assert!(g.in_flight.is_empty(), "the claim was never released");
+        }
+        assert!(matches!(
+            cache.entries.get(&key).map(|e| &e.state),
+            Some(TileState::Ready)
+        ));
     }
 
     #[test]

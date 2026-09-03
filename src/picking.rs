@@ -80,15 +80,25 @@ pub fn measure_of(geom: &Geometry<f64>, latlong: bool) -> Option<Measure> {
     }
 }
 
+/// A layer's geometry sections as picking sees them: the chunk meshes
+/// (points, and the bin each chunk was drawn with) beside the R-tree over
+/// everything else.
+pub type PickSections = Vec<(Arc<Vec<ChunkMesh>>, Arc<RTree<PickItem>>)>;
+
 /// Cheap snapshot of everything picking needs from a layer, so the whole
 /// pick (candidate reads, exact tests, attribute fetch) can run off the
 /// UI thread — on remote layers those are network reads.
 pub struct PickLayer {
     pub id: u64,
     pub visible: bool,
-    pub sections: Vec<(Arc<Vec<ChunkMesh>>, Arc<RTree<PickItem>>)>,
+    pub sections: PickSections,
     pub store: Arc<FeatureStore>,
     pub crs: Crs,
+    /// Legend toggles, mirroring `DrawStyle`: only meaningful while the
+    /// layer is data-styled, because an unstyled layer reports bin 0 for
+    /// everything and the mask would hide all of it.
+    pub styled: bool,
+    pub hidden_bins: u64,
 }
 
 impl PickLayer {
@@ -103,8 +113,24 @@ impl PickLayer {
                 .collect(),
             store: Arc::clone(&l.store),
             crs: l.crs.clone(),
+            styled: l.style.style_by.is_some(),
+            hidden_bins: l.style.style_by.as_ref().map_or(0, |sb| sb.hidden_bins),
         }
     }
+
+    /// Whether the map is drawing this bin, on the same terms as
+    /// [`crate::map::renderer::DrawStyle::bin_hidden`].
+    fn bin_hidden(&self, bin: u8) -> bool {
+        bin_hidden(self.styled, self.hidden_bins, bin)
+    }
+}
+
+/// The legend mask, honoured only under data styling: an unstyled layer
+/// reports bin 0 for every feature, so a stale mask would make the whole
+/// layer unpickable. Mirrors `DrawStyle::bin_hidden`, which is what
+/// decides whether the feature is on screen at all.
+fn bin_hidden(styled: bool, hidden_bins: u64, bin: u8) -> bool {
+    styled && hidden_bins & (1u64 << bin) != 0
 }
 
 /// Transform a geometry from a data CRS into world coordinates.
@@ -130,11 +156,15 @@ fn pick_point_in_chunks<'a>(
     chunks: impl Iterator<Item = &'a ChunkMesh>,
     world: [f64; 2],
     tol_world: f64,
+    hidden: impl Fn(u8) -> bool,
 ) -> Option<(FeatureRef, [f64; 2])> {
     let tol2 = tol_world * tol_world;
     let mut best: Option<(f64, FeatureRef, [f64; 2])> = None;
     for chunk in chunks {
-        if chunk.point_instances.is_empty() {
+        // A chunk holds one style bin, so a hidden class is a whole chunk
+        // that is not on screen. Picking through it would select a feature
+        // the user cannot see and highlight nothing.
+        if chunk.point_instances.is_empty() || hidden(chunk.bin) {
             continue;
         }
         // Points land in the chunk keyed by their feature's bbox center, so
@@ -165,6 +195,32 @@ fn pick_point_in_chunks<'a>(
     best.map(|(_, f, p)| (f, p))
 }
 
+/// Features whose bbox meets `env`, in row order, minus the style bins
+/// the legend has switched off: a class that is not drawn must not be
+/// picked either, or clicking empty map selects a feature nobody can see.
+fn candidates_near(
+    sections: &PickSections,
+    env: AABB<[f64; 2]>,
+    hidden: impl Fn(u8) -> bool,
+) -> Vec<FeatureRef> {
+    let mut candidates: Vec<FeatureRef> = sections
+        .iter()
+        .flat_map(|(_, rtree)| {
+            rtree
+                .locate_in_envelope_intersecting(env)
+                .filter(|item| !hidden(item.bin))
+                .map(|item| item.feature)
+        })
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    // Later rows render on top. If the safety cap is hit, preserve those
+    // highest row ids instead of discarding them with `truncate`.
+    let drop = candidates.len().saturating_sub(512);
+    candidates.drain(..drop);
+    candidates
+}
+
 /// Pick the topmost feature near a world-space point.
 ///
 /// `tol_world` is the pick tolerance in world units (derived from pixels).
@@ -185,7 +241,9 @@ pub fn pick(
         // highlight comes straight from the rendered instance position —
         // no geometry read.
         let layer_chunks = layer.sections.iter().flat_map(|(c, _)| c.iter());
-        if let Some((fref, pos)) = pick_point_in_chunks(layer_chunks, world, tol_world) {
+        if let Some((fref, pos)) =
+            pick_point_in_chunks(layer_chunks, world, tol_world, |b| layer.bin_hidden(b))
+        {
             return Some(Selection {
                 layer_id: layer.id,
                 feature: fref,
@@ -198,24 +256,10 @@ pub fn pick(
             [world[0] - tol_world, world[1] - tol_world],
             [world[0] + tol_world, world[1] + tol_world],
         );
-        let mut candidates: Vec<FeatureRef> = layer
-            .sections
-            .iter()
-            .flat_map(|(_, rtree)| {
-                rtree
-                    .locate_in_envelope_intersecting(env)
-                    .map(|item| item.feature)
-            })
-            .collect();
+        let candidates = candidates_near(&layer.sections, env, |b| layer.bin_hidden(b));
         if candidates.is_empty() {
             continue;
         }
-        candidates.sort();
-        candidates.dedup();
-        // Later rows render on top. If the safety cap is hit, preserve those
-        // highest row ids instead of discarding them with `truncate`.
-        let drop = candidates.len().saturating_sub(512);
-        candidates.drain(..drop);
 
         // Exact test in the data CRS: transform the click point + tolerance there.
         let (px, py) = display.projected_from_world(world);
@@ -276,6 +320,65 @@ mod point_pick_tests {
     use crate::data::geometry::MeshBuilder;
     use geo_types::MultiPoint;
 
+    /// A class switched off in the legend is not on the map, and must not
+    /// be pickable either: clicking it selected an invisible feature and
+    /// highlighted nothing. Chunks carry their bin, and so do the R-tree
+    /// entries, so both halves of the pick can skip it.
+    #[test]
+    fn hidden_bin_is_not_pickable() {
+        let mut mb = MeshBuilder::default();
+        // Two points, one per style bin (a bin change splits chunks).
+        mb.bin = 0;
+        mb.add(&Geometry::Point(Point::new(0.50, 0.5)), FeatureRef { index: 1 });
+        mb.bin = 1;
+        mb.add(&Geometry::Point(Point::new(0.60, 0.5)), FeatureRef { index: 2 });
+        let chunks = Arc::new(mb.finish());
+        assert!(chunks.iter().any(|c| c.bin == 1), "no bin-1 chunk was built");
+
+        let hide_bin_1 = |b: u8| b == 1;
+        let tol = 1e-4;
+        assert!(
+            pick_point_in_chunks(chunks.iter(), [0.50, 0.5], tol, hide_bin_1).is_some(),
+            "a visible class stopped being pickable"
+        );
+        assert!(
+            pick_point_in_chunks(chunks.iter(), [0.60, 0.5], tol, hide_bin_1).is_none(),
+            "a hidden class was picked"
+        );
+
+        // Areal / linear features go through the R-tree instead.
+        let rtree = Arc::new(RTree::bulk_load(vec![
+            PickItem { bbox: [0.49, 0.49, 0.51, 0.51], feature: FeatureRef { index: 1 }, bin: 0 },
+            PickItem { bbox: [0.59, 0.49, 0.61, 0.51], feature: FeatureRef { index: 2 }, bin: 1 },
+        ]));
+        let sections = vec![(Arc::clone(&chunks), rtree)];
+        let env = |x: f64| AABB::from_corners([x - tol, 0.5 - tol], [x + tol, 0.5 + tol]);
+        assert_eq!(
+            candidates_near(&sections, env(0.60), |_| false)
+                .iter()
+                .map(|f| f.index)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "the feature is there when nothing is hidden"
+        );
+        assert!(
+            candidates_near(&sections, env(0.60), hide_bin_1).is_empty(),
+            "a hidden class survived the candidate filter"
+        );
+        assert_eq!(candidates_near(&sections, env(0.50), hide_bin_1).len(), 1);
+    }
+
+    /// The mask only means anything under data styling: an unstyled layer
+    /// reports bin 0 for every feature, so honouring a stale mask would
+    /// make the whole layer unpickable.
+    #[test]
+    fn an_unstyled_layer_ignores_the_hidden_mask() {
+        assert!(bin_hidden(true, 0b101, 0));
+        assert!(bin_hidden(true, 0b101, 2));
+        assert!(!bin_hidden(true, 0b101, 1));
+        assert!(!bin_hidden(false, 0b101, 0), "unstyled layers have no bins");
+    }
+
     #[test]
     fn multipoint_member_outside_center_cell_is_pickable() {
         let mut mb = MeshBuilder::default();
@@ -288,14 +391,15 @@ mod point_pick_tests {
         let chunks = mb.finish();
         let tol = 1e-5;
 
-        let (fref, pos) = pick_point_in_chunks(chunks.iter(), [0.51, 0.5], tol)
+        let shown = |_: u8| false;
+        let (fref, pos) = pick_point_in_chunks(chunks.iter(), [0.51, 0.5], tol, shown)
             .expect("member outside the bbox-center cell must be pickable");
         assert_eq!(fref.index, 7);
         assert!((pos[0] - 0.51).abs() < tol && (pos[1] - 0.5).abs() < tol);
 
-        assert!(pick_point_in_chunks(chunks.iter(), [0.5, 0.5], tol).is_some());
+        assert!(pick_point_in_chunks(chunks.iter(), [0.5, 0.5], tol, shown).is_some());
         // Between the members: inside the content bounds, but no hit.
-        assert!(pick_point_in_chunks(chunks.iter(), [0.505, 0.5], tol).is_none());
+        assert!(pick_point_in_chunks(chunks.iter(), [0.505, 0.5], tol, shown).is_none());
     }
 }
 

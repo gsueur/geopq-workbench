@@ -61,13 +61,29 @@ struct LineOut {
 fn vs_line(
     @builtin(vertex_index) vi: u32,
     @location(0) seg_a: vec2<f32>,
-    @location(1) seg_b: vec2<f32>,
+    @location(1) seg_b3: vec3<f32>,
     @location(2) cum_a: f32,
     @location(3) prev: vec3<f32>,
     @location(4) next: vec3<f32>,
 ) -> LineOut {
-    // NaN in either endpoint (run sentinel in the shared point stream)
-    // yields NaN corners: the primitive is clipped, drawing nothing.
+    var out: LineOut;
+    // An instance that reaches a run sentinel is not a segment. Sentinels
+    // are recognised by their negative arc length (`cum_a` is `a`'s,
+    // `seg_b3.z` is `b`'s) and the quad is collapsed to a single point,
+    // which rasterizes nothing. This used to rely on the sentinel's NaN
+    // position clipping the primitive, which fast-math is free to fold
+    // away — the sentinel now carries a finite out-of-range position and
+    // no NaN reaches the shader at all.
+    if (cum_a < 0.0 || seg_b3.z < 0.0) {
+        out.pos = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        out.p = vec2<f32>(0.0, 0.0);
+        out.a = vec2<f32>(0.0, 0.0);
+        out.b = vec2<f32>(0.0, 0.0);
+        out.cum_a = 0.0;
+        out.ends = 0u;
+        return out;
+    }
+    let seg_b = seg_b3.xy;
     let a_px = ndc_to_px(seg_a * u.ab + u.t);
     let b_px = ndc_to_px(seg_b * u.ab + u.t);
     var dir = b_px - a_px;
@@ -91,7 +107,6 @@ fn vs_line(
         default: { corner = b_px + dir * w - n * w; }
     }
 
-    var out: LineOut;
     out.pos = vec4<f32>(px_to_ndc(corner), 0.0, 1.0);
     out.p = corner;
     out.a = a_px;
@@ -101,8 +116,8 @@ fn vs_line(
     let local_len = length(seg_b - seg_a);
     out.cum_a = cum_a * len / max(local_len, 1e-12);
     // A sentinel neighbour (run break, or the stream's padded ends)
-    // marks a run end. Sentinels carry a negative arc length: the NaN
-    // in their position cannot be tested here, fast-math folds it.
+    // marks a run end. Sentinels are recognised by their negative arc
+    // length, never by their position.
     out.ends = select(0u, 1u, prev.z < 0.0) | select(0u, 2u, next.z < 0.0);
     return out;
 }
@@ -120,7 +135,8 @@ fn cap_dist(beyond: f32, s_d: f32, cap: u32, r: f32) -> f32 {
 @fragment
 fn fs_line(in: LineOut) -> @location(0) vec4<f32> {
     let ab = in.b - in.a;
-    let len = max(length(ab), 1e-6);
+    let raw_len = length(ab);
+    let len = max(raw_len, 1e-6);
     let dir = ab / len;
     let rel = in.p - in.a;
     let t = dot(rel, dir);
@@ -131,6 +147,13 @@ fn fs_line(in: LineOut) -> @location(0) vec4<f32> {
     let cap_b = select(0u, u.cap, (in.ends & 2u) != 0u);
     var d = max(cap_dist(-t, s_d, cap_a, u.size),
                 cap_dist(t - len, s_d, cap_b, u.size));
+    // A segment whose endpoints coincide (repeated coordinates are common
+    // in real data) has no direction: with a square or flat cap the two
+    // cap distances above then describe the whole extended quad and the
+    // segment paints an opaque box. It is a dot, so draw one.
+    if (raw_len <= 1e-5) {
+        d = length(rel) - u.size;
+    }
     if (u.dash.x >= 0.0) {
         // Dash pattern (dash1, gap1, dash2, gap2) tiled along the run's
         // arc length. Each on-interval is a stroke with the user cap at
@@ -318,4 +341,40 @@ fn vs_tile_mesh(
 fn fs_tile(in: TileOut) -> @location(0) vec4<f32> {
     let c = textureSample(tile_tex, tile_samp, in.uv);
     return vec4<f32>(c.rgb, c.a * u.color.a);
+}
+
+// ---------------- layer fill composite ----------------
+
+// A layer's fills are drawn opaque into an offscreen target that was
+// cleared transparent, so the resolve leaves *premultiplied* texels: an
+// antialiased edge covering 40% of a pixel comes back as 0.4·C with
+// alpha 0.4. Scaling only the alpha (what `fs_tile` does for a raster
+// tile, whose texels are unmultiplied) would then blend 0.4·C as if it
+// were the full colour and draw a dark fringe along every edge. Both
+// channels are scaled here instead, and the pipeline blends
+// premultiplied.
+//
+// The target is rounded up to a 128 px grid so a window resize does not
+// reallocate it every frame; `u.edge.xy` carries viewport/texture, the
+// fraction of it the fills were rendered into.
+@vertex
+fn vs_composite(@builtin(vertex_index) vi: u32) -> TileOut {
+    var corner: vec2<f32>;
+    switch (vi) {
+        case 0u: { corner = vec2<f32>(0.0, 0.0); }
+        case 1u: { corner = vec2<f32>(1.0, 0.0); }
+        case 2u: { corner = vec2<f32>(0.0, 1.0); }
+        case 3u: { corner = vec2<f32>(0.0, 1.0); }
+        case 4u: { corner = vec2<f32>(1.0, 0.0); }
+        default: { corner = vec2<f32>(1.0, 1.0); }
+    }
+    var out: TileOut;
+    out.pos = vec4<f32>(corner * u.ab + u.t, 0.0, 1.0);
+    out.uv = corner * u.edge.xy;
+    return out;
+}
+
+@fragment
+fn fs_composite(in: TileOut) -> @location(0) vec4<f32> {
+    return textureSample(tile_tex, tile_samp, in.uv) * u.color.a;
 }

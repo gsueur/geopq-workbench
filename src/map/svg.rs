@@ -107,8 +107,12 @@ impl Proj {
 }
 
 /// A coordinate, rounded to 0.01 pt and stripped of trailing zeros.
-/// Non-finite input would poison a whole path, so it fails loudly to the
-/// caller instead (the path is dropped).
+///
+/// This does not guard finiteness: a NaN would be written as `NaN` and
+/// poison the element it lands in. Every caller has to drop the element
+/// first — [`sub_path`] filters non-finite vertices, and
+/// [`marker_element`] checks its centre and radius before writing any of
+/// the shapes that do not go through `sub_path`.
 fn n(v: f64) -> String {
     let r = (v * 100.0).round() / 100.0;
     if r == 0.0 {
@@ -264,6 +268,13 @@ fn marker_element(
     out: &mut String,
 ) {
     let r = radius * shape.reach() as f64;
+    // A feature whose coordinates did not survive projection reaches this
+    // as NaN. `sub_path` drops such vertices, but `<circle>` is written
+    // straight out of `n`, so the whole marker is refused here instead —
+    // one `cx="NaN"` invalidates the document for every renderer.
+    if !c[0].is_finite() || !c[1].is_finite() || !r.is_finite() {
+        return;
+    }
     let ring = |count: usize, rad: f64, start: f64| -> Vec<[f64; 2]> {
         (0..count)
             .map(|i| {
@@ -458,24 +469,24 @@ fn render_layer(s: &mut String, li: usize, layer: &SvgLayer, proj: &Proj) {
             };
             let e = st.edge_for(f.bin);
             let width_px = st.half_width_for(f.bin) * 2.0;
-            let dashes = dash_array(st.line_pattern, st.line_cap, width_px, proj.ppp);
+            let dashes = dash_array(st.line_pattern, st.line_cap, width_px);
             let _ = writeln!(
                 s,
                 r#"<path d="{d}" fill="none" stroke="{}"{} stroke-width="{}" stroke-linecap="{cap}" stroke-linejoin="round"{dashes}/>"#,
                 hex([e[0], e[1], e[2]]),
                 opacity_attr("stroke-opacity", e[3]),
-                n(width_px as f64 / proj.ppp),
+                n(width_px as f64),
             );
         }
     }
 
     // Markers, on top of the layer's own fills and lines.
     if st.point_color[3] > 0.0 && !layer.points.is_empty() {
-        let radius = st.point_radius_px as f64 / proj.ppp;
+        let radius = st.point_radius_px as f64;
         // The renderer insets the border inside the marker and caps it to
         // half the radius; SVG has no inset stroke, so this is a centred
         // stroke of the same width — half of it sits outside the symbol.
-        let border = (st.line_half_width_px * 2.0).min(st.point_radius_px * 0.5) as f64 / proj.ppp;
+        let border = (st.line_half_width_px * 2.0).min(st.point_radius_px * 0.5) as f64;
         let bordered = st.line_color[3] > 0.0 && border > 0.0;
         for (w, bin) in &layer.points {
             if st.bin_hidden(*bin) {
@@ -547,16 +558,17 @@ fn render_credits(s: &mut String, scene: &SvgScene, w: f64, h: f64) {
 }
 
 /// The ` stroke-dasharray="…"` attribute for a pattern, or an empty
-/// string for a solid stroke. `dashes_px` is the renderer's own pattern
-/// in physical px, including the flat-cap correction and the 3 px floor
-/// on the unit; the trailing pair is dropped when the pattern only has
-/// one dash-gap cycle, which is what it means there.
-fn dash_array(pattern: LinePattern, cap: LineCap, width_px: f32, ppp: f64) -> String {
+/// string for a solid stroke. `dashes_px` is the renderer's own pattern,
+/// including the flat-cap correction and the 3 unit floor; like every
+/// other style size it is in points, which is what SVG wants. The
+/// trailing pair is dropped when the pattern only has one dash-gap
+/// cycle, which is what it means there.
+fn dash_array(pattern: LinePattern, cap: LineCap, width_px: f32) -> String {
     let d = pattern.dashes_px(cap, width_px);
     if d[0] < 0.0 {
         return String::new();
     }
-    let v = |i: usize| n(d[i] as f64 / ppp);
+    let v = |i: usize| n(d[i] as f64);
     if d[2] == 0.0 && d[3] == 0.0 {
         format!(r#" stroke-dasharray="{},{}""#, v(0), v(1))
     } else {
@@ -761,12 +773,14 @@ mod tests {
         let svg = render(&sc);
         // The second marker sits at that x, rounded to 0.01 pt.
         assert!(
-            svg.contains(r#"M855.36 146.34"#),
+            svg.contains(r#"M855.36 142.69"#),
             "star at the projected point missing"
         );
         // First marker at the centre, first vertex straight up: the star's
-        // outer radius is 5 px · 1.4620 reach / 2 ppp = 3.655 pt.
-        assert!(svg.contains(r#"M200 146.34"#), "star tip up at the centre");
+        // outer radius is 5 pt · 1.4620 reach = 7.31 pt. Style sizes are
+        // points, not physical pixels, so `pixels_per_point` moves the
+        // geometry under the symbol and never the symbol itself.
+        assert!(svg.contains(r#"M200 142.69"#), "star tip up at the centre");
     }
 
     #[test]
@@ -827,12 +841,12 @@ mod tests {
         // emitted one would still "have dashes" on the dashed layer.
         assert_eq!(count(&l0, "stroke-dasharray"), 0, "{l0}");
         assert_eq!(count(&l1, "stroke-dasharray"), 2, "one per line feature");
-        // Dash at 3 px full width, flat cap: dashes_px gives [12, 6, 0, 0]
-        // physical px, so 6,3 pt at 2 px/pt, and the empty trailing pair
-        // is dropped rather than written as zeros.
+        // Dash at 3 pt full width, flat cap: dashes_px gives [12, 6, 0, 0]
+        // and the empty trailing pair is dropped rather than written as
+        // zeros. The pattern is in the same points the width is.
         let expect = LinePattern::Dash.dashes_px(LineCap::Flat, 3.0);
         assert_eq!(expect, [12.0, 6.0, 0.0, 0.0], "renderer pattern moved");
-        assert!(l1.contains(r#"stroke-dasharray="6,3""#), "{l1}");
+        assert!(l1.contains(r#"stroke-dasharray="12,6""#), "{l1}");
         assert!(l1.contains(r#"stroke-linecap="butt""#), "flat cap is butt");
         // Round joints everywhere: the line pass has no other join.
         assert_eq!(count(&svg, r#"stroke-linejoin="round""#), count(&svg, "fill=\"none\""));
@@ -842,8 +856,8 @@ mod tests {
     fn a_width_ramp_gives_each_class_its_own_stroke_width() {
         let svg = render(&scene());
         let l0 = layer_block(&svg, 0);
-        // Half-widths 0.5/1.5/2.5 px → full 1/3/5 px → 0.5/1.5/2.5 pt.
-        for w in ["0.5", "1.5", "2.5"] {
+        // Half-widths 0.5/1.5/2.5 pt → full 1/3/5 pt.
+        for w in ["1", "3", "5"] {
             assert!(
                 l0.contains(&format!(r#"stroke-width="{w}""#)),
                 "missing width {w} in {l0}"
@@ -854,7 +868,7 @@ mod tests {
         let mut flat = scene();
         flat.layers[0].style.bin_half_widths = None;
         let f0 = layer_block(&render(&flat), 0);
-        assert_eq!(count(&f0, r#"stroke-width="0.6""#), 3, "{f0}");
+        assert_eq!(count(&f0, r#"stroke-width="1.2""#), 3, "{f0}");
     }
 
     #[test]
@@ -871,9 +885,47 @@ mod tests {
         assert_eq!(d.matches('M').count(), 1, "{d}");
         assert_eq!(d.matches('L').count(), 9, "{d}");
         assert!(d.ends_with('Z'));
-        // Border width: min(line_half_width·2, radius·0.5) = 1.2 px at
-        // 2 px/pt.
-        assert!(l2.contains(r#"stroke-width="0.6""#), "{l2}");
+        // Border width: min(line_half_width·2, radius·0.5) = 1.2 pt.
+        assert!(l2.contains(r#"stroke-width="1.2""#), "{l2}");
+    }
+
+    /// A feature whose coordinates did not survive projection arrives as
+    /// NaN. Paths already drop non-finite vertices, but a circular marker
+    /// is written straight from `n`, and one `cx="NaN"` invalidates the
+    /// document for every renderer that reads it. The bad feature goes,
+    /// everything else stays.
+    #[test]
+    fn a_non_finite_feature_is_dropped_and_the_rest_survives() {
+        let mut sc = scene();
+        sc.layers[2].style.point_shape = PointShape::Circle;
+        let clean = render(&sc);
+        assert_eq!(count(&clean, "<circle"), 2);
+
+        sc.layers[2].points.push(([f64::NAN, 0.5], 0));
+        sc.layers[2].points.push(([0.5, f64::INFINITY], 1));
+        sc.layers[0].features.push(SvgFeature {
+            geom: Geometry::Polygon(geo_types::Polygon::new(
+                LineString(vec![
+                    Coord { x: 0.49, y: 0.49 },
+                    Coord { x: f64::NAN, y: 0.49 },
+                    Coord { x: 0.51, y: 0.51 },
+                    Coord { x: 0.49, y: 0.49 },
+                ]),
+                vec![],
+            )),
+            bin: 0,
+            underlay: false,
+        });
+        let svg = render(&sc);
+        assert!(!svg.contains("NaN"), "NaN reached the document");
+        assert!(!svg.contains("inf"), "an infinity reached the document");
+        assert_eq!(count(&svg, "<circle"), 2, "a bad marker was written");
+        // The layers around it are untouched.
+        assert_eq!(
+            layer_block(&svg, 1),
+            layer_block(&clean, 1),
+            "a bad feature disturbed another layer"
+        );
     }
 
     #[test]

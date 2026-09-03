@@ -157,9 +157,11 @@ fn line_lod_for_zoom(zoom: f64) -> usize {
 /// feature a few pixels wide just darkens it into outline color).
 const MIN_OUTLINE_FEATURE_PX: f64 = 4.0;
 
-/// Segments to draw from a size-sorted LOD buffer given the current scale.
-fn line_count_for_scale(index: &[(f32, u32)], scale: f64) -> u32 {
-    let cutoff = MIN_OUTLINE_FEATURE_PX / scale;
+/// Segments to draw from a size-sorted LOD buffer, given how many *points*
+/// of screen one world unit covers (the cutoff is a size in points, so a
+/// hi-dpi screen must not raise it).
+fn line_count_for_scale(index: &[(f32, u32)], pt_per_world: f64) -> u32 {
+    let cutoff = MIN_OUTLINE_FEATURE_PX / pt_per_world;
     let mut count = 0u32;
     for &(threshold, prefix) in index {
         if (threshold as f64) >= cutoff {
@@ -178,13 +180,14 @@ struct LayerGpu {
 /// Convert a LOD's 16 B/segment `[x0,y0,x1,y1]` list into a shared point
 /// stream (12 B/point: x, y, arc length): consecutive segments that chain
 /// (`prev.b == cur.a`, the common case — ring order survives the stable
-/// extent sort) share their joint point, and a NaN sentinel separates
+/// extent sort) share their joint point, and a sentinel separates
 /// runs (its quads collapse to nothing in the vertex shader). Instance
 /// `i` reads its segment as `points[i]`, `points[i+1]` (same buffer
 /// bound at two offsets), so segment counts in the size index translate
 /// to instance counts here; a sentinel padded at each end lets two more
-/// bindings expose `points[i-1]` / `points[i+2]`, whose NaN marks the
-/// instance as a run end (line caps). Arc length accumulates in
+/// bindings expose `points[i-1]` / `points[i+2]`, whose negative arc
+/// length marks the instance as a run end (line caps). Arc length
+/// accumulates in
 /// chunk-local units and restarts at every sentinel, so each run
 /// anchors its dash pattern at its own start. Net: ~13 B/segment
 /// instead of 16.
@@ -195,11 +198,13 @@ fn line_point_stream(
     if segs.is_empty() {
         return (Vec::new(), Vec::new());
     }
-    // The NaN position collapses any instance touching the sentinel;
-    // the negative arc length is the run-end marker for its neighbours
-    // (NaN self-comparison is folded away under fast-math on Metal, so
-    // the shader must not test the NaN itself).
-    const SENTINEL: [f32; 3] = [f32::NAN, f32::NAN, -1.0];
+    // The negative arc length is the sentinel: it collapses any instance
+    // that reaches it and marks its neighbours as run ends. The position
+    // is finite and far outside any chunk-local coordinate, so it never
+    // chains onto a real point and no NaN ever reaches the shader — a NaN
+    // position was the earlier design, and NaN comparisons are folded
+    // away under fast-math on Metal.
+    const SENTINEL: [f32; 3] = [f32::MAX, f32::MAX, -1.0];
     let mut points: Vec<[f32; 3]> = Vec::with_capacity(segs.len() + segs.len() / 8 + 2);
     points.push(SENTINEL); // lead pad: `prev` of instance 0
     // Instance index of each segment (transient; only the size-index
@@ -208,7 +213,7 @@ fn line_point_stream(
     let mut cum = 0.0f32;
     for s in segs {
         let (a, b) = ([s[0], s[1]], [s[2], s[3]]);
-        // A NaN sentinel never equals `a`, so it breaks runs naturally.
+        // A sentinel never equals `a`, so it breaks runs naturally.
         let chained = points.last().is_some_and(|p| p[0] == a[0] && p[1] == a[1]);
         if !chained {
             if points.len() > 1 {
@@ -283,6 +288,9 @@ pub struct MapResources {
     line_pipeline: wgpu::RenderPipeline,
     point_pipeline: wgpu::RenderPipeline,
     tile_pipeline: wgpu::RenderPipeline,
+    /// Full-viewport quad over a group's offscreen fills. Its own
+    /// pipeline because that target is premultiplied and a tile is not.
+    composite_pipeline: wgpu::RenderPipeline,
     /// Warped tiles: same texture and fragment shader, but vertices come
     /// from a buffer instead of being generated from the vertex index.
     tile_mesh_pipeline: wgpu::RenderPipeline,
@@ -302,9 +310,36 @@ pub struct MapResources {
     composites: HashMap<u64, CompositeTarget>,
     /// Shared MSAA scratch for offscreen fill passes.
     scratch_msaa: Option<(wgpu::TextureView, [u32; 2])>,
+    /// Size every composite target and the MSAA scratch is allocated at:
+    /// the viewport rounded up to `COMPOSITE_GRID`, and shrunk only after
+    /// `SHRINK_AFTER` frames below it (a drag-resize would otherwise
+    /// reallocate every one of them on every frame of the drag).
+    composite_size: [u32; 2],
+    shrink_frames: u32,
     target_format: wgpu::TextureFormat,
     /// Draw list built in prepare, executed in paint.
+    ///
+    /// One slot, so one map: two `MapCallback`s sharing these resources in
+    /// a frame would each overwrite the other's list before it is painted.
+    /// The app draws a single map viewport; a second one would have to key
+    /// this (and the composites) by a map id.
     draw_list: Vec<DrawCmd>,
+    /// Uniform bytes for the frame, kept across frames for its capacity
+    /// (a busy frame is tens of thousands of draws' worth).
+    uniform_scratch: Vec<u8>,
+}
+
+/// Composite targets are allocated in steps of this many pixels.
+const COMPOSITE_GRID: u32 = 128;
+/// Frames a smaller viewport must hold before the targets shrink to it.
+const SHRINK_AFTER: u32 = 120;
+
+/// Viewport size rounded up to the allocation grid.
+fn composite_alloc_size(vp: [u32; 2]) -> [u32; 2] {
+    [
+        vp[0].next_multiple_of(COMPOSITE_GRID).max(COMPOSITE_GRID),
+        vp[1].next_multiple_of(COMPOSITE_GRID).max(COMPOSITE_GRID),
+    ]
 }
 
 impl MapResources {
@@ -312,6 +347,17 @@ impl MapResources {
     pub fn has_layer_uploaded(&self, key: (u64, u64)) -> bool {
         self.layers.contains_key(&key)
     }
+}
+
+/// Which pipeline a draw needs, so `paint` can skip redundant binds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pipe {
+    Tile,
+    TileMesh,
+    Composite,
+    Fill,
+    Line,
+    Point,
 }
 
 enum DrawCmd {
@@ -332,6 +378,13 @@ enum DrawCmd {
     /// the layer's fill opacity (uniform tone regardless of feature overlap).
     Composite {
         group: u64,
+        uoffset: u32,
+    },
+    /// An opaque fill drawn straight into the frame: at opacity 1 the
+    /// offscreen round trip changes nothing (see `prepare`).
+    Fill {
+        layer: (u64, u64),
+        chunk: usize,
         uoffset: u32,
     },
     Line {
@@ -469,17 +522,17 @@ impl MapResources {
             immediate_size: 0,
         });
 
-        let target = [Some(wgpu::ColorTargetState {
-            format: target_format,
-            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-            write_mask: wgpu::ColorWrites::ALL,
-        })];
-
-        let make_pipeline = |label: &str,
-                             layout: &wgpu::PipelineLayout,
-                             vs: &str,
-                             fs: &str,
-                             buffers: &[wgpu::VertexBufferLayout<'_>]| {
+        let make_blended = |label: &str,
+                            layout: &wgpu::PipelineLayout,
+                            vs: &str,
+                            fs: &str,
+                            buffers: &[wgpu::VertexBufferLayout<'_>],
+                            blend: wgpu::BlendState| {
+            let target = [Some(wgpu::ColorTargetState {
+                format: target_format,
+                blend: Some(blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })];
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(layout),
@@ -507,6 +560,13 @@ impl MapResources {
                 multiview_mask: None,
                 cache: None,
             })
+        };
+        let make_pipeline = |label: &str,
+                             layout: &wgpu::PipelineLayout,
+                             vs: &str,
+                             fs: &str,
+                             buffers: &[wgpu::VertexBufferLayout<'_>]| {
+            make_blended(label, layout, vs, fs, buffers, wgpu::BlendState::ALPHA_BLENDING)
         };
 
         let fill_pipeline = make_pipeline(
@@ -536,10 +596,12 @@ impl MapResources {
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &wgpu::vertex_attr_array![0 => Float32x2, 2 => Float32],
                 },
+                // Float32x3: `b`'s arc length rides along, and a negative
+                // one is how the shader recognises the run sentinel.
                 wgpu::VertexBufferLayout {
                     array_stride: 12,
                     step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![1 => Float32x2],
+                    attributes: &wgpu::vertex_attr_array![1 => Float32x3],
                 },
                 wgpu::VertexBufferLayout {
                     array_stride: 12,
@@ -565,6 +627,16 @@ impl MapResources {
             }],
         );
         let tile_pipeline = make_pipeline("tile", &tile_layout, "vs_tile", "fs_tile", &[]);
+        // The offscreen fill target resolves to premultiplied texels, so
+        // the composite has to blend premultiplied (see `fs_composite`).
+        let composite_pipeline = make_blended(
+            "layer composite",
+            &tile_layout,
+            "vs_composite",
+            "fs_composite",
+            &[],
+            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+        );
         let tile_mesh_pipeline = make_pipeline(
             "tile mesh",
             &tile_layout,
@@ -601,6 +673,7 @@ impl MapResources {
             line_pipeline,
             point_pipeline,
             tile_pipeline,
+            composite_pipeline,
             tile_mesh_pipeline,
             tile_mesh_vbuf: None,
             tile_mesh_ibuf: None,
@@ -614,9 +687,32 @@ impl MapResources {
             tiles: HashMap::new(),
             composites: HashMap::new(),
             scratch_msaa: None,
+            composite_size: [0, 0],
+            shrink_frames: 0,
             target_format,
             draw_list: Vec::new(),
+            uniform_scratch: Vec::new(),
         }
+    }
+
+    /// Track the size the offscreen targets should have: grow at once,
+    /// shrink only once the smaller viewport has held for a while.
+    fn update_composite_size(&mut self, vp: [u32; 2]) -> [u32; 2] {
+        let want = composite_alloc_size(vp);
+        let cur = self.composite_size;
+        if want[0] > cur[0] || want[1] > cur[1] {
+            self.composite_size = [want[0].max(cur[0]), want[1].max(cur[1])];
+            self.shrink_frames = 0;
+        } else if want != cur {
+            self.shrink_frames += 1;
+            if self.shrink_frames >= SHRINK_AFTER {
+                self.composite_size = want;
+                self.shrink_frames = 0;
+            }
+        } else {
+            self.shrink_frames = 0;
+        }
+        self.composite_size
     }
 
     fn ensure_composite_target(
@@ -900,11 +996,18 @@ impl egui_wgpu::CallbackTrait for MapCallback {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _screen: &egui_wgpu::ScreenDescriptor,
+        screen: &egui_wgpu::ScreenDescriptor,
         _encoder: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         let res: &mut MapResources = resources.get_mut().expect("MapResources installed");
+        // A viewport under one pixel makes ndc-per-world infinite and puts
+        // inf (then NaN) in every uniform; it happens for a frame or two
+        // while a panel is dragged shut. Nothing to draw either way.
+        if self.viewport_px[0] < 1.0 || self.viewport_px[1] < 1.0 {
+            res.draw_list.clear();
+            return Vec::new();
+        }
 
         // Upload new tiles, evict dead ones and dead layer generations.
         for up in &self.tile_uploads {
@@ -913,20 +1016,20 @@ impl egui_wgpu::CallbackTrait for MapCallback {
         res.tiles.retain(|k, _| self.alive_tiles.contains(k));
         res.layers
             .retain(|k, _| self.alive_layers.contains(k) || self.layers.iter().any(|l| l.key == *k));
-        res.composites
-            .retain(|g, _| self.layers.iter().any(|l| l.composite_group == *g));
         for draw in &self.layers {
             res.ensure_layer(device, draw);
         }
-        let vp_size = [
-            (self.viewport_px[0].max(1.0)) as u32,
-            (self.viewport_px[1].max(1.0)) as u32,
-        ];
+        let vp_size = [self.viewport_px[0] as u32, self.viewport_px[1] as u32];
+        let alloc_size = res.update_composite_size(vp_size);
 
         // Build uniforms + draw list.
         let cam = &self.camera;
         let scale = cam.scale();
         let [vw, vh] = self.viewport_px;
+        // Style sizes (widths, radii, the outline cutoff) are in points,
+        // which is what the user set them in and what the SVG export
+        // writes; the shader works in physical pixels.
+        let ppp = screen.pixels_per_point.max(0.1);
         let ndc_per_world_x = scale * 2.0 / vw as f64;
         let ndc_per_world_y = scale * 2.0 / vh as f64;
         // Viewport rect in world units, padded for line widths / point radii.
@@ -941,8 +1044,12 @@ impl egui_wgpu::CallbackTrait for MapCallback {
             b[0] <= view[2] && b[2] >= view[0] && b[1] <= view[3] && b[3] >= view[1]
         };
 
-        let mut uniforms: Vec<u8> = Vec::new();
-        let mut draw_list: Vec<DrawCmd> = Vec::new();
+        // Both Vecs live on the resources: the frame refills them, but the
+        // capacity is bought once.
+        let mut uniforms: Vec<u8> = std::mem::take(&mut res.uniform_scratch);
+        uniforms.clear();
+        let mut draw_list: Vec<DrawCmd> = std::mem::take(&mut res.draw_list);
+        draw_list.clear();
         // group -> fill draws collected across that group's sections.
         let mut offscreen_jobs: Vec<(u64, Vec<((u64, u64), usize, u32)>)> = Vec::new();
         let push_uniform = |uniforms: &mut Vec<u8>,
@@ -964,14 +1071,22 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                 ],
                 color,
                 wh: [vw, vh],
-                size,
-                feather: 1.0,
+                size: size * ppp,
+                feather: ppp,
                 shape: marker.shape,
-                edge_px: marker.edge_px,
+                edge_px: marker.edge_px * ppp,
                 cap: marker.cap,
                 _pad: 0,
                 edge: marker.edge,
-                dash: marker.dash,
+                // The dash pattern is measured along the same arc length
+                // the shader works in, so it scales with everything else.
+                // A negative first entry means "solid" and stays negative.
+                dash: [
+                    marker.dash[0] * ppp,
+                    marker.dash[1] * ppp,
+                    marker.dash[2] * ppp,
+                    marker.dash[3] * ppp,
+                ],
             };
             uniforms.extend_from_slice(bytemuck::bytes_of(&u));
             uniforms.resize(uniforms.len().next_multiple_of(UNIFORM_STRIDE as usize), 0);
@@ -1066,36 +1181,64 @@ impl egui_wgpu::CallbackTrait for MapCallback {
             // Fills render opaque into the group's offscreen texture and
             // composite once at the layer's fill opacity: overlapping
             // features (stacked condo parcels etc.) don't darken.
+            //
+            // At full opacity there is nothing to composite — overlap is
+            // invisible when every fill is opaque — so those go straight
+            // into the frame and the group needs no texture at all. That
+            // is the common case (a colour map opens at opacity 1) and
+            // each of these targets is a viewport-sized RGBA8.
+            let fill_alpha = s.fill_color[3];
+            let direct = fill_alpha >= 1.0;
             let mut fill_cmds: Vec<((u64, u64), usize, u32)> = Vec::new();
             // Two passes: underlay chunks (oversized features) first, so
             // giant polygons draw below normal fills across ALL sections
             // of the group, not only their own.
-            for underlay_pass in [true, false] {
-                for layer in group_layers {
-                    let Some(gpu) = res.layers.get(&layer.key) else {
-                        continue;
-                    };
-                    for (ci, chunk) in gpu.chunks.iter().enumerate() {
-                        if chunk.underlay != underlay_pass || layer.style.bin_hidden(chunk.bin) {
+            if fill_alpha > 0.0 && !no_fills {
+                for underlay_pass in [true, false] {
+                    for layer in group_layers {
+                        let Some(gpu) = res.layers.get(&layer.key) else {
                             continue;
-                        }
-                        if !no_fills && chunk.fill_index_count > 0 && visible(&chunk.bounds_world) {
-                            let rgb = layer.style.rgb_for(chunk.bin, s.fill_color);
-                            let opaque = [rgb[0], rgb[1], rgb[2], 1.0];
-                            let uoffset =
-                                push_uniform(&mut uniforms, chunk.origin, [1.0, 1.0], opaque, 0.0, MarkerU::default());
-                            fill_cmds.push((layer.key, ci, uoffset));
+                        };
+                        for (ci, chunk) in gpu.chunks.iter().enumerate() {
+                            if chunk.underlay != underlay_pass
+                                || layer.style.bin_hidden(chunk.bin)
+                            {
+                                continue;
+                            }
+                            if chunk.fill_index_count > 0 && visible(&chunk.bounds_world) {
+                                let rgb = layer.style.rgb_for(chunk.bin, s.fill_color);
+                                let opaque = [rgb[0], rgb[1], rgb[2], 1.0];
+                                let uoffset = push_uniform(
+                                    &mut uniforms,
+                                    chunk.origin,
+                                    [1.0, 1.0],
+                                    opaque,
+                                    0.0,
+                                    MarkerU::default(),
+                                );
+                                if direct {
+                                    draw_list.push(DrawCmd::Fill {
+                                        layer: layer.key,
+                                        chunk: ci,
+                                        uoffset,
+                                    });
+                                } else {
+                                    fill_cmds.push((layer.key, ci, uoffset));
+                                }
+                            }
                         }
                     }
                 }
             }
-            if !fill_cmds.is_empty() && s.fill_color[3] > 0.0 {
-                // Full-viewport quad: corner (0,0)..(1,1) -> NDC.
+            if !fill_cmds.is_empty() {
+                // Full-viewport quad: corner (0,0)..(1,1) -> NDC. The
+                // target is allocated on a coarse grid, so `edge.xy`
+                // carries the fraction of it the fills cover.
                 let quad_offset = uniforms.len() as u32;
                 let u = ChunkUniform {
                     ab: [2.0, -2.0],
                     t: [-1.0, 1.0],
-                    color: [1.0, 1.0, 1.0, s.fill_color[3]],
+                    color: [1.0, 1.0, 1.0, fill_alpha],
                     wh: [vw, vh],
                     size: 0.0,
                     feather: 1.0,
@@ -1103,7 +1246,12 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                     edge_px: 0.0,
                     cap: 0,
                     _pad: 0,
-                    edge: [0.0; 4],
+                    edge: [
+                        vp_size[0] as f32 / alloc_size[0].max(1) as f32,
+                        vp_size[1] as f32 / alloc_size[1].max(1) as f32,
+                        0.0,
+                        0.0,
+                    ],
                     dash: [-1.0, 0.0, 0.0, 0.0],
                 };
                 uniforms.extend_from_slice(bytemuck::bytes_of(&u));
@@ -1130,7 +1278,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                         }
                         let count = chunk.line_bufs[lod]
                             .as_ref()
-                            .map(|(_, index)| line_count_for_scale(index, scale))
+                            .map(|(_, index)| line_count_for_scale(index, scale / ppp as f64))
                             .unwrap_or(0);
                         if count > 0 && visible(&chunk.bounds_world) {
                             #[cfg(test)]
@@ -1215,15 +1363,20 @@ impl egui_wgpu::CallbackTrait for MapCallback {
         if !uniforms.is_empty() {
             queue.write_buffer(&res.uniform_buf, 0, &uniforms);
         }
+        res.uniform_scratch = uniforms;
         res.draw_list = draw_list;
 
         // Offscreen fill passes (submitted before the egui render pass).
+        // Only the groups that asked for one this frame keep a texture:
+        // a layer turned opaque, hidden or removed gives its back.
+        res.composites
+            .retain(|g, _| offscreen_jobs.iter().any(|(j, _)| j == g));
         if offscreen_jobs.is_empty() {
             return Vec::new();
         }
-        res.ensure_scratch_msaa(device, vp_size);
+        res.ensure_scratch_msaa(device, alloc_size);
         for (group, _) in &offscreen_jobs {
-            res.ensure_composite_target(device, *group, vp_size);
+            res.ensure_composite_target(device, *group, alloc_size);
         }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("layer fill composites"),
@@ -1247,6 +1400,10 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            // The target is rounded up to the allocation grid; the fills
+            // belong in its top-left viewport-sized corner, which is what
+            // `fs_composite` samples back.
+            pass.set_viewport(0.0, 0.0, vw, vh, 0.0, 1.0);
             pass.set_pipeline(&res.fill_pipeline);
             for (section_key, ci, uoffset) in cmds {
                 let Some(gpu) = res.layers.get(section_key) else {
@@ -1273,13 +1430,32 @@ impl egui_wgpu::CallbackTrait for MapCallback {
     ) {
         let res: &MapResources = resources.get().expect("MapResources installed");
 
+        // Runs of the same pipeline are the norm (a layer's chunks all draw
+        // through one), and re-binding it per draw is the expensive half of
+        // a small draw. Track what is bound instead.
+        let mut bound: Option<Pipe> = None;
+        let mut set = |pass: &mut wgpu::RenderPass<'static>, which: Pipe| {
+            if bound == Some(which) {
+                return;
+            }
+            bound = Some(which);
+            pass.set_pipeline(match which {
+                Pipe::Tile => &res.tile_pipeline,
+                Pipe::TileMesh => &res.tile_mesh_pipeline,
+                Pipe::Composite => &res.composite_pipeline,
+                Pipe::Fill => &res.fill_pipeline,
+                Pipe::Line => &res.line_pipeline,
+                Pipe::Point => &res.point_pipeline,
+            });
+        };
+
         for cmd in &res.draw_list {
             match cmd {
                 DrawCmd::Tile { key, uoffset } => {
                     let Some(tile) = res.tiles.get(key) else {
                         continue;
                     };
-                    pass.set_pipeline(&res.tile_pipeline);
+                    set(pass, Pipe::Tile);
                     pass.set_bind_group(0, &res.uniform_bg, &[*uoffset]);
                     pass.set_bind_group(1, &tile.bind_group, &[]);
                     pass.draw(0..6, 0..1);
@@ -1298,7 +1474,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                     ) else {
                         continue;
                     };
-                    pass.set_pipeline(&res.tile_mesh_pipeline);
+                    set(pass, Pipe::TileMesh);
                     pass.set_bind_group(0, &res.uniform_bg, &[*uoffset]);
                     pass.set_bind_group(1, &tile.bind_group, &[]);
                     pass.set_vertex_buffer(0, vb.slice(..));
@@ -1313,10 +1489,26 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                     let Some(target) = res.composites.get(group) else {
                         continue;
                     };
-                    pass.set_pipeline(&res.tile_pipeline);
+                    set(pass, Pipe::Composite);
                     pass.set_bind_group(0, &res.uniform_bg, &[*uoffset]);
                     pass.set_bind_group(1, &target.bind_group, &[]);
                     pass.draw(0..6, 0..1);
+                }
+                DrawCmd::Fill {
+                    layer,
+                    chunk,
+                    uoffset,
+                } => {
+                    let Some(l) = res.layers.get(layer) else { continue };
+                    let c = &l.chunks[*chunk];
+                    let (Some(vb), Some(ib)) = (&c.fill_vbuf, &c.fill_ibuf) else {
+                        continue;
+                    };
+                    set(pass, Pipe::Fill);
+                    pass.set_bind_group(0, &res.uniform_bg, &[*uoffset]);
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), c.fill_index_format);
+                    pass.draw_indexed(0..c.fill_index_count, 0, 0..1);
                 }
                 DrawCmd::Line {
                     layer,
@@ -1330,7 +1522,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                     let Some((buf, _)) = &c.line_bufs[*lod] else {
                         continue;
                     };
-                    pass.set_pipeline(&res.line_pipeline);
+                    set(pass, Pipe::Line);
                     pass.set_bind_group(0, &res.uniform_bg, &[*uoffset]);
                     // The stream is sentinel-padded on both ends: element
                     // 0 is the pad, so the segment endpoints sit at +12
@@ -1350,7 +1542,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                     let Some(l) = res.layers.get(layer) else { continue };
                     let c = &l.chunks[*chunk];
                     let Some(buf) = &c.point_buf else { continue };
-                    pass.set_pipeline(&res.point_pipeline);
+                    set(pass, Pipe::Point);
                     pass.set_bind_group(0, &res.uniform_bg, &[*uoffset]);
                     pass.set_vertex_buffer(0, buf.slice(..));
                     pass.draw(0..6, 0..*count);
@@ -2305,6 +2497,33 @@ mod tests {
         style: DrawStyle,
         build: impl FnOnce(&mut MeshBuilder),
     ) -> Vec<u8> {
+        render_geoms_on(
+            device,
+            queue,
+            size,
+            zoom,
+            wgpu::Color::BLACK,
+            1.0,
+            style,
+            build,
+        )
+        .0
+    }
+
+    /// As `render_geoms`, over a chosen background and at a chosen
+    /// `pixels_per_point`; also hands back the resources so a test can
+    /// look at what the frame allocated.
+    #[allow(clippy::too_many_arguments)]
+    fn render_geoms_on(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        size: u32,
+        zoom: f64,
+        clear: wgpu::Color,
+        ppp: f32,
+        style: DrawStyle,
+        build: impl FnOnce(&mut MeshBuilder),
+    ) -> (Vec<u8>, egui_wgpu::CallbackResources) {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut resources = egui_wgpu::CallbackResources::default();
         resources.insert(MapResources::new(device, format));
@@ -2354,7 +2573,7 @@ mod tests {
         let resolve_view = resolve.create_view(&Default::default());
         let screen = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [size, size],
-            pixels_per_point: 1.0,
+            pixels_per_point: ppp,
         };
         let mut encoder = device.create_command_encoder(&Default::default());
         let bufs = cb.prepare(device, queue, &screen, &mut encoder, &mut resources);
@@ -2369,7 +2588,7 @@ mod tests {
                         depth_slice: None,
                         resolve_target: Some(&resolve_view),
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            load: wgpu::LoadOp::Clear(clear),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -2386,7 +2605,7 @@ mod tests {
                 eframe::egui::PaintCallbackInfo {
                     viewport: rect,
                     clip_rect: rect,
-                    pixels_per_point: 1.0,
+                    pixels_per_point: ppp,
                     screen_size_px: [size, size],
                 },
                 &mut pass,
@@ -2424,7 +2643,392 @@ mod tests {
         let slice = out.slice(..);
         slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        slice.get_mapped_range().to_vec()
+        let px = slice.get_mapped_range().to_vec();
+        (px, resources)
+    }
+
+    /// The offscreen fill target comes back premultiplied: an edge pixel
+    /// covering a fraction k of a fill holds k·C with alpha k. The
+    /// composite must scale both by the layer opacity, not the alpha
+    /// alone — scaling alpha twice makes every antialiased edge darker
+    /// than the fill it borders, which is a visible fringe around every
+    /// polygon in the layer.
+    ///
+    /// Over a known background the correct blend is
+    /// `C·k·op + B·(1 − k·op)` per channel; with a red fill at op = 0.5
+    /// over a blue background that is exactly `red + blue = 255`, for
+    /// every k, so no pixel has to be identified as an edge to be judged.
+    #[test]
+    fn a_translucent_fill_composites_without_a_dark_fringe() {
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        // 192 is not a multiple of the 128 px allocation grid, so this
+        // also pins the sub-rectangle the composite samples back. (It has
+        // to keep the readback row stride a multiple of 256, or
+        // copy_texture_to_buffer refuses and every pixel reads zero.)
+        let size = 192u32;
+        let style = DrawStyle {
+            fill_color: [1.0, 0.0, 0.0, 0.5],
+            ..Default::default()
+        };
+        let (data, res) = render_geoms_on(
+            &device,
+            &queue,
+            size,
+            10.0,
+            wgpu::Color { r: 0.0, g: 0.0, b: 1.0, a: 1.0 },
+            1.0,
+            style,
+            |mb| {
+                // A diamond: every edge crosses pixels at an angle, so
+                // most of its boundary is partial coverage.
+                let r = 0.0002;
+                let pts = vec![
+                    (0.5, 0.5 - r),
+                    (0.5 + r, 0.5),
+                    (0.5, 0.5 + r),
+                    (0.5 - r, 0.5),
+                    (0.5, 0.5 - r),
+                ];
+                mb.add(
+                    &geo_types::Geometry::Polygon(geo_types::Polygon::new(
+                        geo_types::LineString::from(pts),
+                        vec![],
+                    )),
+                    crate::data::geometry::FeatureRef::INVALID,
+                );
+            },
+        );
+        let gpu: &MapResources = res.get().expect("resources");
+        assert_eq!(gpu.composites.len(), 1, "a translucent fill needs a target");
+        assert_eq!(
+            gpu.composite_size,
+            [256, 256],
+            "targets are allocated on the 128 px grid"
+        );
+
+        let mut painted = 0usize;
+        for px in data.chunks_exact(4) {
+            // Everything the fill reached: the untouched background is
+            // pure blue.
+            if px[2] == 255 && px[0] == 0 {
+                continue;
+            }
+            painted += 1;
+            let sum = px[0] as i32 + px[2] as i32;
+            assert!((sum - 255).abs() <= 3, "fringe at {px:?} (sum {sum})");
+        }
+        assert!(painted > 2_000, "fill barely drew: {painted} px");
+    }
+
+    /// An opaque fill has nothing to composite — overlapping features
+    /// cannot darken each other when every one of them is opaque — so it
+    /// must not cost a viewport-sized offscreen texture per layer.
+    #[test]
+    fn opaque_fills_skip_the_offscreen_target() {
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let size = 128u32;
+        let style = DrawStyle {
+            fill_color: [1.0, 0.0, 0.0, 1.0],
+            ..Default::default()
+        };
+        let (data, res) = render_geoms_on(
+            &device,
+            &queue,
+            size,
+            10.0,
+            wgpu::Color::BLACK,
+            1.0,
+            style,
+            |mb| {
+                let poly = geo_types::Polygon::new(
+                    geo_types::LineString::from(vec![
+                        (0.4998, 0.4998),
+                        (0.5002, 0.4998),
+                        (0.5002, 0.5002),
+                        (0.4998, 0.5002),
+                        (0.4998, 0.4998),
+                    ]),
+                    vec![],
+                );
+                mb.add(
+                    &geo_types::Geometry::Polygon(poly),
+                    crate::data::geometry::FeatureRef::INVALID,
+                );
+            },
+        );
+        let gpu: &MapResources = res.get().expect("resources");
+        assert!(
+            gpu.composites.is_empty(),
+            "an opaque fill allocated {} offscreen target(s)",
+            gpu.composites.len()
+        );
+        let red = data
+            .chunks_exact(4)
+            .filter(|px| px[0] > 200 && px[1] < 60)
+            .count();
+        assert!(red > 5_000, "opaque fill did not draw: {red} px");
+    }
+
+    /// Offscreen targets follow the viewport in steps, and only grow
+    /// promptly: a drag-resize walks through hundreds of sizes, and
+    /// reallocating every target on every one of them is what the grid
+    /// and the shrink delay exist to avoid.
+    #[test]
+    fn composite_targets_grow_at_once_and_shrink_slowly() {
+        let Some((device, _queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let mut res = MapResources::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        assert_eq!(res.update_composite_size([1000, 600]), [1024, 640]);
+        // Same grid cell: no change at all.
+        assert_eq!(res.update_composite_size([1010, 600]), [1024, 640]);
+        // Bigger: immediately.
+        assert_eq!(res.update_composite_size([1100, 600]), [1152, 640]);
+        // Smaller: not yet, and not for a good while.
+        for _ in 0..SHRINK_AFTER - 1 {
+            assert_eq!(res.update_composite_size([500, 400]), [1152, 640]);
+        }
+        assert_eq!(res.update_composite_size([500, 400]), [512, 512]);
+    }
+
+    /// Repeated coordinates are everywhere in published data. A segment
+    /// between two identical points has no direction, and with a square
+    /// cap the stroke shader used to paint the whole extended quad: a
+    /// solid box at the joint. The drawn ink must not depend on whether
+    /// the source repeated a vertex.
+    #[test]
+    fn a_repeated_vertex_paints_nothing_extra() {
+        use crate::data::layer::{LineCap, LinePattern};
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let size = 128u32;
+        let w = |p: f64| 0.5 + (p - 40.0) / (1u64 << 24) as f64;
+        let lit = |pts: Vec<(f64, f64)>| -> usize {
+            let data = render_geoms(
+                &device,
+                &queue,
+                size,
+                16.0,
+                line_style(3.0, LinePattern::Solid, LineCap::Square),
+                |mb| {
+                    mb.add(
+                        &geo_types::Geometry::LineString(geo_types::LineString::from(pts)),
+                        crate::data::geometry::FeatureRef::INVALID,
+                    );
+                },
+            );
+            data.chunks_exact(4).filter(|px| px[1] > 128).count()
+        };
+        let clean = lit(vec![(w(0.0), w(0.0)), (w(80.0), w(80.0))]);
+        let repeated = lit(vec![
+            (w(0.0), w(0.0)),
+            (w(0.0), w(0.0)),
+            (w(80.0), w(80.0)),
+        ]);
+        assert!(clean > 200, "the control line did not draw: {clean}");
+        assert!(
+            repeated.abs_diff(clean) <= 8,
+            "the repeated vertex added ink: {repeated} vs {clean}"
+        );
+    }
+
+    /// Runs inside one chunk are separated by a sentinel, and the
+    /// instances that reach it must collapse. That used to ride on a NaN
+    /// position being clipped, which fast-math may fold away; the
+    /// sentinel now carries a finite, far-out-of-range position, so a
+    /// collapse that failed would smear a quad across the whole frame
+    /// instead of quietly doing nothing.
+    #[test]
+    fn a_broken_run_draws_only_its_segments() {
+        use crate::data::layer::{LineCap, LinePattern};
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let size = 128u32;
+        let style = line_style(1.0, LinePattern::Solid, LineCap::Flat);
+        let at = |px: f64, py: f64| {
+            (
+                0.5 + (px - 64.0) / (1u64 << 24) as f64,
+                0.5 + (py - 64.0) / (1u64 << 24) as f64,
+            )
+        };
+        let draw = |runs: Vec<Vec<(f64, f64)>>| -> usize {
+            let data = render_geoms(&device, &queue, size, 16.0, style.clone(), |mb| {
+                for r in &runs {
+                    mb.add(
+                        &geo_types::Geometry::LineString(geo_types::LineString::from(
+                            r.clone(),
+                        )),
+                        crate::data::geometry::FeatureRef::INVALID,
+                    );
+                }
+            });
+            data.chunks_exact(4).filter(|px| px[1] > 128).count()
+        };
+        let one = draw(vec![vec![at(20.0, 40.0), at(100.0, 40.0)]]);
+        // Two runs that do not chain: the stream puts a sentinel between
+        // them, and three instances of the six touch it.
+        let two = draw(vec![
+            vec![at(20.0, 40.0), at(100.0, 40.0)],
+            vec![at(20.0, 90.0), at(100.0, 90.0)],
+        ]);
+        assert!(one > 100, "the control run did not draw: {one}");
+        assert!(
+            two.abs_diff(2 * one) <= 12,
+            "sentinel instances painted: {two} vs {} for two runs",
+            2 * one
+        );
+    }
+
+    /// Widths, radii and the outline cutoff are in points: that is what
+    /// the user typed, what the style panel shows and what the SVG export
+    /// writes. On a hi-dpi screen the shader has to scale them, or a
+    /// 2 pt line comes out half as thick as the same line beside it in
+    /// egui's own painter.
+    #[test]
+    fn style_widths_are_points_not_physical_pixels() {
+        use crate::data::layer::{LineCap, LinePattern};
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let size = 128u32;
+        let across = |ppp: f32| -> usize {
+            let (data, _) = render_geoms_on(
+                &device,
+                &queue,
+                size,
+                16.0,
+                wgpu::Color::BLACK,
+                ppp,
+                line_style(1.0, LinePattern::Solid, LineCap::Flat),
+                |mb| add_horizontal_chain(mb, 100.0, 1),
+            );
+            (0..size)
+                .filter(|y| data[((y * size + size / 2) * 4 + 1) as usize] > 128)
+                .count()
+        };
+        // A 2 pt stroke: 2 physical px at 1x, 4 at 2x.
+        let one = across(1.0);
+        let two = across(2.0);
+        assert!((2..=3).contains(&one), "2 pt at 1x covered {one} px");
+        assert!((4..=6).contains(&two), "2 pt at 2x covered {two} px");
+    }
+
+    /// A viewport can be a fraction of a pixel wide for a frame or two
+    /// while a side panel is dragged shut. The camera transform is then
+    /// infinite and every uniform NaN, which wgpu reports as a validation
+    /// error per draw. There is nothing to draw at that size anyway.
+    #[test]
+    fn a_degenerate_viewport_draws_nothing() {
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let mut resources = egui_wgpu::CallbackResources::default();
+        resources.insert(MapResources::new(&device, wgpu::TextureFormat::Rgba8Unorm));
+        let mut mb = MeshBuilder::default();
+        mb.add(
+            &geo_types::Geometry::Point(geo_types::Point::new(0.5, 0.5)),
+            crate::data::geometry::FeatureRef::INVALID,
+        );
+        let cb = MapCallback {
+            camera: crate::map::camera::Camera { center: [0.5, 0.5], zoom: 10.0 },
+            viewport_px: [0.0, 600.0],
+            tile_opacity: 1.0,
+            tile_draws: vec![],
+            tile_uploads: vec![],
+            alive_tiles: Default::default(),
+            alive_layers: Default::default(),
+            layers: vec![LayerDraw {
+                key: (1, 0),
+                composite_group: 1,
+                chunks: std::sync::Arc::new(mb.finish()),
+                style: marker_style(crate::data::layer::PointShape::Circle, 4.0),
+            }],
+            background: [0.0; 4],
+        };
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [0, 600],
+            pixels_per_point: 1.0,
+        };
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let bufs = cb.prepare(&device, &queue, &screen, &mut encoder, &mut resources);
+        assert!(bufs.is_empty());
+        let res: &MapResources = resources.get().expect("resources");
+        assert!(res.draw_list.is_empty(), "drew into a zero-width viewport");
+    }
+
+    /// The uniform bytes and the draw list are rebuilt every frame, but
+    /// their storage is not: a busy frame is tens of thousands of draws,
+    /// and allocating that from scratch 60 times a second is pure waste.
+    #[test]
+    fn frame_scratch_is_reused_between_frames() {
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let mut resources = egui_wgpu::CallbackResources::default();
+        resources.insert(MapResources::new(&device, wgpu::TextureFormat::Rgba8Unorm));
+        let mut mb = MeshBuilder::default();
+        for i in 0..64u32 {
+            mb.add(
+                &geo_types::Geometry::Point(geo_types::Point::new(
+                    0.5 + i as f64 * 1e-5,
+                    0.5,
+                )),
+                crate::data::geometry::FeatureRef { index: i },
+            );
+        }
+        let cb = MapCallback {
+            camera: crate::map::camera::Camera { center: [0.5, 0.5], zoom: 10.0 },
+            viewport_px: [256.0, 256.0],
+            tile_opacity: 1.0,
+            tile_draws: vec![],
+            tile_uploads: vec![],
+            alive_tiles: Default::default(),
+            alive_layers: Default::default(),
+            layers: vec![LayerDraw {
+                key: (1, 0),
+                composite_group: 1,
+                chunks: std::sync::Arc::new(mb.finish()),
+                style: marker_style(crate::data::layer::PointShape::Circle, 4.0),
+            }],
+            background: [0.0; 4],
+        };
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [256, 256],
+            pixels_per_point: 1.0,
+        };
+        let mut frame = |resources: &mut egui_wgpu::CallbackResources| {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            queue.submit(cb.prepare(&device, &queue, &screen, &mut encoder, resources));
+        };
+        frame(&mut resources);
+        let (cap_u, cap_d, draws) = {
+            let res: &MapResources = resources.get().expect("resources");
+            (
+                res.uniform_scratch.capacity(),
+                res.draw_list.capacity(),
+                res.draw_list.len(),
+            )
+        };
+        assert!(draws > 0 && cap_u > 0);
+        frame(&mut resources);
+        let res: &MapResources = resources.get().expect("resources");
+        assert_eq!(res.draw_list.len(), draws, "the frame changed");
+        assert_eq!(res.uniform_scratch.capacity(), cap_u, "uniforms reallocated");
+        assert_eq!(res.draw_list.capacity(), cap_d, "draw list reallocated");
     }
 
     /// A borderless blue marker of the given shape.
@@ -2693,9 +3297,11 @@ mod tests {
             size_index: vec![(1.0, 3)],
         };
         let (points, index) = super::line_point_stream(&lod);
-        let nan = |p: &[f32; 3]| p[0].is_nan();
+        // Sentinels are recognised by their negative arc length; their
+        // position is finite (a NaN one is not safe under fast-math).
+        let sentinel = |p: &[f32; 3]| p[2] < 0.0 && p[0].is_finite();
         assert_eq!(points.len(), 8, "{points:?}");
-        assert!(nan(&points[0]) && nan(&points[4]) && nan(&points[7]));
+        assert!(sentinel(&points[0]) && sentinel(&points[4]) && sentinel(&points[7]));
         assert_eq!(points[1], [0.0, 0.0, 0.0]);
         assert_eq!(points[2], [3.0, 0.0, 3.0]);
         assert_eq!(points[3], [3.0, 4.0, 7.0], "arc length accumulates");

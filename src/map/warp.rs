@@ -184,12 +184,31 @@ pub fn plan(
         return Err(NoTiles::WorldScale);
     }
 
-    let mut bbox = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
-    for p in &pts {
-        bbox[0] = bbox[0].min(p[0]);
-        bbox[1] = bbox[1].min(p[1]);
-        bbox[2] = bbox[2].max(p[0]);
-        bbox[3] = bbox[3].max(p[1]);
+    let bbox_of = |unwrap_seam: bool| {
+        let mut b = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+        for p in &pts {
+            // Past the seam the samples come back on the far side of the
+            // pyramid; lifting them a whole world width puts the view back
+            // together, and `tiles_for` wraps the column index again.
+            let x = if unwrap_seam && p[0] < 0.5 { p[0] + 1.0 } else { p[0] };
+            b[0] = b[0].min(x);
+            b[1] = b[1].min(p[1]);
+            b[2] = b[2].max(x);
+            b[3] = b[3].max(p[1]);
+        }
+        b
+    };
+    let mut bbox = bbox_of(false);
+    // A view straddling the antimeridian samples both ends of Mercator x,
+    // and read as one interval that is the whole world minus the bit the
+    // user is actually looking at — so a Pacific view got no basemap at
+    // all. Both ends occupied and nothing in between is the signature.
+    if bbox[2] - bbox[0] > WORLD_SPAN_LIMIT
+        && pts.iter().any(|p| p[0] < 0.25)
+        && pts.iter().any(|p| p[0] > 0.75)
+        && pts.iter().all(|p| p[0] < 0.25 || p[0] > 0.75)
+    {
+        bbox = bbox_of(true);
     }
     if bbox[2] - bbox[0] > WORLD_SPAN_LIMIT || bbox[3] - bbox[1] > WORLD_SPAN_LIMIT {
         return Err(NoTiles::WorldScale);
@@ -368,10 +387,16 @@ pub fn tile_mesh(warp: &Warp, id: TileId, subdiv: usize) -> Option<TileMesh> {
 
 /// Tile ids covering a Mercator-world rect at one level, capped so a
 /// degenerate view cannot ask for thousands.
+///
+/// The x range is not clamped: a bbox that crosses the antimeridian runs
+/// past 1 (see [`plan`]), and the column index wraps into the pyramid
+/// rather than being cut off at the seam. Latitude has no such wrap —
+/// there is nothing above the top row — so y stays clamped.
 pub fn tiles_for(bbox: [f64; 4], zoom: u8, cap: usize) -> Vec<TileId> {
     let n = 1i64 << zoom;
-    let x0 = ((bbox[0] * n as f64).floor() as i64).max(0);
-    let x1 = ((bbox[2] * n as f64).ceil() as i64).min(n);
+    let x0 = (bbox[0] * n as f64).floor() as i64;
+    // At most one copy of the world, however wide the bbox claims to be.
+    let x1 = ((bbox[2] * n as f64).ceil() as i64).min(x0 + n);
     let y0 = ((bbox[1] * n as f64).floor() as i64).max(0);
     let y1 = ((bbox[3] * n as f64).ceil() as i64).min(n);
     let mut out = Vec::new();
@@ -379,7 +404,7 @@ pub fn tiles_for(bbox: [f64; 4], zoom: u8, cap: usize) -> Vec<TileId> {
         for y in y0..y1 {
             out.push(TileId {
                 z: zoom,
-                x: x as u32,
+                x: x.rem_euclid(n) as u32,
                 y: y as u32,
             });
             if out.len() >= cap {
@@ -618,5 +643,54 @@ mod tests {
         assert_eq!(ids.len(), 16);
         assert!(ids.iter().all(|t| t.z == 4 && t.x >= 4 && t.x < 8));
         assert_eq!(tiles_for([0.0, 0.0, 1.0, 1.0], 8, 100).len(), 100);
+    }
+
+    /// A bbox that crosses the antimeridian runs past x = 1 (see `plan`),
+    /// and the columns it asks for wrap into the pyramid. Clamping the
+    /// range instead left the eastern half of such a view empty.
+    #[test]
+    fn tiles_for_wraps_across_the_antimeridian() {
+        let ids = tiles_for([0.99, 0.4, 1.01, 0.5], 4, 4096);
+        let xs: Vec<u32> = ids.iter().map(|t| t.x).collect();
+        assert!(xs.contains(&15), "nothing west of the seam: {xs:?}");
+        assert!(xs.contains(&0), "nothing east of the seam: {xs:?}");
+        assert!(ids.iter().all(|t| t.x < 16 && t.z == 4));
+        // A bbox claiming more than the whole world still asks for one
+        // copy of it, not several.
+        let wide = tiles_for([-2.0, 0.4, 3.0, 0.5], 4, 4096);
+        let cols: std::collections::HashSet<u32> = wide.iter().map(|t| t.x).collect();
+        assert_eq!(cols.len(), 16, "asked for more than one world");
+        assert_eq!(wide.len(), 16 * 2, "16 columns over 2 rows");
+    }
+
+    /// A viewport straddling the antimeridian samples both ends of
+    /// Mercator x. Read as one interval that spans nearly the whole
+    /// world, and the view was refused a basemap altogether — the bug a
+    /// Pacific-centred map ran into. The span is what it looks like on
+    /// screen: a couple of degrees.
+    #[test]
+    fn a_view_on_the_seam_is_not_mistaken_for_the_whole_world() {
+        let d = DisplayCrs::mercator();
+        let w = Warp::new(&d);
+        // Just west of x = 1, with the viewport reaching past it.
+        let cam = Camera { center: [0.9999, 0.5], zoom: 12.0 };
+        let p = plan(&w, &cam, [1400.0, 900.0], 20).expect("a seam view still plans");
+        let span = p.merc_bbox[2] - p.merc_bbox[0];
+        assert!(span < 0.01, "span read as {span}: {:?}", p.merc_bbox);
+        assert!(
+            p.merc_bbox[2] > 1.0 || p.merc_bbox[0] < 0.0,
+            "the bbox should cross the seam: {:?}",
+            p.merc_bbox
+        );
+        // And the tiles it asks for land on both sides of it.
+        let xs: Vec<u32> = tiles_for(p.merc_bbox, p.zoom, 512)
+            .iter()
+            .map(|t| t.x)
+            .collect();
+        let n = 1u32 << p.zoom;
+        assert!(
+            xs.iter().any(|&x| x == 0) && xs.iter().any(|&x| x == n - 1),
+            "tiles only on one side: {xs:?}"
+        );
     }
 }

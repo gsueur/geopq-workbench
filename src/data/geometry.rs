@@ -477,6 +477,14 @@ impl MeshBuilder {
         let chunk = self.chunk_for(bbox);
         let o = chunk.origin;
         for w in pts.windows(2) {
+            // Repeated coordinates are everywhere in published data (a
+            // ring closing on itself, a digitizer double-click). A
+            // zero-length segment carries no direction, so the stroke
+            // shader can only guess one, and with a square or flat cap it
+            // guesses a filled box: drop the segment instead.
+            if w[0] == w[1] {
+                continue;
+            }
             let a = local(o, w[0].x, w[0].y);
             let b = local(o, w[1].x, w[1].y);
             chunk.lines[0].segments.push([a[0], a[1], b[0], b[1]]);
@@ -494,6 +502,9 @@ impl MeshBuilder {
             }
             let chunk = self.chunk_for(bbox);
             for w in kept.windows(2) {
+                if w[0] == w[1] {
+                    continue;
+                }
                 let a = local(o, w[0].x, w[0].y);
                 let b = local(o, w[1].x, w[1].y);
                 chunk.lines[1 + lvl].segments.push([a[0], a[1], b[0], b[1]]);

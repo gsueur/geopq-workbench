@@ -434,6 +434,7 @@ pub(crate) fn emit_bulk(
             items.push(PickItem {
                 bbox: wb,
                 feature: fref,
+                bin: mb.bin,
             });
         }
     }

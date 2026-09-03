@@ -63,12 +63,25 @@ impl Camera {
     }
 
     /// Fit world-space bounds `[minx, miny, maxx, maxy]` into the viewport.
+    ///
+    /// The extent is floored at a world unit that is still meaningful at
+    /// MAX_ZOOM (a single point, or a bounds collapsed by a projection
+    /// failure, otherwise asks for a scale of 1e12 px per world unit) and
+    /// the scale itself is clamped *before* the log, so the zoom the
+    /// camera ends at is the one this scale describes. Clamping after it
+    /// left `zoom` and `scale` disagreeing, and the fit then framed the
+    /// data at the wrong size without saying so.
     pub fn fit(&mut self, bounds: [f64; 4], viewport_px: [f32; 2], padding_px: f64) {
-        let w = (bounds[2] - bounds[0]).max(1e-12);
-        let h = (bounds[3] - bounds[1]).max(1e-12);
+        // 1e-9 world units is ~4 mm on an Earth-sized projection, and
+        // below the f32 mesh coordinates the renderer draws with.
+        const MIN_EXTENT: f64 = 1e-9;
+        let w = (bounds[2] - bounds[0]).max(MIN_EXTENT);
+        let h = (bounds[3] - bounds[1]).max(MIN_EXTENT);
         let vw = (viewport_px[0] as f64 - 2.0 * padding_px).max(64.0);
         let vh = (viewport_px[1] as f64 - 2.0 * padding_px).max(64.0);
-        let scale = (vw / w).min(vh / h);
+        let lo = 256.0 * MIN_ZOOM.exp2();
+        let hi = 256.0 * MAX_ZOOM.exp2();
+        let scale = (vw / w).min(vh / h).clamp(lo, hi);
         self.zoom = (scale / 256.0).log2().clamp(MIN_ZOOM, MAX_ZOOM);
         self.center = [(bounds[0] + bounds[2]) * 0.5, (bounds[1] + bounds[3]) * 0.5];
     }
@@ -96,6 +109,32 @@ mod tests {
         cam.zoom_about(1.7, cursor, vp);
         let after = cam.screen_to_world(cursor, vp);
         assert!((before[0] - after[0]).abs() < 1e-12 && (before[1] - after[1]).abs() < 1e-12);
+    }
+
+    /// Degenerate bounds are routine: a single-point layer, or one whose
+    /// projection collapsed. The fit has to come back with a camera —
+    /// finite, inside the zoom limits, centred on the data — instead of
+    /// a scale of 1e14 that the zoom clamp then silently disagrees with.
+    #[test]
+    fn fit_survives_zero_area_and_oversized_bounds() {
+        let mut cam = Camera::default();
+        let vp = [1000.0, 800.0];
+
+        cam.fit([0.4, 0.7, 0.4, 0.7], vp, 40.0);
+        assert!(cam.zoom.is_finite(), "zoom {}", cam.zoom);
+        assert_eq!(cam.zoom, MAX_ZOOM, "a point should sit at the zoom cap");
+        assert_eq!(cam.center, [0.4, 0.7]);
+        assert!(cam.scale().is_finite() && cam.scale() > 0.0);
+
+        // Wider than any world: pinned at the other end, still finite.
+        cam.fit([-1e9, -1e9, 1e9, 1e9], vp, 40.0);
+        assert_eq!(cam.zoom, MIN_ZOOM);
+        assert!(cam.scale().is_finite() && cam.scale() > 0.0);
+
+        // Bounds that arrive non-finite must not poison the zoom.
+        cam.fit([f64::NAN, 0.0, f64::NAN, 1.0], vp, 40.0);
+        assert!(cam.zoom.is_finite(), "NaN bounds left zoom {}", cam.zoom);
+        assert!((MIN_ZOOM..=MAX_ZOOM).contains(&cam.zoom));
     }
 
     #[test]

@@ -15,6 +15,9 @@ pub use super::geometry::FeatureRef;
 pub struct PickItem {
     pub bbox: [f64; 4],
     pub feature: FeatureRef,
+    /// Style bin the feature was built with (0 when the layer is not
+    /// data-styled), so a pick can skip what the legend has hidden.
+    pub bin: u8,
 }
 
 impl RTreeObject for PickItem {

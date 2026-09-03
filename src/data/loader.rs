@@ -5203,6 +5203,7 @@ fn process_batch(
                         items.push(PickItem {
                             bbox: added.bbox,
                             feature: fref,
+                            bin: mb.bin,
                         });
                     }
                 }
@@ -5353,6 +5354,7 @@ fn process_box_batch(
         items.push(PickItem {
             bbox: added.bbox,
             feature: fref,
+            bin: mb.bin,
         });
     }
     n
