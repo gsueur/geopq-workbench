@@ -4973,26 +4973,25 @@ impl ViewerApp {
                 })
                 .collect(),
         };
-        match serde_json::to_string_pretty(&ctx)
-            .map_err(|e| e.to_string())
-            .and_then(|json| std::fs::write(&path, json).map_err(|e| e.to_string()))
-        {
+        match crate::context::save(&ctx, &path) {
             Ok(()) => log::info!("context saved to {}", path.display()),
             Err(e) => self.push_error(format!("context save failed: {e}")),
         }
     }
 
     fn read_context_file(&mut self, path: PathBuf, ctx: &egui::Context) {
-        let parsed: Result<crate::context::Context, String> = std::fs::read_to_string(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()));
-        let saved = match parsed {
+        // Parsed and validated before anything is cleared: a file this
+        // build cannot read must leave the current session alone.
+        let (saved, warnings) = match crate::context::load(&path) {
             Ok(c) => c,
             Err(e) => {
                 self.push_error(format!("context load failed: {e}"));
                 return;
             }
         };
+        for w in warnings {
+            self.push_error(format!("context: {w}"));
+        }
 
         // Replace the current session: projection first (so loads build in
         // the right space), then camera, then layers with their styles.
@@ -6791,7 +6790,12 @@ impl ViewerApp {
                     let _ = tx_prog.send(GridMsg::Progress(f));
                     ctx3.request_repaint();
                 };
-                let res = crate::data::grid::compute(&store, &crs, &spec, &dst, &prog);
+                // Nothing wires a Stop button to the grid dialog yet, so
+                // this flag stays false; it exists so `compute` can poll
+                // one place and the button is a UI change, not a
+                // threading change.
+                let cancel = std::sync::atomic::AtomicBool::new(false);
+                let res = crate::data::grid::compute(&store, &crs, &spec, &dst, &prog, &cancel);
                 let _ = tx.send(match res {
                     Ok((cells, rows)) => GridMsg::Done(dst, name, cells, rows),
                     Err(e) => GridMsg::Failed(e),
@@ -10182,9 +10186,19 @@ impl ViewerApp {
         }
         let (layers, tables) = self.sql_sources();
         let egui_ctx = ctx.clone();
-        crate::sql::engine::spawn_query(id, sql, layers, tables, self.join_tx.clone(), move || {
-            egui_ctx.request_repaint();
-        });
+        crate::sql::engine::spawn_query(
+            id,
+            sql,
+            layers,
+            tables,
+            self.join_tx.clone(),
+            // The join dialog's match count is a small, quick query and
+            // has no Stop control; it runs to completion.
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            move || {
+                egui_ctx.request_repaint();
+            },
+        );
     }
 
     /// Layers and tables as SQL sees them, named the same way the console
@@ -10531,6 +10545,9 @@ impl ViewerApp {
                 tables,
                 path,
                 self.join_tx.clone(),
+                // The join dialog has no Stop control; it runs to
+                // completion (its own Cancel closes the dialog only).
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 move || egui_ctx.request_repaint(),
             );
         } else if !open {
@@ -13393,9 +13410,8 @@ fn load_carto_api_key() -> Option<String> {
     {
         return Some(k);
     }
-    let txt = std::fs::read_to_string(crate::data::settings::settings_path()?).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
-    v.get("carto_api_key")?
+    crate::data::settings::read()
+        .get("carto_api_key")?
         .as_str()
         .map(str::trim)
         .filter(|k| !k.is_empty())
@@ -13403,39 +13419,25 @@ fn load_carto_api_key() -> Option<String> {
 }
 
 fn save_carto_api_key(key: &str) {
-    let Some(p) = crate::data::settings::settings_path() else { return };
-    let mut root = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    root["carto_api_key"] = serde_json::json!(key);
-    if let Ok(txt) = serde_json::to_string_pretty(&root)
-        && let Err(e) = std::fs::write(&p, txt)
+    if let Err(e) =
+        crate::data::settings::update(|root| root["carto_api_key"] = serde_json::json!(key))
     {
-        log::warn!("could not save {}: {e}", p.display());
+        log::warn!("could not save the API key: {e}");
     }
 }
 
 fn load_direct_files() -> HashSet<String> {
-    let read = || -> Option<HashSet<String>> {
-        let txt = std::fs::read_to_string(crate::data::settings::settings_path()?).ok()?;
-        let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
-        serde_json::from_value(v.get("direct_files")?.clone()).ok()
-    };
-    read().unwrap_or_default()
+    crate::data::settings::read()
+        .get("direct_files")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
 }
 
 fn save_direct_files(files: &HashSet<String>) {
-    let Some(p) = crate::data::settings::settings_path() else { return };
-    let mut root = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    root["direct_files"] = serde_json::json!(files);
-    if let Ok(txt) = serde_json::to_string_pretty(&root) {
-        if let Err(e) = std::fs::write(&p, txt) {
-            log::warn!("could not save {}: {e}", p.display());
-        }
+    if let Err(e) =
+        crate::data::settings::update(|root| root["direct_files"] = serde_json::json!(files))
+    {
+        log::warn!("could not save the direct-file list: {e}");
     }
 }
 
@@ -13581,6 +13583,10 @@ impl eframe::App for ViewerApp {
         }
         match sql_action {
             Some(crate::sql::console::ConsoleAction::LoadLayer(path)) => {
+                // "Result as layer" writes a temp GeoParquet like the
+                // grid does. It was never registered, so every query
+                // turned into a layer left its file in /tmp for good.
+                self.temp_outputs.push(path.clone());
                 self.enqueue_load(Source::Local(path), &ctx);
             }
             Some(crate::sql::console::ConsoleAction::Select { crs, geoms }) => {

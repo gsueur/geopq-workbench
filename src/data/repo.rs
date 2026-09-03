@@ -1807,6 +1807,19 @@ fn download_agent() -> &'static ureq::Agent {
     })
 }
 
+/// Whether `dst` names a format an HTML body can never be. Text formats
+/// (GeoJSON, CSV) are left alone: portals do serve them with careless
+/// content types, and the parser rejects a web page there anyway.
+fn wants_binary(dst: &Path) -> bool {
+    const BINARY: [&str; 9] = [
+        "parquet", "gpkg", "zip", "gz", "7z", "fgb", "shp", "gdb", "tar",
+    ];
+    dst.extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|e| BINARY.contains(&e.as_str()))
+}
+
 pub fn download_to(
     url: &str,
     dst: &Path,
@@ -1824,15 +1837,44 @@ pub fn download_to(
     if res.status() != 200 {
         return Err(format!("{url}: HTTP {}", res.status()));
     }
+    // A portal that has moved a dataset, or wants a login, answers 200
+    // with an HTML page. Saved under a .gpkg name it is a "corrupt file"
+    // report from the importer instead of "that link is dead", and the
+    // notice next to it says the download succeeded.
+    if wants_binary(dst) {
+        let ct = res
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ct.starts_with("text/html") || ct.starts_with("application/xhtml") {
+            return Err(format!(
+                "{url}: the server returned a web page ({ct}), not the data file — \
+                 the link has probably moved or needs a sign-in"
+            ));
+        }
+    }
     let total = res
         .headers()
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0);
-    let mut part = dst.as_os_str().to_os_string();
-    part.push(".part");
-    let part = PathBuf::from(part);
+    // Unique per download, not just per destination: two datasets whose
+    // best distribution is the same file, or a retry racing the fetch it
+    // is replacing, both staged through `<dst>.part` and interleaved
+    // their bytes into one file that then got the real name.
+    let part = {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let mut p = dst.as_os_str().to_os_string();
+        p.push(format!(
+            ".{}-{}.part",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        PathBuf::from(p)
+    };
     let mut file =
         std::fs::File::create(&part).map_err(|e| format!("cannot write {}: {e}", part.display()))?;
     let mut body = res.into_body().into_reader();
@@ -2020,6 +2062,98 @@ mod tests {
             }
         });
         (format!("http://127.0.0.1:{port}"), hits)
+    }
+
+    /// Loopback responder that answers every request with a fixed
+    /// content type and body — a portal's "this dataset has moved" page.
+    fn spawn_typed_server(content_type: &str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ct = content_type.to_string();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { continue };
+                let ct = ct.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 2048];
+                    let _ = conn.read(&mut buf);
+                    let _ = write!(
+                        conn,
+                        "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\n\
+                         Connection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// A dead portal link answers 200 with a login or "moved" page.
+    /// Saved under its .gpkg name, that page is a corrupt-file report
+    /// from the importer rather than a dead link, and the notice beside
+    /// it claims the download worked.
+    #[test]
+    fn an_html_page_is_not_accepted_as_a_binary_download() {
+        let base = spawn_typed_server(
+            "text/html; charset=utf-8",
+            "<html><body>Sign in to continue</body></html>",
+        );
+        let dir = std::env::temp_dir().join(format!("geopq_dl_html_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let dst = dir.join("parcels.gpkg");
+        let err = download_to(&format!("{base}/parcels.gpkg"), &dst, &|_, _| true).unwrap_err();
+        assert!(err.contains("web page"), "{err}");
+        assert!(!dst.exists(), "nothing was written");
+        assert!(
+            std::fs::read_dir(&dir).unwrap().next().is_none(),
+            "not even a .part"
+        );
+
+        // A text format is left alone: portals do serve GeoJSON with
+        // careless content types, and the parser catches a web page there.
+        let dst = dir.join("parcels.geojson");
+        download_to(&format!("{base}/parcels.geojson"), &dst, &|_, _| true).unwrap();
+        assert!(dst.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two downloads racing for one destination both staged through
+    /// `<dst>.part`, so their bytes interleaved into one file that then
+    /// got the real name — a "corrupt download" nothing could explain.
+    #[test]
+    fn concurrent_downloads_to_one_destination_do_not_interleave() {
+        let a = "a".repeat(400_000);
+        let b = "b".repeat(400_000);
+        let base = spawn_files(&[("a.geojson", a.as_str()), ("b.geojson", b.as_str())]);
+        let dir = std::env::temp_dir().join(format!("geopq_dl_race_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join("same.geojson");
+
+        std::thread::scope(|s| {
+            for name in ["a.geojson", "b.geojson"] {
+                let (base, dst) = (base.clone(), dst.clone());
+                s.spawn(move || {
+                    download_to(&format!("{base}/{name}"), &dst, &|_, _| true).unwrap();
+                });
+            }
+        });
+
+        // Whichever landed last, the file is one download whole, not a
+        // mixture of both.
+        let got = std::fs::read_to_string(&dst).unwrap();
+        assert!(got == a || got == b, "{} bytes, mixed content", got.len());
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".part"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

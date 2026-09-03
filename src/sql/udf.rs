@@ -168,24 +168,41 @@ fn all_udfs() -> Vec<ScalarUDF> {
             Ok(Arc::new(b.finish()))
         }),
         // Constructors.
-        make_udf("st_geomfromtext", vec![Utf8], Binary, |args| {
-            let arr = arrow::array::cast::as_string_array(&args[0]);
-            let mut b = WkbOut::new();
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    b.push(None)?;
-                    continue;
-                }
-                let g: Option<Geometry<f64>> = std::str::FromStr::from_str(arr.value(i))
+        // A literal the user typed and a column of stored text are not
+        // the same kind of input. Bad WKT in the query is a typo and has
+        // to be reported; one bad row out of a million in a column is
+        // data, and killing the whole query over it contradicts the rule
+        // every other function here follows — an undecodable geometry is
+        // NULL, not a failure.
+        make_udf_cv("st_geomfromtext", vec![Utf8], Binary, |args, rows| {
+            let a = StrArg::new(&args[0])?;
+            let literal = matches!(args[0], ColumnarValue::Scalar(_));
+            let parse = |t: &str| -> Option<Geometry<f64>> {
+                std::str::FromStr::from_str(t)
                     .ok()
-                    .and_then(|w: wkt::Wkt<f64>| Geometry::try_from(w).ok());
-                let Some(g) = g else {
-                    return Err(DataFusionError::Execution(format!(
-                        "st_geomfromtext: invalid WKT {:?}",
-                        arr.value(i)
-                    )));
+                    .and_then(|w: wkt::Wkt<f64>| Geometry::try_from(w).ok())
+            };
+            let mut b = WkbOut::new();
+            if literal {
+                // Parsed once, not once per row.
+                let g = match a.get(0) {
+                    None => None,
+                    Some(t) => Some(parse(t).ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "st_geomfromtext: invalid WKT {t:?}"
+                        ))
+                    })?),
                 };
-                b.push(Some(&g))?;
+                for _ in 0..rows {
+                    b.push(g.as_ref())?;
+                }
+                return Ok(b.finish());
+            }
+            for i in 0..rows {
+                match a.get(i).and_then(parse) {
+                    Some(g) => b.push(Some(&g))?,
+                    None => b.push(None)?,
+                }
             }
             Ok(b.finish())
         }),
@@ -238,30 +255,27 @@ fn all_udfs() -> Vec<ScalarUDF> {
         }),
         geom_pair_to_geom("st_difference", |a, b| set_op(a, b, OpType::Difference)),
         geom_pair_to_geom("st_symdifference", |a, b| set_op(a, b, OpType::Xor)),
-        make_udf("st_buffer", vec![Binary, Float64], Binary, |args| {
-            let g = geom_array(&args[0])?;
-            let d = f64_array(&args[1])?;
+        make_udf_cv("st_buffer", vec![Binary, Float64], Binary, |args, rows| {
+            let g = GeomArg::new(&args[0])?;
+            let d = F64Arg::new(&args[1])?;
             let mut b = WkbOut::new();
-            for i in 0..g.len() {
-                match (geom_at(&g, i), d.is_null(i)) {
-                    (Some(g), false) => b.push(Some(&Geometry::MultiPolygon(
-                        g.buffer(d.value(i)),
-                    )))?,
+            for i in 0..rows {
+                match (g.get(i), d.get(i)) {
+                    (Some(g), Some(d)) => {
+                        b.push(Some(&Geometry::MultiPolygon(g.buffer(d))))?
+                    }
                     _ => b.push(None)?,
                 }
             }
             Ok(b.finish())
         }),
-        make_udf("st_simplify", vec![Binary, Float64], Binary, |args| {
-            let g = geom_array(&args[0])?;
-            let t = f64_array(&args[1])?;
+        make_udf_cv("st_simplify", vec![Binary, Float64], Binary, |args, rows| {
+            let g = GeomArg::new(&args[0])?;
+            let t = F64Arg::new(&args[1])?;
             let mut b = WkbOut::new();
-            for i in 0..g.len() {
-                match (geom_at(&g, i), t.is_null(i)) {
-                    (Some(g), false) => {
-                        let s = simplify_geom(&g, t.value(i));
-                        b.push(Some(&s))?
-                    }
+            for i in 0..rows {
+                match (g.get(i), t.get(i)) {
+                    (Some(g), Some(t)) => b.push(Some(&simplify_geom(&g, t)))?,
                     _ => b.push(None)?,
                 }
             }
@@ -269,19 +283,18 @@ fn all_udfs() -> Vec<ScalarUDF> {
         }),
         // Reprojection. WKB carries no SRID here, so both CRSs are
         // explicit; strings parse per distinct value, not per row.
-        make_udf("st_transform", vec![Binary, Utf8, Utf8], Binary, |args| {
+        make_udf_cv("st_transform", vec![Binary, Utf8, Utf8], Binary, |args, rows| {
             use geo::MapCoords;
-            let g = geom_array(&args[0])?;
-            let from = arrow::array::cast::as_string_array(&args[1]);
-            let to = arrow::array::cast::as_string_array(&args[2]);
+            let g = GeomArg::new(&args[0])?;
+            let from = StrArg::new(&args[1])?;
+            let to = StrArg::new(&args[2])?;
             let mut cache: Option<(String, String, Crs, Crs)> = None;
             let mut b = WkbOut::new();
-            for i in 0..g.len() {
-                if g.is_null(i) || from.is_null(i) || to.is_null(i) {
+            for i in 0..rows {
+                let (Some(fs), Some(ts)) = (from.get(i), to.get(i)) else {
                     b.push(None)?;
                     continue;
-                }
-                let (fs, ts) = (from.value(i), to.value(i));
+                };
                 if cache.as_ref().map(|(f, t, ..)| (f.as_str(), t.as_str()))
                     != Some((fs, ts))
                 {
@@ -290,7 +303,7 @@ fn all_udfs() -> Vec<ScalarUDF> {
                     cache = Some((fs.to_string(), ts.to_string(), src, dst));
                 }
                 let (_, _, src, dst) = cache.as_ref().unwrap();
-                let out = geom_at(&g, i).and_then(|geom| {
+                let out = g.get(i).and_then(|geom| {
                     geom.try_map_coords(|c| {
                         crate::data::crs::transform_point(src, dst, c.x, c.y)
                             .map(|(x, y)| geo_types::Coord { x, y })
@@ -305,31 +318,31 @@ fn all_udfs() -> Vec<ScalarUDF> {
         geom_pair_to_bool("st_intersects", |a, b| a.intersects(b)),
         geom_pair_to_bool("st_contains", |a, b| a.contains(b)),
         geom_pair_to_bool("st_within", |a, b| a.is_within(b)),
-        make_udf("st_distance", vec![Binary, Binary], Float64, |args| {
-            let a = geom_array(&args[0])?;
-            let c = geom_array(&args[1])?;
+        make_udf_cv("st_distance", vec![Binary, Binary], Float64, |args, rows| {
+            let a = GeomArg::new(&args[0])?;
+            let c = GeomArg::new(&args[1])?;
             let mut b = Float64Builder::new();
-            for i in 0..a.len() {
-                match (geom_at(&a, i), geom_at(&c, i)) {
-                    (Some(ga), Some(gb)) => b.append_value(Euclidean.distance(&ga, &gb)),
+            for i in 0..rows {
+                match (a.get(i), c.get(i)) {
+                    (Some(ga), Some(gb)) => b.append_value(Euclidean.distance(&*ga, &*gb)),
                     _ => b.append_null(),
                 }
             }
             Ok(Arc::new(b.finish()))
         }),
-        make_udf(
+        make_udf_cv(
             "st_dwithin",
             vec![Binary, Binary, Float64],
             Boolean,
-            |args| {
-                let a = geom_array(&args[0])?;
-                let c = geom_array(&args[1])?;
-                let d = f64_array(&args[2])?;
+            |args, rows| {
+                let a = GeomArg::new(&args[0])?;
+                let c = GeomArg::new(&args[1])?;
+                let d = F64Arg::new(&args[2])?;
                 let mut b = BooleanBuilder::new();
-                for i in 0..a.len() {
-                    match (geom_at(&a, i), geom_at(&c, i), d.is_null(i)) {
-                        (Some(ga), Some(gb), false) => {
-                            b.append_value(Euclidean.distance(&ga, &gb) <= d.value(i))
+                for i in 0..rows {
+                    match (a.get(i), c.get(i), d.get(i)) {
+                        (Some(ga), Some(gb), Some(d)) => {
+                            b.append_value(Euclidean.distance(&*ga, &*gb) <= d)
                         }
                         _ => b.append_null(),
                     }
@@ -362,6 +375,125 @@ fn make_udf(
     )
 }
 
+/// Like [`make_udf`], but the implementation sees the arguments as
+/// DataFusion handed them over — `Scalar` for a literal, `Array` for a
+/// column — plus the row count.
+///
+/// `values_to_arrays` expands a scalar argument into one copy per row,
+/// and the row loops here then decoded that copy again for every one of
+/// them. The console's own viewport filter is exactly that shape —
+/// `st_intersects(geometry, st_makeenvelope(…))`, whose second argument
+/// folds to a literal — so browsing a 2M-row layer decoded the same
+/// envelope two million times.
+fn make_udf_cv(
+    name: &str,
+    args: Vec<DataType>,
+    ret: DataType,
+    f: impl Fn(&[ColumnarValue], usize) -> DfResult<ArrayRef> + Send + Sync + 'static,
+) -> ScalarUDF {
+    create_udf(
+        name,
+        args,
+        ret,
+        Volatility::Immutable,
+        Arc::new(move |cols: &[ColumnarValue]| {
+            // A column fixes the row count; all-scalar arguments mean one.
+            let rows = cols
+                .iter()
+                .filter_map(|c| match c {
+                    ColumnarValue::Array(a) => Some(a.len()),
+                    ColumnarValue::Scalar(_) => None,
+                })
+                .max()
+                .unwrap_or(1);
+            f(cols, rows).map(ColumnarValue::Array)
+        }),
+    )
+}
+
+/// The single-row array behind one argument, whatever form it arrived in.
+fn as_one(v: &ColumnarValue) -> DfResult<ArrayRef> {
+    Ok(ColumnarValue::values_to_arrays(std::slice::from_ref(v))?.remove(0))
+}
+
+/// A geometry argument: a column of WKB, or one value shared by every row
+/// and therefore decoded once.
+enum GeomArg {
+    Const(Option<Geometry<f64>>),
+    Col(BinaryArray),
+}
+
+impl GeomArg {
+    fn new(v: &ColumnarValue) -> DfResult<Self> {
+        let arr = as_one(v)?;
+        let b = geom_array(&arr)?;
+        match v {
+            ColumnarValue::Scalar(_) => Ok(GeomArg::Const(geom_at(&b, 0))),
+            ColumnarValue::Array(_) => Ok(GeomArg::Col(b)),
+        }
+    }
+
+    fn get(&self, i: usize) -> Option<std::borrow::Cow<'_, Geometry<f64>>> {
+        use std::borrow::Cow;
+        match self {
+            GeomArg::Const(g) => g.as_ref().map(Cow::Borrowed),
+            GeomArg::Col(a) => geom_at(a, i).map(Cow::Owned),
+        }
+    }
+}
+
+/// A f64 argument, constant or per row.
+enum F64Arg {
+    Const(Option<f64>),
+    Col(Float64Array),
+}
+
+impl F64Arg {
+    fn new(v: &ColumnarValue) -> DfResult<Self> {
+        let arr = as_one(v)?;
+        let a = f64_array(&arr)?.clone();
+        match v {
+            ColumnarValue::Scalar(_) => {
+                Ok(F64Arg::Const((!a.is_null(0)).then(|| a.value(0))))
+            }
+            ColumnarValue::Array(_) => Ok(F64Arg::Col(a)),
+        }
+    }
+
+    fn get(&self, i: usize) -> Option<f64> {
+        match self {
+            F64Arg::Const(v) => *v,
+            F64Arg::Col(a) => (!a.is_null(i)).then(|| a.value(i)),
+        }
+    }
+}
+
+/// A string argument, constant or per row.
+enum StrArg {
+    Const(Option<String>),
+    Col(arrow::array::StringArray),
+}
+
+impl StrArg {
+    fn new(v: &ColumnarValue) -> DfResult<Self> {
+        let arr = as_one(v)?;
+        let a = arrow::array::cast::as_string_array(&arr).clone();
+        match v {
+            ColumnarValue::Scalar(_) => {
+                Ok(StrArg::Const((!a.is_null(0)).then(|| a.value(0).to_string())))
+            }
+            ColumnarValue::Array(_) => Ok(StrArg::Col(a)),
+        }
+    }
+
+    fn get(&self, i: usize) -> Option<&str> {
+        match self {
+            StrArg::Const(v) => v.as_deref(),
+            StrArg::Col(a) => (!a.is_null(i)).then(|| a.value(i)),
+        }
+    }
+}
+
 fn geom_to_f64(name: &str, f: fn(&Geometry<f64>) -> Option<f64>) -> ScalarUDF {
     make_udf(name, vec![DataType::Binary], DataType::Float64, move |args| {
         let g = geom_array(&args[0])?;
@@ -377,33 +509,38 @@ fn geom_to_f64(name: &str, f: fn(&Geometry<f64>) -> Option<f64>) -> ScalarUDF {
 }
 
 fn geom_to_geom(name: &str, f: fn(&Geometry<f64>) -> Option<Geometry<f64>>) -> ScalarUDF {
-    make_udf(name, vec![DataType::Binary], DataType::Binary, move |args| {
-        let g = geom_array(&args[0])?;
-        let mut b = WkbOut::new();
-        for i in 0..g.len() {
-            match geom_at(&g, i).and_then(|g| f(&g)) {
-                Some(g) => b.push(Some(&g))?,
-                None => b.push(None)?,
+    make_udf_cv(
+        name,
+        vec![DataType::Binary],
+        DataType::Binary,
+        move |args, rows| {
+            let g = GeomArg::new(&args[0])?;
+            let mut b = WkbOut::new();
+            for i in 0..rows {
+                match g.get(i).and_then(|g| f(&g)) {
+                    Some(g) => b.push(Some(&g))?,
+                    None => b.push(None)?,
+                }
             }
-        }
-        Ok(b.finish())
-    })
+            Ok(b.finish())
+        },
+    )
 }
 
 fn geom_pair_to_geom(
     name: &str,
     f: fn(&Geometry<f64>, &Geometry<f64>) -> Option<Geometry<f64>>,
 ) -> ScalarUDF {
-    make_udf(
+    make_udf_cv(
         name,
         vec![DataType::Binary, DataType::Binary],
         DataType::Binary,
-        move |args| {
-            let a = geom_array(&args[0])?;
-            let c = geom_array(&args[1])?;
+        move |args, rows| {
+            let a = GeomArg::new(&args[0])?;
+            let c = GeomArg::new(&args[1])?;
             let mut b = WkbOut::new();
-            for i in 0..a.len() {
-                match (geom_at(&a, i), geom_at(&c, i)) {
+            for i in 0..rows {
+                match (a.get(i), c.get(i)) {
                     (Some(ga), Some(gb)) => b.push(f(&ga, &gb).as_ref())?,
                     _ => b.push(None)?,
                 }
@@ -442,16 +579,16 @@ fn set_op(a: &Geometry<f64>, b: &Geometry<f64>, op: OpType) -> Option<Geometry<f
 }
 
 fn geom_pair_to_bool(name: &str, f: fn(&Geometry<f64>, &Geometry<f64>) -> bool) -> ScalarUDF {
-    make_udf(
+    make_udf_cv(
         name,
         vec![DataType::Binary, DataType::Binary],
         DataType::Boolean,
-        move |args| {
-            let a = geom_array(&args[0])?;
-            let c = geom_array(&args[1])?;
+        move |args, rows| {
+            let a = GeomArg::new(&args[0])?;
+            let c = GeomArg::new(&args[1])?;
             let mut b = BooleanBuilder::new();
-            for i in 0..a.len() {
-                match (geom_at(&a, i), geom_at(&c, i)) {
+            for i in 0..rows {
+                match (a.get(i), c.get(i)) {
                     (Some(ga), Some(gb)) => b.append_value(f(&ga, &gb)),
                     _ => b.append_null(),
                 }
@@ -479,10 +616,21 @@ fn f64_array(arr: &ArrayRef) -> DfResult<&Float64Array> {
     })
 }
 
+// How many WKB blobs this thread has decoded. Test-only, and per thread
+// so a parallel test run cannot perturb the count: it is what pins the
+// "a constant argument is decoded once, not once per row" property,
+// which is otherwise invisible from the outside.
+#[cfg(test)]
+thread_local! {
+    static WKB_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn geom_at(arr: &BinaryArray, i: usize) -> Option<Geometry<f64>> {
     if arr.is_null(i) {
         return None;
     }
+    #[cfg(test)]
+    WKB_DECODES.with(|c| c.set(c.get() + 1));
     decode_wkb(arr.value(i))
 }
 
@@ -554,5 +702,149 @@ impl WkbOut {
 
     fn finish(mut self) -> ArrayRef {
         Arc::new(self.b.finish())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::scalar::ScalarValue;
+
+    fn wkb(g: &Geometry<f64>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        wkb::writer::write_geometry(&mut buf, g, &wkb::writer::WriteOptions::default()).unwrap();
+        buf
+    }
+
+    fn decodes<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        WKB_DECODES.with(|c| c.set(0));
+        let out = f();
+        (out, WKB_DECODES.with(|c| c.get()))
+    }
+
+    /// `st_intersects(geometry, st_makeenvelope(…))` — the console's own
+    /// viewport filter — reaches the UDF with the envelope folded to a
+    /// literal. `values_to_arrays` copied it once per row and the row
+    /// loop decoded every copy, so the cost of the constant scaled with
+    /// the layer. It is decoded once now.
+    #[test]
+    fn a_constant_geometry_argument_is_decoded_once() {
+        const ROWS: usize = 1000;
+        let point = wkb(&Geometry::Point(Point::new(1.0, 1.0)));
+        let envelope = wkb(&Geometry::Polygon(
+            Rect::new((0.0, 0.0), (10.0, 10.0)).to_polygon(),
+        ));
+        let col: BinaryArray = (0..ROWS).map(|_| Some(point.clone())).collect();
+        let column = ColumnarValue::Array(Arc::new(col));
+        let literal = ColumnarValue::Scalar(ScalarValue::Binary(Some(envelope)));
+
+        let (hits, n) = decodes(|| {
+            let a = GeomArg::new(&column).unwrap();
+            let b = GeomArg::new(&literal).unwrap();
+            (0..ROWS)
+                .filter(|&i| match (a.get(i), b.get(i)) {
+                    (Some(x), Some(y)) => x.intersects(&*y),
+                    _ => false,
+                })
+                .count()
+        });
+        assert_eq!(hits, ROWS, "every point is inside the envelope");
+        assert_eq!(n, ROWS + 1, "one decode per row plus one for the literal");
+
+        // A null literal is still one lookup, and yields NULL per row.
+        let (_, n) = decodes(|| {
+            let b = GeomArg::new(&ColumnarValue::Scalar(ScalarValue::Binary(None))).unwrap();
+            assert!((0..ROWS).all(|i| b.get(i).is_none()));
+        });
+        assert_eq!(n, 0, "a NULL literal decodes nothing");
+    }
+
+    /// A typo in the query is worth an error; one unparseable row out of
+    /// a million is data, and the rest of this module turns that into
+    /// NULL rather than failing the query.
+    #[test]
+    fn bad_wkt_fails_a_literal_and_nulls_a_column() {
+        let ctx = SessionContext::new();
+        register_all(&ctx);
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+
+        let err = rt.block_on(async {
+            match ctx.sql("select st_geomfromtext('POINT(oops)')").await {
+                Err(e) => e.to_string(),
+                Ok(df) => match df.collect().await {
+                    Err(e) => e.to_string(),
+                    Ok(_) => panic!("a bad literal must be reported"),
+                },
+            }
+        });
+        assert!(err.contains("invalid WKT"), "{err}");
+
+        // The same text arriving in a column: NULL for the bad row, the
+        // good rows unaffected.
+        let batches = rt.block_on(async {
+            ctx.sql(
+                "select st_astext(st_geomfromtext(w)) g from ( \
+                   select 'POINT(1 2)' w union all select 'POINT(oops)' \
+                   union all select 'POINT(3 4)') order by g nulls last",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()
+        });
+        let col = batches[0].column(0);
+        let vals: Vec<Option<String>> = (0..col.len())
+            .map(|i| {
+                (!col.is_null(i))
+                    .then(|| arrow::util::display::array_value_to_string(col, i).unwrap())
+            })
+            .collect();
+        assert_eq!(
+            vals,
+            vec![
+                Some("POINT(1 2)".to_string()),
+                Some("POINT(3 4)".to_string()),
+                None
+            ],
+            "one bad row must not sink the query"
+        );
+    }
+
+    /// The scalar arguments still have to produce the right answers.
+    #[test]
+    fn constant_arguments_still_give_the_right_answers() {
+        let ctx = SessionContext::new();
+        register_all(&ctx);
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let one = |sql: &str| -> String {
+            let batches = rt
+                .block_on(async { ctx.sql(sql).await.unwrap().collect().await.unwrap() });
+            let b = &batches[0];
+            arrow::util::display::array_value_to_string(b.column(0), 0).unwrap()
+        };
+        assert_eq!(
+            one("select st_intersects(st_geomfromtext('POINT(1 1)'), \
+                 st_makeenvelope(0, 0, 10, 10))"),
+            "true"
+        );
+        assert_eq!(
+            one("select st_intersects(st_geomfromtext('POINT(50 50)'), \
+                 st_makeenvelope(0, 0, 10, 10))"),
+            "false"
+        );
+        assert_eq!(
+            one("select st_astext(st_transform(st_geomfromtext('POINT(0 0)'), \
+                 'EPSG:4326', 'EPSG:4326'))"),
+            "POINT(0 0)"
+        );
+        assert_eq!(
+            one("select round(st_area(st_buffer(st_geomfromtext('POINT(0 0)'), 1)))"),
+            "3.0"
+        );
+        assert_eq!(one("select st_distance(st_geomfromtext('POINT(0 0)'), \
+             st_geomfromtext('POINT(3 4)'))"), "5.0");
+        assert_eq!(one("select st_dwithin(st_geomfromtext('POINT(0 0)'), \
+             st_geomfromtext('POINT(3 4)'), 5)"), "true");
     }
 }

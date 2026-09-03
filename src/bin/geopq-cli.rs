@@ -60,7 +60,7 @@ struct Cli {
     no_covering: bool,
 
     /// Add an H3 cell column at this resolution (0-15).
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=15))]
     h3: Option<u8>,
 
     /// Partition output into hive directories by these output column
@@ -84,7 +84,7 @@ struct Cli {
 
     /// Finest resolution the adaptive-H3 split may reach (0-15).
     /// Defaults to --h3 when that is set, otherwise 10.
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=15))]
     partition_h3_max_res: Option<u8>,
 
     /// Order the output coarse to fine and write the COGP v0.1 level
@@ -187,6 +187,17 @@ fn options(cli: &Cli) -> Result<OptimizeOptions, String> {
     if !cli.partition_by.is_empty() && cli.partition_h3 {
         return Err("--partition-by and --partition-h3 are mutually exclusive".into());
     }
+    // Single-layer formats have nothing to pick from, so --layer there is
+    // a typo (usually the wrong --input), not a no-op.
+    if cli.layer.is_some()
+        && let Some(fmt) = ImportFormat::from_path(&cli.input)
+        && !matches!(fmt, ImportFormat::Gpkg)
+    {
+        return Err(format!(
+            "--layer applies to multi-layer sources; {} holds a single layer",
+            cli.input.display()
+        ));
+    }
     let partition = if cli.partition_h3 {
         // The adaptive split needs a floor to stop at. --h3 is the natural
         // one when the run already asks for a cell column at that
@@ -225,7 +236,14 @@ fn options(cli: &Cli) -> Result<OptimizeOptions, String> {
                         drop --no-covering"
                 .into());
         }
-        Some(settings::cogp_defaults().clone())
+        // Refuse rather than silently substitute the reference GSDs:
+        // a pyramid written to levels the user did not configure is
+        // wrong in a way nothing downstream can detect.
+        Some(
+            settings::cogp_settings()
+                .map_err(|e| format!("--cogp: {e}"))?
+                .clone(),
+        )
     } else {
         None
     };
@@ -328,7 +346,10 @@ fn print_layers(input: &Path) -> Result<(), String> {
             }
         }
         ImportFormat::Shapefile | ImportFormat::GeoJson => {
-            println!("(single layer — no --layer needed)");
+            // Prose, not data: stdout carries the tab-separated layer
+            // list, and a shell pipeline must not have to filter this
+            // sentence back out of it.
+            eprintln!("(single layer — no --layer needed)");
         }
     }
     Ok(())

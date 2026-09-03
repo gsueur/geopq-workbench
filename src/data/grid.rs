@@ -206,20 +206,33 @@ struct Acc {
     wsum: f64,
     /// (value, weight) pairs, kept only for the median.
     vals: Option<Vec<(f64, f64)>>,
-    /// Σ w per interned code, kept only for majority/minority — the
-    /// value then travels as a dictionary code cast to f64.
+    /// Σ q per interned code, kept only for majority/minority — the
+    /// value then travels as a dictionary code cast to f64. This sums
+    /// the *absolute* quantity the cell holds (see `push`), not the
+    /// self-normalized weight.
     cats: Option<HashMap<u32, f64>>,
 }
 
 impl Acc {
-    fn push(&mut self, v: f64, w: f64) {
+    /// `w` is the feature's self-share of this cell (its weights sum to
+    /// 1 across the cells it touches) and drives the numeric statistics.
+    /// `q` is how much of the feature the cell actually holds, in
+    /// absolute terms: covered area in CRS units² for areal features, 1
+    /// for points and other non-areal ones.
+    ///
+    /// Majority/minority need `q`, not `w`: a forest spanning a hundred
+    /// cells has a self-share of ~0.01 in each of them while a shed
+    /// wholly inside one has a share of 1, so ranking by `w` reported
+    /// the shed as the majority category of a cell that is 99.99%
+    /// forest. Ranking by covered area asks the question the user meant.
+    fn push(&mut self, v: f64, w: f64, q: f64) {
         self.sum += w * v;
         self.wsum += w;
         if let Some(vals) = &mut self.vals {
             vals.push((v, w));
         }
         if let Some(cats) = &mut self.cats {
-            *cats.entry(v as u32).or_insert(0.0) += w;
+            *cats.entry(v as u32).or_insert(0.0) += q;
         }
     }
 
@@ -236,7 +249,9 @@ impl Acc {
                 .expect("majority keeps counts")
                 .iter()
                 .max_by(|(ka, wa), (kb, wb)| {
-                    wa.partial_cmp(wb).unwrap().then(kb.cmp(ka))
+                    wa.partial_cmp(wb)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(kb.cmp(ka))
                 })
                 .map(|(k, _)| *k as f64)
                 .unwrap_or(f64::NAN),
@@ -246,7 +261,9 @@ impl Acc {
                 .expect("minority keeps counts")
                 .iter()
                 .min_by(|(ka, wa), (kb, wb)| {
-                    wa.partial_cmp(wb).unwrap().then(ka.cmp(kb))
+                    wa.partial_cmp(wb)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(ka.cmp(kb))
                 })
                 .map(|(k, _)| *k as f64)
                 .unwrap_or(f64::NAN),
@@ -254,7 +271,9 @@ impl Acc {
                 // Weighted median: value where the cumulative weight
                 // crosses half the total.
                 let vals = self.vals.as_mut().expect("median keeps values");
-                vals.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                vals.sort_unstable_by(|a, b| {
+                    a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                });
                 let half = vals.iter().map(|(_, w)| w).sum::<f64>() * 0.5;
                 let mut cum = 0.0;
                 for &(v, w) in vals.iter() {
@@ -269,8 +288,16 @@ impl Acc {
     }
 }
 
+/// Error a cancelled run returns, so the caller can tell "the user
+/// stopped it" from a real failure and stay quiet about it.
+pub const CANCELLED: &str = "grid: cancelled";
+
 /// Aggregate `store`'s `spec.value_col` into cells and write the grid as
 /// GeoParquet at `dst`. Returns (cells, rows aggregated).
+///
+/// `cancel` is polled once per scan chunk and once per apportionment
+/// chunk: a continent-wide grid over a parcel layer runs for minutes and
+/// had no way out short of killing the app.
 #[allow(clippy::type_complexity)]
 pub fn compute(
     store: &FeatureStore,
@@ -278,6 +305,7 @@ pub fn compute(
     spec: &GridSpec,
     dst: &Path,
     progress: &(dyn Fn(f32) + Sync),
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<(usize, u64), String> {
     let wgs84 = Crs::wgs84();
     let geographic = !matches!(spec.system, CellSystem::Square { .. });
@@ -324,40 +352,59 @@ pub fn compute(
             CellSystem::Square { .. } => None,
         }
     };
-    scan_bbox_values(store, spec.value_col, text.then_some(&mut dict), &mut |row, b, v, frac| {
-        progress(frac * 0.55);
-        match spec.system {
-            CellSystem::Square { sx, sy } => {
-                let (ix0, iy0) = ((b[0] / sx).floor() as i64, (b[1] / sy).floor() as i64);
-                let (ix1, iy1) = ((b[2] / sx).floor() as i64, (b[3] / sy).floor() as i64);
-                if ix0 == ix1 && iy0 == iy1 {
-                    sq.entry((ix0, iy0)).or_insert_with(blank).push(v, 1.0);
-                    rows_used += 1;
-                } else {
-                    stash.push((row, v));
+    // Absolute quantity a wholly-contained feature contributes: its
+    // bbox area, which is all pass 1 knows without touching geometry,
+    // and 1 for a degenerate bbox (a point, an axis-aligned line). Only
+    // majority/minority read it, and they only ever compare it against
+    // other features of the same layer.
+    let bbox_quantity = |b: &[f64; 4]| -> f64 {
+        let a = (b[2] - b[0]) * (b[3] - b[1]);
+        if a > 0.0 { a } else { 1.0 }
+    };
+    scan_bbox_values(
+        store,
+        spec.value_col,
+        text.then_some(&mut dict),
+        cancel,
+        &mut |row, b, v, frac| {
+            progress(frac * 0.55);
+            match spec.system {
+                CellSystem::Square { sx, sy } => {
+                    let (ix0, iy0) = ((b[0] / sx).floor() as i64, (b[1] / sy).floor() as i64);
+                    let (ix1, iy1) = ((b[2] / sx).floor() as i64, (b[3] / sy).floor() as i64);
+                    if ix0 == ix1 && iy0 == iy1 {
+                        sq.entry((ix0, iy0))
+                            .or_insert_with(blank)
+                            .push(v, 1.0, bbox_quantity(&b));
+                        rows_used += 1;
+                    } else {
+                        stash.push((row, v));
+                    }
+                }
+                _ => {
+                    // Same cell for all four bbox corners ⇒ contained.
+                    let c00 = to_geo_cell(b[0], b[1]);
+                    let Some(c) = c00 else { return };
+                    let contained = [(b[2], b[1]), (b[2], b[3]), (b[0], b[3])]
+                        .iter()
+                        .all(|&(x, y)| to_geo_cell(x, y) == Some(c));
+                    if contained {
+                        geo.entry(c)
+                            .or_insert_with(blank)
+                            .push(v, 1.0, bbox_quantity(&b));
+                        rows_used += 1;
+                    } else {
+                        stash.push((row, v));
+                    }
                 }
             }
-            _ => {
-                // Same cell for all four bbox corners ⇒ contained.
-                let c00 = to_geo_cell(b[0], b[1]);
-                let Some(c) = c00 else { return };
-                let contained = [(b[2], b[1]), (b[2], b[3]), (b[0], b[3])]
-                    .iter()
-                    .all(|&(x, y)| to_geo_cell(x, y) == Some(c));
-                if contained {
-                    geo.entry(c).or_insert_with(blank).push(v, 1.0);
-                    rows_used += 1;
-                } else {
-                    stash.push((row, v));
-                }
-            }
-        }
-    })?;
+        },
+    )?;
 
     // ---- pass 2: apportion boundary-crossers by covered area ---------
     // Chunks run in parallel (geometry decode + per-sample cell lookups
-    // dominate); each returns (cell, value, weight) triples merged
-    // sequentially into the accumulators.
+    // dominate); each returns (cell, value, self-share, quantity)
+    // tuples merged sequentially into the accumulators.
     if !stash.is_empty() {
         use rayon::prelude::*;
         stash.sort_unstable_by_key(|(r, _)| *r);
@@ -367,39 +414,19 @@ pub fn compute(
         let done = std::sync::atomic::AtomicUsize::new(0);
         match spec.system {
             CellSystem::Square { sx, sy } => {
-                let parts: Result<Vec<Vec<((i64, i64), f64, f64)>>, String> = chunks
+                let parts: Result<Vec<Vec<((i64, i64), f64, f64, f64)>>, String> = chunks
                     .par_iter()
                     .map(|chunk| {
-                        let rows: Vec<u32> = chunk.iter().map(|(r, _)| *r).collect();
-                        let geoms = store.fetch_geoms(&rows)?;
-                        let mut out = Vec::new();
-                        for ((_, g), &(_, v)) in geoms.iter().zip(chunk.iter()) {
-                            let Some(g) = g else { continue };
-                            apportion_square(g, sx, sy, &mut |k, w| out.push((k, v, w)));
+                        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Err(CANCELLED.to_string());
                         }
-                        let d = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        progress(0.55 + 0.15 * d as f32 / n_chunks as f32);
-                        Ok(out)
-                    })
-                    .collect();
-                for part in parts? {
-                    for (k, v, w) in part {
-                        sq.entry(k).or_insert_with(blank).push(v, w);
-                    }
-                }
-                rows_used += stash.len() as u64;
-            }
-            _ => {
-                let parts: Result<Vec<Vec<(u64, f64, f64)>>, String> = chunks
-                    .par_iter()
-                    .map(|chunk| {
                         let rows: Vec<u32> = chunk.iter().map(|(r, _)| *r).collect();
                         let geoms = store.fetch_geoms(&rows)?;
                         let mut out = Vec::new();
                         for ((_, g), &(_, v)) in geoms.iter().zip(chunk.iter()) {
                             let Some(g) = g else { continue };
-                            apportion_sampled(g, &to_geo_cell, &mut |k, w| {
-                                out.push((k, v, w))
+                            apportion_square(g, sx, sy, &mut |k, w, q| {
+                                out.push((k, v, w, q))
                             });
                         }
                         let d = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -408,8 +435,36 @@ pub fn compute(
                     })
                     .collect();
                 for part in parts? {
-                    for (k, v, w) in part {
-                        geo.entry(k).or_insert_with(blank).push(v, w);
+                    for (k, v, w, q) in part {
+                        sq.entry(k).or_insert_with(blank).push(v, w, q);
+                    }
+                }
+                rows_used += stash.len() as u64;
+            }
+            _ => {
+                let parts: Result<Vec<Vec<(u64, f64, f64, f64)>>, String> = chunks
+                    .par_iter()
+                    .map(|chunk| {
+                        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Err(CANCELLED.to_string());
+                        }
+                        let rows: Vec<u32> = chunk.iter().map(|(r, _)| *r).collect();
+                        let geoms = store.fetch_geoms(&rows)?;
+                        let mut out = Vec::new();
+                        for ((_, g), &(_, v)) in geoms.iter().zip(chunk.iter()) {
+                            let Some(g) = g else { continue };
+                            apportion_sampled(g, &to_geo_cell, SAMPLE_LADDER, &mut |k, w, q| {
+                                out.push((k, v, w, q))
+                            });
+                        }
+                        let d = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        progress(0.55 + 0.15 * d as f32 / n_chunks as f32);
+                        Ok(out)
+                    })
+                    .collect();
+                for part in parts? {
+                    for (k, v, w, q) in part {
+                        geo.entry(k).or_insert_with(blank).push(v, w, q);
                     }
                 }
                 rows_used += stash.len() as u64;
@@ -1060,35 +1115,99 @@ fn materialize<K: Hash + Eq + Copy>(
     Ok((batch, schema, n))
 }
 
+/// Most cells one feature may be clipped against before the exact
+/// apportionment gives up and samples instead. The clipper costs
+/// (bbox cells × ring vertices) with four allocations per cell, so a
+/// single continent-spanning polygon against a 100 m grid would run for
+/// hours inside a chunk nobody can interrupt. Sampling that one feature
+/// is a far smaller error than never finishing the grid.
+const MAX_CELLS_PER_FEATURE: u64 = 100_000;
+
+/// Sample lattice sizes tried in order, coarse first (see
+/// `apportion_sampled`).
+const SAMPLE_LADDER: &[usize] = &[8, 32];
+
+/// Finer ladder for a feature too large for exact clipping: it covers
+/// more cells than the default lattice has samples, so the coarse pass
+/// would collapse it onto a handful of them.
+const SAMPLE_LADDER_LARGE: &[usize] = &[32, 128];
+
 /// Split a feature's value across the square cells it covers: exact
-/// axis-aligned rectangle clipping per cell, weight = covered fraction
-/// of the feature's total area. Degenerate/non-areal geometries fall
-/// back to their bbox-center cell with weight 1.
+/// axis-aligned rectangle clipping per cell, self-share = covered
+/// fraction of the feature's total area, quantity = the covered area
+/// itself in CRS units².
+///
+/// Degenerate and non-areal geometries (points, lines, zero-area
+/// polygons) fall back to their bbox-centre cell with share 1 and
+/// quantity 1 — a line's "coverage" of a cell is not an area, so
+/// majority/minority over a line layer rank by feature count, which is
+/// the only honest reading of the data we have here. Apportioning a
+/// line by its length inside each cell would be the better answer; the
+/// grid dialog does not offer line layers a length statistic today, so
+/// this stays a documented approximation rather than a silent one.
 fn apportion_square(
     g: &geo_types::Geometry<f64>,
     sx: f64,
     sy: f64,
-    add: &mut dyn FnMut((i64, i64), f64),
+    add: &mut dyn FnMut((i64, i64), f64, f64),
 ) {
     use geo::{Area, BoundingRect};
     // Only used to detect degenerate (zero-area) input; the weights are
     // normalized against the measured coverage below.
     let total = g.unsigned_area();
-    let centroid_fallback = |add: &mut dyn FnMut((i64, i64), f64)| {
+    // A non-finite vertex makes every derived index garbage: NaN floors
+    // into cell (0, 0) and an infinity saturates to i64::MIN/MAX, whose
+    // `for ix in ix0..=ix1` never returns. Geometries reach us straight
+    // out of WKB, so this is a decode away, not a hypothetical.
+    let cell_of = |x: f64, y: f64| -> Option<(i64, i64)> {
+        let (cx, cy) = (x / sx, y / sy);
+        (cx.is_finite() && cy.is_finite()).then(|| (cx.floor() as i64, cy.floor() as i64))
+    };
+    let centroid_fallback = |add: &mut dyn FnMut((i64, i64), f64, f64)| {
         if let Some(r) = g.bounding_rect() {
             let (cx, cy) = ((r.min().x + r.max().x) * 0.5, (r.min().y + r.max().y) * 0.5);
-            add(((cx / sx).floor() as i64, (cy / sy).floor() as i64), 1.0);
+            if let Some(k) = cell_of(cx, cy) {
+                add(k, 1.0, 1.0);
+            }
         }
     };
     if total <= 0.0 {
         centroid_fallback(add);
         return;
     }
+    // Exact clipping is unbounded in the feature's extent; count the
+    // cells first and hand anything oversized to the sampler.
+    let cell_span = |r: &geo_types::Rect<f64>| -> Option<u64> {
+        let (a, b) = (cell_of(r.min().x, r.min().y)?, cell_of(r.max().x, r.max().y)?);
+        let w = (b.0 - a.0).unsigned_abs().saturating_add(1);
+        let h = (b.1 - a.1).unsigned_abs().saturating_add(1);
+        Some(w.saturating_mul(h))
+    };
+    let budget: u64 = match g {
+        geo_types::Geometry::Polygon(p) => p.bounding_rect().and_then(|r| cell_span(&r)),
+        geo_types::Geometry::MultiPolygon(mp) => mp
+            .0
+            .iter()
+            .try_fold(0u64, |acc, p| {
+                let r = p.bounding_rect()?;
+                Some(acc.saturating_add(cell_span(&r)?))
+            }),
+        _ => Some(0),
+    }
+    .unwrap_or(u64::MAX);
+    if budget > MAX_CELLS_PER_FEATURE {
+        let to_cell = |x: f64, y: f64| cell_of(x, y);
+        apportion_sampled(g, &to_cell, SAMPLE_LADDER_LARGE, add);
+        return;
+    }
     let mut covered: HashMap<(i64, i64), f64> = HashMap::new();
     let mut per_poly = |poly: &geo_types::Polygon<f64>| {
         let Some(r) = poly.bounding_rect() else { return };
-        let (ix0, ix1) = ((r.min().x / sx).floor() as i64, (r.max().x / sx).floor() as i64);
-        let (iy0, iy1) = ((r.min().y / sy).floor() as i64, (r.max().y / sy).floor() as i64);
+        let (Some((ix0, iy0)), Some((ix1, iy1))) =
+            (cell_of(r.min().x, r.min().y), cell_of(r.max().x, r.max().y))
+        else {
+            return;
+        };
         for ix in ix0..=ix1 {
             for iy in iy0..=iy1 {
                 let rect = [
@@ -1131,7 +1250,7 @@ fn apportion_square(
         return;
     }
     for (k, a) in covered {
-        add(k, a / sum);
+        add(k, a / sum, a);
     }
 }
 
@@ -1190,24 +1309,30 @@ fn ring_area_in_rect(ring: &[geo_types::Coord<f64>], rect: [f64; 4]) -> f64 {
     (a2 * 0.5).abs()
 }
 
-/// Split a feature's value across geographic cells by sampling an 8×8
-/// lattice over its bbox: weight = samples in cell / samples inside the
-/// polygon. Membership is a scanline even-odd test (one crossing pass
-/// over the ring edges per sample row — no per-point ray cast), which
-/// handles holes and multipolygons naturally. Exact hexagon/pentagon
-/// clipping isn't worth it at carroyage cell sizes. Falls back to the
-/// bbox-center cell for degenerate/non-areal geometries.
-fn apportion_sampled(
+/// Split a feature's value across cells by sampling an n×n lattice over
+/// its bbox: self-share = samples in cell / samples inside the polygon,
+/// quantity = those samples' share of the bbox area, which estimates the
+/// ground area the cell holds. Membership is a scanline even-odd test
+/// (one crossing pass over the ring edges per sample row — no per-point
+/// ray cast), which handles holes and multipolygons naturally. Exact
+/// hexagon/pentagon clipping isn't worth it at carroyage cell sizes.
+/// Falls back to the bbox-center cell for degenerate/non-areal
+/// geometries (share 1, quantity 1 — see `apportion_square`).
+///
+/// Generic over the cell key so the square grid can borrow it as the
+/// bounded fallback for a feature too large to clip exactly.
+fn apportion_sampled<K: Copy + Eq + Hash>(
     g: &geo_types::Geometry<f64>,
-    to_cell: &dyn Fn(f64, f64) -> Option<u64>,
-    add: &mut dyn FnMut(u64, f64),
+    to_cell: &dyn Fn(f64, f64) -> Option<K>,
+    ladder: &[usize],
+    add: &mut dyn FnMut(K, f64, f64),
 ) {
     use geo::BoundingRect;
     let Some(r) = g.bounding_rect() else { return };
-    let centroid_fallback = |add: &mut dyn FnMut(u64, f64)| {
+    let centroid_fallback = |add: &mut dyn FnMut(K, f64, f64)| {
         let (cx, cy) = ((r.min().x + r.max().x) * 0.5, (r.min().y + r.max().y) * 0.5);
         if let Some(c) = to_cell(cx, cy) {
-            add(c, 1.0);
+            add(c, 1.0, 1.0);
         }
     };
     let rings: Vec<&[geo_types::Coord<f64>]> = match g {
@@ -1229,7 +1354,7 @@ fn apportion_sampled(
     // Coarse first; a geometry thinner than the sample spacing (a ring,
     // a river strip, a diagonal sliver) needs a finer lattice before the
     // bbox-center fallback, which for an annulus would land in the hole.
-    for n in [8usize, 32] {
+    for &n in ladder {
         if sample_rings(&rings, &r, n, to_cell, add) {
             return;
         }
@@ -1240,21 +1365,24 @@ fn apportion_sampled(
 /// One sampling pass at `n`×`n` over `r`. Returns false when no sample
 /// landed inside the rings (or none of those could be classified), so
 /// the caller can refine or fall back.
-fn sample_rings(
+fn sample_rings<K: Copy + Eq + Hash>(
     rings: &[&[geo_types::Coord<f64>]],
     r: &geo_types::Rect<f64>,
     n: usize,
-    to_cell: &dyn Fn(f64, f64) -> Option<u64>,
-    add: &mut dyn FnMut(u64, f64),
+    to_cell: &dyn Fn(f64, f64) -> Option<K>,
+    add: &mut dyn FnMut(K, f64, f64),
 ) -> bool {
     let (dx, dy) = (
         (r.max().x - r.min().x) / n as f64,
         (r.max().y - r.min().y) / n as f64,
     );
-    if dx <= 0.0 || dy <= 0.0 {
+    // The finite check is not redundant with `<= 0.0`: a NaN spacing —
+    // from a non-finite vertex in the bbox — compares false against
+    // everything and would otherwise reach the crossing sort below.
+    if !dx.is_finite() || !dy.is_finite() || dx <= 0.0 || dy <= 0.0 {
         return false;
     }
-    let mut per_cell: HashMap<u64, u32> = HashMap::new();
+    let mut per_cell: HashMap<K, u32> = HashMap::new();
     let mut xs: Vec<f64> = Vec::new();
     for j in 0..n {
         let y = r.min().y + (j as f64 + 0.5) * dy;
@@ -1279,7 +1407,7 @@ fn sample_rings(
         if xs.is_empty() {
             continue;
         }
-        xs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        xs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         for i in 0..n {
             let x = r.min().x + (i as f64 + 0.5) * dx;
             // Odd number of crossings to the left ⇒ inside (even-odd).
@@ -1298,8 +1426,14 @@ fn sample_rings(
     if classified == 0 {
         return false;
     }
+    // Each in-polygon sample stands for one dx×dy patch of the bbox, so
+    // `k · dx · dy` is this cell's share of the feature's ground area —
+    // the absolute quantity majority/minority rank by. Deriving it from
+    // the samples rather than from `unsigned_area` keeps it right for
+    // the self-intersecting rings that already broke normalization.
+    let patch = dx * dy;
     for (c, k) in per_cell {
-        add(c, k as f64 / classified as f64);
+        add(c, k as f64 / classified as f64, k as f64 * patch);
     }
     true
 }
@@ -1358,6 +1492,7 @@ fn scan_bbox_values(
     store: &FeatureStore,
     value_col: usize,
     text_dict: Option<&mut Vec<String>>,
+    cancel: &std::sync::atomic::AtomicBool,
     f: &mut dyn FnMut(u32, [f64; 4], f64, f32),
 ) -> Result<(), String> {
     const CHUNK: u64 = 131_072;
@@ -1365,10 +1500,24 @@ fn scan_bbox_values(
     if total == 0 {
         return Err("layer has no rows".into());
     }
+    // One guard for both branches. A null Arrow slot reads as 0.0, NaN
+    // floors into cell (0, 0) rather than erroring, and an infinity
+    // saturates the cell index to i64::MIN/MAX — so a corrupt covering
+    // column, or a geometry whose WKB carries a non-finite vertex, would
+    // quietly pile features onto the origin or hang pass 2. The covering
+    // branch used to check this and the geometry-decode branch did not.
+    let mut emit = |row: u32, bb: [f64; 4], v: f64, frac: f32| {
+        if bb.iter().all(|c| c.is_finite()) {
+            f(row, bb, v, frac);
+        }
+    };
     let mut interner = text_dict.map(|d| (HashMap::new(), d));
     let covering = store.covering.clone();
     let mut start = 0u64;
     while start < total {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(CANCELLED.to_string());
+        }
         let end = (start + CHUNK).min(total);
         let rows: Vec<u32> = (start as u32..end as u32).collect();
         let frac = end as f32 / total as f32;
@@ -1406,13 +1555,7 @@ fn scan_bbox_values(
                             continue;
                         }
                         let bb = [xmin.value(i), ymin.value(i), xmax.value(i), ymax.value(i)];
-                        // A null Arrow slot reads as 0.0 and NaN floors to
-                        // cell 0 rather than erroring, so a corrupt covering
-                        // column would quietly pile features onto the origin.
-                        if !bb.iter().all(|c| c.is_finite()) {
-                            continue;
-                        }
-                        f(rows[i + row_base], bb, v, frac);
+                        emit(rows[i + row_base], bb, v, frac);
                     }
                     row_base += b.num_rows();
                 }
@@ -1427,9 +1570,18 @@ fn scan_bbox_values(
                 let geoms = store.fetch_geoms(&rows)?;
                 for (k, ((_, g), v)) in geoms.iter().zip(&vals_all).enumerate() {
                     let (Some(g), Some(v)) = (g, v) else { continue };
-                    use geo::BoundingRect;
+                    use geo::{BoundingRect, CoordsIter};
+                    // `bounding_rect` folds with f64::min/max, which drop
+                    // a NaN silently: a ring with one NaN vertex yields a
+                    // perfectly finite (and wrong) rect that assigns the
+                    // feature to a cell near the origin. The bbox check in
+                    // `emit` cannot see that, so the decode path — the only
+                    // one holding real coordinates — checks the vertices.
+                    if !g.coords_iter().all(|c| c.x.is_finite() && c.y.is_finite()) {
+                        continue;
+                    }
                     if let Some(r) = g.bounding_rect() {
-                        f(
+                        emit(
                             rows[k],
                             [r.min().x, r.min().y, r.max().x, r.max().y],
                             *v,
@@ -1491,8 +1643,8 @@ mod tests {
             ]),
             vec![],
         ));
-        let mut w = 0.0;
-        apportion_square(&bowtie, 100.0, 100.0, &mut |_, x| w += x);
+        let mut w = 0.0f64;
+        apportion_square(&bowtie, 100.0, 100.0, &mut |_, x, _| w += x);
         assert!((w - 1.0).abs() < 1e-9, "bowtie weights sum to {w}");
 
         // A thin annulus: no 8×8 sample lands in the 1-unit band and the
@@ -1519,8 +1671,8 @@ mod tests {
         let to_cell = |x: f64, y: f64| -> Option<u64> {
             Some((((x / 100.0) as u64) << 32) | ((y / 100.0) as u64))
         };
-        let mut total = 0.0;
-        apportion_sampled(&annulus, &to_cell, &mut |c, wt| {
+        let mut total = 0.0f64;
+        apportion_sampled(&annulus, &to_cell, SAMPLE_LADDER, &mut |c, wt, _| {
             hits.push((((c >> 32) as i64, (c & 0xffff_ffff) as i64), wt));
             total += wt;
         });
@@ -1545,8 +1697,8 @@ mod tests {
             // Half the samples fail to project, as they would near a pole.
             (x > 200.0).then_some(7)
         };
-        let mut total = 0.0;
-        apportion_sampled(&square, &picky, &mut |_, wt| total += wt);
+        let mut total = 0.0f64;
+        apportion_sampled(&square, &picky, SAMPLE_LADDER, &mut |_, wt, _| total += wt);
         assert!((total - 1.0).abs() < 1e-9, "projection failures cost {total}");
     }
 
@@ -1802,7 +1954,7 @@ mod tests {
     fn acc_stats() {
         let mut a = Acc { sum: 0.0, wsum: 0.0, vals: Some(Vec::new()), cats: None };
         for v in [1.0, 100.0, 3.0] {
-            a.push(v, 1.0);
+            a.push(v, 1.0, 1.0);
         }
         assert_eq!(a.stat(GridStat::Median), 3.0);
         assert_eq!(a.stat(GridStat::Sum), 104.0);
@@ -1811,9 +1963,9 @@ mod tests {
         // Weighted: a huge value at tiny weight must not dominate the
         // weighted median.
         let mut a = Acc { sum: 0.0, wsum: 0.0, vals: Some(Vec::new()), cats: None };
-        a.push(1_000_000.0, 0.01);
-        a.push(10.0, 1.0);
-        a.push(20.0, 1.0);
+        a.push(1_000_000.0, 0.01, 0.01);
+        a.push(10.0, 1.0, 1.0);
+        a.push(20.0, 1.0, 1.0);
         assert_eq!(a.stat(GridStat::Median), 20.0);
         assert!((a.stat(GridStat::Count) - 2.01).abs() < 1e-12);
     }
@@ -1826,7 +1978,7 @@ mod tests {
         let giant_value = 1_000_000.0;
         let mk = |stat: GridStat| {
             let mut a = Acc { sum: 0.0, wsum: 0.0, vals: None, cats: None };
-            a.push(giant_value, 0.5); // half the giant covers this cell
+            a.push(giant_value, 0.5, 0.5); // half the giant covers this cell
             a.stat(stat)
         };
         // Mean: the blob — the cell reads the giant's entire value.
@@ -1837,8 +1989,8 @@ mod tests {
         // A neighboring cell with a small local parcel on top barely
         // differs: no spike between "giant only" and "giant + normal".
         let mut b = Acc { sum: 0.0, wsum: 0.0, vals: None, cats: None };
-        b.push(giant_value, 0.5);
-        b.push(100.0, 1.0);
+        b.push(giant_value, 0.5, 0.5);
+        b.push(100.0, 1.0, 1.0);
         let density_b = b.stat(GridStat::Density) / (100.0 * 100.0);
         assert!((density_b - density) < 0.02, "{density_b} vs {density}");
     }
@@ -1858,7 +2010,7 @@ mod tests {
             vec![],
         ));
         let mut got: HashMap<(i64, i64), f64> = HashMap::new();
-        apportion_square(&poly, 100.0, 100.0, &mut |k, w| {
+        apportion_square(&poly, 100.0, 100.0, &mut |k, w, _| {
             *got.entry(k).or_insert(0.0) += w;
         });
         assert_eq!(got.len(), 4, "{got:?}");
@@ -1877,7 +2029,7 @@ mod tests {
             vec![],
         ));
         let mut got: HashMap<(i64, i64), f64> = HashMap::new();
-        apportion_square(&poly, 100.0, 100.0, &mut |k, w| {
+        apportion_square(&poly, 100.0, 100.0, &mut |k, w, _| {
             *got.entry(k).or_insert(0.0) += w;
         });
         assert!((got[&(0, 0)] - 0.8).abs() < 1e-9, "{got:?}");
@@ -1902,7 +2054,7 @@ mod tests {
             ])],
         ));
         let mut got: HashMap<(i64, i64), f64> = HashMap::new();
-        apportion_square(&poly, 100.0, 100.0, &mut |k, w| {
+        apportion_square(&poly, 100.0, 100.0, &mut |k, w, _| {
             *got.entry(k).or_insert(0.0) += w;
         });
         assert!((got[&(0, 0)] - 4800.0 / 6400.0).abs() < 1e-9, "{got:?}");
@@ -1973,7 +2125,7 @@ mod tests {
                 post: PostOp::None,
             };
             let dst = dir.join(format!("grid_{}.parquet", stat.label()));
-            let (cells, rows) = compute(&store, &crs, &spec, &dst, &|_| {}).unwrap();
+            let (cells, rows) = compute(&store, &crs, &spec, &dst, &|_| {}, &Default::default()).unwrap();
             assert_eq!(rows, 8, "the species-less tree is skipped");
             assert_eq!(cells, 2);
             let (gs, _, _, _) = crate::data::loader::open_store_for_test(&dst).unwrap();
@@ -2017,9 +2169,260 @@ mod tests {
             smooth_passes: 1,
             post: PostOp::None,
         };
-        let err = compute(&store, &crs, &smoothed, &dir.join("x.parquet"), &|_| {})
+        let err = compute(&store, &crs, &smoothed, &dir.join("x.parquet"), &|_| {}, &Default::default())
             .unwrap_err();
         assert!(err.contains("smooth"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Polygons, not points: the category that covers most of a cell has
+    /// to win it. The forest spans four cells so its self-share in each
+    /// is 0.25, while the shed sits wholly inside one and had a share of
+    /// 1 — ranking by share reported a cell that is 99.99% forest as
+    /// "shed". Majority/minority rank by covered area instead.
+    #[test]
+    fn a_polygon_categorical_grid_is_won_by_the_larger_cover() {
+        use arrow::array::StringArray;
+        use geo_types::{Coord, LineString, Polygon};
+        let dir = std::env::temp_dir().join(format!("geopq_grid_cover_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("parcels.parquet");
+
+        let rect = |x0: f64, y0: f64, x1: f64, y1: f64| {
+            geo_types::Geometry::Polygon(Polygon::new(
+                LineString(vec![
+                    Coord { x: x0, y: y0 },
+                    Coord { x: x1, y: y0 },
+                    Coord { x: x1, y: y1 },
+                    Coord { x: x0, y: y1 },
+                    Coord { x: x0, y: y0 },
+                ]),
+                vec![],
+            ))
+        };
+        let mut wkb = BinaryBuilder::new();
+        let mut use_ = StringBuilder::new();
+        // The forest covers all four cells of a 2×2 grid of 100-unit
+        // cells; the shed is a 1×1 square wholly inside cell (0, 0).
+        for (g, u) in [
+            (rect(0.0, 0.0, 200.0, 200.0), "forest"),
+            (rect(10.0, 10.0, 11.0, 11.0), "shed"),
+        ] {
+            wkb.append_value(crate::data::import::to_wkb(&g).unwrap());
+            use_.append_value(u);
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("USE", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(wkb.finish()) as ArrayRef, Arc::new(use_.finish())],
+        )
+        .unwrap();
+        crate::sql::export::write_result(&src, &schema, &[batch], 0, &Crs::wgs84()).unwrap();
+        let (store, crs, _, _) = crate::data::loader::open_store_for_test(&src).unwrap();
+        let col = store.schema.index_of("USE").unwrap();
+
+        let run = |stat: GridStat| -> HashMap<String, String> {
+            let sp = GridSpec {
+                value_col: col,
+                value_name: "USE".into(),
+                system: CellSystem::square(100.0),
+                stat,
+                kernel: Kernel::Box,
+                output: GridOutput::Cells,
+                smooth_passes: 0,
+                post: PostOp::None,
+            };
+            let dst = dir.join(format!("cover_{}.parquet", stat.label()));
+            compute(&store, &crs, &sp, &dst, &|_| {}, &Default::default()).unwrap();
+            let (gs, _, _, _) = crate::data::loader::open_store_for_test(&dst).unwrap();
+            let rows: Vec<u32> = (0..gs.total_rows() as u32).collect();
+            let mut out = HashMap::new();
+            for b in &gs.fetch(&rows, None).unwrap() {
+                let sc = b.schema();
+                let v = b
+                    .column(sc.index_of("USE").unwrap())
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .clone();
+                let cell = b
+                    .column(sc.index_of("cell").unwrap())
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .clone();
+                for i in 0..b.num_rows() {
+                    out.insert(cell.value(i).to_string(), v.value(i).to_string());
+                }
+            }
+            out
+        };
+        let maj = run(GridStat::Majority);
+        assert_eq!(maj["0:0"], "forest", "the 1-unit shed cannot outrank 10000 units of forest");
+        assert_eq!(maj["1:1"], "forest");
+        // The shed is still present, as the rarest cover of its cell.
+        let min = run(GridStat::Minority);
+        assert_eq!(min["0:0"], "shed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A non-finite vertex used to reach the cell arithmetic through the
+    /// geometry-decode path (files with no covering bbox column), where
+    /// NaN floors into cell (0, 0) and an infinity saturates the index
+    /// to i64::MIN/MAX, whose `for ix in ix0..=ix1` never returns. Only
+    /// the covering branch had the guard; now both share it.
+    #[test]
+    fn non_finite_vertices_are_dropped_on_the_decode_path() {
+        use geo_types::{Coord, LineString, Polygon};
+        let dir = std::env::temp_dir().join(format!("geopq_grid_nonfinite_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("bad.parquet");
+
+        let poly = |x: f64, y: f64| {
+            geo_types::Geometry::Polygon(Polygon::new(
+                LineString(vec![
+                    Coord { x: 0.0, y: 0.0 },
+                    Coord { x, y: 0.0 },
+                    Coord { x, y },
+                    Coord { x: 0.0, y },
+                    Coord { x: 0.0, y: 0.0 },
+                ]),
+                vec![],
+            ))
+        };
+        let mut wkb = BinaryBuilder::new();
+        let mut vals: Vec<f64> = Vec::new();
+        for (g, v) in [
+            (poly(150.0, 150.0), 1.0),      // straddles four cells: real work
+            (poly(f64::NAN, 50.0), 2.0),    // NaN would land in cell (0, 0)
+            (poly(f64::INFINITY, 50.0), 3.0), // infinity would loop forever
+        ] {
+            wkb.append_value(crate::data::import::to_wkb(&g).unwrap());
+            vals.push(v);
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("v", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(wkb.finish()) as ArrayRef,
+                Arc::new(Float64Array::from(vals)),
+            ],
+        )
+        .unwrap();
+        // write_result adds no covering column, so the scan takes the
+        // geometry-decode branch this test is about.
+        crate::sql::export::write_result(&src, &schema, &[batch], 0, &Crs::wgs84()).unwrap();
+        let (store, crs, _, _) = crate::data::loader::open_store_for_test(&src).unwrap();
+        assert!(store.covering.is_none(), "the fixture must exercise the decode path");
+        let sp = spec(CellSystem::square(100.0), GridStat::Sum, 0);
+        let sp = GridSpec {
+            value_col: store.schema.index_of("v").unwrap(),
+            value_name: "v".into(),
+            ..sp
+        };
+        let (cells, rows) = compute(
+            &store,
+            &crs,
+            &sp,
+            &dir.join("g.parquet"),
+            &|_| {},
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(rows, 1, "only the finite feature is aggregated");
+        assert_eq!(cells, 4, "and it lands in its own four cells, not the origin");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A feature whose bbox spans more cells than the exact clipper may
+    /// visit falls back to sampling instead of running for hours inside
+    /// an uninterruptible chunk. The weights still sum to 1, and the
+    /// quantities still add up to roughly the covered area.
+    #[test]
+    fn an_oversized_feature_falls_back_to_sampling() {
+        use geo_types::{Coord, LineString, Polygon};
+        // 1-unit cells over a 1000×1000 square: a million cells, ten
+        // times the cap.
+        let big = geo_types::Geometry::Polygon(Polygon::new(
+            LineString(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 1000.0, y: 0.0 },
+                Coord { x: 1000.0, y: 1000.0 },
+                Coord { x: 0.0, y: 1000.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        ));
+        let (mut w, mut q, mut n) = (0.0f64, 0.0f64, 0usize);
+        let t0 = std::time::Instant::now();
+        apportion_square(&big, 1.0, 1.0, &mut |_, wt, qt| {
+            w += wt;
+            q += qt;
+            n += 1;
+        });
+        assert!(t0.elapsed().as_secs() < 5, "the cap must bound the work");
+        assert!((w - 1.0).abs() < 1e-9, "weights sum to {w}");
+        assert!(n <= 128 * 128, "sampled, not clipped: {n} cells");
+        assert!((q - 1_000_000.0).abs() < 50_000.0, "covered area ≈ {q}");
+
+        // Just under the cap still takes the exact path, cell for cell.
+        let small = geo_types::Geometry::Polygon(Polygon::new(
+            LineString(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 100.0, y: 0.0 },
+                Coord { x: 100.0, y: 100.0 },
+                Coord { x: 0.0, y: 100.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        ));
+        let mut cells = 0usize;
+        apportion_square(&small, 1.0, 1.0, &mut |_, _, _| cells += 1);
+        assert_eq!(cells, 10_000);
+    }
+
+    /// `compute` polls the cancel flag rather than running to the end.
+    #[test]
+    fn a_cancelled_grid_stops_instead_of_finishing() {
+        let dir = std::env::temp_dir().join(format!("geopq_grid_cancel_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("pts.parquet");
+        let mut wkb = BinaryBuilder::new();
+        let mut vals: Vec<f64> = Vec::new();
+        for i in 0..64 {
+            let p = geo_types::Geometry::Point(geo_types::Point::new(i as f64, i as f64));
+            wkb.append_value(crate::data::import::to_wkb(&p).unwrap());
+            vals.push(i as f64);
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("v", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(wkb.finish()) as ArrayRef,
+                Arc::new(Float64Array::from(vals)),
+            ],
+        )
+        .unwrap();
+        crate::sql::export::write_result(&src, &schema, &[batch], 0, &Crs::wgs84()).unwrap();
+        let (store, crs, _, _) = crate::data::loader::open_store_for_test(&src).unwrap();
+        let sp = GridSpec {
+            value_col: store.schema.index_of("v").unwrap(),
+            value_name: "v".into(),
+            ..spec(CellSystem::square(10.0), GridStat::Mean, 0)
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let err = compute(&store, &crs, &sp, &dir.join("g.parquet"), &|_| {}, &cancel)
+            .unwrap_err();
+        assert_eq!(err, CANCELLED);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2088,7 +2491,7 @@ mod real_file_tests {
                 label.replace(' ', "_")
             ));
             let t = std::time::Instant::now();
-            let (cells, rows) = compute(&store, &crs, &spec, &dst, &|_| {}).unwrap();
+            let (cells, rows) = compute(&store, &crs, &spec, &dst, &|_| {}, &Default::default()).unwrap();
             eprintln!("{label}: {cells} cells from {rows} rows in {:?}", t.elapsed());
             assert!(rows > 2_000_000, "{label}: most parcels aggregated");
             assert!(cells > 500, "{label}: {cells} cells");
@@ -2117,7 +2520,7 @@ mod real_file_tests {
         };
         let dst = std::env::temp_dir().join("geopq_grid_e2e_contours.parquet");
         let t = std::time::Instant::now();
-        let (lines, rows) = compute(&store, &crs, &spec, &dst, &|_| {}).unwrap();
+        let (lines, rows) = compute(&store, &crs, &spec, &dst, &|_| {}, &Default::default()).unwrap();
         eprintln!("contours: {lines} lines from {rows} rows in {:?}", t.elapsed());
         assert!(lines > 8, "several stitched isolines, got {lines}");
         let (gs, gcrs, _, _) = crate::data::loader::open_store_for_test(&dst).unwrap();
@@ -2146,7 +2549,7 @@ mod real_file_tests {
         };
         let dst = std::env::temp_dir().join("geopq_grid_e2e_shade.parquet");
         let t = std::time::Instant::now();
-        let (cells, _) = compute(&store, &crs, &spec, &dst, &|_| {}).unwrap();
+        let (cells, _) = compute(&store, &crs, &spec, &dst, &|_| {}, &Default::default()).unwrap();
         eprintln!("hillshade: {cells} cells in {:?}", t.elapsed());
         let (gs, _, _, _) = crate::data::loader::open_store_for_test(&dst).unwrap();
         assert!(gs.schema.index_of("LAND_VAL_shade").is_ok());

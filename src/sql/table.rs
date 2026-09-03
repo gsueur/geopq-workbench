@@ -52,18 +52,27 @@ pub const ROW_INDEX_COL: &str = "___row";
 /// splices a store column name into SQL must map it through this — plain
 /// lowercasing diverges on collisions.
 pub fn sql_column_names(schema: &arrow::datatypes::Schema) -> Vec<String> {
-    let mut seen: std::collections::HashMap<String, usize> = Default::default();
+    // The suffix is checked against the names already emitted rather
+    // than counted per base name: a file with `ID`, `id` and `id_2`
+    // renamed the second column to `id_2` on top of the third, so the
+    // SQL schema carried the duplicate this function exists to remove
+    // (and `SELECT id_2` then resolved ambiguously).
+    let mut used: std::collections::HashSet<String> = Default::default();
     schema
         .fields()
         .iter()
         .map(|f| {
             let base = f.name().to_lowercase();
-            let n = seen.entry(base.clone()).or_insert(0);
-            *n += 1;
-            if *n > 1 {
-                format!("{base}_{n}")
-            } else {
-                base
+            if used.insert(base.clone()) {
+                return base;
+            }
+            let mut k = 2usize;
+            loop {
+                let cand = format!("{base}_{k}");
+                if used.insert(cand.clone()) {
+                    return cand;
+                }
+                k += 1;
             }
         })
         .collect()
@@ -186,7 +195,7 @@ impl TableProvider for LayerTable {
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let projection: Vec<usize> = match projection {
             Some(p) => p.clone(),
@@ -333,6 +342,36 @@ impl TableProvider for LayerTable {
                 })
                 .collect(),
         };
+
+        // `select … limit 200` (the console's own preview, and every
+        // "peek at this layer" query) planned one partition per row
+        // group — thousands of them on a big file, each opening its own
+        // parquet reader, to answer with the first 200 rows. With no
+        // filters every row of a group is a result row, so the first
+        // groups that together hold the limit are the whole answer.
+        // With filters the pushdown is only Inexact, so a later group
+        // may be the one that matches: keep them all.
+        let mut parts = parts;
+        if let Some(limit) = limit
+            && filters.is_empty()
+            && parts.len() > 1
+        {
+            let starts = self.store.rg_starts();
+            let mut rows = 0usize;
+            let mut keep = 0usize;
+            for p in &parts {
+                keep += 1;
+                rows += starts
+                    .get(p.group + 1)
+                    .zip(starts.get(p.group))
+                    .map(|(e, s)| (e - s) as usize)
+                    .unwrap_or(0);
+                if rows >= limit {
+                    break;
+                }
+            }
+            parts.truncate(keep.max(1));
+        }
 
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&out_schema)),
@@ -740,6 +779,117 @@ mod tests {
     use datafusion::logical_expr::col;
     use datafusion::execution::FunctionRegistry;
     use datafusion::prelude::SessionContext;
+
+    /// Lowercasing collides `ID` with `id`, and the `_2` that fixes it
+    /// can collide with a column already called `id_2`. Counting
+    /// occurrences emitted that duplicate; bumping past taken names does
+    /// not.
+    #[test]
+    fn sql_column_names_stay_unique_past_an_existing_suffix() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("ID", DataType::Int64, true),
+            Field::new("id_2", DataType::Int64, true),
+            Field::new("NAME", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("name_2", DataType::Utf8, true),
+        ]);
+        let names = sql_column_names(&schema);
+        assert_eq!(
+            names,
+            ["id", "id_2", "id_2_2", "name", "name_2", "name_2_2"]
+        );
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "{names:?}");
+    }
+
+    /// A GeoParquet file with `rows` points split into row groups of
+    /// `rg` rows, so the scan has several partitions to choose between.
+    fn multi_group_file(tag: &str, rows: usize, rg: usize) -> std::path::PathBuf {
+        use arrow::array::{BinaryBuilder, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        let mut geoms = BinaryBuilder::new();
+        let wopts = wkb::writer::WriteOptions::default();
+        for i in 0..rows {
+            let mut buf = Vec::new();
+            wkb::writer::write_geometry(
+                &mut buf,
+                &geo_types::Geometry::Point(geo_types::Point::new(i as f64, 1.0)),
+                &wopts,
+            )
+            .unwrap();
+            geoms.append_value(&buf);
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, false),
+            Field::new("geometry", DataType::Binary, true),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from((0..rows as i64).collect::<Vec<_>>())),
+                Arc::new(geoms.finish()),
+            ],
+        )
+        .unwrap();
+        let path = std::env::temp_dir()
+            .join(format!("geopq_scan_limit_{tag}_{}.parquet", std::process::id()));
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(rg)
+            .set_key_value_metadata(Some(vec![parquet::file::metadata::KeyValue::new(
+                "geo".to_string(),
+                r#"{"version":"1.1.0","primary_column":"geometry",
+                    "columns":{"geometry":{"encoding":"WKB","geometry_types":["Point"]}}}"#
+                    .to_string(),
+            )]))
+            .build();
+        let file = std::fs::File::create(&path).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        path
+    }
+
+    /// `scan` dropped its `limit`, so `select … limit 5` planned one
+    /// partition per row group — a parquet reader per group, thousands
+    /// of them on a big file, to answer with five rows. With no filters
+    /// every row of a group is a result row, so the first groups that
+    /// cover the limit are the whole answer.
+    #[test]
+    fn a_small_limit_does_not_plan_every_row_group() {
+        let path = multi_group_file("cap", 100, 10);
+        let (store, _, _, _) = open_store_for_test(&path).unwrap();
+        assert_eq!(store.rg_starts().len() - 1, 10, "ten row groups");
+        let table = LayerTable::new(Arc::new(store), None);
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let parts = |limit: Option<usize>| {
+            let plan = pollster::block_on(table.scan(&state, None, &[], limit)).unwrap();
+            plan.properties().output_partitioning().partition_count()
+        };
+        assert_eq!(parts(None), 10, "no limit: every group");
+        assert_eq!(parts(Some(5)), 1, "five rows fit in the first group");
+        assert_eq!(parts(Some(25)), 3, "three groups cover 25 rows");
+        assert_eq!(parts(Some(10_000)), 10, "a limit past the file keeps them all");
+
+        // And the query really does return the rows.
+        let (store, _, _, _) = open_store_for_test(&path).unwrap();
+        let layer = crate::sql::engine::SqlLayer {
+            table: "t".into(),
+            store: Arc::new(store),
+            crs: crate::data::crs::Crs::wgs84(),
+            rg_bboxes: None,
+        };
+        let out =
+            crate::sql::engine::run_query_for_test("select n from t limit 5", &[layer]).unwrap();
+        assert_eq!(out.total_rows, 5);
+        let _ = std::fs::remove_file(&path);
+    }
 
     fn envelope_wkb(b: [f64; 4]) -> Vec<u8> {
         let r = geo_types::Rect::new((b[0], b[1]), (b[2], b[3]));

@@ -20,7 +20,7 @@ use arrow::datatypes::DataType;
 use datafusion::common::{DataFusionError, Result as DfResult, ScalarValue};
 use datafusion::logical_expr::{create_udaf, Accumulator, AggregateUDF, Volatility};
 use datafusion::prelude::SessionContext;
-use geo::unary_union;
+use geo::{CoordsIter, unary_union};
 use geo_types::{Geometry, GeometryCollection, MultiPolygon, Polygon, Rect, coord};
 
 use crate::data::loader::decode_wkb;
@@ -301,7 +301,55 @@ impl Accumulator for CollectAcc {
         self.value()
     }
 
+    /// The real footprint, not the size of the enum headers.
+    ///
+    /// A `Geometry` is a fat pointer to heap coordinate vectors, so
+    /// counting `size_of::<Geometry>()` per element reported a few
+    /// hundred bytes for an accumulator holding tens of megabytes of
+    /// rings — and DataFusion's memory pool sizes spills from this
+    /// number, so `st_collect` over a parcel layer never spilled and the
+    /// process grew until it was killed.
     fn size(&self) -> usize {
-        size_of_val(self) + self.geoms.len() * size_of::<Geometry<f64>>()
+        size_of_val(self)
+            + self
+                .geoms
+                .iter()
+                .map(|g| {
+                    size_of::<Geometry<f64>>()
+                        + g.coords_count() * size_of::<geo_types::Coord<f64>>()
+                })
+                .sum::<usize>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DataFusion sizes its spills from `Accumulator::size`, and a
+    /// `Geometry` is a fat pointer: counting `size_of::<Geometry>()` per
+    /// element reported a few hundred bytes for an accumulator holding
+    /// tens of megabytes of rings, so `st_collect` over a parcel layer
+    /// never spilled and the process grew until it was killed.
+    #[test]
+    fn collect_reports_the_memory_it_actually_holds() {
+        let ring = |n: usize| {
+            geo_types::LineString(
+                (0..n)
+                    .map(|i| coord! { x: i as f64, y: i as f64 })
+                    .collect(),
+            )
+        };
+        let mut small = CollectAcc::default();
+        small.geoms.push(Geometry::Polygon(Polygon::new(ring(4), vec![])));
+        let mut big = CollectAcc::default();
+        big.geoms.push(Geometry::Polygon(Polygon::new(ring(100_000), vec![])));
+
+        assert!(
+            big.size() > 100_000 * size_of::<geo_types::Coord<f64>>(),
+            "a 100k-vertex ring must report megabytes, not {} bytes",
+            big.size()
+        );
+        assert!(big.size() > small.size() * 1000, "{} vs {}", big.size(), small.size());
     }
 }

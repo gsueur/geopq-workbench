@@ -29,10 +29,19 @@ fn parse_nec1(b: &[u8]) -> Option<Vec<Vec<(f64, f64)>>> {
         return None;
     }
     off += 4;
+    // Counts come from the file, and the detail cache is a downloaded
+    // file that can be truncated or corrupt. Reserving from a bad u32
+    // asks for gigabytes and aborts the process on the allocation
+    // failure — instead of returning None and taking the refetch path
+    // two lines down in `load_detail`. Every line costs at least its own
+    // 4-byte count, every point exactly 8 bytes.
     let n_lines = take_u32(&mut off)? as usize;
-    let mut lines = Vec::with_capacity(n_lines);
+    let mut lines = Vec::with_capacity(n_lines.min(b.len().saturating_sub(off) / 4));
     for _ in 0..n_lines {
         let n = take_u32(&mut off)? as usize;
+        if n > b.len().saturating_sub(off) / 8 {
+            return None;
+        }
         let mut pts = Vec::with_capacity(n);
         for _ in 0..n {
             let x = f32::from_le_bytes(b.get(off..off + 4)?.try_into().ok()?);
@@ -223,7 +232,15 @@ fn load_detail() -> Option<Vec<Vec<(f64, f64)>>> {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(p, &bytes);
+        // Temp + rename: a plain write interrupted at exit leaves a
+        // half file that the next run reads, fails to parse, deletes and
+        // refetches — a 20 MB download every start until it happens to
+        // finish cleanly.
+        let tmp = p.with_extension(format!("tmp-{}", std::process::id()));
+        let wrote = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, p));
+        if wrote.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
     Some(lines)
 }
@@ -245,6 +262,41 @@ pub fn build_coastline_at(display: &DisplayCrs, level: CoastLevel) -> Arc<Vec<Ch
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The detail cache is a downloaded file, so its counts are hostile
+    /// input. Reserving from a corrupt u32 asks the allocator for
+    /// gigabytes and aborts the process, instead of returning None and
+    /// letting `load_detail` delete the cache and refetch.
+    #[test]
+    fn a_corrupt_cache_is_rejected_rather_than_reserved_for() {
+        // Header claims 4 billion lines; the file holds none.
+        let mut bad = b"NEC1".to_vec();
+        bad.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_nec1(&bad).is_none());
+
+        // One line claiming 4 billion points, with 8 bytes to give.
+        let mut bad = b"NEC1".to_vec();
+        bad.extend_from_slice(&1u32.to_le_bytes());
+        bad.extend_from_slice(&u32::MAX.to_le_bytes());
+        bad.extend_from_slice(&[0u8; 8]);
+        assert!(parse_nec1(&bad).is_none());
+
+        // Truncated mid-point: still None, still no huge reservation.
+        let mut bad = b"NEC1".to_vec();
+        bad.extend_from_slice(&1u32.to_le_bytes());
+        bad.extend_from_slice(&3u32.to_le_bytes());
+        bad.extend_from_slice(&[0u8; 12]);
+        assert!(parse_nec1(&bad).is_none());
+
+        // A well-formed one still parses.
+        let mut ok = b"NEC1".to_vec();
+        ok.extend_from_slice(&1u32.to_le_bytes());
+        ok.extend_from_slice(&2u32.to_le_bytes());
+        for v in [1.0f32, 2.0, 3.0, 4.0] {
+            ok.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(parse_nec1(&ok).unwrap(), vec![vec![(1.0, 2.0), (3.0, 4.0)]]);
+    }
 
     #[test]
     fn embedded_coastline_parses() {

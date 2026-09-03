@@ -124,6 +124,13 @@ pub struct SqlConsole {
     rx: Receiver<SqlMsg>,
     next_id: u64,
     running: Option<u64>,
+    /// Stop flag shared with the running query/export thread. One per
+    /// job: a stopped job's flag must not stop the next one.
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Table names and the completion dictionary, rebuilt only when the
+    /// layer/table set changes.
+    sources: Option<Arc<Sources>>,
+    sources_key: Option<u64>,
     exporting: Option<u64>,
     result: Option<QueryOutput>,
     /// Rows checked in the results grid — underlying (unsorted) indices.
@@ -153,25 +160,17 @@ pub struct SqlConsole {
 const HISTORY_CAP: usize = 50;
 
 fn load_history() -> Vec<String> {
-    let read = || -> Option<Vec<String>> {
-        let txt = std::fs::read_to_string(crate::data::settings::settings_path()?).ok()?;
-        let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
-        serde_json::from_value(v.get("sql_history")?.clone()).ok()
-    };
-    read().unwrap_or_default()
+    crate::data::settings::read()
+        .get("sql_history")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
 }
 
 fn save_history(history: &[String]) {
-    let Some(p) = crate::data::settings::settings_path() else { return };
-    let mut root = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    root["sql_history"] = serde_json::json!(history);
-    if let Ok(txt) = serde_json::to_string_pretty(&root)
-        && let Err(e) = std::fs::write(&p, txt)
+    if let Err(e) =
+        crate::data::settings::update(|root| root["sql_history"] = serde_json::json!(history))
     {
-        log::warn!("could not save {}: {e}", p.display());
+        log::warn!("could not save the SQL history: {e}");
     }
 }
 
@@ -192,6 +191,9 @@ impl SqlConsole {
             rx,
             next_id: 0,
             running: None,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sources: None,
+            sources_key: None,
             exporting: None,
             result: None,
             selected_rows: BTreeSet::new(),
@@ -251,6 +253,8 @@ impl SqlConsole {
                         self.error = None;
                     }
                     Ok(SqlDone::Export { .. }) => {}
+                    // The user pressing Stop is not a failure to report.
+                    Err(e) if e == engine::CANCELLED => self.error = None,
                     Err(e) => {
                         self.error = Some(e);
                         self.result = None;
@@ -263,6 +267,7 @@ impl SqlConsole {
                         action = Some(ConsoleAction::LoadLayer(path));
                     }
                     Ok(SqlDone::Query(_)) => {}
+                    Err(e) if e == engine::CANCELLED => self.error = None,
                     Err(e) => self.error = Some(e),
                 }
             }
@@ -280,8 +285,9 @@ impl SqlConsole {
         display: &DisplayCrs,
     ) -> Option<ConsoleAction> {
         let mut action = None;
-        let (tables, attr_tables) = sql_names(layers, attrs);
-        let dict = completion_dict(layers, attrs, &tables, &attr_tables);
+        let sources = self.sources(layers, attrs);
+        let (tables, attr_tables) = (&sources.tables, &sources.attr_tables);
+        let dict = &sources.dict;
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -295,6 +301,14 @@ impl SqlConsole {
             if self.exporting.is_some() {
                 ui.spinner();
                 ui.label(RichText::new("exporting full result…").weak());
+            }
+            if (self.running.is_some() || self.exporting.is_some())
+                && ui
+                    .button("Stop")
+                    .on_hover_text("Stop the running query at the next batch")
+                    .clicked()
+            {
+                self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             ui.toggle_value(&mut self.show_help, "ST_* help");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -313,12 +327,22 @@ impl SqlConsole {
         match self.mode {
             Mode::Browse => {
                 // Browsing works on anything registered, geometry or not.
-                let all: Vec<String> =
-                    tables.iter().chain(&attr_tables).cloned().collect();
-                self.browse_bar(ui, layers, attrs, &all, &dict, view_world, display)
+                // The two lists stay apart: the viewport filter needs the
+                // layer they index into, and merging them made the two
+                // index spaces silently different.
+                self.browse_bar(
+                    ui,
+                    layers,
+                    attrs,
+                    tables,
+                    attr_tables,
+                    dict,
+                    view_world,
+                    display,
+                )
             }
             Mode::Query => {
-                self.query_editor(ui, layers, attrs, &tables, &attr_tables, &dict)
+                self.query_editor(ui, layers, attrs, tables, attr_tables, dict)
             }
         }
 
@@ -426,6 +450,15 @@ impl SqlConsole {
                         .add_enabled(self.exporting.is_none(), egui::Button::new(label))
                         .on_hover_text(hover)
                         .clicked();
+                } else if let Some(w) = &out.geom_warning {
+                    // There *is* a WKB column; we just cannot say what
+                    // CRS it is in. Saying so beats an absent button.
+                    ui.label(
+                        RichText::new("⚠ not loadable as a layer")
+                            .weak()
+                            .small(),
+                    )
+                    .on_hover_text(w);
                 }
                 if n_sel > 0 {
                     ui.label(RichText::new(format!("{n_sel} checked")).small());
@@ -551,25 +584,31 @@ impl SqlConsole {
 
     /// TablePlus-style bar: pick a table, type a WHERE clause, Enter (or ▶)
     /// applies it; optionally restrict to the current viewport.
+    #[allow(clippy::too_many_arguments)]
     fn browse_bar(
         &mut self,
         ui: &mut egui::Ui,
         layers: &[VectorLayer],
         attrs: &[AttrTable],
         tables: &[String],
+        attr_tables: &[String],
         dict: &CompletionDict,
         view_world: [f64; 4],
         display: &DisplayCrs,
     ) {
-        if !tables.contains(&self.browse_table) {
-            self.browse_table = tables.first().cloned().unwrap_or_default();
+        // Everything registered can be browsed; the dropdown has to
+        // offer the attribute tables too, or the default below picks one
+        // the user has no way to see or change.
+        let browsable: Vec<&String> = tables.iter().chain(attr_tables).collect();
+        if !browsable.contains(&&self.browse_table) {
+            self.browse_table = browsable.first().map(|t| (*t).clone()).unwrap_or_default();
         }
         let mut run = false;
         ui.horizontal(|ui| {
             let mut picked = self.browse_table.clone();
             egui::ComboBox::from_id_salt("sql_browse_table")
                 .selected_text(if picked.is_empty() {
-                    "no layers".to_string()
+                    "no tables".to_string()
                 } else {
                     picked.clone()
                 })
@@ -577,6 +616,10 @@ impl SqlConsole {
                     for (l, t) in layers.iter().zip(tables) {
                         ui.selectable_value(&mut picked, t.clone(), t)
                             .on_hover_text(&l.name);
+                    }
+                    for (a, t) in attrs.iter().zip(attr_tables) {
+                        ui.selectable_value(&mut picked, t.clone(), t)
+                            .on_hover_text(format!("{} (attribute table)", a.name));
                     }
                 });
             // Selecting a table only targets it — no implicit full-table
@@ -653,6 +696,12 @@ impl SqlConsole {
 
     /// `st_intersects(<geom>, st_makeenvelope(...))` for the current
     /// viewport, in the browsed layer's data CRS.
+    ///
+    /// `tables` is the *layer* table list only. It used to be the merged
+    /// layer + attribute list while `layers` was not, so browsing an
+    /// attribute table (the default pick with no layers loaded) indexed
+    /// past the end of `layers` and panicked instead of saying that a
+    /// table with no geometry cannot be clipped to the viewport.
     fn viewport_predicate(
         &self,
         layers: &[VectorLayer],
@@ -660,11 +709,17 @@ impl SqlConsole {
         view_world: [f64; 4],
         display: &DisplayCrs,
     ) -> Result<String, String> {
+        let no_geom = || {
+            format!(
+                "{} has no geometry column, so it cannot be limited to the viewport",
+                self.browse_table
+            )
+        };
         let idx = tables
             .iter()
             .position(|t| *t == self.browse_table)
-            .ok_or("no table selected")?;
-        let layer = &layers[idx];
+            .ok_or_else(no_geom)?;
+        let layer = layers.get(idx).ok_or_else(no_geom)?;
         let b = viewport_to_data_bbox(view_world, display, &layer.crs)
             .ok_or("viewport does not transform into the layer CRS")?;
         let geom = layer
@@ -878,12 +933,16 @@ impl SqlConsole {
                 batches: Arc::clone(&t.batches),
             })
             .collect();
+        // A fresh flag per job; the previous one may still be set from a
+        // Stop the user pressed a moment ago.
+        self.cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         engine::spawn_query(
             id,
             sql,
             self.last_layers.clone(),
             self.last_tables.clone(),
             self.tx.clone(),
+            Arc::clone(&self.cancel),
             move || {
                 egui_ctx.request_repaint();
             },
@@ -914,6 +973,7 @@ impl SqlConsole {
             std::process::id(),
             self.export_n
         ));
+        self.cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         engine::spawn_export(
             id,
             self.last_sql.clone(),
@@ -921,6 +981,7 @@ impl SqlConsole {
             self.last_tables.clone(),
             path,
             self.tx.clone(),
+            Arc::clone(&self.cancel),
             || {},
         );
         None
@@ -1362,7 +1423,13 @@ fn apply_completion(
     word: &str,
 ) {
     let range = ac.token.clone();
-    if range.end > text.len() || !text.is_char_boundary(range.start) {
+    // Both ends: the token is a byte range into the text as it was when
+    // the popup opened, and an edit since then can leave `end` inside a
+    // multi-byte character — `replace_range` panics on that, not errors.
+    if range.end > text.len()
+        || !text.is_char_boundary(range.start)
+        || !text.is_char_boundary(range.end)
+    {
         ac.open = false;
         return;
     }
@@ -1405,6 +1472,52 @@ pub fn sql_table_names(
     attrs: &[AttrTable],
 ) -> (Vec<String>, Vec<String>) {
     sql_names(layers, attrs)
+}
+
+/// The SQL table names and the autocomplete dictionary for one layer
+/// and attribute-table set.
+///
+/// `panel_ui` used to build both every frame: `completion_dict` walks
+/// every column of every layer through `sql_column_names` and fills two
+/// hash maps, sixty times a second, for a set that changes when a layer
+/// is loaded or renamed. Cached behind a key over the sources instead.
+pub(crate) struct Sources {
+    tables: Vec<String>,
+    attr_tables: Vec<String>,
+    dict: CompletionDict,
+}
+
+impl SqlConsole {
+    /// Cached [`Sources`], rebuilt when the layer/table set changes.
+    /// Returns an `Arc` so the caller holds no borrow of `self`.
+    fn sources(&mut self, layers: &[VectorLayer], attrs: &[AttrTable]) -> Arc<Sources> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for l in layers {
+            l.id.hash(&mut h);
+            l.name.hash(&mut h);
+            // A rebuilt store (a reopened file) can change the columns
+            // under the same id and name.
+            (Arc::as_ptr(&l.store) as usize).hash(&mut h);
+        }
+        for t in attrs {
+            t.id.hash(&mut h);
+            t.name.hash(&mut h);
+            (Arc::as_ptr(&t.schema) as *const u8 as usize).hash(&mut h);
+        }
+        let key = h.finish();
+        if self.sources_key != Some(key) || self.sources.is_none() {
+            let (tables, attr_tables) = sql_names(layers, attrs);
+            let dict = completion_dict(layers, attrs, &tables, &attr_tables);
+            self.sources = Some(Arc::new(Sources {
+                tables,
+                attr_tables,
+                dict,
+            }));
+            self.sources_key = Some(key);
+        }
+        Arc::clone(self.sources.as_ref().expect("just built"))
+    }
 }
 
 fn sql_names(layers: &[VectorLayer], attrs: &[AttrTable]) -> (Vec<String>, Vec<String>) {
@@ -1681,6 +1794,31 @@ fn geom_cell(col: &dyn Array, i: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{aliases, from_context, qualifier, suppressed, CompletionDict, Dismissed};
+
+    /// Browse mode offers the attribute tables as well as the layers,
+    /// and with no layers loaded the default pick is one of them. The
+    /// viewport filter used to look that name up in the merged list and
+    /// index the layer list with the result: `&layers[0]` on an empty
+    /// slice, i.e. a panic on a plain checkbox click.
+    #[test]
+    fn the_viewport_filter_refuses_a_table_without_geometry() {
+        use crate::data::crs::{Crs, DisplayCrs};
+        let mut c = super::SqlConsole::new();
+        c.browse_table = "attr_1".into();
+        let display = DisplayCrs::new(Crs::wgs84());
+        // No layers at all: what a session with only an imported CSV has.
+        let err = c
+            .viewport_predicate(&[], &[], [0.0, 0.0, 1.0, 1.0], &display)
+            .unwrap_err();
+        assert!(err.contains("attr_1"), "{err}");
+        assert!(err.contains("no geometry"), "{err}");
+        // And with layers loaded, a name that is not one of them is
+        // still an explanation rather than an out-of-bounds index.
+        let err = c
+            .viewport_predicate(&[], &["roads".into()], [0.0, 0.0, 1.0, 1.0], &display)
+            .unwrap_err();
+        assert!(err.contains("no geometry"), "{err}");
+    }
 
     /// Accepting a candidate must not reopen the popup on the word it
     /// just inserted, and typing on must bring it back.

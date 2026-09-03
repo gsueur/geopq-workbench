@@ -323,13 +323,26 @@ pub fn sanitize(name: &str) -> String {
 }
 
 /// Make every name unique, in order, with `_2`, `_3`, … suffixes.
+///
+/// The suffix has to be checked against the names already emitted, not
+/// just counted: `NAME, name, name_2` sanitizes to `name, name, name_2`,
+/// and renaming the second one to `name_2` by occurrence count collides
+/// head-on with the third — which is exactly the duplicate this function
+/// exists to prevent. Bumping until free gives `name, name_2, name_2_2`.
 pub fn dedupe(names: &mut [String]) {
-    let mut seen: std::collections::HashMap<String, usize> = Default::default();
+    let mut used: std::collections::HashSet<String> = Default::default();
     for n in names.iter_mut() {
-        let e = seen.entry(n.clone()).or_insert(0);
-        *e += 1;
-        if *e > 1 {
-            *n = format!("{n}_{}", *e);
+        if used.insert(n.clone()) {
+            continue;
+        }
+        let mut k = 2usize;
+        loop {
+            let cand = format!("{n}_{k}");
+            if used.insert(cand.clone()) {
+                *n = cand;
+                break;
+            }
+            k += 1;
         }
     }
 }
@@ -552,13 +565,24 @@ fn suggest_type(values: &[String], fmt: NumberFormat) -> ColType {
 
 /// Guess the number format from the sample.
 ///
-/// The tell is a group of exactly three digits after a separator: `3,739`
-/// and `1 234` are grouped numbers, because no one writes three decimal
-/// places on a count. `3,5` is left alone — it is genuinely ambiguous, and
-/// a wrong guess there changes a value by a factor of a thousand rather
-/// than failing visibly.
+/// The tell that a separator *groups* is a run of exactly three digits
+/// after it: `3,739` and `1 234` are grouped numbers, because no one
+/// writes three decimal places on a count. `3,5` is left alone — it is
+/// genuinely ambiguous, and a wrong guess there changes a value by a
+/// factor of a thousand rather than failing visibly.
+///
+/// Which of the two grouped formats it is comes from the *decimal mark*,
+/// not from which separator was seen more often. Counting was wrong for
+/// the Swiss and French-with-a-dot styles: `1'234.56` and `1 234.56` hit
+/// the grouping branch with no comma anywhere, which read as
+/// `DecimalComma`, and `normalize_number` then dropped the dot and
+/// turned 1234.56 into 123456. A comma only means "decimal" when it is
+/// followed by a digit run that is *not* exactly three long.
 fn detect_number_format(cols: &[Vec<String>]) -> NumberFormat {
-    let (mut comma, mut spaced) = (0usize, 0usize);
+    // `grouped`: separators demonstrably used for grouping.
+    // `comma_groups`: how many of those were commas.
+    // `decimal_commas`: commas that behave like a decimal mark.
+    let (mut grouped, mut comma_groups, mut decimal_commas) = (0usize, 0usize, 0usize);
     for values in cols {
         for v in values.iter().take(SAMPLE_ROWS) {
             let t = v.trim();
@@ -572,30 +596,37 @@ fn detect_number_format(cols: &[Vec<String>]) -> NumberFormat {
                 if sep != ',' && !grouping {
                     continue;
                 }
-                // Three digits, then either the end or another separator.
-                let after: Vec<char> = bytes[i + 1..].iter().copied().take(4).collect();
-                let three = after.len() >= 3 && after[..3].iter().all(|c| c.is_ascii_digit());
-                let ends = after.len() == 3
-                    || after
-                        .get(3)
-                        .is_some_and(|c| !c.is_ascii_digit());
                 let before_digit = i > 0 && bytes[i - 1].is_ascii_digit();
-                if three && ends && before_digit {
+                if !before_digit {
+                    continue;
+                }
+                // Length of the digit run following the separator.
+                let run = bytes[i + 1..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_digit())
+                    .count();
+                if run == 3 {
+                    grouped += 1;
                     if sep == ',' {
-                        comma += 1;
-                    } else {
-                        spaced += 1;
+                        comma_groups += 1;
                     }
+                } else if sep == ',' && run > 0 {
+                    decimal_commas += 1;
                 }
             }
         }
     }
-    if comma == 0 && spaced == 0 {
-        NumberFormat::Plain
-    } else if comma >= spaced {
-        NumberFormat::GroupComma
-    } else {
+    if grouped == 0 {
+        // Nothing proves any separator groups; `3,5` stays ambiguous.
+        return NumberFormat::Plain;
+    }
+    if decimal_commas > comma_groups {
+        // `1 234,56`: the comma is the decimal mark, the rest groups.
         NumberFormat::DecimalComma
+    } else {
+        // `3,739`, `1 234`, `1'234.56`, `1 234.56`: separators group and
+        // the dot, if any, is the decimal mark.
+        NumberFormat::GroupComma
     }
 }
 
@@ -1425,8 +1456,53 @@ mod tests {
             NumberFormat::Plain,
             "ambiguous, so left alone for the user to say",
         );
+        // A grouping space with no comma anywhere: the dot is still the
+        // decimal mark, so this is GroupComma. It used to be classed
+        // DecimalComma purely because spaces outnumbered commas.
         let src = temp("spc.csv", "a\n1 234\n5 678\n");
+        assert_eq!(inspect(&src).unwrap().plan.numbers, NumberFormat::GroupComma);
+    }
+
+    /// The Swiss apostrophe and the space-grouped-with-a-dot style put a
+    /// grouping character in the sample with no comma in sight. Deciding
+    /// the format by "which separator won the count" classed both as
+    /// DecimalComma, and `normalize_number` then dropped the decimal
+    /// point: 1'234.56 came back as 123456, a thousandfold error that
+    /// parsed cleanly and so was never noticed.
+    #[test]
+    fn a_grouping_char_without_a_comma_keeps_the_decimal_point() {
+        for (file, text) in [
+            ("swiss.csv", "a\n1'234.56\n9'876.54\n"),
+            ("spacedot.csv", "a\n1 234.56\n9 876.54\n"),
+        ] {
+            let src = temp(file, text);
+            let p = inspect(&src).unwrap();
+            assert_eq!(p.plan.numbers, NumberFormat::GroupComma, "{file}");
+            assert_eq!(p.plan.columns[0].ty, ColType::Float, "{file}");
+        }
+        assert_eq!(normalize_number("1'234.56", NumberFormat::GroupComma), "1234.56");
+        assert_eq!(normalize_number("1 234.56", NumberFormat::GroupComma), "1234.56");
+        // And the French style still reads the comma as the decimal mark.
+        let src = temp("fr2.csv", "a\n\"1 234,56\"\n\"9 876,54\"\n");
         assert_eq!(inspect(&src).unwrap().plan.numbers, NumberFormat::DecimalComma);
+    }
+
+    /// `_2` suffixes have to dodge the names already taken: counting
+    /// occurrences renamed the second `name` to `name_2` right on top of
+    /// a third column that was literally called `name_2`.
+    #[test]
+    fn dedupe_does_not_collide_with_an_existing_suffix() {
+        let mut names: Vec<String> = ["NAME", "name", "name_2"]
+            .iter()
+            .map(|n| sanitize(n))
+            .collect();
+        dedupe(&mut names);
+        assert_eq!(names, ["name", "name_2", "name_2_2"]);
+        let mut names: Vec<String> = ["id", "ID", "id_2"].iter().map(|n| sanitize(n)).collect();
+        dedupe(&mut names);
+        assert_eq!(names, ["id", "id_2", "id_2_2"]);
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len());
     }
 
     #[test]

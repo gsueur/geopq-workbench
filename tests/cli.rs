@@ -203,8 +203,13 @@ fn imports_a_geojson_and_lists_its_single_layer() {
     let src = scratch.path("points.geojson");
     write_geojson(&src);
 
-    let listed = stdout_ok(&["--input", src.to_str().unwrap(), "--list-layers"]);
+    // The note goes to stderr: stdout is the machine-readable layer list
+    // and a shell pipeline should not have to filter prose out of it.
+    let out = run(&["--input", src.to_str().unwrap(), "--list-layers"]);
+    assert!(out.status.success());
+    let listed = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(listed.contains("single layer"), "listing: {listed:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
 
     let dst = scratch.path("points.parquet");
     let summary = stdout_ok(&[
@@ -289,6 +294,10 @@ fn refuses_impossible_flag_combinations_before_doing_any_work() {
         ),
         (vec!["--cogp", "--partition-by", "score"], "--cogp cannot"),
         (vec!["--cogp", "--no-hilbert"], "implies the Hilbert sort"),
+        // H3 tops out at 15. This used to be checked deep inside the
+        // write pass, after the import had already run.
+        (vec!["--h3", "20"], "20"),
+        (vec!["--partition-h3", "--partition-h3-max-res", "16"], "16"),
     ] {
         let dst = scratch.path("never-written");
         let mut full = vec![
@@ -304,6 +313,42 @@ fn refuses_impossible_flag_combinations_before_doing_any_work() {
         assert!(err.contains(expect), "{args:?}: stderr was {err:?}");
         assert!(!dst.exists(), "{args:?} wrote an output anyway");
     }
+
+    // --layer names a table in a multi-layer source; on a single-layer
+    // one it was accepted and then ignored, so a mistyped --input read
+    // as a successful conversion of the wrong file.
+    let gj = scratch.path("one.geojson");
+    std::fs::write(
+        &gj,
+        r#"{"type":"FeatureCollection","features":[
+             {"type":"Feature","properties":{},
+              "geometry":{"type":"Point","coordinates":[1,2]}}]}"#,
+    )
+    .unwrap();
+    let dst = scratch.path("never-written-layer");
+    let out = run(&[
+        "--input",
+        gj.to_str().unwrap(),
+        "--output",
+        dst.to_str().unwrap(),
+        "--layer",
+        "places",
+    ]);
+    assert!(!out.status.success(), "--layer on a geojson should fail");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("single layer"), "stderr was {err:?}");
+    assert!(!dst.exists());
+
+    // --list-layers keeps stdout for the layer list; the "nothing to
+    // pick" note is prose and belongs on stderr.
+    let out = run(&["--input", gj.to_str().unwrap(), "--list-layers"]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "stdout was {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("single layer"));
 
     // A missing input is an error too, not a silently empty output.
     let out = run(&[

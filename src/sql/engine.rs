@@ -1,6 +1,7 @@
 //! Query execution: a fresh DataFusion session per query, run on a worker
 //! thread, results delivered over a channel like the layer loader.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Instant;
@@ -20,6 +21,18 @@ use crate::data::store::FeatureStore;
 /// Cap on collected result rows; queries keep running to completion for
 /// aggregates, this only bounds what is materialized for display/export.
 pub const MAX_RESULT_ROWS: usize = 500_000;
+
+/// Cap on collected result *bytes*, beside the row cap.
+///
+/// Rows are a poor proxy for memory when the result carries geometry:
+/// 500k parcels with their rings is gigabytes, and the row cap let all
+/// of it into the console's `RecordBatch` before anything noticed. The
+/// budget is checked per batch, so a single enormous batch can overshoot
+/// by one batch's worth — which is bounded by the scan's batch size.
+pub const MAX_RESULT_BYTES: usize = 512 * 1024 * 1024;
+
+/// Error a stopped query returns, so the console can stay quiet about it.
+pub const CANCELLED: &str = "query stopped";
 
 /// A layer visible to SQL.
 #[derive(Clone)]
@@ -54,6 +67,11 @@ pub struct QueryOutput {
     /// Result geometry column (index, CRS carried from the source layer),
     /// when one was detected — enables "add as layer".
     pub geom: Option<(usize, Crs)>,
+    /// Why the result carries no usable geometry even though a WKB
+    /// column is there — currently only "the query mixes layers in
+    /// different CRSs and nothing says which one this is". Shown next to
+    /// the disabled "Result as layer" control.
+    pub geom_warning: Option<String>,
 }
 
 /// A finished background job.
@@ -120,7 +138,7 @@ pub fn join_sql(
     fields: &[JoinField],
     keep_unmatched: bool,
 ) -> String {
-    let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\"\""));
+    let q = quote_ident;
     let mut cols = vec!["l.*".to_string()];
     for f in fields {
         if f.source == f.out {
@@ -144,7 +162,7 @@ pub fn join_sql(
 /// most common way a join goes wrong and the only symptom is an empty or
 /// blank-styled layer afterwards.
 pub fn match_count_sql(layer_table: &str, layer_key: &str, attr_table: &str, attr_key: &str) -> String {
-    let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\"\""));
+    let q = quote_ident;
     format!(
         "select count(*) total, count(t.{}) matched from {layer_table} l \
          left join {attr_table} t on l.{} = t.{}",
@@ -156,18 +174,23 @@ pub fn match_count_sql(layer_table: &str, layer_key: &str, attr_table: &str, att
 
 /// Run `query` on its own thread; the result arrives on `tx`, then
 /// `on_done` runs (e.g. to wake the UI).
+/// `cancel` is polled once per collected batch: a query over a large
+/// remote layer runs for minutes and the console had no way to stop it
+/// short of closing the app.
 pub fn spawn_query(
     id: u64,
     query: String,
     layers: Vec<SqlLayer>,
     tables: Vec<SqlTable>,
     tx: Sender<SqlMsg>,
+    cancel: Arc<AtomicBool>,
     on_done: impl FnOnce() + Send + 'static,
 ) {
     std::thread::Builder::new()
         .name("sql-query".into())
         .spawn(move || {
-            let result = run_query_with_tables(&query, &layers, &tables).map(SqlDone::Query);
+            let result =
+                run_query_with_tables(&query, &layers, &tables, &cancel).map(SqlDone::Query);
             let _ = tx.send(SqlMsg { id, result });
             on_done();
         })
@@ -177,6 +200,7 @@ pub fn spawn_query(
 /// Re-run `query` and stream the FULL result (no display cap) to a
 /// GeoParquet file on a worker thread — "add as layer" beyond what the
 /// grid materialized.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_export(
     id: u64,
     query: String,
@@ -184,12 +208,13 @@ pub fn spawn_export(
     tables: Vec<SqlTable>,
     path: std::path::PathBuf,
     tx: Sender<SqlMsg>,
+    cancel: Arc<AtomicBool>,
     on_done: impl FnOnce() + Send + 'static,
 ) {
     std::thread::Builder::new()
         .name("sql-export".into())
         .spawn(move || {
-            let result = run_export(&query, &layers, &tables, &path)
+            let result = run_export(&query, &layers, &tables, &path, &cancel)
                 .map(|rows| SqlDone::Export { path, rows });
             let _ = tx.send(SqlMsg { id, result });
             on_done();
@@ -237,9 +262,7 @@ pub fn spawn_row_filter(
 
 pub(crate) fn run_row_filter(layer: &SqlLayer, predicate: &str) -> Result<FilterRows, String> {
     use super::table::{LayerTable, ROW_INDEX_COL};
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let rt = runtime()?;
     let config = SessionConfig::new().with_target_partitions(num_cpus());
     let ctx = SessionContext::new_with_config(config);
     udf::register_all(&ctx);
@@ -307,6 +330,15 @@ pub(crate) fn run_row_filter(layer: &SqlLayer, predicate: &str) -> Result<Filter
     })
 }
 
+/// Quote a name as a SQL identifier: wrap in double quotes and double
+/// any it contains. The escape is `""`, not `"""` — the join builders
+/// each had their own copy that tripled the quote, which turns a column
+/// called `a"b` into a syntax error and a spaced name into a silent
+/// mis-parse. One copy, used by everything that splices a name into SQL.
+pub fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 /// Quoted SQL identifier for a store-schema column name: mapped through
 /// the same lowercase + collision-dedupe renaming the registered table
 /// applies, with embedded double quotes doubled.
@@ -321,7 +353,7 @@ fn sql_ident(layer: &SqlLayer, column: &str) -> String {
         // Unknown store name: fall back to plain lowercasing and let the
         // query surface the error.
         .unwrap_or_else(|| column.to_lowercase());
-    format!("\"{}\"", name.replace('"', "\"\""))
+    quote_ident(&name)
 }
 
 /// Distinct-value count per column (partition-field candidates in the
@@ -400,7 +432,7 @@ pub fn run_join_for_test(
     layers: &[SqlLayer],
     tables: &[SqlTable],
 ) -> Result<QueryOutput, String> {
-    run_query_with_tables(query, layers, tables)
+    run_query_with_tables(query, layers, tables, &AtomicBool::new(false))
 }
 
 #[cfg(test)]
@@ -409,7 +441,7 @@ pub fn run_export_for_test(
     layers: &[SqlLayer],
     path: &std::path::Path,
 ) -> Result<usize, String> {
-    run_export(query, layers, &[], path)
+    run_export(query, layers, &[], path, &AtomicBool::new(false))
 }
 
 fn make_ctx(layers: &[SqlLayer], tables: &[SqlTable]) -> Result<SessionContext, String> {
@@ -443,18 +475,17 @@ fn make_ctx(layers: &[SqlLayer], tables: &[SqlTable]) -> Result<SessionContext, 
 /// Layers only. The internal callers (distinct counts, top values, the
 /// tests) have no attribute tables in play.
 fn run_query(query: &str, layers: &[SqlLayer]) -> Result<QueryOutput, String> {
-    run_query_with_tables(query, layers, &[])
+    run_query_with_tables(query, layers, &[], &AtomicBool::new(false))
 }
 
 fn run_query_with_tables(
     query: &str,
     layers: &[SqlLayer],
     tables: &[SqlTable],
+    cancel: &AtomicBool,
 ) -> Result<QueryOutput, String> {
     let started = Instant::now();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let rt = runtime()?;
     let ctx = make_ctx(layers, tables)?;
 
     let (schema, batches, total_rows, truncated) = rt.block_on(async {
@@ -463,8 +494,12 @@ fn run_query_with_tables(
         let schema = stream.schema();
         let mut batches: Vec<RecordBatch> = Vec::new();
         let mut rows = 0usize;
+        let mut bytes = 0usize;
         let mut truncated = false;
         while let Some(batch) = stream.next().await {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(CANCELLED.to_string());
+            }
             let batch = batch.map_err(fmt_df_err)?;
             if batch.num_rows() == 0 {
                 continue;
@@ -478,15 +513,22 @@ fn run_query_with_tables(
                 truncated = true;
                 break;
             }
+            // Geometry makes a row's memory unbounded, so the row cap
+            // alone did not bound the console's footprint.
+            bytes += batch.get_array_memory_size();
             rows += batch.num_rows();
             batches.push(batch);
+            if bytes >= MAX_RESULT_BYTES {
+                truncated = true;
+                break;
+            }
         }
         Ok::<_, String>((schema, batches, rows, truncated))
     })?;
 
     let batch = arrow::compute::concat_batches(&schema, &batches)
         .map_err(|e| format!("result concat: {e}"))?;
-    let geom = detect_geometry(&schema, &batch, layers, query);
+    let (geom, geom_warning) = detect_geometry(&schema, &batch, layers, query);
     Ok(QueryOutput {
         schema,
         batch,
@@ -494,6 +536,7 @@ fn run_query_with_tables(
         truncated,
         elapsed_ms: started.elapsed().as_millis() as u64,
         geom,
+        geom_warning,
     })
 }
 
@@ -503,32 +546,53 @@ fn run_export(
     layers: &[SqlLayer],
     tables: &[SqlTable],
     path: &std::path::Path,
+    cancel: &AtomicBool,
 ) -> Result<usize, String> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let rt = runtime()?;
     let ctx = make_ctx(layers, tables)?;
     rt.block_on(async {
         let df = ctx.sql(query).await.map_err(fmt_df_err)?;
         let mut stream = df.execute_stream().await.map_err(fmt_df_err)?;
         let schema = stream.schema();
-        // Geometry detection needs a data sample: peek the first batch.
-        let mut first = None;
+        // Geometry detection needs a decodable value, and the first
+        // non-empty batch need not have one: a left join, a partitioned
+        // scan, or a layer with a run of NULL geometries all start with
+        // batches that say nothing. Keep pulling until one settles it,
+        // up to a bounded head — the alternative was exporting a
+        // perfectly good layer as a plain table.
+        const PEEK_BATCHES: usize = 32;
+        let mut head: Vec<RecordBatch> = Vec::new();
+        let mut found = None;
         while let Some(b) = stream.next().await {
             let b = b.map_err(fmt_df_err)?;
-            if b.num_rows() > 0 {
-                first = Some(b);
+            if b.num_rows() == 0 {
+                continue;
+            }
+            let (geom, warning) = detect_geometry(&schema, &b, layers, query);
+            head.push(b);
+            if let Some(g) = geom {
+                found = Some(g);
+                break;
+            }
+            if let Some(w) = warning {
+                return Err(w);
+            }
+            if head.len() >= PEEK_BATCHES {
                 break;
             }
         }
-        let Some(first) = first else {
+        if head.is_empty() {
             return Err("no rows to export".into());
-        };
-        let (geom_col, crs) = detect_geometry(&schema, &first, layers, query)
-            .ok_or("no geometry column in result")?;
+        }
+        let (geom_col, crs) = found.ok_or("no geometry column in result")?;
         let mut writer = super::export::StreamWriter::new(path, &schema, geom_col, &crs)?;
-        writer.write(&first)?;
+        for b in &head {
+            writer.write(b)?;
+        }
         while let Some(b) = stream.next().await {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(CANCELLED.to_string());
+            }
             writer.write(&b.map_err(fmt_df_err)?)?;
         }
         writer.finish()
@@ -549,6 +613,19 @@ fn num_cpus() -> usize {
         .unwrap_or(4)
 }
 
+/// Runtime for one query. Multi-threaded, because the session config
+/// asks DataFusion for `num_cpus()` partitions and `LayerScanExec`
+/// serves each of them from a blocking parquet reader: on a
+/// current-thread runtime those partitions interleave on one core, so
+/// the plan was as wide as the machine and as fast as a single thread.
+fn runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(num_cpus())
+        .thread_name("sql-worker")
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))
+}
+
 /// Find the result's geometry column: a Binary column whose first non-null
 /// value decodes as WKB, preferring well-known geometry column names. The
 /// CRS is taken from the first registered layer the query text references.
@@ -557,7 +634,7 @@ fn detect_geometry(
     batch: &RecordBatch,
     layers: &[SqlLayer],
     query: &str,
-) -> Option<(usize, Crs)> {
+) -> (Option<(usize, Crs)>, Option<String>) {
     let mut candidates: Vec<usize> = schema
         .fields()
         .iter()
@@ -573,7 +650,7 @@ fn detect_geometry(
             _ => 1,
         }
     });
-    let col = candidates.into_iter().find(|&i| {
+    let Some(col) = candidates.into_iter().find(|&i| {
         let arr = batch.column(i);
         let arr = arr.as_any().downcast_ref::<arrow::array::BinaryArray>();
         arr.is_some_and(|arr| {
@@ -581,22 +658,94 @@ fn detect_geometry(
                 .find(|&r| !arr.is_null(r))
                 .is_some_and(|r| decode_wkb(arr.value(r)).is_some())
         })
-    })?;
+    }) else {
+        return (None, None);
+    };
 
     let q = query.to_ascii_lowercase();
     // Match table names as whole identifiers, not substrings — `roads`
     // must not shadow `roads_2` (the console's dedupe suffixes make
-    // prefix collisions routine). First registered match wins.
-    let tokens: std::collections::HashSet<&str> = q
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .filter(|t| !t.is_empty())
-        .collect();
-    let crs = layers
+    // prefix collisions routine).
+    let tokens = identifiers(&q);
+    let named: Vec<&SqlLayer> = layers
         .iter()
-        .find(|l| tokens.contains(l.table.as_str()))
-        .map(|l| l.crs.clone())
-        .or_else(|| layers.first().map(|l| l.crs.clone()))?;
-    Some((col, crs))
+        .filter(|l| tokens.iter().any(|t| *t == l.table))
+        .collect();
+
+    // No layer named at all (a query over attribute tables alone, or one
+    // whose only source is a subquery): the first registered layer's CRS
+    // is the only guess available.
+    if named.is_empty() {
+        return match layers.first() {
+            Some(l) => (Some((col, l.crs.clone())), None),
+            None => (None, None),
+        };
+    }
+
+    // One layer, or several that agree: no ambiguity to resolve.
+    let same = |a: &Crs, b: &Crs| a.epsg == b.epsg && a.proj4 == b.proj4;
+    if named.iter().all(|l| same(&l.crs, &named[0].crs)) {
+        return (Some((col, named[0].crs.clone())), None);
+    }
+
+    // They disagree. `roads.geometry` (or an alias for it) says which
+    // layer the column came from; taking "the first layer the query
+    // mentions" instead silently labelled the result with the wrong CRS,
+    // which reprojects every feature to the wrong place on the map.
+    let gname = schema.field(col).name().to_ascii_lowercase();
+    let qualified: Vec<&&SqlLayer> = named
+        .iter()
+        .filter(|l| {
+            std::iter::once(l.table.clone())
+                .chain(table_aliases(&tokens, &l.table))
+                .any(|n| q.contains(&format!("{n}.{gname}")))
+        })
+        .collect();
+    if qualified.len() == 1 {
+        return (Some((col, qualified[0].crs.clone())), None);
+    }
+    let names: Vec<&str> = named.iter().map(|l| l.crs.name.as_str()).collect();
+    (
+        None,
+        Some(format!(
+            "the query mixes layers in different coordinate systems ({}) and \
+             nothing says which one `{gname}` is in — qualify it \
+             (`{}.{gname}`) to make the result a layer",
+            names.join(", "),
+            named[0].table,
+        )),
+    )
+}
+
+/// The query's identifier tokens, in order.
+fn identifiers(q: &str) -> Vec<&str> {
+    q.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Aliases bound to `table` by `from roads r` / `join roads as r`.
+fn table_aliases(tokens: &[&str], table: &str) -> Vec<String> {
+    const KEYWORDS: [&str; 12] = [
+        "on", "where", "group", "order", "limit", "join", "inner", "left", "right", "full",
+        "cross", "using",
+    ];
+    let mut out = Vec::new();
+    for (i, t) in tokens.iter().enumerate() {
+        if *t != table || i == 0 || !matches!(tokens[i - 1], "from" | "join") {
+            continue;
+        }
+        let mut j = i + 1;
+        if tokens.get(j) == Some(&"as") {
+            j += 1;
+        }
+        if let Some(a) = tokens.get(j)
+            && !KEYWORDS.contains(a)
+        {
+            out.push((*a).to_string());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -886,6 +1035,7 @@ mod tests {
             "select b.label, count(*) n, st_union_agg(t.geometry) geometry              from t join bands b                on b.band = case when st_xmin(t.geometry) > 0 then 1 else 0 end              where t.geometry is not null              group by b.label order by b.label",
             &layers,
             &tables,
+            &AtomicBool::new(false),
         )
         .unwrap();
 
@@ -980,7 +1130,7 @@ mod tests {
         let keyed = "(select geometry, cast(st_xmin(geometry) as bigint) % 2 band                      from t where geometry is not null)";
 
         let count = match_count_sql(keyed, "band", "bands", "band");
-        let out = run_query_with_tables(&count, &layers, &tables).unwrap();
+        let out = run_query_with_tables(&count, &layers, &tables, &AtomicBool::new(false)).unwrap();
         let total = out.batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
         let matched = out.batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
         assert!(total > 0, "layer has rows");
@@ -989,7 +1139,7 @@ mod tests {
         // The left join keeps every feature, matched or not.
         let fields = vec![JoinField { source: "label".into(), out: "label".into() }];
         let sql = join_sql(keyed, "band", "bands", "band", &fields, true);
-        let out = run_query_with_tables(&sql, &layers, &tables).unwrap();
+        let out = run_query_with_tables(&sql, &layers, &tables, &AtomicBool::new(false)).unwrap();
         assert_eq!(out.total_rows as i64, total, "nothing was dropped");
         let labels = out
             .batch
@@ -1005,7 +1155,7 @@ mod tests {
 
         // And the inner join drops exactly those.
         let sql = join_sql(keyed, "band", "bands", "band", &fields, false);
-        let out = run_query_with_tables(&sql, &layers, &tables).unwrap();
+        let out = run_query_with_tables(&sql, &layers, &tables, &AtomicBool::new(false)).unwrap();
         assert_eq!(out.total_rows as i64, matched);
     }
 
@@ -1365,6 +1515,122 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A query joining two layers in different CRSs used to take the CRS
+    /// of whichever the query mentioned first, so half the time "Result
+    /// as layer" loaded the features at a wrong place on the map without
+    /// a word. Qualifying the geometry column settles it; nothing else
+    /// can, so the result refuses to be a layer and says why.
+    #[test]
+    fn a_mixed_crs_join_needs_the_geometry_column_qualified() {
+        let (path, store) = store_with_columns(
+            "geopq_sql_mixed_crs_test.parquet",
+            &[("name", vec!["a", "b"])],
+        );
+        let layers = vec![
+            SqlLayer {
+                table: "lambert".into(),
+                store: Arc::clone(&store),
+                crs: Crs::from_epsg(2154).unwrap(),
+                rg_bboxes: None,
+            },
+            SqlLayer {
+                table: "wgs".into(),
+                store,
+                crs: Crs::wgs84(),
+                rg_bboxes: None,
+            },
+        ];
+
+        // Nothing in the text says which layer `geometry` came from —
+        // here it is built from both — so the result is not offered as a
+        // layer rather than offered in the wrong CRS.
+        let out = run_query(
+            "select l.name, st_makeenvelope(0, 0, 1, 1) geometry \
+             from lambert l join wgs w on l.name = w.name",
+            &layers,
+        )
+        .unwrap();
+        assert!(out.geom.is_none(), "an ambiguous CRS must not be guessed");
+        let w = out.geom_warning.expect("and it has to say why");
+        assert!(w.contains("coordinate systems"), "{w}");
+        assert!(w.contains("geometry"), "{w}");
+
+        // Qualified by table name.
+        let out = run_query(
+            "select wgs.name, wgs.geometry from lambert join wgs on lambert.name = wgs.name",
+            &layers,
+        )
+        .unwrap();
+        assert_eq!(out.geom.expect("qualified").1.epsg, Some(4326));
+        let out = run_query(
+            "select lambert.geometry from lambert join wgs on lambert.name = wgs.name",
+            &layers,
+        )
+        .unwrap();
+        assert_eq!(out.geom.expect("qualified").1.epsg, Some(2154));
+
+        // Qualified through an alias, which is how anyone writes a join.
+        let out = run_query(
+            "select l.name, l.geometry from lambert l join wgs w on l.name = w.name",
+            &layers,
+        )
+        .unwrap();
+        assert_eq!(out.geom.expect("aliased").1.epsg, Some(2154));
+        let out = run_query(
+            "select w.geometry from lambert as l join wgs as w on l.name = w.name",
+            &layers,
+        )
+        .unwrap();
+        assert_eq!(out.geom.expect("aliased").1.epsg, Some(4326));
+
+        // One layer only: no ambiguity, no warning.
+        let out = run_query("select * from wgs", &layers).unwrap();
+        assert_eq!(out.geom.expect("single layer").1.epsg, Some(4326));
+        assert!(out.geom_warning.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A query over a big remote layer runs for minutes and there was no
+    /// way to stop it but closing the app. The flag is polled per
+    /// collected batch, and a stopped query is not an error to report.
+    #[test]
+    fn a_query_can_be_stopped() {
+        let (path, store) = store_with_columns(
+            "geopq_sql_cancel_test.parquet",
+            &[("name", vec!["a", "b", "c"])],
+        );
+        let layers = vec![SqlLayer {
+            table: "t".into(),
+            store,
+            crs: Crs::wgs84(),
+            rg_bboxes: None,
+        }];
+        let stop = AtomicBool::new(true);
+        let err = run_query_with_tables("select * from t", &layers, &[], &stop).unwrap_err();
+        assert_eq!(err, CANCELLED);
+        // Not stopped, the same query runs.
+        let out = run_query_with_tables(
+            "select * from t",
+            &layers,
+            &[],
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(out.total_rows, 3);
+
+        // The export path takes the same flag.
+        let dst = std::env::temp_dir().join(format!("geopq_sql_cancel_{}.parquet", std::process::id()));
+        let err = run_export("select * from t", &layers, &[], &dst, &AtomicBool::new(true));
+        // Either it stopped mid-stream, or the whole result fit in the
+        // head batches it must read before it can write anything; both
+        // are fine, it must simply not hang or panic.
+        if let Err(e) = err {
+            assert!(e == CANCELLED || e.contains("geometry"), "{e}");
+        }
+        let _ = std::fs::remove_file(&dst);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Store-name → sql-name mapping in top_values/distinct_counts: a
     /// NAME/name case collision resolves to the deduped `name_2`, and a
     /// column name containing a double quote is escaped, not spliced raw.
@@ -1400,7 +1666,77 @@ mod tests {
         assert_eq!(counts.get("NAME"), Some(&1));
         assert_eq!(counts.get("name"), Some(&2));
         assert_eq!(counts.get("va\"l"), Some(&1));
+
+        // The join builders quote through the same helper. They used to
+        // escape a double quote as `\"\"\"`, which is a syntax error, and
+        // both are shown to the user and pasted into the console.
+        let fields = vec![JoinField {
+            source: "a\"b".into(),
+            out: "my col".into(),
+        }];
+        let sql = join_sql("l", "my col", "t", "a\"b", &fields, true);
+        assert!(sql.contains("t.\"a\"\"b\" as \"my col\""), "{sql}");
+        assert!(sql.contains("l.\"my col\" = t.\"a\"\"b\""), "{sql}");
+        assert!(!sql.contains("\"\"\""), "tripled quote is back: {sql}");
+        let sql = match_count_sql("l", "my col", "t", "a\"b");
+        assert!(sql.contains("count(t.\"a\"\"b\")"), "{sql}");
+        assert!(!sql.contains("\"\"\""), "tripled quote is back: {sql}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Both builders' SQL has to parse and run against columns whose
+    /// names need quoting, not just read correctly.
+    #[test]
+    fn join_sql_runs_against_awkward_column_names() {
+        use arrow::array::{ArrayRef, Int64Array, StringArray};
+        use arrow::datatypes::{Field, Schema};
+        let table = |name: &str, keys: Vec<i64>, labels: Vec<&str>| {
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("a\"b", DataType::Int64, false),
+                    Field::new("my col", DataType::Utf8, false),
+                ])),
+                vec![
+                    Arc::new(Int64Array::from(keys)) as ArrayRef,
+                    Arc::new(StringArray::from(labels)) as ArrayRef,
+                ],
+            )
+            .unwrap();
+            SqlTable {
+                table: name.into(),
+                schema: batch.schema(),
+                batches: Arc::new(vec![batch]),
+            }
+        };
+        let tables = vec![
+            table("left_t", vec![1, 2, 3], vec!["a", "b", "c"]),
+            table("right_t", vec![1, 3], vec!["one", "three"]),
+        ];
+
+        let count = match_count_sql("left_t", "a\"b", "right_t", "a\"b");
+        let out = run_query_with_tables(&count, &[], &tables, &AtomicBool::new(false)).unwrap();
+        let col = |i: usize| {
+            out.batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!((col(0), col(1)), (3, 2), "3 rows, 2 matched");
+
+        let fields = vec![JoinField {
+            source: "my col".into(),
+            out: "joined label".into(),
+        }];
+        let sql = join_sql("left_t", "a\"b", "right_t", "a\"b", &fields, true);
+        let out = run_query_with_tables(&sql, &[], &tables, &AtomicBool::new(false)).unwrap();
+        assert_eq!(out.total_rows, 3);
+        assert!(
+            out.batch.column_by_name("joined label").is_some(),
+            "{:?}",
+            out.batch.schema()
+        );
     }
 
     #[test]
