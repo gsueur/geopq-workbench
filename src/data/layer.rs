@@ -98,7 +98,15 @@ pub enum GroupLoad {
     /// intersecting `rect` (data CRS) first when the load was
     /// viewport-filtered. Never covers a viewport, so zooming in refines
     /// it with real rows.
-    Preview { stride: u32, rect: Option<[f64; 4]> },
+    /// `ranges`: the in-rect rows the load's covering scan resolved,
+    /// before decimation — kept so a rebuild replays the selection
+    /// instead of paying for that scan again. None when the load was not
+    /// rect-filtered, or when the state predates the scan.
+    Preview {
+        stride: u32,
+        rect: Option<[f64; 4]>,
+        ranges: Option<Vec<(u32, u32)>>,
+    },
     /// Every feature of the group is on the map, drawn from its covering
     /// bounding box instead of its geometry (restricted to the features
     /// intersecting `rect` when the load was viewport-filtered).
@@ -109,7 +117,11 @@ pub enum GroupLoad {
     /// the coverage complete at a resolution the screen can show, for
     /// four doubles a feature and no geometry decode at all. Like a
     /// preview it never covers a viewport, so zooming in refines it.
-    Boxes { rect: Option<[f64; 4]> },
+    /// `ranges` as in [`GroupLoad::Preview`].
+    Boxes {
+        rect: Option<[f64; 4]>,
+        ranges: Option<Vec<(u32, u32)>>,
+    },
     /// Whole group decoded.
     Full,
 }

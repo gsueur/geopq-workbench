@@ -384,6 +384,56 @@ impl FeatureStore {
         ranges: Option<&[(u32, u32)]>,
         columns: Option<&[usize]>,
     ) -> Result<GroupReader, String> {
+        self.reader_for_group_cached(group, batch_size, ranges, columns, None)
+    }
+
+    /// Fetch one row group's projected column chunks up front, so a
+    /// selector scan and the decode that acts on its answer read the same
+    /// bytes instead of downloading the column twice.
+    ///
+    /// The envelope/covering scan streams a whole column chunk to decide
+    /// which rows are in view; without this, `reader_for_group` then
+    /// opened a fresh reader and paid for those same chunks again — the
+    /// dominant cost of a rect refinement over the network. `None` for a
+    /// local file (the page cache already does this) or when the plan
+    /// exceeds the prefetch budget.
+    pub fn prefetch_group(&self, group: usize, columns: &[usize]) -> Option<GroupBytes> {
+        let frag = self.frag_of_group(group);
+        if !frag.source.is_remote() {
+            return None;
+        }
+        let base = self.base_fields();
+        let mut reads: Vec<usize> = columns.iter().copied().filter(|&i| i < base).collect();
+        if let Some((x, y)) = self.xy_geom.filter(|_| columns.contains(&base)) {
+            reads.extend([x, y]);
+        }
+        reads.sort_unstable();
+        reads.dedup();
+        if reads.is_empty() {
+            return None;
+        }
+        let local = group - frag.rg_offset;
+        let cache =
+            prefetch_columns(frag, &[local], &reads, group_prefetch_max_bytes()).ok()??;
+        Some(GroupBytes {
+            inner: Arc::new(cache),
+            group,
+            roots: reads,
+        })
+    }
+
+    /// [`FeatureStore::reader_for_group`], optionally served from bytes a
+    /// previous pass over the same group already fetched. The cache is
+    /// used only when it holds every column this read projects; anything
+    /// else falls through to the normal fetch.
+    pub fn reader_for_group_cached(
+        &self,
+        group: usize,
+        batch_size: usize,
+        ranges: Option<&[(u32, u32)]>,
+        columns: Option<&[usize]>,
+        cache: Option<&GroupBytes>,
+    ) -> Result<GroupReader, String> {
         let base = self.base_fields();
         debug_assert!(
             columns.is_none_or(|c| c.iter().all(|&i| i < self.first_part_index())),
@@ -411,15 +461,26 @@ impl FeatureStore {
 
         let frag = self.frag_of_group(group);
         let local = group - frag.rg_offset;
+        // Bytes a selector scan over this same group already paid for.
+        let inner = if let Some(c) = cache.filter(|c| c.covers(group, &reads)) {
+            open_file_group_reader(
+                c.clone(),
+                &frag.meta,
+                local,
+                batch_size,
+                ranges,
+                Some(&reads),
+            )?
+        }
         // Remote file without a page index: the reader would stream every
         // projected column chunk sequentially (one round trip each — SQL
         // scans over wide remote files never finish that way). Prefetch
         // the group's projected chunks in a few coalesced range requests
         // instead. With a page index, per-page fetches are already exact.
-        let inner = if frag.source.is_remote()
+        else if frag.source.is_remote()
             && frag.meta.metadata().offset_index().is_none()
         {
-            match prefetch_columns(frag, &[local], &reads, GROUP_PREFETCH_MAX_BYTES)? {
+            match prefetch_columns(frag, &[local], &reads, group_prefetch_max_bytes())? {
                 Some(cache) => {
                     open_file_group_reader(cache, &frag.meta, local, batch_size, ranges, Some(&reads))?
                 }
@@ -741,9 +802,22 @@ impl FeatureStore {
 /// Prefetch budget for coalesced remote reads; larger projections fall
 /// back to the streaming per-chunk path.
 const PREFETCH_MAX_BYTES: u64 = 128 * 1024 * 1024;
-/// Tighter per-row-group budget for scan prefetches: several scan
-/// partitions decode concurrently, so the caps multiply.
-const GROUP_PREFETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Whole-build budget for scan prefetches, shared across the workers.
+///
+/// Group reads run one per rayon worker, so a fixed *per-group* cap is
+/// really that cap times the pool width: 64 MB a group looked modest and
+/// authorized 2 GB in flight on a 32-core machine — before the decoded
+/// batches those bytes turn into. Divide one total by the current pool
+/// width instead, with a floor so a wide machine can still coalesce a
+/// group's chunks into a few requests rather than falling back to the
+/// per-chunk streaming path on every group.
+const GROUP_PREFETCH_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+const GROUP_PREFETCH_FLOOR_BYTES: u64 = 8 * 1024 * 1024;
+
+fn group_prefetch_max_bytes() -> u64 {
+    (GROUP_PREFETCH_TOTAL_BYTES / rayon::current_num_threads().max(1) as u64)
+        .max(GROUP_PREFETCH_FLOOR_BYTES)
+}
 /// Ranges closer than this merge into one request (a gap this size costs
 /// less to download than a fresh round trip).
 const PREFETCH_GAP: u64 = 1024 * 1024;
@@ -835,6 +909,54 @@ fn prefetch_columns(
         len,
         segments: fetched,
     }))
+}
+
+/// One row group's projected column chunks, held between the pass that
+/// fetched them and the one that reads them again.
+///
+/// Cheap to clone: the segments are refcounted `Bytes`, so handing a copy
+/// to a parquet builder (which takes its reader by value) shares the
+/// buffers rather than duplicating them.
+#[derive(Clone)]
+pub struct GroupBytes {
+    inner: Arc<Prefetched>,
+    /// The global row group these bytes belong to.
+    group: usize,
+    /// Arrow root indices the fetch plan covered, sorted.
+    roots: Vec<usize>,
+}
+
+impl GroupBytes {
+    /// Can this cache serve a read of `reads` over `group`? Reads outside
+    /// the fetched segments error rather than fall back, so a partial
+    /// match must not be used.
+    fn covers(&self, group: usize, reads: &[usize]) -> bool {
+        self.group == group && reads.iter().all(|r| self.roots.binary_search(r).is_ok())
+    }
+
+    /// Bytes held, for tests and logging.
+    #[cfg(test)]
+    pub fn len(&self) -> u64 {
+        self.inner.segments.iter().map(|(_, b)| b.len() as u64).sum()
+    }
+}
+
+impl parquet::file::reader::Length for GroupBytes {
+    fn len(&self) -> u64 {
+        parquet::file::reader::Length::len(self.inner.as_ref())
+    }
+}
+
+impl parquet::file::reader::ChunkReader for GroupBytes {
+    type T = std::io::Cursor<Bytes>;
+
+    fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+        self.inner.get_read(start)
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
+        self.inner.get_bytes(start, length)
+    }
 }
 
 /// In-memory byte ranges of a remote file, served as a `ChunkReader`.
@@ -1110,6 +1232,26 @@ pub(crate) fn percent_decode(v: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The group prefetch budget is what every worker may hold at once,
+    /// so it is the product with the pool width that has to stay bounded
+    /// — a per-group constant made the real ceiling a property of the
+    /// machine.
+    #[test]
+    fn the_group_prefetch_budget_is_shared_across_workers() {
+        let budget = group_prefetch_max_bytes();
+        let width = rayon::current_num_threads().max(1) as u64;
+        assert!(budget >= GROUP_PREFETCH_FLOOR_BYTES, "{budget} B is below the floor");
+        assert!(
+            budget * width <= GROUP_PREFETCH_TOTAL_BYTES.max(GROUP_PREFETCH_FLOOR_BYTES * width),
+            "{width} workers x {budget} B exceeds the whole-build budget"
+        );
+        // A wide pool gets a smaller slice, never the same fixed cap.
+        assert!(
+            width == 1 || budget < GROUP_PREFETCH_TOTAL_BYTES,
+            "{width} workers still got the whole budget each"
+        );
+    }
 
     #[test]
     fn hive_segment_parsing() {

@@ -34,6 +34,29 @@ const BATCH_TARGET_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Error string of a user-cancelled load (the app treats it quietly).
 pub const CANCELLED: &str = "load cancelled";
+
+/// Pool for the opener/resolver fan-outs, which block on the network
+/// rather than on a core.
+///
+/// Those passes (presign + length probe per part, footer fetch per part)
+/// ran on the global rayon pool, which is sized for CPU work: on a
+/// 4-core machine a 60-part collection resolved four parts at a time,
+/// each waiting on a round trip, while every other rayon consumer in the
+/// app — tessellation, the SQL scan, the extent scan — queued behind
+/// them. A separate, wider pool lets the round trips overlap and keeps
+/// them out of the way of work that is actually computing. Bounded so a
+/// large collection cannot open hundreds of sockets at once.
+pub(crate) fn io_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let n = (rayon::current_num_threads() * 4).clamp(4, 32);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .thread_name(|i| format!("geopq-io-{i}"))
+            .build()
+            .expect("io thread pool")
+    })
+}
 /// An append that found nothing to do. Not an error: the viewport simply
 /// holds no part files the layer has not already opened.
 pub const NOTHING_TO_APPEND: &str = "no parts to add";
@@ -367,12 +390,33 @@ pub enum GroupSel {
         rect: Option<[f64; 4]>,
         stride: u32,
     },
+    /// A preview whose rect filter is already resolved (`ranges` = the
+    /// in-rect rows before decimation; None = the whole group).
+    ///
+    /// A projection rebuild re-emits every group's current state, and
+    /// re-emitting a rect preview as `Preview` made the worker run the
+    /// covering scan again — one pass over each group's bbox column per
+    /// rebuild, which on a remote source is the rebuild's whole latency.
+    /// The state already knows the answer.
+    ResolvedPreview {
+        group: u32,
+        rect: Option<[f64; 4]>,
+        stride: u32,
+        ranges: Option<Vec<(u32, u32)>>,
+    },
     /// Every feature drawn from its covering bbox, no geometry read.
     /// Chosen over `Preview` for polygon coverages that carry a covering
     /// column (see `GroupLoad::Boxes`).
     Boxes {
         group: u32,
         rect: Option<[f64; 4]>,
+    },
+    /// A box selection whose rect filter is already resolved, for the same
+    /// reason as [`GroupSel::ResolvedPreview`].
+    ResolvedBoxes {
+        group: u32,
+        rect: Option<[f64; 4]>,
+        ranges: Option<Vec<(u32, u32)>>,
     },
     /// Boxes for exactly these group-relative rows.
     ///
@@ -389,7 +433,9 @@ impl GroupSel {
         match self {
             GroupSel::All(g) | GroupSel::Rect(g, _) | GroupSel::Ranges(g, _) => *g,
             GroupSel::Preview { group, .. }
+            | GroupSel::ResolvedPreview { group, .. }
             | GroupSel::Boxes { group, .. }
+            | GroupSel::ResolvedBoxes { group, .. }
             | GroupSel::BoxRanges { group, .. }
             | GroupSel::ResolvedRect { group, .. } => *group,
         }
@@ -489,6 +535,25 @@ pub fn complement_ranges(ranges: &[(u32, u32)], len: u32) -> Vec<(u32, u32)> {
     out
 }
 
+/// A cancel flag for the callers that have none of their own (SQL scans,
+/// tests): never set, so the checks compile away to a relaxed load.
+pub(crate) fn never_cancelled() -> &'static std::sync::atomic::AtomicBool {
+    static NEVER: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    &NEVER
+}
+
+/// Bytes one selector scan fetched, handed to the decode that follows.
+type GroupCache = Option<super::store::GroupBytes>;
+
+/// A resolved selection plus the group bytes the scan fetched to resolve
+/// it, so the decode that follows can be served from them.
+pub(crate) type Selection = (Option<Vec<(u32, u32)>>, GroupCache);
+
+/// The same, from a scan that always resolves to ranges (there is no
+/// "this store has no selector" answer once one is running).
+type ScanResult = (Vec<(u32, u32)>, GroupCache);
+
 /// Scan a group's covering bbox leaves and return the row ranges of
 /// features intersecting `rect`. None when the file has no usable covering
 /// column (caller falls back to the whole group).
@@ -496,7 +561,24 @@ pub(crate) fn covering_select(
     store: &FeatureStore,
     group: u32,
     rect: [f64; 4],
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Option<Vec<(u32, u32)>>, String> {
+    covering_select_cached(store, group, rect, cancel).map(|(r, _)| r)
+}
+
+/// [`covering_select`], also handing back the bytes it read.
+///
+/// The scan and the decode that acts on its answer look at the same
+/// column on every path but one (a covering column stands in front of the
+/// geometry); returning the cache lets the caller pay for those bytes
+/// once instead of downloading the column, deciding, and downloading it
+/// again.
+pub(crate) fn covering_select_cached(
+    store: &FeatureStore,
+    group: u32,
+    rect: [f64; 4],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Selection, String> {
     use arrow::array::{Array, Float64Array, StructArray};
     let Some(cov) = &store.covering else {
         // x/y point stores: the coordinate columns themselves are an
@@ -504,21 +586,36 @@ pub(crate) fn covering_select(
         // what keeps lat-ordered global grids from decoding a whole
         // world-wide strip per row group.
         if let Some((xi, yi)) = store.xy_geom {
-            return xy_select(store, group, rect, xi, yi).map(Some);
+            return xy_select(store, group, rect, xi, yi, cancel)
+                .map(|(r, c)| (Some(r), c));
         }
         // WKB (incl. 2.0 native GEOMETRY) without a covering column:
         // scan the geometry column's envelopes byte-wise. Reads the same
         // column the decode would, but only matching rows become
         // geometry — the win is decode/tessellation work and memory.
         if store.encoding.is_wkb() {
-            return wkb_envelope_select(store, group, rect).map(Some);
+            return wkb_envelope_select(store, group, rect, cancel)
+                .map(|(r, c)| (Some(r), c));
         }
-        return Ok(None);
+        return Ok((None, None));
     };
-    let reader = store.reader_for_group(group as usize, BATCH_SIZE, None, Some(&[cov.root]))?;
+    let cache = store.prefetch_group(group as usize, &[cov.root]);
+    let reader = store.reader_for_group_cached(
+        group as usize,
+        BATCH_SIZE,
+        None,
+        Some(&[cov.root]),
+        cache.as_ref(),
+    )?;
     let mut rows: Vec<u32> = Vec::new();
     let mut row = 0u32;
     for res in reader {
+        // Once per batch: a covering scan over a remote group is a series
+        // of range requests, and a camera that has already moved on
+        // should not be waiting on the one before it.
+        if cancel.load(Ordering::Relaxed) {
+            return Err(CANCELLED.into());
+        }
         let batch = res.map_err(|e| format!("covering scan error: {e}"))?;
         let st = batch
             .column(0)
@@ -540,19 +637,31 @@ pub(crate) fn covering_select(
             leaf(&cov.children[3])?,
         );
         for i in 0..batch.num_rows() {
-            if !st.is_null(i)
-                && !xmin.is_null(i)
-                && xmin.value(i) <= rect[2]
-                && xmax.value(i) >= rect[0]
-                && ymin.value(i) <= rect[3]
-                && ymax.value(i) >= rect[1]
+            // All four leaves, not just xmin: a struct with a present
+            // xmin and a null ymax read as a box reaching to whatever
+            // `value` returns for a null slot (0.0), which selects rows
+            // at the equator that are nowhere near the viewport. Same
+            // reasoning for non-finite values, which compare false into
+            // "not selected" here but would sort as infinite extents.
+            if st.is_null(i)
+                || xmin.is_null(i)
+                || ymin.is_null(i)
+                || xmax.is_null(i)
+                || ymax.is_null(i)
             {
+                continue;
+            }
+            let (x0, y0, x1, y1) = (xmin.value(i), ymin.value(i), xmax.value(i), ymax.value(i));
+            if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+                continue;
+            }
+            if x0 <= rect[2] && x1 >= rect[0] && y0 <= rect[3] && y1 >= rect[1] {
                 rows.push(row + i as u32);
             }
         }
         row += batch.num_rows() as u32;
     }
-    Ok(Some(rows_to_ranges(rows.into_iter())))
+    Ok((Some(rows_to_ranges(rows.into_iter())), cache))
 }
 
 /// In-rect row ranges of one group by scanning the WKB envelopes (byte
@@ -562,12 +671,22 @@ fn wkb_envelope_select(
     store: &FeatureStore,
     group: u32,
     rect: [f64; 4],
-) -> Result<Vec<(u32, u32)>, String> {
-    let reader =
-        store.reader_for_group(group as usize, BATCH_SIZE, None, Some(&[store.geom_col]))?;
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<ScanResult, String> {
+    let cache = store.prefetch_group(group as usize, &[store.geom_col]);
+    let reader = store.reader_for_group_cached(
+        group as usize,
+        BATCH_SIZE,
+        None,
+        Some(&[store.geom_col]),
+        cache.as_ref(),
+    )?;
     let mut rows: Vec<u32> = Vec::new();
     let mut row = 0u32;
     for res in reader {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(CANCELLED.into());
+        }
         let batch = res.map_err(|e| format!("geometry scan error: {e}"))?;
         let col = BinCol::new(batch.column(0).as_ref())
             .ok_or("geometry column is not binary")?;
@@ -587,7 +706,7 @@ fn wkb_envelope_select(
         }
         row += batch.num_rows() as u32;
     }
-    Ok(rows_to_ranges(rows.into_iter()))
+    Ok((rows_to_ranges(rows.into_iter()), cache))
 }
 
 /// In-rect row ranges of one group of an x/y point store, by scanning
@@ -599,14 +718,25 @@ fn xy_select(
     rect: [f64; 4],
     xi: usize,
     yi: usize,
-) -> Result<Vec<(u32, u32)>, String> {
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<ScanResult, String> {
     use arrow::array::Float64Array;
     let cols = if xi < yi { [xi, yi] } else { [yi, xi] };
     let (xpos, ypos) = if xi < yi { (0, 1) } else { (1, 0) };
-    let reader = store.reader_for_group(group as usize, BATCH_SIZE, None, Some(&cols))?;
+    let cache = store.prefetch_group(group as usize, &cols);
+    let reader = store.reader_for_group_cached(
+        group as usize,
+        BATCH_SIZE,
+        None,
+        Some(&cols),
+        cache.as_ref(),
+    )?;
     let mut rows: Vec<u32> = Vec::new();
     let mut row = 0u32;
     for res in reader {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(CANCELLED.into());
+        }
         let batch = res.map_err(|e| format!("coordinate scan error: {e}"))?;
         let as_f64 = |i: usize| -> Result<Float64Array, String> {
             arrow::compute::cast(batch.column(i), &DataType::Float64)
@@ -627,7 +757,7 @@ fn xy_select(
         }
         row += batch.num_rows() as u32;
     }
-    Ok(rows_to_ranges(rows.into_iter()))
+    Ok((rows_to_ranges(rows.into_iter()), cache))
 }
 
 /// Load a GeoParquet file in a background thread. Only geometry-derived data
@@ -874,7 +1004,9 @@ fn build_opened(
             "initial load",
         )
     };
-    let box_layer = sel.iter().any(|s| matches!(s, GroupSel::Boxes { .. }));
+    let box_layer = sel
+        .iter()
+        .any(|s| matches!(s, GroupSel::Boxes { .. } | GroupSel::ResolvedBoxes { .. }));
     let build_t0 = Instant::now();
     // No style asked for (a plain open, not a restored context): let the
     // schema speak. A column named for a published nomenclature gets
@@ -1034,12 +1166,21 @@ fn rebuild_selection(loaded: &[GroupLoad], starts: &[u64], box_gaps: bool) -> Ve
                     }
                     out
                 }
-                GroupLoad::Preview { stride, rect } => vec![GroupSel::Preview {
+                // Resolved forms: the rect scan that produced this state
+                // does not have to run again for every rebuild.
+                GroupLoad::Preview { stride, rect, ranges } => {
+                    vec![GroupSel::ResolvedPreview {
+                        group,
+                        rect: *rect,
+                        stride: *stride,
+                        ranges: ranges.clone(),
+                    }]
+                }
+                GroupLoad::Boxes { rect, ranges } => vec![GroupSel::ResolvedBoxes {
                     group,
                     rect: *rect,
-                    stride: *stride,
+                    ranges: ranges.clone(),
                 }],
-                GroupLoad::Boxes { rect } => vec![GroupSel::Boxes { group, rect: *rect }],
             }
         })
         .collect()
@@ -1257,6 +1398,33 @@ fn parts_to_add(
 /// the collection (empty for a part addressed by its own Item).
 type AppendPart = (Source, String, FileOpen, Vec<(String, Option<String>)>);
 
+/// Part URLs an append pass opened and could not use.
+///
+/// A rejected part stays in the collection document, so the next camera
+/// settle scores it, presigns it, fetches its footer and rejects it
+/// again — forever, once per settle. Remembering it costs a string.
+/// Never cleared: a part whose schema does not match the dataset will not
+/// start matching it while the app is running.
+fn rejected_part_set() -> &'static Mutex<std::collections::HashSet<String>> {
+    static REJECTED: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    REJECTED.get_or_init(Default::default)
+}
+
+fn reject_part(url: String) {
+    rejected_part_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(url);
+}
+
+fn rejected_parts() -> std::collections::HashSet<String> {
+    rejected_part_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// Open the part files of a STAC collection that the viewport wants and
 /// the layer does not have yet, then build their geometry.
 ///
@@ -1304,7 +1472,11 @@ pub fn spawn_part_append(
             Ok(p) => p,
             Err(e) => return ended(&format!("{collection}: {e}")),
         };
-        let have = store.part_urls();
+        // Parts already open, plus the ones a previous pass opened and
+        // could not use: both are parts this pass must not spend a round
+        // trip on again.
+        let mut have = store.part_urls();
+        have.extend(rejected_parts());
         let room = PART_APPEND_PER_PASS.min(PART_TOTAL_CAP - store.fragments.len());
         let wanted = parts_to_add(parts, &have, rect, room);
         if wanted.is_empty() {
@@ -1319,7 +1491,8 @@ pub fn spawn_part_append(
         // Resolve and read footers in parallel: each part is a round trip.
         let opened: Vec<AppendPart> = {
             use rayon::prelude::*;
-            let r: Result<Vec<_>, String> = wanted
+            let r: Result<Vec<_>, String> = io_pool().install(|| {
+                wanted
                 .par_iter()
                 .map(|p| {
                     let short = p
@@ -1340,7 +1513,8 @@ pub fn spawn_part_append(
                         .unwrap_or_default();
                     Ok((src, short, f, hive))
                 })
-                .collect();
+                .collect()
+            });
             match r {
                 Ok(v) => v,
                 Err(e) => return ended(&e),
@@ -1353,16 +1527,26 @@ pub fn spawn_part_append(
         let mut frags: Vec<(super::store::Fragment, Vec<u64>)> = Vec::new();
         let mut added_boxes: Vec<[f64; 4]> = Vec::new();
         let mut names: Vec<String> = Vec::new();
-        let mut boxes_ok = true;
         for (src, short, f, hive) in opened {
             if !f.crs.same_as(&crs) || f.encoding != base.encoding || f.geom_col != base.geom_col {
                 log::warn!("{short}: does not match the collection's schema; skipped");
+                if let Some(u) = src.url() {
+                    reject_part(u);
+                }
                 continue;
             }
+            // Same rule as `open_multi_store`: a part describing no
+            // extent gets empty boxes for its groups rather than voiding
+            // the pass. Aborting here was worse than losing the index —
+            // the part never entered the store, so the next camera
+            // settle selected it again, re-probed it, and aborted again,
+            // for as long as the layer was open.
             match (&f.rg_boxes, f.info.geo.bbox) {
                 (Some((_, b)), _) => added_boxes.extend_from_slice(b),
                 (None, Some(b)) => added_boxes.extend(std::iter::repeat_n(b, f.rg_rows.len())),
-                (None, None) => boxes_ok = false,
+                (None, None) => {
+                    added_boxes.extend(std::iter::repeat_n(EMPTY_BBOX, f.rg_rows.len()))
+                }
             }
             // Partition values of a part panned into, keyed by the
             // columns the layer already has: leaving them null would make
@@ -1388,7 +1572,7 @@ pub fn spawn_part_append(
             ));
             names.push(short);
         }
-        if frags.is_empty() || !boxes_ok {
+        if frags.is_empty() {
             ended(NOTHING_TO_APPEND);
             return;
         }
@@ -1461,7 +1645,9 @@ fn append_batches_with(
             GroupSel::Ranges(_, r) | GroupSel::ResolvedRect { ranges: r, .. } => {
                 r.iter().map(|&(s, e)| (e - s) as u64).sum()
             }
-            GroupSel::Preview { stride, .. } => group_rows.div_ceil((*stride).max(2) as u64),
+            GroupSel::Preview { stride, .. } | GroupSel::ResolvedPreview { stride, .. } => {
+                group_rows.div_ceil((*stride).max(2) as u64)
+            }
             _ => group_rows,
         }
     };
@@ -1537,7 +1723,7 @@ fn prepare_refinement_jobs(
                 if cancel.load(Ordering::Relaxed) {
                     return Err(CANCELLED.to_string());
                 }
-                covering_select(store, g, r).map(|ranges| (g, ranges))
+                covering_select(store, g, r, cancel).map(|ranges| (g, ranges))
             })
             .collect();
         let mut map = std::collections::HashMap::new();
@@ -1558,7 +1744,7 @@ fn prepare_refinement_jobs(
             GroupSel::Rect(group, rect) => match resolved_rects
                 .get(&group)
                 .cloned()
-                .unwrap_or_else(|| covering_select(store, group, rect).ok().flatten())
+                .unwrap_or_else(|| covering_select(store, group, rect, cancel).ok().flatten())
             {
                 Some(ranges) => {
                     let count = ranges.iter().map(|&(s, e)| (e - s) as u64).sum();
@@ -1599,13 +1785,16 @@ fn prepare_refinement_jobs(
                 (count, GroupSel::Ranges(group, ranges))
             }
             GroupSel::All(group) => (group_rows, GroupSel::All(group)),
-            preview @ GroupSel::Preview { stride, .. } => {
+            preview @ (GroupSel::Preview { stride, .. }
+            | GroupSel::ResolvedPreview { stride, .. }) => {
                 (group_rows.div_ceil(stride.max(2) as u64), preview)
             }
             // Boxes read four doubles a row and tessellate two triangles;
             // against a refine budget meant for geometry, that is not
             // work worth counting.
-            boxes @ (GroupSel::Boxes { .. } | GroupSel::BoxRanges { .. }) => (0, boxes),
+            boxes @ (GroupSel::Boxes { .. }
+            | GroupSel::ResolvedBoxes { .. }
+            | GroupSel::BoxRanges { .. }) => (0, boxes),
         };
         rows = rows.saturating_add(count);
         // The group's bytes in proportion to the rows this job selects.
@@ -1764,10 +1953,19 @@ fn plan_viewport_selection(
     }
     // Per-feature covering selection: only when the viewport doesn't
     // already cover the whole data extent.
-    let use_rect = (store.covering.is_some()
-        || store.xy_geom.is_some()
-        || store.encoding.is_wkb())
+    //
+    // Missing row-group boxes decide which *groups* are read, not how
+    // each one is read. Folding the two together meant a file with a
+    // covering column but no row-group statistics — every group a
+    // candidate — also gave up per-feature selection and decoded whole
+    // groups, which is the case where the covering column is worth the
+    // most.
+    let has_selector =
+        store.covering.is_some() || store.xy_geom.is_some() || store.encoding.is_wkb();
+    let use_rect = has_selector
         && match (boxes, rect) {
+            // The extent is known: skip the scan when the viewport
+            // already contains all of it (every row would match).
             (Some(bs), Some(r)) => {
                 let mut u = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
                 for b in bs {
@@ -1775,7 +1973,9 @@ fn plan_viewport_selection(
                 }
                 !(r[0] <= u[0] && r[1] <= u[1] && r[2] >= u[2] && r[3] >= u[3])
             }
-            _ => false,
+            // No extent to compare against: the rect still filters.
+            (None, Some(_)) => true,
+            (_, None) => false,
         };
     let mut sel: Vec<GroupSel> = groups
         .iter()
@@ -2149,7 +2349,7 @@ fn open_pyramid_store(
         plan.res,
         plan.parts.len()
     );
-    let files: Vec<(Source, String)> = {
+    let files: Vec<(Source, String)> = io_pool().install(|| {
         use rayon::prelude::*;
         plan.parts
             .par_iter()
@@ -2158,8 +2358,8 @@ fn open_pyramid_store(
                     .map(|src| (src, rel.clone()))
                     .map_err(|e| format!("{rel}: {e}"))
             })
-            .collect::<Result<_, _>>()?
-    };
+            .collect::<Result<Vec<_>, _>>()
+    })?;
     let hive: Vec<Vec<(String, Option<String>)>> =
         plan.parts.iter().map(|rel| pyramid_hive(rel)).collect();
     let mut opened = open_multi_store(source, files, hive)?;
@@ -2680,7 +2880,7 @@ fn open_s3_prefix_store(source: &Source) -> Result<StoreOpen, String> {
         })
         .collect();
     // Resolve (presign + length probe) every part in parallel.
-    let files: Vec<(Source, String)> = {
+    let files: Vec<(Source, String)> = io_pool().install(|| {
         use rayon::prelude::*;
         keys.par_iter()
             .map(|k| {
@@ -2696,8 +2896,8 @@ fn open_s3_prefix_store(source: &Source) -> Result<StoreOpen, String> {
                 .map(|src| (src, short.clone()))
                 .map_err(|e| format!("{short}: {e}"))
             })
-            .collect::<Result<_, _>>()?
-    };
+            .collect::<Result<Vec<_>, _>>()
+    })?;
     log::info!("{uri}: opening {} part files", files.len());
     open_multi_store(source, files, hive)
 }
@@ -2766,7 +2966,7 @@ fn open_stac_store(
         })
         .collect();
     // Resolve (length probe) every part in parallel.
-    let files: Vec<(Source, String)> = {
+    let files: Vec<(Source, String)> = io_pool().install(|| {
         use rayon::prelude::*;
         keep.into_par_iter()
             .map(|p| {
@@ -2779,8 +2979,8 @@ fn open_stac_store(
                     .map(|src| (src, short.clone()))
                     .map_err(|e| format!("{short}: {e}"))
             })
-            .collect::<Result<_, _>>()?
-    };
+            .collect::<Result<Vec<_>, _>>()
+    })?;
     let mut opened = open_multi_store(source, files, hive)?;
     // The parts are plain object-store URLs, so the info built from the
     // first one looked for a credit beside a parquet file in a bucket and
@@ -2818,13 +3018,13 @@ fn open_multi_store(
     // time in network round-trips (a HEAD probe plus footer ranges
     // each), so this is the wall-clock win for prefix/STAC datasets.
     // The merge below stays sequential and order-stable.
-    let opened: Vec<FileOpen> = {
+    let opened: Vec<FileOpen> = io_pool().install(|| {
         use rayon::prelude::*;
         files
             .par_iter()
             .map(|(src, short)| open_file(src).map_err(|e| format!("{short}: {e}")))
-            .collect::<Result<_, _>>()?
-    };
+            .collect::<Result<Vec<_>, _>>()
+    })?;
     // A hive key shadowed by a real column stays path-only.
     part_cols.retain(|k| {
         !opened[0]
@@ -3103,7 +3303,7 @@ fn open_file(source: &Source) -> Result<FileOpen, String> {
                 }
                 None => {
                     // Last resort: coordinate columns → synthesized points.
-                    let (xi, yi) = xy_columns(&schema).ok_or(
+                    let (xi, yi) = xy_columns(&schema, &builder).ok_or(
                         "no 'geo' metadata, no column whose values read as WKB \
                          geometry, and no lon/lat or x/y coordinate columns found",
                     )?;
@@ -3617,17 +3817,76 @@ fn probe_wkb_column(
     seen > 0
 }
 
+/// File-wide min/max of one leaf column from its row-group statistics.
+/// None when any group lacks them.
+fn leaf_stat_range(
+    builder: &ParquetRecordBatchReaderBuilder<super::source::SourceReader>,
+    leaf: usize,
+) -> Option<(f64, f64)> {
+    use parquet::file::statistics::Statistics;
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for rg in builder.metadata().row_groups() {
+        let (mn, mx) = match rg.columns().get(leaf)?.statistics()? {
+            Statistics::Double(s) => (*s.min_opt()?, *s.max_opt()?),
+            Statistics::Float(s) => (*s.min_opt()? as f64, *s.max_opt()? as f64),
+            _ => return None,
+        };
+        lo = lo.min(mn);
+        hi = hi.max(mx);
+    }
+    (lo.is_finite() && hi.is_finite()).then_some((lo, hi))
+}
+
 /// Coordinate-column pair (x/lon, y/lat) guessed from names, for files
 /// with no geometry column at all. Both must be floating point.
-fn xy_columns(schema: &arrow::datatypes::SchemaRef) -> Option<(usize, usize)> {
-    let find = |names: &[&str]| {
-        schema.fields().iter().position(|f| {
-            names.contains(&f.name().to_ascii_lowercase().as_str())
-                && matches!(f.data_type(), DataType::Float64 | DataType::Float32)
+///
+/// This is the last resort of the opener, and it declares the result
+/// CRS84 degrees. Two guards keep that from being a fabrication:
+///
+/// - Named spellings win over bare `x`/`y`. A file with both `lon` and
+///   an unrelated `x` column used to take whichever the schema listed
+///   first.
+/// - `x`/`y` must actually hold degrees. On projected data they hold
+///   metres, and adopting them put the layer several thousand degrees
+///   from anywhere; the columns' own min/max says so for free.
+fn xy_columns(
+    schema: &arrow::datatypes::SchemaRef,
+    builder: &ParquetRecordBatchReaderBuilder<super::source::SourceReader>,
+) -> Option<(usize, usize)> {
+    let pq_columns = builder.parquet_schema().columns();
+    let leaf_of = |name: &str| -> Option<usize> {
+        pq_columns
+            .iter()
+            .position(|c| c.path().parts().first().map(String::as_str) == Some(name))
+    };
+    let in_range = |i: usize, limit: f64| -> bool {
+        let name = schema.field(i).name();
+        match leaf_of(name).and_then(|l| leaf_stat_range(builder, l)) {
+            Some((lo, hi)) => lo >= -limit && hi <= limit,
+            // No statistics to check against. A column that says "lon" is
+            // taken at its word; a bare `x` is not.
+            None => false,
+        }
+    };
+    // Ordered by how much the name commits to a geographic coordinate.
+    let find = |names: &[&str]| -> Option<usize> {
+        names.iter().find_map(|n| {
+            schema.fields().iter().position(|f| {
+                f.name().eq_ignore_ascii_case(n)
+                    && matches!(f.data_type(), DataType::Float64 | DataType::Float32)
+            })
         })
     };
-    let x = find(&["lon", "longitude", "long", "lng", "x"])?;
-    let y = find(&["lat", "latitude", "y"])?;
+    let named_x = find(&["lon", "longitude", "long", "lng"]);
+    let named_y = find(&["lat", "latitude"]);
+    let x = match named_x {
+        Some(i) => i,
+        None => find(&["x"]).filter(|&i| in_range(i, 180.0))?,
+    };
+    let y = match named_y {
+        Some(i) => i,
+        None => find(&["y"]).filter(|&i| in_range(i, 90.0))?,
+    };
     (x != y).then_some((x, y))
 }
 
@@ -3697,10 +3956,46 @@ fn covering_column(
     if r0 != r1 || r0 != r2 || r0 != r3 {
         return None;
     }
-    Some(CoveringCol {
-        root: schema.index_of(&r0).ok()?,
-        children: [xmin, ymin, xmax, ymax],
-    })
+    let root = schema.index_of(&r0).ok()?;
+    // Check the column exists in the shape the metadata claims, here,
+    // once, rather than per batch on every scan. A `covering` block that
+    // names a column that is not a struct, or is missing one of the four
+    // leaves, used to be adopted anyway: `covering_select` then failed
+    // the whole load with "covering column is not a struct", while
+    // `process_box_batch` quietly counted every feature of the same file
+    // as a bad geometry. Returning None here drops back to reading the
+    // geometry, which always works.
+    let children = [xmin, ymin, xmax, ymax];
+    let fields = match schema.field(root).data_type() {
+        DataType::Struct(f) => f,
+        _ => {
+            log::warn!(
+                "{r0}: the covering column is not a struct; \
+                 falling back to the geometry column"
+            );
+            return None;
+        }
+    };
+    for name in &children {
+        let Some(child) = fields.iter().find(|f| f.name() == name) else {
+            log::warn!(
+                "{r0}: the covering column has no '{name}' child; \
+                 falling back to the geometry column"
+            );
+            return None;
+        };
+        // The scan casts each leaf to f64; a string or a timestamp there
+        // is not a coordinate however the cast behaves.
+        if !child.data_type().is_numeric() {
+            log::warn!(
+                "{r0}.{name} is {:?}, not a number; falling back to the \
+                 geometry column",
+                child.data_type()
+            );
+            return None;
+        }
+    }
+    Some(CoveringCol { root, children })
 }
 
 /// Extract per-row-group bboxes from file metadata, best source first:
@@ -3980,9 +4275,9 @@ pub fn sample_loaded_values(
         if !allowed(g) {
             continue;
         }
-        if let GroupLoad::Preview { stride, rect: Some(r) } = st {
+        if let GroupLoad::Preview { stride, rect: Some(r), .. } = st {
             let group_rows = (starts[g + 1] - starts[g]) as u32;
-            let ranges = covering_select(store, g as u32, *r)?
+            let ranges = covering_select(store, g as u32, *r, never_cancelled())?
                 .unwrap_or_else(|| vec![(0, group_rows)]);
             let sampled: Vec<u32> = ranges
                 .iter()
@@ -4002,7 +4297,7 @@ pub fn sample_loaded_values(
                 ranges.iter().map(|&(s, e)| (e - s) as u64).sum()
             }
             GroupLoad::Preview { rect: Some(_), .. } => preview_rows[&g].len() as u64,
-            GroupLoad::Preview { stride, rect: None } => {
+            GroupLoad::Preview { stride, rect: None, .. } => {
                 (starts[g + 1] - starts[g]).div_ceil(*stride as u64)
             }
             // Boxes hold every feature of the group; a rect-filtered one
@@ -4055,7 +4350,7 @@ pub fn sample_loaded_values(
                 }
                 c += list.len();
             }
-            GroupLoad::Preview { stride: ps, rect: None } => {
+            GroupLoad::Preview { stride: ps, rect: None, .. } => {
                 push_span(0, (starts[g + 1] - starts[g]) as u32, &mut c, *ps as usize)
             }
             GroupLoad::Boxes { .. } => {
@@ -4143,23 +4438,66 @@ pub(crate) fn ground_area(g: &geo_types::Geometry<f64>, latlong: bool) -> f64 {
     if !latlong {
         return g.unsigned_area();
     }
-    let mut g = g.clone();
     let dst = crate::data::crs::equal_area_measure();
     let src = crate::data::crs::wgs84_cached();
-    let failed = std::cell::Cell::new(false);
-    use geo::MapCoordsInPlace;
-    g.map_coords_in_place(
-        |c| match crate::data::crs::transform_point(src, dst, c.x, c.y) {
-            Ok((x, y)) => geo_types::Coord { x, y },
-            Err(_) => {
-                // Outside the projection's domain: no usable area, and
-                // norm_bin sends a zero area to bin 0 like a null.
-                failed.set(true);
-                c
-            }
-        },
-    );
-    if failed.get() { 0.0 } else { g.unsigned_area() }
+    let project = |c: geo_types::Coord<f64>| -> Option<geo_types::Coord<f64>> {
+        crate::data::crs::transform_point(src, dst, c.x, c.y)
+            .ok()
+            .map(|(x, y)| geo_types::Coord { x, y })
+    };
+    // Fold the shoelace over the projected coordinates instead of cloning
+    // the whole geometry and rewriting it in place: this runs once per
+    // styled feature, and on land cover the clone alone was megabytes of
+    // churn a batch. Rings only — a point or a line has no area, and
+    // `unsigned_area` reports 0.0 for both.
+    fn ring_area(
+        ring: &geo_types::LineString<f64>,
+        project: &impl Fn(geo_types::Coord<f64>) -> Option<geo_types::Coord<f64>>,
+    ) -> Option<f64> {
+        let mut it = ring.0.iter();
+        let Some(&first) = it.next() else { return Some(0.0) };
+        let first = project(first)?;
+        let mut prev = first;
+        let mut a = 0.0;
+        for &c in it {
+            let cur = project(c)?;
+            a += prev.x * cur.y - cur.x * prev.y;
+            prev = cur;
+        }
+        // geo-types rings are closed, so the closing edge is already in
+        // the loop; an unclosed one gets it here.
+        a += prev.x * first.y - first.x * prev.y;
+        Some(a * 0.5)
+    }
+    fn poly_area(
+        p: &geo_types::Polygon<f64>,
+        project: &impl Fn(geo_types::Coord<f64>) -> Option<geo_types::Coord<f64>>,
+    ) -> Option<f64> {
+        let mut a = ring_area(p.exterior(), project)?.abs();
+        for h in p.interiors() {
+            a -= ring_area(h, project)?.abs();
+        }
+        Some(a.max(0.0))
+    }
+    // Outside the projection's domain: no usable area, and norm_bin sends
+    // a zero area to bin 0 like a null.
+    let area = match g {
+        geo_types::Geometry::Polygon(p) => poly_area(p, &project),
+        geo_types::Geometry::MultiPolygon(mp) => {
+            mp.0.iter().try_fold(0.0, |acc, p| Some(acc + poly_area(p, &project)?))
+        }
+        geo_types::Geometry::Rect(r) => poly_area(&r.to_polygon(), &project),
+        geo_types::Geometry::Triangle(t) => poly_area(&t.to_polygon(), &project),
+        geo_types::Geometry::GeometryCollection(gc) => {
+            gc.0.iter().try_fold(0.0, |acc, g| {
+                let a = ground_area(g, true);
+                a.is_finite().then_some(acc + a)
+            })
+        }
+        // Points and lines have no area either way.
+        _ => Some(0.0),
+    };
+    area.unwrap_or(0.0)
 }
 
 /// Same, for coordinates already split into x/y slices (the GeoArrow
@@ -4184,7 +4522,9 @@ pub(crate) fn norm_bin(v: f64, area: f64, breaks: &[f64]) -> u8 {
         return 0;
     }
     let x = v / area;
-    (breaks.partition_point(|b| x >= *b) as u8).min((STYLE_BINS - 1) as u8)
+    // Clamp before the cast: `partition_point` counts breaks, and a
+    // palette with 256 of them would wrap a top-bin feature back to bin 0.
+    breaks.partition_point(|b| x >= *b).min(STYLE_BINS - 1) as u8
 }
 
 /// Raw numeric per row (NaN for nulls / uncastable columns).
@@ -4221,8 +4561,7 @@ pub(crate) fn batch_bins(arr: &arrow::array::ArrayRef, binning: &Binning) -> Vec
                     // row from brightest to darkest.
                     Some(v) if !v.is_null(i) && v.value(i).is_finite() => {
                         let x = v.value(i);
-                        (breaks.partition_point(|b| x >= *b) as u8)
-                            .min((STYLE_BINS - 1) as u8)
+                        breaks.partition_point(|b| x >= *b).min(STYLE_BINS - 1) as u8
                     }
                     _ => 0,
                 })
@@ -4327,7 +4666,10 @@ fn build_geometry(
     // otherwise open tens of thousands of GPU buffers.
     let cell = if sel
         .iter()
-        .any(|s| matches!(s, GroupSel::Boxes { .. } | GroupSel::BoxRanges { .. }))
+        .any(|s| matches!(
+            s,
+            GroupSel::Boxes { .. } | GroupSel::ResolvedBoxes { .. } | GroupSel::BoxRanges { .. }
+        ))
     {
         crate::data::geometry::BOX_CHUNK_WORLD
     } else {
@@ -4369,50 +4711,74 @@ fn build_geometry(
         // returning early: every path has to yield the same iterator
         // type, and an empty one reads nothing.
         let stop = cancelled();
-        // Resolve the job to optional group-relative ranges + final state.
-        let (ranges, state): (Option<Vec<(u32, u32)>>, GroupLoad) = if stop {
-            (Some(Vec::new()), GroupLoad::None)
+        // Resolve the job to optional group-relative ranges + final state,
+        // keeping any bytes the resolving scan read so the decode below
+        // does not fetch the same column chunk a second time.
+        let cancel_flag = match cancel {
+            Some(c) => c,
+            None => never_cancelled(),
+        };
+        let (ranges, state, cached): (Option<Vec<(u32, u32)>>, GroupLoad, GroupCache) = if stop
+        {
+            (Some(Vec::new()), GroupLoad::None, None)
         } else {
             match &job {
-                GroupSel::All(_) => (None, GroupLoad::Full),
-                GroupSel::Ranges(_, r) => (Some(r.clone()), GroupLoad::Full),
+                GroupSel::All(_) => (None, GroupLoad::Full, None),
+                GroupSel::Ranges(_, r) => (Some(r.clone()), GroupLoad::Full, None),
                 GroupSel::ResolvedRect { rect, ranges, .. } => (
                     Some(ranges.clone()),
                     GroupLoad::Rows {
                         ranges: ranges.clone(),
                         rect: *rect,
                     },
+                    None,
                 ),
                 GroupSel::Rect(_, rect) => {
-                    match covering_select(store, g, *rect) {
-                        Ok(Some(r)) if r == [(0, group_rows)] => (None, GroupLoad::Full),
-                        Ok(Some(r)) => (
+                    match covering_select_cached(store, g, *rect, cancel_flag) {
+                        Ok((Some(r), c)) if r == [(0, group_rows)] => {
+                            (None, GroupLoad::Full, c)
+                        }
+                        Ok((Some(r), c)) => (
                             Some(r.clone()),
                             GroupLoad::Rows {
                                 ranges: r,
                                 rect: *rect,
                             },
+                            c,
                         ),
-                        Ok(None) => (None, GroupLoad::Full),
+                        Ok((None, c)) => (None, GroupLoad::Full, c),
                         Err(e) => {
                             *err_ref.lock().unwrap() = Some(e);
-                            (Some(vec![]), GroupLoad::None)
+                            (Some(vec![]), GroupLoad::None, None)
                         }
                     }
                 }
-                GroupSel::Preview { rect, stride, .. } => {
+                GroupSel::Preview { rect, stride, .. }
+                | GroupSel::ResolvedPreview { rect, stride, .. } => {
                     // Optional rect filter first, then every stride-th row of
                     // the selection as explicit 1-row ranges (the reader skips
                     // decoding the rest).
-                    let base: Option<Vec<(u32, u32)>> = match rect {
-                        Some(r) => match covering_select(store, g, *r) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                *err_ref.lock().unwrap() = Some(e);
-                                Some(vec![])
+                    let (base, cache): (Option<Vec<(u32, u32)>>, GroupCache) = match &job {
+                        // A rebuild resolved this group's rect already:
+                        // reuse the answer instead of re-scanning. Only
+                        // when it really carries one — a state from
+                        // before the scan falls through and re-resolves,
+                        // rather than quietly decimating the whole group.
+                        GroupSel::ResolvedPreview { ranges: Some(rs), .. } => {
+                            (Some(rs.clone()), None)
+                        }
+                        _ => match rect {
+                            Some(r) => {
+                                match covering_select_cached(store, g, *r, cancel_flag) {
+                                    Ok((v, c)) => (v, c),
+                                    Err(e) => {
+                                        *err_ref.lock().unwrap() = Some(e);
+                                        (Some(vec![]), None)
+                                    }
+                                }
                             }
+                            None => (None, None),
                         },
-                        None => None,
                     };
                     let stride = (*stride).max(2) as usize;
                     let sampled: Vec<u32> = match &base {
@@ -4425,31 +4791,55 @@ fn build_geometry(
                     };
                     (
                         Some(rows_to_ranges(sampled.into_iter())),
-                        GroupLoad::Preview { stride: stride as u32, rect: *rect },
+                        GroupLoad::Preview {
+                            stride: stride as u32,
+                            rect: *rect,
+                            ranges: base,
+                        },
+                        cache,
                     )
                 }
-                GroupSel::Boxes { rect, .. } => {
+                GroupSel::Boxes { rect, .. } | GroupSel::ResolvedBoxes { rect, .. } => {
                     // The row selection a rect load would make; only the
                     // columns read differ.
-                    let ranges = match rect {
-                        Some(r) => match covering_select(store, g, *r) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                *err_ref.lock().unwrap() = Some(e);
-                                Some(vec![])
+                    let (ranges, cache): (Option<Vec<(u32, u32)>>, GroupCache) = match &job {
+                        GroupSel::ResolvedBoxes { ranges: Some(rs), .. } => {
+                            (Some(rs.clone()), None)
+                        }
+                        _ => match rect {
+                            Some(r) => {
+                                match covering_select_cached(store, g, *r, cancel_flag) {
+                                    Ok((v, c)) => (v, c),
+                                    Err(e) => {
+                                        *err_ref.lock().unwrap() = Some(e);
+                                        (Some(vec![]), None)
+                                    }
+                                }
                             }
+                            None => (None, None),
                         },
-                        None => None,
                     };
-                    (ranges, GroupLoad::Boxes { rect: *rect })
+                    (
+                        ranges.clone(),
+                        GroupLoad::Boxes {
+                            rect: *rect,
+                            ranges,
+                        },
+                        cache,
+                    )
                 }
                 // Gap filler beside a refined group: the group's own state
                 // belongs to the geometry selection, so this one records
                 // nothing.
-                GroupSel::BoxRanges { ranges, .. } => (Some(ranges.clone()), GroupLoad::None),
+                GroupSel::BoxRanges { ranges, .. } => {
+                    (Some(ranges.clone()), GroupLoad::None, None)
+                }
             }
         };
-        let boxes = matches!(job, GroupSel::Boxes { .. } | GroupSel::BoxRanges { .. });
+        let boxes = matches!(
+            job,
+            GroupSel::Boxes { .. } | GroupSel::ResolvedBoxes { .. } | GroupSel::BoxRanges { .. }
+        );
         // A gap filler must not overwrite the state its group already has.
         let record = !matches!(job, GroupSel::BoxRanges { .. });
         if !stop && record {
@@ -4473,11 +4863,12 @@ fn build_geometry(
             } else {
                 store.batch_rows(g as usize, BATCH_TARGET_BYTES, BATCH_SIZE)
             };
-            match store.reader_for_group(
+            match store.reader_for_group_cached(
                 g as usize,
                 batch_rows,
                 ranges.as_deref(),
                 Some(if boxes { box_proj_ref } else { proj_ref }),
+                cached.as_ref(),
             ) {
                 Ok(r) => Some(r),
                 Err(e) => {
@@ -4550,6 +4941,7 @@ fn build_geometry(
                         covering.as_ref().map(|c| &c.children),
                         style.map(|st| (box_style_pos.unwrap(), &st.binning, st.per_area)),
                         crs.is_latlong,
+                        err_ref,
                     )
                 } else {
                     process_batch(
@@ -4843,16 +5235,27 @@ fn process_box_batch(
     children: Option<&[String; 4]>,
     style: Option<(usize, &Binning, bool)>,
     crs_latlong: bool,
+    err: &Mutex<Option<String>>,
 ) -> usize {
     use arrow::array::{Array, Float64Array, StructArray};
     let n = batch.num_rows();
+    // The covering column is validated at open (`covering_column`), so
+    // anything failing here is the file contradicting its own footer, not
+    // a feature-level fault. Reporting it as N bad geometries drew an
+    // empty map and blamed the data; it is a decode error, and the load
+    // says so.
+    let fail = |what: String| -> usize {
+        let mut slot = err.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(what);
+        }
+        n
+    };
     let Some(children) = children else {
-        *bad += n;
-        return n;
+        return fail("box selection on a store with no covering column".into());
     };
     let Some(st) = batch.column(box_pos).as_any().downcast_ref::<StructArray>() else {
-        *bad += n;
-        return n;
+        return fail("covering column is not a struct".into());
     };
     let leaf = |name: &str| -> Option<Float64Array> {
         let col = st.column_by_name(name)?;
@@ -4866,8 +5269,10 @@ fn process_box_batch(
         leaf(&children[2]),
         leaf(&children[3]),
     ) else {
-        *bad += n;
-        return n;
+        return fail(format!(
+            "covering column: one of {:?} is missing or not numeric",
+            children
+        ));
     };
     let bins: Option<RowBins> = style.map(|(pos, binning, per_area)| match binning {
         Binning::Breaks(breaks) if per_area => RowBins::PerArea {
@@ -5306,6 +5711,279 @@ pub fn build_selection_for_test(
         })
         .collect();
     build_geometry(store, crs, display, None, sel, None, style).map(|(g, r, b, _, _)| (g, r, b))
+}
+
+/// The selection layer: what a scan does with a cancel flag, with null
+/// bbox leaves, and what a rebuild has to re-derive.
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use arrow::array::{ArrayRef, BinaryArray, Float64Array, StructArray};
+    use arrow::datatypes::{Field, Fields, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use std::fs::File;
+    use std::sync::atomic::AtomicBool;
+
+    fn wkb_point(x: f64, y: f64) -> Vec<u8> {
+        let mut b = vec![1u8];
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&x.to_le_bytes());
+        b.extend_from_slice(&y.to_le_bytes());
+        b
+    }
+
+    /// `n` points on a diagonal with a canonical covering column.
+    /// `holes(i)` decides which of the four leaves row `i` nulls out
+    /// (None = a complete box).
+    fn write(
+        path: &std::path::Path,
+        n: usize,
+        holes: impl Fn(usize) -> Option<usize>,
+    ) -> FeatureStore {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {
+                "encoding": "WKB",
+                "geometry_types": ["Point"],
+                "bbox": [0.0, 0.0, 100.0, 100.0],
+                "covering": {"bbox": {
+                    "xmin": ["bbox", "xmin"],
+                    "ymin": ["bbox", "ymin"],
+                    "xmax": ["bbox", "xmax"],
+                    "ymax": ["bbox", "ymax"],
+                }},
+            }},
+        });
+        let bbox_fields: Fields = ["xmin", "ymin", "xmax", "ymax"]
+            .iter()
+            .map(|k| Field::new(*k, DataType::Float64, true))
+            .collect::<Vec<_>>()
+            .into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("bbox", DataType::Struct(bbox_fields.clone()), true),
+        ]));
+        let mut geoms: Vec<Vec<u8>> = Vec::with_capacity(n);
+        let mut leaves: [Vec<Option<f64>>; 4] = Default::default();
+        for i in 0..n {
+            // Spread over [0, 100]: a small rect selects a few rows.
+            let v = i as f64 * 100.0 / n as f64;
+            geoms.push(wkb_point(v, v));
+            let hole = holes(i);
+            for (k, out) in leaves.iter_mut().enumerate() {
+                out.push((hole != Some(k)).then_some(v));
+            }
+        }
+        let cols: Vec<ArrayRef> = leaves
+            .iter()
+            .map(|v| Arc::new(Float64Array::from(v.clone())) as ArrayRef)
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(geoms.iter())),
+                Arc::new(StructArray::try_new(bbox_fields, cols, None).unwrap()),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(256))
+            .build();
+        let mut w =
+            ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(props)).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        open_store_for_test(&path.to_path_buf()).unwrap().0
+    }
+
+    /// A partly-null covering box is not a box.
+    ///
+    /// Only `xmin` was null-checked, so a row whose `ymax` was null
+    /// compared against whatever `value()` returns for a null slot (0.0)
+    /// and got selected as if it sat on the equator. `process_box_batch`
+    /// checked all four and skipped the same row, so the selection and
+    /// the drawing disagreed about which features exist.
+    #[test]
+    fn a_covering_box_missing_any_leaf_is_not_selected() {
+        let dir = std::env::temp_dir().join(format!("geopq_sel_null_{}", std::process::id()));
+        // Rows 0..4 each null one leaf; the rest are complete.
+        let store = write(&dir.join("nulls.parquet"), 256, |i| (i < 4).then_some(i));
+        // A rect at the origin, where a row whose missing leaf were read
+        // as 0.0 would land. Rows sit at v = i * 100/256, so rows 0..=6
+        // are inside it — and rows 0..4 each have a hole.
+        let ranges = covering_select(&store, 0, [-1.0, -1.0, 2.5, 2.5], never_cancelled())
+            .unwrap()
+            .expect("covering store");
+        let selected: Vec<u32> = ranges.iter().flat_map(|&(s, e)| s..e).collect();
+        assert_eq!(
+            selected,
+            vec![4, 5, 6],
+            "only the rows with a complete box may be selected"
+        );
+    }
+
+    /// A scan is a series of range requests on a remote source, and a
+    /// camera that has moved on should not wait for the one it started.
+    #[test]
+    fn a_cancelled_scan_stops_instead_of_finishing() {
+        let dir = std::env::temp_dir().join(format!("geopq_sel_cancel_{}", std::process::id()));
+        let store = write(&dir.join("plain.parquet"), 2048, |_| None);
+        assert!(store.rg_starts().len() - 1 > 1, "several row groups to walk");
+        let rect = [0.0, 0.0, 100.0, 100.0];
+
+        // Set before the scan starts: the first batch check trips.
+        let cancel = AtomicBool::new(true);
+        let err = covering_select(&store, 0, rect, &cancel).expect_err("must not finish");
+        assert_eq!(err, CANCELLED);
+
+        // The same store, uncancelled, does finish — so the check is what
+        // stopped it, not a broken fixture.
+        let ranges = covering_select(&store, 0, rect, never_cancelled())
+            .unwrap()
+            .expect("covering store");
+        assert_eq!(ranges, vec![(0, 256)]);
+
+        // Every selector path honours it, including the two that do not
+        // go through a covering column.
+        let mut plain = store.clone();
+        plain.covering = None;
+        let err = covering_select(&plain, 0, rect, &cancel).expect_err("wkb scan must stop");
+        assert_eq!(err, CANCELLED);
+    }
+
+    /// A rebuild replays each group's decode state. Re-emitting a
+    /// rect-filtered preview or box group as an unresolved `Preview` /
+    /// `Boxes` made the worker re-run the covering scan for it — every
+    /// group, every projection change, every style change.
+    #[test]
+    fn a_rebuild_replays_a_resolved_selection_without_rescanning() {
+        let starts = [0u64, 100, 200];
+        let ranges = vec![(0u32, 10u32), (20, 30)];
+        let loaded = vec![
+            GroupLoad::Preview {
+                stride: 4,
+                rect: Some([0.0, 0.0, 1.0, 1.0]),
+                ranges: Some(ranges.clone()),
+            },
+            GroupLoad::Boxes {
+                rect: Some([0.0, 0.0, 1.0, 1.0]),
+                ranges: Some(ranges.clone()),
+            },
+        ];
+        let sel = rebuild_selection(&loaded, &starts, false);
+        match &sel[0] {
+            GroupSel::ResolvedPreview { group, stride, ranges: r, .. } => {
+                assert_eq!((*group, *stride), (0, 4));
+                assert_eq!(r.as_ref().unwrap(), &ranges);
+            }
+            other => panic!("a resolved preview must stay resolved, got {other:?}"),
+        }
+        match &sel[1] {
+            GroupSel::ResolvedBoxes { group, ranges: r, .. } => {
+                assert_eq!(*group, 1);
+                assert_eq!(r.as_ref().unwrap(), &ranges);
+            }
+            other => panic!("a resolved box group must stay resolved, got {other:?}"),
+        }
+        // A state from before the scan (no ranges) still re-resolves
+        // rather than silently widening to the whole group.
+        let loaded = vec![GroupLoad::Boxes {
+            rect: Some([0.0, 0.0, 1.0, 1.0]),
+            ranges: None,
+        }];
+        assert!(matches!(
+            rebuild_selection(&loaded, &starts, false)[0],
+            GroupSel::ResolvedBoxes { ranges: None, .. }
+        ));
+    }
+
+    /// Which row groups are candidates and how each one is read are two
+    /// questions. A file with a covering column but no row-group boxes
+    /// (nothing to prune with) used to lose per-feature selection too,
+    /// which is exactly the file where the covering column earns most.
+    #[test]
+    fn a_rect_still_filters_when_there_are_no_row_group_boxes() {
+        let dir = std::env::temp_dir().join(format!("geopq_sel_norg_{}", std::process::id()));
+        let store = write(&dir.join("plain.parquet"), 512, |_| None);
+        let rect = [0.0, 0.0, 10.0, 10.0];
+        let sel = plan_viewport_selection(&store, "t", None, Some(rect), None, "test");
+        assert_eq!(sel.len(), store.rg_starts().len() - 1, "every group is a candidate");
+        assert!(
+            sel.iter().all(|s| matches!(s, GroupSel::Rect(_, _))),
+            "the rect must still filter within each group: {sel:?}"
+        );
+        // With boxes and a viewport that contains the whole extent, the
+        // scan is skipped as before.
+        let boxes = vec![[0.0, 0.0, 100.0, 100.0]; sel.len()];
+        let sel = plan_viewport_selection(
+            &store,
+            "t",
+            Some(&boxes),
+            Some([-1.0, -1.0, 200.0, 200.0]),
+            None,
+            "test",
+        );
+        assert!(sel.iter().all(|s| matches!(s, GroupSel::All(_))), "{sel:?}");
+    }
+
+    /// The opener fan-outs block on round trips, not on cores, so they
+    /// run on their own pool: wide enough that a 60-part collection does
+    /// not resolve four parts at a time on a laptop, bounded so it cannot
+    /// open hundreds of sockets, and separate so those waits do not sit
+    /// in front of tessellation on the global pool.
+    #[test]
+    fn network_fan_outs_get_their_own_bounded_pool() {
+        let n = io_pool().current_num_threads();
+        assert!((4..=32).contains(&n), "io pool width {n}");
+        assert!(
+            n >= rayon::current_num_threads().min(4),
+            "the io pool must not be narrower than the compute pool"
+        );
+        // Work submitted to it really runs there, not on the global pool.
+        let inside = io_pool().install(|| {
+            use rayon::prelude::*;
+            (0..64)
+                .into_par_iter()
+                .map(|_| {
+                    std::thread::current()
+                        .name()
+                        .is_some_and(|t| t.starts_with("geopq-io-"))
+                })
+                .all(|b| b)
+        });
+        assert!(inside, "installed work must run on the io pool's threads");
+    }
+
+    /// `norm_bin` counts breaks into a `u8`. Casting before clamping
+    /// wrapped a top-bin feature back to bin 0 — the darkest class
+    /// rendered as the "no data" one.
+    #[test]
+    fn a_bin_index_is_clamped_before_it_is_narrowed() {
+        use crate::data::layer::STYLE_BINS;
+        // More breaks than a byte holds: every one of them is below the
+        // value, so the raw count is 300.
+        let breaks: Vec<f64> = (0..300).map(|i| i as f64).collect();
+        assert_eq!(norm_bin(1e9, 1.0, &breaks), (STYLE_BINS - 1) as u8);
+        assert_eq!(
+            batch_bins(
+                &(Arc::new(Float64Array::from(vec![1e9])) as ArrayRef),
+                &Binning::Breaks(breaks.clone()),
+            ),
+            vec![(STYLE_BINS - 1) as u8]
+        );
+        // The ordinary range is unchanged.
+        let breaks = vec![1.0, 2.0, 3.0];
+        assert_eq!(norm_bin(0.5, 1.0, &breaks), 0);
+        assert_eq!(norm_bin(2.5, 1.0, &breaks), 2);
+        assert_eq!(norm_bin(9.0, 1.0, &breaks), 3);
+    }
 }
 
 #[cfg(test)]
@@ -5749,7 +6427,7 @@ mod pruning_tests {
         assert_eq!(bad, 0);
         for (_, st) in &resolved {
             assert!(
-                matches!(st, GroupLoad::Boxes { rect: None }),
+                matches!(st, GroupLoad::Boxes { rect: None, .. }),
                 "expected a box state, got {st:?}"
             );
             // A box state never satisfies a viewport, so zooming refines it.
@@ -5836,7 +6514,7 @@ mod pruning_tests {
             // Its bbox met the viewport, none of its features did. This
             // is the state that used to vanish.
             GroupLoad::Rows { ranges: Vec::new(), rect: [0.0; 4] },
-            GroupLoad::Boxes { rect: None },
+            GroupLoad::Boxes { rect: None, ranges: None },
             GroupLoad::Full,
             GroupLoad::None,
         ];
@@ -5907,6 +6585,7 @@ mod pruning_tests {
             "xmax".to_string(),
             "ymax".to_string(),
         ];
+        let err: Mutex<Option<String>> = Mutex::new(None);
         let rows = process_box_batch(
             &batch,
             &RowMap::Contiguous(0),
@@ -5921,9 +6600,11 @@ mod pruning_tests {
             Some(&children),
             None,
             true,
+            &err,
         );
         assert_eq!(rows, 3, "every row is accounted for");
         assert_eq!(bad, 0, "a missing box is not a failure");
+        assert!(err.lock().unwrap().is_none(), "and not a decode error either");
         assert_eq!(items.len(), 2, "the two real features are drawn and pickable");
     }
 
@@ -6601,6 +7282,106 @@ mod pruning_tests {
         let selected: u32 = ranges.iter().map(|(s, e)| e - s).sum();
         assert_eq!(rows_c as u32, n - selected);
         assert!(matches!(resolved_c[0].1, GroupLoad::Full));
+    }
+
+    /// A rect refinement on a file with no covering column resolves by
+    /// scanning the geometry column's envelopes, then decodes the rows it
+    /// chose — out of the same column. Those bytes must be paid for once.
+    ///
+    /// They were paid for twice: the scan streamed the whole chunk to
+    /// decide, then `reader_for_group` opened a fresh reader and
+    /// downloaded it again. On a remote source that is the dominant cost
+    /// of every camera settle.
+    #[test]
+    fn a_remote_rect_refinement_reads_the_geometry_column_once() {
+        use arrow::array::BinaryArray;
+        use arrow::datatypes::{Field, Schema};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        use std::sync::atomic::Ordering as O;
+
+        let dir = std::env::temp_dir().join(format!("geopq_reuse_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.parquet");
+
+        // Plain WKB, no `covering` block: the envelope scan is the
+        // selector, and it reads the column the decode wants.
+        let n = 20_000usize;
+        let geo = serde_json::json!({
+            "version": "1.0.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {"encoding": "WKB", "geometry_types": ["Point"]}},
+        });
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "geometry",
+            DataType::Binary,
+            false,
+        )]));
+        let wkbs: Vec<Vec<u8>> = (0..n)
+            .map(|i| {
+                let mut b = vec![1u8];
+                b.extend_from_slice(&1u32.to_le_bytes());
+                b.extend_from_slice(&((i % 200) as f64 * 0.5).to_le_bytes());
+                b.extend_from_slice(&((i / 200) as f64 * 0.5).to_le_bytes());
+                b
+            })
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(BinaryArray::from_iter_values(wkbs.iter()))],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(n))
+            .build();
+        let mut w =
+            ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, Some(props))
+                .unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let server = crate::data::source::testserver::spawn(path.clone());
+        let remote = Source::remote(&server.url).unwrap();
+        let (store, crs, _info, _rg) = open_store(&remote).unwrap();
+        assert!(store.covering.is_none(), "the envelope scan is the selector here");
+        assert_eq!(store.rg_starts().len() - 1, 1, "one group keeps the accounting simple");
+
+        // What the geometry column of that group actually weighs on disk.
+        let chunk: u64 = store.fragments[0]
+            .meta
+            .metadata()
+            .row_group(0)
+            .columns()
+            .iter()
+            .map(|c| c.compressed_size().max(0) as u64)
+            .sum();
+
+        let before = server.bytes_served.load(O::SeqCst);
+        let rect = [0.0, 0.0, 10.0, 10.0];
+        let display = crate::data::crs::DisplayCrs::hobo_dyer();
+        let (_g, rows, bad, _rg, _res) = build_geometry(
+            &store,
+            &crs,
+            &display,
+            None,
+            vec![GroupSel::Rect(0, rect)],
+            None,
+            None,
+        )
+        .unwrap();
+        let moved = server.bytes_served.load(O::SeqCst) - before;
+        assert!(rows > 0 && rows < n, "a real subset was selected: {rows}");
+        assert_eq!(bad, 0);
+        eprintln!("rect refinement moved {moved} B for a {chunk} B chunk ({rows} rows)");
+        assert!(
+            moved <= chunk * 12 / 10,
+            "the geometry column was fetched more than once: {moved} B for a {chunk} B chunk"
+        );
     }
 
     /// Remote loading over HTTP range requests must produce exactly the
@@ -7365,7 +8146,7 @@ mod hive_tests {
     /// with an all-null covering and no `bbox` in `geo` when it is not.
     /// The second shape is what adaptive H3 writes into
     /// `h3=__HIVE_DEFAULT_PARTITION__`, and it is the case under test.
-    fn write_covering_part(path: &std::path::Path, n: usize, cx: f64, cy: f64, extent: bool) {
+    pub(super) fn write_covering_part(path: &std::path::Path, n: usize, cx: f64, cy: f64, extent: bool) {
         use arrow::array::{ArrayRef, Float64Array, StructArray};
         use arrow::datatypes::Fields;
 
@@ -7501,6 +8282,173 @@ mod hive_tests {
     }
 }
 
+/// A `covering` block is metadata, and metadata can be wrong. These pin
+/// what happens when it does not describe the file it is in.
+#[cfg(test)]
+mod covering_validation_tests {
+    use super::*;
+    use arrow::array::{ArrayRef, BinaryArray, Float64Array, StringArray, StructArray};
+    use arrow::datatypes::{Field, Fields, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use std::fs::File;
+
+    fn wkb_point(x: f64, y: f64) -> Vec<u8> {
+        let mut b = vec![1u8];
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&x.to_le_bytes());
+        b.extend_from_slice(&y.to_le_bytes());
+        b
+    }
+
+    /// Points plus a `covering` block naming the column `cov_col`, whose
+    /// actual shape is chosen by `shape`.
+    fn write(path: &std::path::Path, n: usize, shape: &str) {
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {
+                "encoding": "WKB",
+                "geometry_types": ["Point"],
+                "bbox": [0.0, 0.0, 1.0, 1.0],
+                "covering": {"bbox": {
+                    "xmin": ["bbox", "xmin"],
+                    "ymin": ["bbox", "ymin"],
+                    "xmax": ["bbox", "xmax"],
+                    "ymax": ["bbox", "ymax"],
+                }},
+            }},
+        });
+        let xs: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
+        let geoms: Vec<Vec<u8>> = xs.iter().map(|&x| wkb_point(x, x)).collect();
+        // The declared covering root, built three ways.
+        let (cov_field, cov_array): (Field, ArrayRef) = match shape {
+            // Not a struct at all: a plain float column named "bbox".
+            "not_a_struct" => (
+                Field::new("bbox", DataType::Float64, true),
+                Arc::new(Float64Array::from(xs.clone())),
+            ),
+            // A struct, but one leaf short.
+            "missing_child" => {
+                let f: Fields = vec![
+                    Field::new("xmin", DataType::Float64, true),
+                    Field::new("ymin", DataType::Float64, true),
+                    Field::new("xmax", DataType::Float64, true),
+                ]
+                .into();
+                let col = || Arc::new(Float64Array::from(xs.clone())) as ArrayRef;
+                (
+                    Field::new("bbox", DataType::Struct(f.clone()), true),
+                    Arc::new(StructArray::try_new(f, vec![col(), col(), col()], None).unwrap()),
+                )
+            }
+            // A struct with all four names, but they hold text.
+            "text_children" => {
+                let f: Fields = ["xmin", "ymin", "xmax", "ymax"]
+                    .iter()
+                    .map(|n| Field::new(*n, DataType::Utf8, true))
+                    .collect::<Vec<_>>()
+                    .into();
+                let col = || {
+                    Arc::new(StringArray::from(
+                        xs.iter().map(|v| v.to_string()).collect::<Vec<_>>(),
+                    )) as ArrayRef
+                };
+                (
+                    Field::new("bbox", DataType::Struct(f.clone()), true),
+                    Arc::new(
+                        StructArray::try_new(f, vec![col(), col(), col(), col()], None).unwrap(),
+                    ),
+                )
+            }
+            other => panic!("unknown shape {other}"),
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            cov_field,
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(geoms.iter())),
+                cov_array,
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(64))
+            .build();
+        let mut w =
+            ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(props)).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    /// A covering the file does not actually carry is not adopted.
+    ///
+    /// Adopting it split the file's behaviour in two, both wrong: a rect
+    /// selection failed the load with "covering column is not a struct",
+    /// while a box build counted every feature as a bad geometry and drew
+    /// an empty map. The geometry column is right there and always works.
+    #[test]
+    fn a_covering_that_does_not_match_the_file_is_not_adopted() {
+        let dir = std::env::temp_dir().join(format!("geopq_cov_bad_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for shape in ["not_a_struct", "missing_child", "text_children"] {
+            let path = dir.join(format!("{shape}.parquet"));
+            write(&path, 128, shape);
+            let (store, crs, _info, _rg) = open_store_for_test(&path).unwrap();
+            assert!(
+                store.covering.is_none(),
+                "{shape}: a covering that does not validate must not be adopted"
+            );
+
+            // The file still renders, from its geometry: a rect selection
+            // resolves through the WKB envelope scan instead.
+            let rect = [0.0, 0.0, 0.2, 0.2];
+            let ranges = covering_select(&store, 0, rect, never_cancelled())
+                .unwrap_or_else(|e| panic!("{shape}: rect selection failed: {e}"))
+                .expect("wkb stores always have a selector");
+            let selected: u32 = ranges.iter().map(|(a, b)| b - a).sum();
+            assert!(selected > 0 && selected < 64, "{shape}: {ranges:?}");
+
+            let display = crate::data::crs::DisplayCrs::hobo_dyer();
+            let (geom, rows, bad, _rg, _st) = build_geometry(
+                &store,
+                &crs,
+                &display,
+                None,
+                all_groups(&store),
+                None,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{shape}: build failed: {e}"));
+            assert_eq!(rows, 128, "{shape}");
+            assert_eq!(bad, 0, "{shape}: nothing is a bad geometry here");
+            assert!(geom.bounds_world[0].is_finite(), "{shape}: the layer has bounds");
+        }
+    }
+
+    /// The well-formed twin of the above: a covering that does describe
+    /// the file is still adopted, so the validation is not refusing
+    /// everything.
+    #[test]
+    fn a_well_formed_covering_is_still_adopted() {
+        let dir = std::env::temp_dir().join(format!("geopq_cov_ok_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("good.parquet");
+        // `write_covering_part` writes the canonical shape.
+        super::hive_tests::write_covering_part(&path, 128, 10.0, 45.0, true);
+        let (store, _crs, _info, _rg) = open_store_for_test(&path).unwrap();
+        let cov = store.covering.as_ref().expect("a valid covering is adopted");
+        assert_eq!(cov.children, ["xmin", "ymin", "xmax", "ymax"].map(String::from));
+    }
+}
+
 #[cfg(test)]
 mod native_2_0_tests {
     use super::*;
@@ -7595,7 +8543,7 @@ mod native_2_0_tests {
         // Grid spans x 2.00..2.15, y 48.00..48.15; select the lower-left
         // quadrant (8 columns x 8 rows of the 16x16 grid).
         let rect = [1.99, 47.99, 2.074, 48.074];
-        let ranges = covering_select(&store, 0, rect).unwrap().expect("scan supported");
+        let ranges = covering_select(&store, 0, rect, never_cancelled()).unwrap().expect("scan supported");
         let selected: u32 = ranges.iter().map(|(a, b)| b - a).sum();
         assert_eq!(selected, 64, "{ranges:?}");
         // And the planner uses Rect for a sub-extent viewport.
@@ -7962,6 +8910,193 @@ mod stac_tests {
         assert!(info.files >= 1);
         assert!(rg_meta.is_some(), "covering stats expected on Overture");
     }
+
+    /// A part with a STAC bbox but no extent inside the file (no
+    /// row-group boxes, no `geo` bbox) must still join the layer.
+    ///
+    /// It used to void the whole append pass: `boxes_ok` went false, the
+    /// pass ended with "no parts to add", and — because the part never
+    /// entered the store — the next camera settle scored it again,
+    /// presigned it again, fetched its footer again and aborted again,
+    /// for as long as the layer stayed open. The two settles here are the
+    /// regression: the second must add nothing *because the first added
+    /// it*, not because it failed the same way twice.
+    #[test]
+    fn a_bbox_less_part_joins_the_layer_instead_of_voiding_the_pass() {
+        use std::sync::atomic::AtomicBool;
+
+        let root =
+            std::env::temp_dir().join(format!("geopq_stac_noextent_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // `west` describes itself; `east` does not (no geo bbox, and its
+        // single row group's statistics say nothing about geometry).
+        write_part(&root.join("west.parquet"), 200, -10.0, 45.0);
+        write_part_without_extent(&root.join("east.parquet"), 300, 10.0, 45.0);
+        write_json(
+            &root,
+            "collection.json",
+            r#"{"links": [
+                {"rel": "item", "href": "./items/west.json"},
+                {"rel": "item", "href": "./items/east.json"}
+            ]}"#
+            .into(),
+        );
+        let base = crate::data::source::testserver::spawn_dir(root.clone());
+        // Both Items carry a bbox — the collection knows where the part
+        // is even though the file does not say so itself.
+        for (name, bbox, rows) in [
+            ("west", "[-11.0, 44.0, -9.0, 46.0]", 200),
+            ("east", "[9.0, 44.0, 11.0, 46.0]", 300),
+        ] {
+            write_json(
+                &root,
+                &format!("items/{name}.json"),
+                format!(
+                    r#"{{"bbox": {bbox}, "properties": {{"num_rows": {rows}}},
+                        "assets": {{"aws": {{"href": "{base}/{name}.parquet"}}}}}}"#
+                ),
+            );
+        }
+        let source = Source::Stac {
+            url: format!("{base}/collection.json"),
+            name: "parts".into(),
+        };
+
+        // Open on the west part only.
+        let west_view = ViewHint { rect: [-12.0, 43.0, -8.0, 47.0], view_px: 1600.0 };
+        let (store, crs, _info, _rg) =
+            open_store_with_view(&source, Some(west_view)).unwrap();
+        assert_eq!(store.fragments.len(), 1, "only the west part is in view");
+
+        // Pan east: one settle, one append pass.
+        let settle = |store: Arc<FeatureStore>| -> (Vec<LoadMsg>, Option<Arc<FeatureStore>>) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let handle = LoaderHandle {
+                tx,
+                egui_ctx: eframe::egui::Context::default(),
+            };
+            spawn_part_append(
+                handle,
+                1,
+                1,
+                store,
+                crs.clone(),
+                crate::data::crs::DisplayCrs::hobo_dyer(),
+                [9.0, 44.0, 11.0, 46.0],
+                false,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                None,
+            );
+            let mut msgs = Vec::new();
+            let mut grown = None;
+            // The thread ends with either PartsOpened + Appended(done) or
+            // a single AppendEnded.
+            while let Ok(m) = rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                let stop = match &m {
+                    LoadMsg::PartsOpened { store, .. } => {
+                        grown = Some(store.clone());
+                        false
+                    }
+                    LoadMsg::Appended { done, .. } => *done,
+                    LoadMsg::AppendEnded { .. } => true,
+                    _ => false,
+                };
+                msgs.push(m);
+                if stop {
+                    break;
+                }
+            }
+            (msgs, grown)
+        };
+
+        let (msgs, grown) = settle(Arc::new(store));
+        let grown = grown.unwrap_or_else(|| {
+            panic!(
+                "the bbox-less part must join the store, got {:?}",
+                msgs.iter()
+                    .map(|m| match m {
+                        LoadMsg::AppendEnded { error, .. } => error.clone(),
+                        _ => "(other)".into(),
+                    })
+                    .collect::<Vec<_>>()
+            )
+        });
+        assert_eq!(grown.fragments.len(), 2, "the east part is open");
+        assert_eq!(grown.total_rows(), 500);
+        // Its groups got empty boxes, index-aligned with the rest.
+        let added = msgs.iter().find_map(|m| match m {
+            LoadMsg::PartsOpened { added_boxes, added_groups, .. } => {
+                Some((added_boxes.clone(), *added_groups))
+            }
+            _ => None,
+        });
+        let (added_boxes, added_groups) = added.unwrap();
+        assert_eq!(added_boxes.len(), added_groups, "one box per appended group");
+        assert!(
+            added_boxes.iter().all(|b| b == &EMPTY_BBOX),
+            "a part describing no extent gets empty boxes: {added_boxes:?}"
+        );
+        // And rows really arrived.
+        let appended: usize = msgs
+            .iter()
+            .map(|m| match m {
+                LoadMsg::Appended { rows, .. } => *rows,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(appended, 300, "the appended part's rows are on the map");
+
+        // Second settle at the same viewport: nothing left to add,
+        // because the part is in `part_urls()` now.
+        let (msgs, grown_again) = settle(grown);
+        assert!(grown_again.is_none(), "no part is opened twice");
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                LoadMsg::AppendEnded { error, .. } if error == NOTHING_TO_APPEND
+            )),
+            "the second pass has nothing to do"
+        );
+    }
+
+    /// A part that describes no extent at all: no `bbox` in `geo`, and a
+    /// geometry column whose statistics carry no spatial information.
+    fn write_part_without_extent(path: &std::path::Path, n: usize, cx: f64, cy: f64) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let geo = serde_json::json!({
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {"encoding": "WKB", "geometry_types": ["Point"]}},
+        });
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let wkbs: Vec<Vec<u8>> = (0..n)
+            .map(|i| wkb_point(cx + (i % 10) as f64 * 0.01, cy + (i / 10) as f64 * 0.01))
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(wkbs.iter())),
+                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(128))
+            .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
+            .build();
+        let mut w =
+            ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(props)).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            geo.to_string(),
+        ));
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -8051,7 +9186,7 @@ mod xy_tests {
         // only in-rect rows of a group are selected, so lat-ordered
         // row groups don't decode as world-wide strips.
         let rect = [-70.95, 42.05, -70.9, 42.1];
-        let ranges = covering_select(&store, 0, rect)
+        let ranges = covering_select(&store, 0, rect, never_cancelled())
             .unwrap()
             .expect("x/y stores have an exact covering");
         let selected: u32 = ranges.iter().map(|(s, e)| e - s).sum();
@@ -8082,9 +9217,9 @@ mod xy_tests {
         assert_eq!(rows_prev, expect_prev);
         assert!(resolved
             .iter()
-            .all(|(_, st)| matches!(st, GroupLoad::Preview { stride: 4, rect: None })));
+            .all(|(_, st)| matches!(st, GroupLoad::Preview { stride: 4, rect: None, .. })));
         assert!(
-            !GroupLoad::Preview { stride: 4, rect: None }.covers([0.0, 0.0, 1.0, 1.0])
+            !GroupLoad::Preview { stride: 4, rect: None, ranges: None }.covers([0.0, 0.0, 1.0, 1.0])
         );
 
         // Data-driven styling: graduated bins on the id column spread
@@ -8188,6 +9323,92 @@ mod xy_tests {
             .unwrap()
             .value(0);
         assert_eq!(x, lons[21]);
+    }
+
+    /// Write a plain table of the given float columns (no geo metadata).
+    fn write_table(path: &std::path::Path, cols: Vec<(&str, Vec<f64>)>) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let fields: Vec<Field> = cols
+            .iter()
+            .map(|(n, _)| Field::new(*n, DataType::Float64, false))
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+        let arrays: Vec<arrow::array::ArrayRef> = cols
+            .iter()
+            .map(|(_, v)| Arc::new(Float64Array::from(v.clone())) as arrow::array::ArrayRef)
+            .collect();
+        let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(128))
+            .build();
+        let mut w =
+            ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    /// Bare `x`/`y` columns are adopted as CRS84 degrees, which is a
+    /// claim about their values — so it has to be checked against them.
+    ///
+    /// A projected table (Lambert-93 metres, say) has `x` and `y` too,
+    /// and adopting those put the layer 600,000 degrees east of anywhere.
+    /// The columns' own min/max statistics say so for free.
+    #[test]
+    fn projected_x_y_columns_are_not_taken_for_degrees() {
+        let dir = std::env::temp_dir().join(format!("geopq_xy_proj_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Lambert-93 metres around Toulouse.
+        let n = 256usize;
+        let xs: Vec<f64> = (0..n).map(|i| 574_000.0 + i as f64).collect();
+        let ys: Vec<f64> = (0..n).map(|i| 6_279_000.0 + i as f64).collect();
+        let path = dir.join("metres.parquet");
+        write_table(&path, vec![("x", xs), ("y", ys)]);
+        let Err(err) = open_store(&Source::Local(path)) else {
+            panic!("metres must not open as a degree grid");
+        };
+        assert!(err.contains("no lon/lat or x/y coordinate columns"), "{err}");
+
+        // The same file in degrees still opens.
+        let xs: Vec<f64> = (0..n).map(|i| 1.4 + i as f64 * 0.001).collect();
+        let ys: Vec<f64> = (0..n).map(|i| 43.6 + i as f64 * 0.001).collect();
+        let path = dir.join("degrees.parquet");
+        write_table(&path, vec![("x", xs), ("y", ys)]);
+        let (store, _crs, _info, _rg) = open_store(&Source::Local(path)).unwrap();
+        assert_eq!(store.xy_geom, Some((0, 1)), "x/y in range are still adopted");
+    }
+
+    /// A named coordinate column beats a bare one, whichever the schema
+    /// lists first. `find` used to scan the schema once per name group
+    /// and take the first field matching *any* spelling, so a table with
+    /// `x` before `lon` synthesized its points from the wrong column.
+    #[test]
+    fn named_lon_lat_win_over_bare_x_y() {
+        let dir = std::env::temp_dir().join(format!("geopq_xy_named_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let n = 256usize;
+        // `x`/`y` hold something else entirely (still in range, so the
+        // value gate alone would not settle it).
+        let noise: Vec<f64> = (0..n).map(|i| (i % 7) as f64).collect();
+        let lons: Vec<f64> = (0..n).map(|i| 1.4 + i as f64 * 0.001).collect();
+        let lats: Vec<f64> = (0..n).map(|i| 43.6 + i as f64 * 0.001).collect();
+        let path = dir.join("both.parquet");
+        write_table(
+            &path,
+            vec![
+                ("x", noise.clone()),
+                ("y", noise),
+                ("lon", lons.clone()),
+                ("lat", lats.clone()),
+            ],
+        );
+        let (store, _crs, _info, _rg) = open_store(&Source::Local(path)).unwrap();
+        assert_eq!(store.xy_geom, Some((2, 3)), "lon/lat, not x/y");
+        let geoms = store.fetch_geoms(&[0, 255]).unwrap();
+        let geo_types::Geometry::Point(p) = geoms[0].1.clone().unwrap() else {
+            panic!("expected a point");
+        };
+        assert_eq!((p.x(), p.y()), (lons[0], lats[0]));
     }
 }
 
@@ -8304,7 +9525,7 @@ mod preview_rect_tests {
         assert_eq!(rows, expected.len(), "only in-rect decimated rows decode");
         assert_eq!(resolved.len(), 1);
         match &resolved[0] {
-            (0, GroupLoad::Preview { stride: s, rect: r }) => {
+            (0, GroupLoad::Preview { stride: s, rect: r, .. }) => {
                 assert_eq!(*s, stride);
                 assert_eq!(*r, Some(rect), "resolved state must keep the rect");
             }

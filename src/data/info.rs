@@ -132,16 +132,24 @@ pub fn summarize_geo_meta(
                         .collect();
                 }
                 if let Some(bbox) = col.get("bbox").and_then(Value::as_array) {
-                    let v: Vec<f64> = bbox.iter().filter_map(Value::as_f64).collect();
+                    // Every element must be a number, or the box is not
+                    // one. Dropping the ones that are not (a stringified
+                    // "-5.0", a null) would re-index the rest and hand
+                    // row-group pruning a box shifted by a slot — which
+                    // prunes away real data rather than failing loudly.
+                    let v: Option<Vec<f64>> = bbox.iter().map(Value::as_f64).collect();
                     // 6 elements = 3D per spec: [xmin, ymin, zmin, xmax,
                     // ymax, zmax]. Taking the first four would put zmin/
                     // xmax into the xmax/ymax slots (and this bbox feeds
                     // row-group pruning as a fallback).
-                    if v.len() >= 6 {
-                        info.bbox = Some([v[0], v[1], v[3], v[4]]);
-                    } else if v.len() >= 4 {
-                        info.bbox = Some([v[0], v[1], v[2], v[3]]);
-                    }
+                    info.bbox = v.and_then(|v| match v.len() {
+                        6 => Some([v[0], v[1], v[3], v[4]]),
+                        4 => Some([v[0], v[1], v[2], v[3]]),
+                        _ => None,
+                    })
+                    .filter(|b| {
+                        b.iter().all(|c| c.is_finite()) && b[0] <= b[2] && b[1] <= b[3]
+                    });
                 }
                 if let Some(cov) = col.get("covering") {
                     // Human summary instead of the raw JSON: the column the
@@ -203,5 +211,33 @@ mod tests {
             meta("[-5.0, 41.0, 0.0, 10.0, 51.0, 200.0]").bbox,
             Some([-5.0, 41.0, 10.0, 51.0])
         );
+    }
+
+    /// A bbox that is not four (or six) numbers is no bbox at all.
+    /// Skipping the non-numeric elements re-indexed the rest, so a
+    /// stringified xmin silently produced [ymin, xmax, ymax, ?] — and
+    /// this box is a row-group pruning fallback, so a shifted one prunes
+    /// away data that is really in view.
+    #[test]
+    fn a_malformed_bbox_is_rejected_rather_than_re_indexed() {
+        let meta = |bbox: &str| -> GeoParquetInfo {
+            let m: Value = serde_json::from_str(&format!(
+                r#"{{"version":"1.0.0","primary_column":"geometry",
+                     "columns":{{"geometry":{{"encoding":"WKB","bbox":{bbox}}}}}}}"#
+            ))
+            .unwrap();
+            summarize_geo_meta(Some(&m), "geometry", "WGS 84", false)
+        };
+        // A stringified xmin used to shift every other element down one.
+        assert_eq!(meta(r#"["-5.0", 41.0, 10.0, 51.0]"#).bbox, None);
+        assert_eq!(meta("[null, 41.0, 10.0, 51.0]").bbox, None);
+        // Too few / too many elements.
+        assert_eq!(meta("[-5.0, 41.0, 10.0]").bbox, None);
+        assert_eq!(meta("[-5.0, 41.0, 0.0, 10.0, 51.0]").bbox, None);
+        // Non-finite and inverted boxes are not usable either.
+        assert_eq!(meta(r#"[-5.0, 41.0, 10.0, "NaN"]"#).bbox, None);
+        assert_eq!(meta("[10.0, 41.0, -5.0, 51.0]").bbox, None);
+        // The well-formed one still passes.
+        assert_eq!(meta("[-5.0, 41.0, 10.0, 51.0]").bbox, Some([-5.0, 41.0, 10.0, 51.0]));
     }
 }

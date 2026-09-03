@@ -10,12 +10,18 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use bytes::Bytes;
+
 /// The last window a streaming read fetched: its start offset and bytes,
 /// shared between the reader that filled it and the bounded reads that
 /// can be served from it.
-type WindowCache = Arc<Mutex<Option<(u64, Arc<Vec<u8>>)>>>;
-
-use bytes::Bytes;
+///
+/// `Bytes` rather than `Arc<Vec<u8>>` so both the streaming cursor and the
+/// bounded read take refcounted slices of the one buffer: with a `Vec`
+/// every window was copied once into the cursor and again per served
+/// read, which on an 8 MB window is the window's own size in memcpy per
+/// page header.
+type WindowCache = Arc<Mutex<Option<(u64, Bytes)>>>;
 use parquet::errors::{ParquetError, Result as PqResult};
 use parquet::file::reader::{ChunkReader, Length};
 
@@ -121,7 +127,10 @@ impl Source {
                 url,
                 ..
             } if url.is_empty() => {
-                let url = aws::presign(&uri, profile.as_deref(), endpoint.as_deref())?;
+                // Through the cache, so the reader's later refresh check
+                // knows when this grant was minted.
+                let url =
+                    aws::presign_cached(&uri, profile.as_deref(), endpoint.as_deref(), false)?;
                 let len = remote_len(&url)
                     .map_err(|e| format!("{uri}: {}", redact_presign(&e)))?;
                 Ok(Source::S3 {
@@ -224,11 +233,43 @@ impl Source {
                     window: Arc::default(),
                 })
             }
-            Source::Remote { url, len } | Source::S3 { url, len, .. } => Ok(SourceReader {
-                inner: Inner::Remote { url: url.clone() },
+            Source::Remote { url, len } => Ok(SourceReader {
+                inner: Inner::Remote(Arc::new(RemoteTarget {
+                    url: Mutex::new(url.clone()),
+                    s3: None,
+                })),
                 len: *len,
                 window: Arc::default(),
             }),
+            Source::S3 {
+                uri,
+                profile,
+                endpoint,
+                url,
+                len,
+            } => {
+                // Re-presign here rather than reuse the URL frozen into
+                // the source at open: a layer outlives its grant, and the
+                // cache hands back the same URL until it is close to
+                // expiring, so this is free on the common path.
+                let url = aws::presign_cached(uri, profile.as_deref(), endpoint.as_deref(), false)
+                    .unwrap_or_else(|e| {
+                        log::debug!("{uri}: keeping the resolved URL ({e})");
+                        url.clone()
+                    });
+                Ok(SourceReader {
+                    inner: Inner::Remote(Arc::new(RemoteTarget {
+                        url: Mutex::new(url),
+                        s3: Some(S3Grant {
+                            uri: uri.clone(),
+                            profile: profile.clone(),
+                            endpoint: endpoint.clone(),
+                        }),
+                    })),
+                    len: *len,
+                    window: Arc::default(),
+                })
+            }
         }
     }
 }
@@ -325,6 +366,7 @@ fn redact_presign(msg: &str) -> String {
 pub mod aws {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, OnceLock};
     use std::time::Duration;
 
     fn dirs_home() -> Option<PathBuf> {
@@ -459,22 +501,31 @@ pub mod aws {
         if custom_endpoint {
             return configured().unwrap_or_else(|| "us-east-1".into());
         }
+        // One probe per bucket, even under concurrent part resolution.
+        // A prefix dataset presigns its parts on a rayon fan-out, so a
+        // plain read-then-insert cache let every one of them miss and
+        // fire its own HEAD: 64 identical round trips before the first
+        // footer was asked for. The `OnceLock` per bucket makes the
+        // losers block on the winner's answer instead.
+        type BucketRegion = Arc<OnceLock<Option<String>>>;
         static BUCKET_REGIONS: std::sync::OnceLock<
-            std::sync::Mutex<HashMap<String, String>>,
+            std::sync::Mutex<HashMap<String, BucketRegion>>,
         > = std::sync::OnceLock::new();
         let cache = BUCKET_REGIONS.get_or_init(Default::default);
-        if let Some(r) = cache.lock().unwrap().get(bucket) {
+        let slot: BucketRegion = {
+            let mut m = cache.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(m.entry(bucket.to_string()).or_default())
+        };
+        let probed = slot.get_or_init(|| {
+            let res = super::http_agent()
+                .head(&format!("https://{bucket}.s3.amazonaws.com/"))
+                .header("User-Agent", super::USER_AGENT)
+                .call()
+                .ok()?;
+            super::header(&res, "x-amz-bucket-region")
+        });
+        if let Some(r) = probed {
             return r.clone();
-        }
-        if let Ok(res) = super::http_agent()
-            .head(&format!("https://{bucket}.s3.amazonaws.com/"))
-            .header("User-Agent", super::USER_AGENT)
-            .call()
-        {
-            if let Some(r) = super::header(&res, "x-amz-bucket-region") {
-                cache.lock().unwrap().insert(bucket.to_string(), r.clone());
-                return r;
-            }
         }
         configured().unwrap_or_else(|| "us-east-1".into())
     }
@@ -538,6 +589,83 @@ pub mod aws {
         profile: Option<&str>,
         endpoint: Option<&str>,
     ) -> Result<String, String> {
+        presign_with_expiry(uri, profile, endpoint).map(|(url, _)| url)
+    }
+
+    /// Fraction of a presigned URL's validity after which it is re-minted
+    /// rather than reused. A 6 h grant refreshed at 4.8 h leaves over an
+    /// hour for the read that is using it.
+    const PRESIGN_REFRESH_AT: f64 = 0.8;
+
+    /// A minted URL and the moment it was minted, keyed by the object.
+    struct Presigned {
+        url: String,
+        minted: std::time::Instant,
+        expiry: Duration,
+    }
+
+    impl Presigned {
+        fn fresh(&self) -> bool {
+            self.minted.elapsed().as_secs_f64()
+                < self.expiry.as_secs_f64() * PRESIGN_REFRESH_AT
+        }
+    }
+
+    fn presign_cache() -> &'static std::sync::Mutex<HashMap<String, Presigned>> {
+        static CACHE: OnceLock<std::sync::Mutex<HashMap<String, Presigned>>> =
+            OnceLock::new();
+        CACHE.get_or_init(Default::default)
+    }
+
+    /// The GET URL for an object, re-presigned when the last one is past
+    /// [`PRESIGN_REFRESH_AT`] of its validity (or when `force`).
+    ///
+    /// A presigned URL is a grant with a deadline — six hours with session
+    /// tokens — and a source resolved once at open kept using the same one
+    /// for the life of the layer. Panning a collection the morning after
+    /// then failed with a 403 per range request, reported as if the server
+    /// had refused range support. Minting is local (credentials from
+    /// `~/.aws`, region cached per bucket), so refreshing costs no round
+    /// trip.
+    pub(crate) fn presign_cached(
+        uri: &str,
+        profile: Option<&str>,
+        endpoint: Option<&str>,
+        force: bool,
+    ) -> Result<String, String> {
+        let key = format!(
+            "{uri}\u{1}{}\u{1}{}",
+            profile.unwrap_or_default(),
+            endpoint.unwrap_or_default()
+        );
+        if !force {
+            let cache = presign_cache().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(p) = cache.get(&key).filter(|p| p.fresh()) {
+                return Ok(p.url.clone());
+            }
+        }
+        let (url, expiry) = presign_with_expiry(uri, profile, endpoint)?;
+        presign_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                key,
+                Presigned {
+                    url: url.clone(),
+                    minted: std::time::Instant::now(),
+                    expiry,
+                },
+            );
+        Ok(url)
+    }
+
+    /// The presigned URL and how long it stays valid (unsigned anonymous
+    /// URLs never expire, reported as the longest window).
+    fn presign_with_expiry(
+        uri: &str,
+        profile: Option<&str>,
+        endpoint: Option<&str>,
+    ) -> Result<(String, Duration), String> {
         let rest = uri
             .strip_prefix("s3://")
             .ok_or_else(|| format!("not an s3:// URI: {uri}"))?;
@@ -566,12 +694,14 @@ pub mod aws {
         match creds {
             None => {
                 // Anonymous: plain object URL, key encoded like the
-                // signed branch.
+                // signed branch. Nothing expires, so it never needs
+                // re-minting.
                 let key = encode_key_path(key);
-                Ok(match &endpoint_env {
+                let url = match &endpoint_env {
                     Some(e) => format!("{}/{bucket}/{key}", e.trim_end_matches('/')),
                     None => format!("https://{bucket}.s3.{region}.amazonaws.com/{key}"),
-                })
+                };
+                Ok((url, Duration::from_secs(u32::MAX as u64)))
             }
             Some(c) => {
                 use rusty_s3::S3Action;
@@ -591,7 +721,7 @@ pub mod aws {
                 } else {
                     Duration::from_secs(6 * 24 * 3600)
                 };
-                Ok(b.get_object(Some(&rc), key).sign(expiry).to_string())
+                Ok((b.get_object(Some(&rc), key).sign(expiry).to_string(), expiry))
             }
         }
     }
@@ -1030,6 +1160,51 @@ pub mod aws {
             assert!(super::presign("http://x/y", None, None).is_err());
         }
 
+        /// A presigned URL is a grant with a deadline. The reader reuses
+        /// the last one while it is comfortably inside its window and
+        /// re-mints past 80% of it — a layer open the morning after used
+        /// to keep presenting a six-hour grant minted yesterday and get a
+        /// 403 per range request.
+        #[test]
+        fn a_grant_is_reused_until_it_nears_its_deadline() {
+            use std::time::{Duration, Instant};
+            let at = |elapsed: Duration, expiry: Duration| super::Presigned {
+                url: String::new(),
+                minted: Instant::now() - elapsed,
+                expiry,
+            };
+            let six_h = Duration::from_secs(6 * 3600);
+            assert!(at(Duration::from_secs(60), six_h).fresh(), "just minted");
+            assert!(at(Duration::from_secs(4 * 3600), six_h).fresh(), "4 h of 6");
+            assert!(
+                !at(Duration::from_secs(5 * 3600), six_h).fresh(),
+                "5 h of 6 is past the refresh point"
+            );
+            assert!(!at(six_h, six_h).fresh(), "expired");
+            // Long-lived keys get a much longer window, and the same rule.
+            let six_d = Duration::from_secs(6 * 24 * 3600);
+            assert!(at(Duration::from_secs(24 * 3600), six_d).fresh());
+        }
+
+        /// Anonymous access is not a grant and never needs re-minting;
+        /// the cache still keys it per (uri, profile, endpoint).
+        #[test]
+        fn an_anonymous_url_does_not_expire() {
+            // No profile named, and the test environment carries no
+            // static credentials for this bucket beyond whatever the
+            // developer has — so only assert the shape when it comes back
+            // unsigned.
+            let (url, expiry) =
+                super::presign_with_expiry("s3://bucket/k.parquet", None, Some("http://127.0.0.1:1"))
+                    .unwrap();
+            if !url.contains("X-Amz-Signature") {
+                assert!(
+                    expiry > std::time::Duration::from_secs(365 * 24 * 3600),
+                    "an unsigned URL has no deadline"
+                );
+            }
+        }
+
         #[test]
         fn percent_decode_listing_keys() {
             assert_eq!(super::percent_decode("a/b%20c%2Bd.parquet"), "a/b c+d.parquet");
@@ -1262,7 +1437,18 @@ fn remote_len(url: &str) -> Result<u64, String> {
     if let Ok(res) = head {
         // Error answers also carry a Content-Length (their body's); only a
         // 200 tells us the object size.
-        if res.status() == 200 {
+        //
+        // And a size is not enough: the whole reader is range requests, so
+        // a server that serves the object but ignores `Range` cannot back
+        // a layer. Taking the HEAD's length and returning meant that
+        // server was only discovered later, by the first page read, as a
+        // "server rejected range request (200)" mid-decode. `Accept-Ranges:
+        // bytes` is the answer to that question; without it, fall through
+        // to the probe below and let it decide.
+        if res.status() == 200
+            && header(&res, "accept-ranges")
+                .is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("bytes")))
+        {
             if let Some(len) = header(&res, "content-length").and_then(|v| v.parse::<u64>().ok()) {
                 if len > 0 {
                     return Ok(len);
@@ -1287,6 +1473,15 @@ fn remote_len(url: &str) -> Result<u64, String> {
                 res.status()
             ),
             404 => format!("{url}: not found (HTTP 404)"),
+            // A 200 here is the server answering a Range request with the
+            // whole object: it serves the file but not the byte ranges
+            // this viewer reads it through.
+            200 => format!(
+                "{url}: server ignores Range requests (answered the whole \
+                 object with HTTP 200). This viewer reads parquet through \
+                 byte ranges, so the file has to be served from something \
+                 that supports them"
+            ),
             _ => format!(
                 "{url}: server does not support range requests (status {})",
                 res.status()
@@ -1329,11 +1524,11 @@ impl SourceReader {
     /// `None` for a local file: reopening one is free, and a duplicated
     /// descriptor would share its seek position with the original.
     pub fn share_remote(&self) -> Option<SourceReader> {
-        let Inner::Remote { url } = &self.inner else {
+        let Inner::Remote(target) = &self.inner else {
             return None;
         };
         Some(SourceReader {
-            inner: Inner::Remote { url: url.clone() },
+            inner: Inner::Remote(Arc::clone(target)),
             len: self.len,
             window: Arc::clone(&self.window),
         })
@@ -1342,7 +1537,61 @@ impl SourceReader {
 
 enum Inner {
     Local(File),
-    Remote { url: String },
+    Remote(Arc<RemoteTarget>),
+}
+
+/// Prefix of the error a 401/403 answer produces, so a caller that can do
+/// something about it (re-presign and retry) can recognize one.
+const ACCESS_DENIED: &str = "access denied (HTTP";
+
+/// The URL a remote reader fetches from, plus what it takes to mint a new
+/// one when the old grant stops being accepted.
+///
+/// The URL is behind a lock rather than owned per reader because readers
+/// are shared (`share_remote`) and re-opened per row group: a refresh has
+/// to be visible to every one of them, or each would pay its own 403
+/// before noticing.
+struct RemoteTarget {
+    url: Mutex<String>,
+    /// Set for S3 sources: the object the URL is a (re-mintable) grant on.
+    s3: Option<S3Grant>,
+}
+
+struct S3Grant {
+    uri: String,
+    profile: Option<String>,
+    endpoint: Option<String>,
+}
+
+impl RemoteTarget {
+    fn url(&self) -> String {
+        self.url.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// A range, re-presigning and retrying once when the grant has gone
+    /// stale under us. Anything else (and any non-S3 source) is returned
+    /// as it came back.
+    fn fetch(&self, start: u64, end_inclusive: u64) -> PqResult<Vec<u8>> {
+        let url = self.url();
+        let first = fetch_range(&url, start, end_inclusive);
+        let Err(e) = first else { return first };
+        let Some(g) = self.s3.as_ref().filter(|_| {
+            e.to_string().contains(ACCESS_DENIED)
+        }) else {
+            return Err(e);
+        };
+        let fresh =
+            aws::presign_cached(&g.uri, g.profile.as_deref(), g.endpoint.as_deref(), true)
+                .map_err(|e| ParquetError::General(redact_presign(&e)))?;
+        if fresh == url {
+            // Same URL back: the credentials, not the deadline, are what
+            // the object is refusing. Report the original answer.
+            return Err(e);
+        }
+        log::debug!("{}: re-presigned after {e}", g.uri);
+        *self.url.lock().unwrap_or_else(|e| e.into_inner()) = fresh.clone();
+        fetch_range(&fresh, start, end_inclusive)
+    }
 }
 
 /// One bounded range request, fully read.
@@ -1359,6 +1608,23 @@ fn fetch_range(url: &str, start: u64, end_inclusive: u64) -> PqResult<Vec<u8>> {
         206 => true,
         // Whole-file answer is only usable from offset 0.
         200 if start == 0 => false,
+        // Same answer at a non-zero offset means the server ignored the
+        // header rather than refused it — saying "rejected" sent people
+        // looking at their credentials for a server-capability problem.
+        200 => {
+            return Err(ParquetError::General(format!(
+                "server ignored the Range header and answered the whole \
+                 object (HTTP 200) at offset {start}"
+            )))
+        }
+        // 401/403 is the credential answer, not a range-support one.
+        s @ (401 | 403) => {
+            return Err(ParquetError::General(format!(
+                "{ACCESS_DENIED} {s}). For a private bucket, pick an AWS \
+                 profile with read access in the Open URL dialog; a presigned \
+                 URL may also simply have expired"
+            )))
+        }
         s => {
             return Err(ParquetError::General(format!(
                 "server rejected range request ({s})"
@@ -1392,11 +1658,11 @@ fn fetch_range(url: &str, start: u64, end_inclusive: u64) -> PqResult<Vec<u8>> {
 /// server only ever sends bytes the reader actually consumes (plus at most
 /// the current window).
 struct WindowedRemote {
-    url: String,
+    target: Arc<RemoteTarget>,
     pos: u64,
     end: u64,
     window: u64,
-    chunk: std::io::Cursor<Vec<u8>>,
+    chunk: std::io::Cursor<Bytes>,
     /// Where to publish each fetched window for the bounded read that
     /// tends to follow it.
     cache: WindowCache,
@@ -1437,14 +1703,16 @@ impl Read for WindowedRemote {
                 self.window
             };
             let take = want.min(self.end - self.pos);
-            let data = fetch_range(&self.url, self.pos, self.pos + take - 1)
-                .map_err(std::io::Error::other)?;
-            let shared = Arc::new(data);
+            let data = Bytes::from(
+                self.target
+                    .fetch(self.pos, self.pos + take - 1)
+                    .map_err(std::io::Error::other)?,
+            );
             *self.cache.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some((self.pos, Arc::clone(&shared)));
-            self.pos += shared.len() as u64;
+                Some((self.pos, data.clone()));
+            self.pos += data.len() as u64;
             self.window = (want * 2).min(WINDOW_MAX);
-            self.chunk = std::io::Cursor::new(shared.as_ref().clone());
+            self.chunk = std::io::Cursor::new(data);
         }
     }
 }
@@ -1466,15 +1734,15 @@ impl Inner {
                     .map_err(|e| ParquetError::General(format!("seek: {e}")))?;
                 Ok(Box::new(BufReader::new(r)))
             }
-            Inner::Remote { url } => match end_inclusive {
-                Some(e) => Ok(Box::new(std::io::Cursor::new(fetch_range(url, start, e)?))),
+            Inner::Remote(target) => match end_inclusive {
+                Some(e) => Ok(Box::new(std::io::Cursor::new(target.fetch(start, e)?))),
                 None => Ok(Box::new(WindowedRemote {
-                    url: url.clone(),
+                    target: Arc::clone(target),
                     pos: start,
                     end: len,
                     // 0 = unsized: the first read decides.
                     window: 0,
-                    chunk: std::io::Cursor::new(Vec::new()),
+                    chunk: std::io::Cursor::new(Bytes::new()),
                     cache: Arc::clone(cache),
                 })),
             },
@@ -1606,6 +1874,76 @@ pub(crate) mod testserver {
         }
     }
 
+    /// A server that serves the file but ignores `Range`: HEAD answers
+    /// 200 with a Content-Length and no `Accept-Ranges`, GET always
+    /// answers 200 with the whole body. Plenty of static hosts and CDN
+    /// configurations behave exactly like this, and the viewer reads
+    /// parquet through byte ranges, so the open has to refuse rather than
+    /// discover it mid-decode.
+    pub fn spawn_no_ranges(file: PathBuf) -> String {
+        use std::io::Read as _;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { continue };
+                let file = file.clone();
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut b = [0u8; 1];
+                    while !buf.ends_with(b"\r\n\r\n") && buf.len() < 8192 {
+                        match conn.read(&mut b) {
+                            Ok(1) => buf.push(b[0]),
+                            _ => return,
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&buf);
+                    let data = std::fs::read(&file).unwrap_or_default();
+                    // No Accept-Ranges: the header is the server saying
+                    // it cannot do this.
+                    let _ = write!(
+                        conn,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        data.len()
+                    );
+                    if !text.starts_with("HEAD") {
+                        let _ = conn.write_all(&data);
+                    }
+                });
+            }
+        });
+        format!("http://127.0.0.1:{port}/data.parquet")
+    }
+
+    /// A server that answers every request with one status and no body
+    /// (403 for an expired grant, 401 for a missing one).
+    pub fn spawn_status(status: u16) -> String {
+        use std::io::Read as _;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { continue };
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut b = [0u8; 1];
+                    while !buf.ends_with(b"\r\n\r\n") && buf.len() < 8192 {
+                        match conn.read(&mut b) {
+                            Ok(1) => buf.push(b[0]),
+                            _ => return,
+                        }
+                    }
+                    let _ = write!(
+                        conn,
+                        "HTTP/1.1 {status} Denied\r\nContent-Length: 0\r\n\
+                         Connection: close\r\n\r\n"
+                    );
+                });
+            }
+        });
+        format!("http://127.0.0.1:{port}/data.parquet")
+    }
+
     /// Serve a directory tree (files resolved from the request path, 404
     /// on miss). Full GETs only — enough for STAC JSON documents plus
     /// small parquet fixtures. Returns the base URL (no trailing slash).
@@ -1694,6 +2032,68 @@ pub(crate) mod testserver {
             }
         });
         format!("http://127.0.0.1:{port}")
+    }
+}
+
+#[cfg(test)]
+mod remote_len_tests {
+    use super::*;
+
+    /// A HEAD 200 with a Content-Length is not permission to range-read.
+    ///
+    /// `remote_len` returned on it, so a host that serves the object and
+    /// ignores `Range` opened fine and then failed at the first page read
+    /// with "server rejected range request (200)" — a message that sends
+    /// people to look at their credentials. Ask the HEAD whether ranges
+    /// are supported, and when it does not say, let the probe find out.
+    #[test]
+    fn a_server_that_ignores_range_is_refused_at_open() {
+        let dir = std::env::temp_dir().join(format!("geopq_noranges_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("data.parquet");
+        std::fs::write(&file, vec![7u8; 4096]).unwrap();
+
+        let url = testserver::spawn_no_ranges(file.clone());
+        let Err(err) = Source::remote(&url) else {
+            panic!("a server that ignores Range must not resolve");
+        };
+        assert!(err.contains("ignores Range"), "{err}");
+        assert!(
+            !err.contains("rejected"),
+            "the server did not refuse anything, it answered the wrong thing: {err}"
+        );
+
+        // The range-capable server in the same fixture still resolves,
+        // so the Accept-Ranges check is not refusing everything.
+        let ok = testserver::spawn(file);
+        let src = Source::remote(&ok.url).expect("a ranged server still opens");
+        assert_eq!(src.size(), 4096);
+    }
+
+    /// A 401/403 to a range request is the object refusing the caller,
+    /// not the server refusing byte ranges. It was reported as "server
+    /// rejected range request (403)", which is what an expired presigned
+    /// URL looks like from the inside and reads as a server problem from
+    /// the outside. It is also the signal the S3 reader re-presigns on,
+    /// so it has to be distinguishable.
+    #[test]
+    fn an_access_denied_range_says_so() {
+        for status in [401u16, 403] {
+            let url = testserver::spawn_status(status);
+            let Err(e) = fetch_range(&url, 0, 15) else {
+                panic!("HTTP {status} must not read as success");
+            };
+            let msg = e.to_string();
+            assert!(msg.contains(ACCESS_DENIED), "{status}: {msg}");
+            assert!(msg.contains(&status.to_string()), "{status}: {msg}");
+            assert!(!msg.contains("rejected range"), "{status}: {msg}");
+        }
+        // A status that really is about range support keeps its message.
+        let url = testserver::spawn_status(416);
+        let Err(e) = fetch_range(&url, 0, 15) else {
+            panic!("416 must not read as success");
+        };
+        assert!(e.to_string().contains("rejected range request"), "{e}");
     }
 }
 
@@ -1815,8 +2215,9 @@ impl ChunkReader for SourceReader {
                 .as_ref()
                 .filter(|(base, data)| start >= *base && end < base + data.len() as u64)
             {
+                // A refcounted slice of the window, not a copy of it.
                 let off = (start - base) as usize;
-                return Ok(Bytes::copy_from_slice(&data[off..off + length]));
+                return Ok(data.slice(off..off + length));
             }
         }
         let mut buf = Vec::with_capacity(length);

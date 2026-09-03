@@ -466,14 +466,21 @@ fn data_area(
                 None => Some((xs[k], ys[k])),
             }
         };
+        // Carry the previous projected vertex instead of projecting each
+        // one twice (once as k, once as the k2 of its predecessor): the
+        // projection is a proj call per vertex, and on a land-cover ring
+        // of 200k vertices the duplicate half is the whole cost of the
+        // measurement.
+        let Some(first) = at(s) else { return 0.0 };
+        let mut prev = first;
         let mut a = 0.0;
-        for k in s..e {
-            let k2 = if k + 1 == e { s } else { k + 1 };
-            let (Some((x1, y1)), Some((x2, y2))) = (at(k), at(k2)) else {
-                return 0.0;
-            };
-            a += x1 * y2 - x2 * y1;
+        for k in s + 1..e {
+            let Some(cur) = at(k) else { return 0.0 };
+            a += prev.0 * cur.1 - cur.0 * prev.1;
+            prev = cur;
         }
+        // Closing edge back to the first vertex.
+        a += prev.0 * first.1 - first.0 * prev.1;
         (a * 0.5).abs()
     };
     match ga.enc {
