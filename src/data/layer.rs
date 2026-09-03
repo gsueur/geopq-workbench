@@ -1455,8 +1455,8 @@ mod load_state_tests {
         let loaded = vec![
             GroupLoad::Full,
             GroupLoad::Rows { ranges: vec![(0, 3), (7, 10)], rect: [0.0; 4] },
-            GroupLoad::Preview { stride: 4, rect: None },
-            GroupLoad::Boxes { rect: None },
+            GroupLoad::Preview { stride: 4, rect: None, ranges: None },
+            GroupLoad::Boxes { rect: None, ranges: None },
             GroupLoad::None,
         ];
         let starts = [0u64, 10, 20, 30, 40, 50];
