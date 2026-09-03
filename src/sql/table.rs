@@ -289,7 +289,12 @@ impl TableProvider for LayerTable {
                     .into_iter()
                     .filter(|&g| group_kept(g as usize))
                     .filter_map(|g| {
-                        match covering_select(&self.store, g, r) {
+                        match covering_select(
+                            &self.store,
+                            g,
+                            r,
+                            crate::data::loader::never_cancelled(),
+                        ) {
                             Ok(Some(ranges)) if ranges.is_empty() => None, // no rows hit
                             Ok(ranges) => Some(Ok(GroupPart {
                                 group: g as usize,
