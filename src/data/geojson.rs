@@ -17,8 +17,8 @@ use parquet::arrow::ArrowWriter;
 use serde_json::{json, Value};
 
 use super::import::{
-    bbox_field, geo_meta, to_wkb, AttrBuilder, BboxBuilder, Cell, GeomStats,
-    IMPORT_WRITE_ROWS,
+    covering_field, geo_meta, to_wkb, AttrBuilder, BboxBuilder, Cell, GeomStats,
+    IMPORT_BATCH_BYTES, IMPORT_WRITE_ROWS,
 };
 
 /// Convert a GeoJSON file to GeoParquet. Returns the rows written.
@@ -117,7 +117,8 @@ pub fn convert(src: &Path, dst: &Path, progress: &dyn Fn(f32)) -> Result<u64, St
     };
     let mut fields: Vec<Field> = vec![Field::new(&geom_name, DataType::Binary, true)];
     fields.extend(cols.iter().map(|(n, dt)| Field::new(n, dt.clone(), true)));
-    fields.push(bbox_field());
+    let (cov_name, cov_field) = covering_field(&fields);
+    fields.push(cov_field);
     let schema = Arc::new(Schema::new(fields));
 
     let out = std::fs::File::create(dst).map_err(|e| format!("cannot create output: {e}"))?;
@@ -126,58 +127,71 @@ pub fn convert(src: &Path, dst: &Path, progress: &dyn Fn(f32)) -> Result<u64, St
 
     let mut stats = GeomStats::new();
     let mut written = 0u64;
-    for chunk in feats.chunks(IMPORT_WRITE_ROWS) {
-        let mut geom_b = BinaryBuilder::new();
-        let mut bbox_b = BboxBuilder::default();
-        let mut attr_b: Vec<AttrBuilder> =
-            cols.iter().map(|(_, dt)| AttrBuilder::new(dt)).collect();
-        for f in chunk {
-            match f.get("geometry") {
-                Some(Value::Null) | None => {
-                    geom_b.append_null();
-                    bbox_b.push(None);
-                }
-                // RFC 7946 §3.1: an empty "coordinates" array is an empty
-                // geometry, which a processor may treat as null. ArcGIS
-                // Hub exports a feature with no location exactly this
-                // way, and one unplaced row must not refuse the file.
-                Some(g) if is_empty_geometry(g) => {
-                    geom_b.append_null();
-                    bbox_b.push(None);
-                }
-                Some(g) => {
-                    let g = parse_geometry(g, 0)?;
-                    bbox_b.push(stats.add(&g));
-                    geom_b.append_value(to_wkb(&g)?);
-                }
+    let mut geom_b = BinaryBuilder::new();
+    let mut bbox_b = BboxBuilder::default();
+    let mut attr_b: Vec<AttrBuilder> = cols.iter().map(|(_, dt)| AttrBuilder::new(dt)).collect();
+    let mut in_batch = 0usize;
+    // Rows alone do not bound a batch: a few thousand administrative
+    // boundaries are hundreds of megabytes of WKB, the row group cannot
+    // close in the middle of one, and the result was import files whose
+    // own scorecard flagged their row groups as too heavy to fetch.
+    let mut batch_bytes = 0usize;
+    for (fi, f) in feats.iter().enumerate() {
+        match f.get("geometry") {
+            Some(Value::Null) | None => {
+                geom_b.append_null();
+                bbox_b.push(None);
             }
-            let props = f.get("properties").and_then(Value::as_object);
-            for ((name, _), b) in cols.iter().zip(&mut attr_b) {
-                let cell = match props.and_then(|p| p.get(name)) {
-                    None | Some(Value::Null) => Cell::Null,
-                    Some(Value::Bool(x)) => Cell::Bool(*x),
-                    Some(Value::Number(n)) => match n.as_i64() {
-                        Some(i) => Cell::Int(i),
-                        None => Cell::Float(n.as_f64().unwrap_or(f64::NAN)),
-                    },
-                    Some(Value::String(s)) => Cell::Str(Cow::Borrowed(s)),
-                    Some(other) => Cell::Str(Cow::Owned(other.to_string())),
-                };
-                b.push(cell);
+            // RFC 7946 §3.1: an empty "coordinates" array is an empty
+            // geometry, which a processor may treat as null. ArcGIS
+            // Hub exports a feature with no location exactly this
+            // way, and one unplaced row must not refuse the file.
+            Some(g) if is_empty_geometry(g) => {
+                geom_b.append_null();
+                bbox_b.push(None);
+            }
+            Some(g) => {
+                let g = parse_geometry(g, 0)?;
+                bbox_b.push(stats.add(&g));
+                let wkb = to_wkb(&g)?;
+                batch_bytes += wkb.len();
+                geom_b.append_value(wkb);
             }
         }
-        let mut arrays: Vec<ArrayRef> = vec![Arc::new(geom_b.finish())];
-        arrays.extend(attr_b.iter_mut().map(AttrBuilder::finish));
-        arrays.push(bbox_b.finish());
-        let batch = RecordBatch::try_new(schema.clone(), arrays).map_err(|e| e.to_string())?;
-        writer.write(&batch).map_err(|e| format!("write failed: {e}"))?;
-        written += chunk.len() as u64;
-        progress(0.15 + 0.85 * (written as f32 / feats.len() as f32));
+        let props = f.get("properties").and_then(Value::as_object);
+        for ((name, _), b) in cols.iter().zip(&mut attr_b) {
+            let cell = match props.and_then(|p| p.get(name)) {
+                None | Some(Value::Null) => Cell::Null,
+                Some(Value::Bool(x)) => Cell::Bool(*x),
+                Some(Value::Number(n)) => match n.as_i64() {
+                    Some(i) => Cell::Int(i),
+                    None => Cell::Float(n.as_f64().unwrap_or(f64::NAN)),
+                },
+                Some(Value::String(s)) => Cell::Str(Cow::Borrowed(s)),
+                Some(other) => Cell::Str(Cow::Owned(other.to_string())),
+            };
+            b.push(cell);
+        }
+        in_batch += 1;
+        if in_batch == IMPORT_WRITE_ROWS
+            || batch_bytes >= IMPORT_BATCH_BYTES
+            || fi + 1 == feats.len()
+        {
+            let mut arrays: Vec<ArrayRef> = vec![Arc::new(geom_b.finish())];
+            arrays.extend(attr_b.iter_mut().map(AttrBuilder::finish));
+            arrays.push(bbox_b.finish());
+            let batch = RecordBatch::try_new(schema.clone(), arrays).map_err(|e| e.to_string())?;
+            writer.write(&batch).map_err(|e| format!("write failed: {e}"))?;
+            written += in_batch as u64;
+            in_batch = 0;
+            batch_bytes = 0;
+            progress(0.15 + 0.85 * (written as f32 / feats.len() as f32));
+        }
     }
 
     writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
         "geo".to_string(),
-        geo_meta(&geom_name, &stats, None).to_string(),
+        geo_meta(&geom_name, &cov_name, &stats, None).to_string(),
     ));
     writer.close().map_err(|e| format!("finalize failed: {e}"))?;
     Ok(written)
@@ -361,5 +375,90 @@ mod tests {
         .unwrap();
         let err = convert(&src, &dst, &|_| {}).unwrap_err();
         assert!(err.contains("without coordinates"), "{err}");
+    }
+
+    /// A property genuinely called `bbox` is data. The covering column
+    /// used to be pushed under that name unconditionally, producing a
+    /// file with two `bbox` fields whose `covering` metadata pointed at
+    /// whichever one a reader resolved first.
+    #[test]
+    fn a_property_named_bbox_keeps_its_name() {
+        let dir = std::env::temp_dir().join("geopq_geojson_bbox_attr");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("bbox_attr.geojson");
+        let dst = dir.join("bbox_attr.parquet");
+
+        let gj = json!({
+            "type": "FeatureCollection",
+            "features": [
+                {"type": "Feature",
+                 "geometry": {"type": "Point", "coordinates": [2.35, 48.85]},
+                 "properties": {"bbox": "the attribute", "id": 1}}
+            ]
+        });
+        std::fs::write(&src, gj.to_string()).unwrap();
+        assert_eq!(convert(&src, &dst, &|_| {}).unwrap(), 1);
+
+        let (store, _crs, info, _rg) =
+            crate::data::loader::open_store_for_test(&dst).unwrap();
+        let sc = store.schema.clone();
+        // The attribute kept its name, its type and its value.
+        assert_eq!(sc.field_with_name("bbox").unwrap().data_type(), &DataType::Utf8);
+        assert!(sc.field_with_name("bbox_1").is_ok(), "covering renamed around it");
+        // And the metadata points readers at the renamed one.
+        let covering = info.geo.covering.expect("covering declared");
+        assert!(covering.contains("\"bbox_1\""), "{covering}");
+        // The reader resolves it: a covering column it could not find
+        // would leave the store without per-row boxes.
+        let g = store.fetch_geoms(&[0]).unwrap();
+        assert!(matches!(g[0].1, Some(geo_types::Geometry::Point(_))));
+    }
+
+    /// Heavy polygons: a batch has to be bounded by its bytes, not only
+    /// by its row count. A few thousand land-cover rings are hundreds of
+    /// megabytes, a row group cannot close in the middle of a write, and
+    /// the row cap alone therefore produced one enormous group.
+    #[test]
+    fn heavy_polygons_close_row_groups_by_bytes() {
+        let dir = std::env::temp_dir().join("geopq_geojson_heavy");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("heavy.geojson");
+        let dst = dir.join("heavy.parquet");
+
+        // 1000 rings of 2000 vertices: ~32 MB of WKB, well inside the
+        // 8192-row batch cap and twice the 16 MB row-group cap. The
+        // radii are jittered so the coordinates do not compress: a ring
+        // every polygon shares would encode small enough for the writer
+        // to keep one group whatever the batching does, and the point
+        // here is the batching.
+        let mut seed = 12345u64;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let feats: Vec<Value> = (0..1000)
+            .map(|k| {
+                let (cx, cy) = (k as f64 * 0.01, 45.0);
+                let ring: Vec<Value> = (0..2000)
+                    .map(|i| {
+                        let a = i as f64 / 2000.0 * std::f64::consts::TAU;
+                        let r = 0.001 * (0.5 + next());
+                        json!([cx + r * a.cos(), cy + r * a.sin()])
+                    })
+                    .chain(std::iter::once(json!([cx + 0.001, cy])))
+                    .collect();
+                json!({"type": "Feature", "properties": {"k": k},
+                       "geometry": {"type": "Polygon", "coordinates": [ring]}})
+            })
+            .collect();
+        std::fs::write(
+            &src,
+            json!({"type": "FeatureCollection", "features": feats}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(convert(&src, &dst, &|_| {}).unwrap(), 1000);
+        crate::data::import::tests::assert_row_groups_bounded(&dst);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

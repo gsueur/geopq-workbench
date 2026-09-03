@@ -59,28 +59,45 @@ pub fn wgs84_bbox(b: [f64; 4], crs: &Crs) -> Option<[f64; 4]> {
     })
 }
 
-/// Rows and data-CRS bbox of one parquet file, from the footer alone
-/// (`geo` metadata bbox of the primary column).
-fn file_facts(path: &Path) -> (u64, Option<[f64; 4]>) {
-    let facts = || -> Option<(u64, Option<[f64; 4]>)> {
+/// Rows, data-CRS bbox and derived flag of one parquet file, from the
+/// footer alone (`geo` metadata bbox of the primary column, and the
+/// `geopq:pyramid` entry an overview level carries).
+struct FileFacts {
+    rows: u64,
+    bbox: Option<[f64; 4]>,
+    /// True for an H3 pyramid overview part: the same features as the
+    /// level below it, generalized. Counting its rows as data would
+    /// report a dataset several times its own size.
+    derived: bool,
+}
+
+fn file_facts(path: &Path) -> FileFacts {
+    let facts = || -> Option<FileFacts> {
         let f = std::fs::File::open(path).ok()?;
         let r = parquet::file::reader::SerializedFileReader::new(f).ok()?;
         let md = r.metadata().file_metadata().clone();
         let rows = md.num_rows().max(0) as u64;
-        let bbox = md
-            .key_value_metadata()
-            .and_then(|kv| kv.iter().find(|k| k.key == "geo"))
-            .and_then(|k| k.value.clone())
-            .and_then(|v| serde_json::from_str::<Value>(&v).ok())
-            .and_then(|g| {
-                let primary = g.get("primary_column")?.as_str()?.to_string();
-                let arr = g.get("columns")?.get(&primary)?.get("bbox")?.as_array()?;
-                let v: Vec<f64> = arr.iter().filter_map(Value::as_f64).collect();
-                (v.len() >= 4).then(|| [v[0], v[1], v[2], v[3]])
-            });
-        Some((rows, bbox))
+        let kv = |key: &str| -> Option<Value> {
+            md.key_value_metadata()
+                .and_then(|kv| kv.iter().find(|k| k.key == key))
+                .and_then(|k| k.value.clone())
+                .and_then(|v| serde_json::from_str::<Value>(&v).ok())
+        };
+        let bbox = kv("geo").and_then(|g| {
+            let primary = g.get("primary_column")?.as_str()?.to_string();
+            let arr = g.get("columns")?.get(&primary)?.get("bbox")?.as_array()?;
+            let v: Vec<f64> = arr.iter().filter_map(Value::as_f64).collect();
+            (v.len() >= 4).then(|| [v[0], v[1], v[2], v[3]])
+        });
+        // The part says what it is: an overview file carries the key,
+        // and deriving the answer from its `r<res>/` directory instead
+        // would need the descriptor parsed and the path re-parsed.
+        let derived = kv(super::pyramid::FILE_KEY)
+            .and_then(|m| m.get("derived").and_then(Value::as_bool))
+            .unwrap_or(false);
+        Some(FileFacts { rows, bbox, derived })
     };
-    facts().unwrap_or((0, None))
+    facts().unwrap_or(FileFacts { rows: 0, bbox: None, derived: false })
 }
 
 /// Every `.parquet` under `dir`, recursively (hive partitions nest),
@@ -120,37 +137,70 @@ fn slug(name: &str) -> String {
     if s.is_empty() { "geoparquet".into() } else { s }
 }
 
-/// The STAC Collection document for a set of parquet parts.
-/// `files`: (href relative to the collection.json, local path).
+/// The STAC Collection document for a set of parts.
+/// `files`: (href relative to the collection.json, local path). A
+/// non-parquet entry is a sidecar (the H3 pyramid descriptor) and is
+/// described as metadata rather than data.
 fn collection_doc(title: &str, files: &[(String, PathBuf)], crs: &Crs) -> Value {
     let mut rows = 0u64;
+    let mut data_files = 0usize;
     let mut data_bbox: Option<[f64; 4]> = None;
     let mut assets = serde_json::Map::new();
+    let mut descriptor_rows: Option<u64> = None;
     for (href, path) in files {
-        let (r, b) = file_facts(path);
-        rows += r;
-        if let Some(b) = b {
+        let key = href.trim_start_matches("./").to_string();
+        // The pyramid descriptor: a sidecar, and the one place that
+        // knows how many source features the whole pyramid stands for.
+        if path.extension().is_some_and(|x| x == "json") {
+            if path.file_name().is_some_and(|n| n == super::pyramid::DESCRIPTOR) {
+                descriptor_rows = std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|t| super::pyramid::Descriptor::parse(&t).ok())
+                    .and_then(|d| d.rows);
+            }
+            assets.insert(
+                key,
+                json!({
+                    "href": href,
+                    "type": "application/json",
+                    "roles": ["metadata"],
+                }),
+            );
+            continue;
+        }
+        let f = file_facts(path);
+        // Overview levels are the same features again, coarser: their
+        // rows are not part of the dataset's feature count, and a reader
+        // must be able to tell them from the leaf.
+        if !f.derived {
+            rows += f.rows;
+            data_files += 1;
+        }
+        if let Some(b) = f.bbox {
             data_bbox = Some(match data_bbox {
                 None => b,
                 Some(u) => [u[0].min(b[0]), u[1].min(b[1]), u[2].max(b[2]), u[3].max(b[3])],
             });
         }
-        let key = href.trim_start_matches("./").to_string();
         let mut asset = json!({
             "href": href,
             "type": "application/vnd.apache.parquet",
-            "roles": ["data"],
+            "roles": [if f.derived { "overview" } else { "data" }],
         });
         // Per-asset extent, same [w,s,e,n] convention as the collection's
         // (an extra asset field is valid STAC). Without it a reader can
         // only prune a partitioned dataset by the extent of the whole,
         // which is to say not at all: every part would claim every view.
-        if let Some(wgs) = b.and_then(|b| wgs84_bbox(b, crs)) {
+        if let Some(wgs) = f.bbox.and_then(|b| wgs84_bbox(b, crs)) {
             asset["bbox"] = json!(wgs);
         }
-        asset["rows"] = json!(r);
+        asset["rows"] = json!(f.rows);
         assets.insert(key, asset);
     }
+    // The descriptor's own count wins where there is one: it is written
+    // by the run that produced the leaf, and counting parquet rows
+    // instead means counting every overview level again.
+    let rows = descriptor_rows.unwrap_or(rows);
     // Unknown extent is written as the world, never invented tighter.
     let bbox = data_bbox
         .and_then(|b| wgs84_bbox(b, crs))
@@ -161,9 +211,8 @@ fn collection_doc(title: &str, files: &[(String, PathBuf)], crs: &Crs) -> Value 
         "id": slug(title),
         "title": title,
         "description": format!(
-            "{title}: {rows} features in {} GeoParquet file{}.",
-            files.len(),
-            if files.len() == 1 { "" } else { "s" },
+            "{title}: {rows} features in {data_files} GeoParquet file{}.",
+            if data_files == 1 { "" } else { "s" },
         ),
         "license": "other",
         "extent": {
@@ -184,6 +233,14 @@ pub fn write_for_output(dst: &Path, title: &str, crs: &Crs) -> Result<PathBuf, S
         if parts.is_empty() {
             return Err("no parquet parts in the output".into());
         }
+        // An H3 pyramid's descriptor is what makes its parts readable as
+        // a pyramid rather than as a pile of files, so it is published
+        // with them as a metadata asset.
+        let descriptor = dst.join(super::pyramid::DESCRIPTOR);
+        let parts: Vec<PathBuf> = parts
+            .into_iter()
+            .chain(descriptor.is_file().then_some(descriptor))
+            .collect();
         let files = parts
             .into_iter()
             .map(|p| {
@@ -381,6 +438,93 @@ mod tests {
         assert!(t[3] < p[1], "Toulouse is south of Paris: {t:?} {p:?}");
         assert!(t[0] >= b[0] && p[2] <= b[2], "parts sit inside the extent");
         assert!(t[2] - t[0] < b[2] - b[0], "a part is narrower than the union");
+    }
+
+    /// The same, plus the `geopq:pyramid` entry an overview file
+    /// carries: derived data, not source features.
+    fn tiny_overview(path: &Path, rows: usize, res: u8, bbox: [f64; 4]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..rows as i64))],
+        )
+        .unwrap();
+        let f = std::fs::File::create(path).unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(f, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            "geo".to_string(),
+            json!({
+                "version": "1.1.0",
+                "primary_column": "geometry",
+                "columns": { "geometry": { "encoding": "WKB", "bbox": bbox } },
+            })
+            .to_string(),
+        ));
+        w.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            super::super::pyramid::FILE_KEY.to_string(),
+            json!({"res": res, "method": "simplify", "source_res": res + 1, "derived": true})
+                .to_string(),
+        ));
+        w.close().unwrap();
+    }
+
+    /// An H3 pyramid is one dataset with generalized copies of itself
+    /// beside the leaf. Walking every `.parquet` under the root counted
+    /// each overview level's rows as more features and described them
+    /// as data, so a 100k-feature pyramid published as a 300k-feature
+    /// collection whose parts a reader could not tell apart.
+    #[test]
+    fn a_pyramid_counts_its_leaf_once_and_badges_its_overviews() {
+        use super::super::pyramid;
+
+        let dir = std::env::temp_dir().join("geopq_stac_pyramid");
+        let _ = std::fs::remove_dir_all(&dir);
+        tiny_parquet(&dir.join("r7/87283472bffffff.parquet"), 10, [-1.0, 46.0, 0.0, 47.0]);
+        tiny_parquet(&dir.join("r7/87283472affffff.parquet"), 5, [0.0, 47.0, 1.0, 48.0]);
+        tiny_overview(&dir.join("r6/86283472fffffff.parquet"), 4, 6, [-1.0, 46.0, 1.0, 48.0]);
+        let desc = pyramid::Descriptor {
+            version: pyramid::VERSION.to_string(),
+            leaf: pyramid::Leaf { res: 7, adaptive_max_res: 7, target_rows: 100, null_part: false },
+            levels: vec![
+                pyramid::Level {
+                    res: 6,
+                    method: Some(pyramid::Method::Simplify),
+                    cells: vec!["86283472fffffff".into()],
+                    rows: Some(4),
+                },
+                pyramid::Level {
+                    res: 7,
+                    method: None,
+                    cells: vec!["87283472bffffff".into(), "87283472affffff".into()],
+                    rows: Some(15),
+                },
+            ],
+            pixels_per_cell: pyramid::DEFAULT_PIXELS_PER_CELL,
+            crs: Value::Null,
+            bbox: Some([-1.0, 46.0, 1.0, 48.0]),
+            rows: Some(15),
+            methods: Value::Null,
+        };
+        std::fs::write(dir.join(pyramid::DESCRIPTOR), desc.to_json()).unwrap();
+
+        let out = write_for_output(&dir, "Pyramid", &Crs::wgs84()).unwrap();
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+
+        // The leaf's features, counted once, over the leaf's files.
+        let d = doc["description"].as_str().unwrap();
+        assert!(d.contains("15 features in 2 GeoParquet files"), "{d}");
+
+        let assets = doc["assets"].as_object().unwrap();
+        assert_eq!(assets["r7/87283472bffffff.parquet"]["roles"], json!(["data"]));
+        assert_eq!(assets["r6/86283472fffffff.parquet"]["roles"], json!(["overview"]));
+        // The descriptor is published with the parts and says what it is.
+        let sidecar = &assets[pyramid::DESCRIPTOR];
+        assert_eq!(sidecar["roles"], json!(["metadata"]));
+        assert_eq!(sidecar["type"], "application/json");
+        assert_eq!(sidecar["href"], format!("./{}", pyramid::DESCRIPTOR));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

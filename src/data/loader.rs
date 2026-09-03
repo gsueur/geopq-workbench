@@ -9258,6 +9258,7 @@ mod xy_tests {
             crs.epsg,
             None,
             &|_, _| {},
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
         assert_eq!(rep.rows, n as u64);
