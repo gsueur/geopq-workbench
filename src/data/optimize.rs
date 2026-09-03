@@ -76,7 +76,7 @@ const MAX_SWEEP_BYTES: u64 = 32 << 30;
 fn sweep_budget() -> u64 {
     #[cfg(test)]
     {
-        let o = tests::SWEEP_BUDGET_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        let o = tests::SWEEP_BUDGET_OVERRIDE.with(|c| c.get());
         if o > 0 {
             return o;
         }
@@ -4884,10 +4884,16 @@ fn hilbert_xy2d(order: u32, mut x: u32, mut y: u32) -> u64 {
 mod tests {
     use super::*;
 
-    /// Lets `a_plan_too_large_to_write_is_refused_before_writing` trip the
-    /// gather-work refusal on a kilobyte fixture; 0 means the real budget.
-    pub(super) static SWEEP_BUDGET_OVERRIDE: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    thread_local! {
+        /// Lets `a_plan_too_large_to_write_is_refused_before_writing` trip
+        /// the gather-work refusal on a kilobyte fixture; 0 means the real
+        /// budget. Thread-local, not a process global: the test runner
+        /// runs the optimize tests in parallel, and a lowered budget that
+        /// every thread could see refused whichever neighbour was
+        /// planning a partitioned write at that moment.
+        pub(super) static SWEEP_BUDGET_OVERRIDE: std::cell::Cell<u64> =
+            const { std::cell::Cell::new(0) };
+    }
     use arrow::array::{BinaryArray, Int64Array, StringArray};
     use parquet::file::properties::WriterProperties;
 
@@ -8675,7 +8681,7 @@ mod tests {
         // work than the build allows: the fixture is kilobytes, so the
         // budget is lowered to what ten sweeps of it would cost.
         let src = write_grid_fixture(&dir, "zones.parquet", 600, 300, 0.001);
-        SWEEP_BUDGET_OVERRIDE.store(1, std::sync::atomic::Ordering::Relaxed);
+        SWEEP_BUDGET_OVERRIDE.with(|c| c.set(1));
         let dst = dir.join("by_zone");
         let opts = OptimizeOptions {
             partition: PartitionBy::Fields(vec!["zone".into()]),
@@ -8685,7 +8691,7 @@ mod tests {
         assert!(err.contains("passes over the source"), "{err}");
         assert!(err.contains("300 output files"), "{err}");
         assert!(!dst.exists(), "refused plans write nothing");
-        SWEEP_BUDGET_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+        SWEEP_BUDGET_OVERRIDE.with(|c| c.set(0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
