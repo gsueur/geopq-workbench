@@ -151,6 +151,16 @@ pub fn default_repos() -> Vec<Repository> {
             attribution_by_license: BTreeMap::new(),
         },
         Repository {
+            name: "Geomermaids FAO GAUL 2024 (global admin)".into(),
+            url: "https://parquetry.geomermaids.com/gaul".into(),
+            kind: RepoKind::Parquetry,
+            // Its ATTRIBUTION.txt sits beside the data and carries the
+            // citation FAO's terms require, access date included; a short
+            // fallback here could only get that wrong.
+            attribution: None,
+            attribution_by_license: BTreeMap::new(),
+        },
+        Repository {
             name: "Geomermaids CORINE Land Cover (Europe)".into(),
             url: "https://parquetry.geomermaids.com/clc".into(),
             kind: RepoKind::Parquetry,
@@ -3486,6 +3496,29 @@ mod tests {
             let url = theme_url(base, "2018/", &ds[0].path, theme);
             eprintln!("{theme}: {rows} rows -> {url}");
             assert!(exists(&url).unwrap(), "{url}");
+        }
+    }
+
+    /// Live probe of GAUL: a whole-world dataset under the release plus
+    /// one folder per country, all from index.json.
+    #[test]
+    #[ignore]
+    fn repo_live_gaul() {
+        let base = "https://parquetry.geomermaids.com/gaul";
+        let snaps = fetch_snapshots(base).unwrap();
+        assert_eq!(snaps[0].path, "2024/", "latest aliases the release");
+        let ds = discover_datasets(base, "2024/").unwrap();
+        eprintln!("{} datasets", ds.len());
+        assert!(ds[0].path.is_empty(), "the whole world comes first");
+        let fra = ds.iter().find(|d| d.code == "FRA").expect("France listed");
+        for d in [&ds[0], fra] {
+            let m = fetch_manifest(base, "2024/", &d.path).unwrap();
+            eprintln!("{}: {:?} {:?}", d.name, m.state_name, m.themes);
+            assert_eq!(m.themes.len(), 3);
+            for (theme, _) in &m.themes {
+                let url = theme_url(base, "2024/", &d.path, theme);
+                assert!(exists(&url).unwrap(), "{url}");
+            }
         }
     }
 
