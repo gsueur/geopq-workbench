@@ -144,6 +144,17 @@ pub fn default_repos() -> Vec<Repository> {
             attribution_by_license: BTreeMap::new(),
         },
         Repository {
+            name: "Geomermaids OSM infrastructure (power, telecoms, oil & gas, water)".into(),
+            // Open Infrastructure Map's content, one folder per GAUL
+            // level 1 unit. Only `latest/` is published: no snapshots.
+            url: "https://parquetry.geomermaids.com/osm-infrastructure".into(),
+            kind: RepoKind::Parquetry,
+            // As for OSM: the fallback when ATTRIBUTION.txt cannot be
+            // fetched.
+            attribution: Some("© OpenStreetMap contributors".into()),
+            attribution_by_license: BTreeMap::new(),
+        },
+        Repository {
             name: "Geomermaids geoBoundaries (global admin)".into(),
             url: "https://parquetry.geomermaids.com/geoboundaries".into(),
             kind: RepoKind::Parquetry,
@@ -3519,6 +3530,29 @@ mod tests {
                 let url = theme_url(base, "2024/", &d.path, theme);
                 assert!(exists(&url).unwrap(), "{url}");
             }
+        }
+    }
+
+    /// Live probe of the OSM infrastructure repository: latest only, one
+    /// folder per country and GAUL level 1 unit, named in index.json.
+    #[test]
+    #[ignore]
+    fn repo_live_osm_infrastructure() {
+        let base = "https://parquetry.geomermaids.com/osm-infrastructure";
+        let snaps = fetch_snapshots(base).unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].path, "latest/");
+        let ds = discover_datasets(base, "latest/").unwrap();
+        let fl = ds
+            .iter()
+            .find(|d| d.name == "Florida")
+            .expect("Florida listed");
+        assert!(fl.path.starts_with("country=US/state="), "{}", fl.path);
+        let m = fetch_manifest(base, "latest/", &fl.path).unwrap();
+        assert!(m.themes.iter().any(|(t, _)| t == "power_line"));
+        for (theme, _) in &m.themes {
+            let url = theme_url(base, "latest/", &fl.path, theme);
+            assert!(exists(&url).unwrap(), "{url}");
         }
     }
 
