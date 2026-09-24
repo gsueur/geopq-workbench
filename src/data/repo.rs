@@ -112,9 +112,11 @@ impl Repository {
 /// the data carries none of its own.
 ///
 /// The longest matching base wins, and does not fall through to a shorter
-/// one: `parquetry.geomermaids.com/geoboundaries` sits under the OSM
-/// repository's base, and crediting geoBoundaries polygons to OpenStreetMap
-/// would be worse than crediting them to nobody.
+/// one: a repository can sit under another's base (a saved OSM entry from
+/// before the bucket moved OSM to /osm still has the bucket root, above
+/// every other parquetry.geomermaids.com repository), and crediting
+/// geoBoundaries polygons to OpenStreetMap would be worse than crediting
+/// them to nobody.
 pub fn credit_for_url(url: &str, license: Option<&str>) -> Option<String> {
     load_repos()
         .into_iter()
@@ -127,7 +129,11 @@ pub fn default_repos() -> Vec<Repository> {
     vec![
         Repository {
             name: "Geomermaids Parquetry (OSM North America)".into(),
-            url: "https://parquetry.geomermaids.com".into(),
+            // The bucket gave each dataset its own prefix on 2026-09-23.
+            // The root still answers for the old paths through a
+            // permanent rewrite, but /osm is where OSM lives now, and it
+            // no longer sits above the other repositories.
+            url: "https://parquetry.geomermaids.com/osm".into(),
             kind: RepoKind::Parquetry,
             // This one publishes an ATTRIBUTION.txt at its root saying the
             // same thing, and that is what normally supplies the credit.
@@ -2259,7 +2265,7 @@ mod tests {
         let repos = default_repos();
         let json = serde_json::to_string(&repos).unwrap();
         let back: Vec<Repository> = serde_json::from_str(&json).unwrap();
-        assert_eq!(back[0].url, "https://parquetry.geomermaids.com");
+        assert_eq!(back[0].url, "https://parquetry.geomermaids.com/osm");
     }
 
     fn write_json(root: &Path, rel: &str, v: serde_json::Value) {
@@ -2415,13 +2421,22 @@ mod tests {
     }
 
     #[test]
-    /// The geoBoundaries and CLC repositories sit under the OSM
-    /// repository's base URL. Matching the shorter base would credit their
-    /// polygons to OpenStreetMap, which is worse than crediting nobody.
+    /// A saved OSM entry from before the move to /osm has the bucket root
+    /// as its base, so the geoBoundaries and CLC repositories sit under it.
+    /// Matching the shorter base would credit their polygons to
+    /// OpenStreetMap, which is worse than crediting nobody.
     fn a_nested_repository_does_not_inherit_its_parents_credit() {
         // Defaults are in play only when the user has no config of their
         // own; these tests share a per-process temp config file.
         let _ = std::fs::remove_file(config_file().unwrap());
+        assert_eq!(
+            credit_for_url("https://parquetry.geomermaids.com/osm/latest/x.parquet", None),
+            Some("© OpenStreetMap contributors".to_string()),
+        );
+        // A pre-move config: OSM at the root, above the others.
+        let mut old = default_repos();
+        old[0].url = "https://parquetry.geomermaids.com".into();
+        save_repos(&old).unwrap();
         assert_eq!(
             credit_for_url("https://parquetry.geomermaids.com/latest/x.parquet", None),
             Some("© OpenStreetMap contributors".to_string()),
@@ -2437,6 +2452,7 @@ mod tests {
             credit_for_url("https://elsewhere.example/a.parquet", None),
             None,
         );
+        let _ = std::fs::remove_file(config_file().unwrap());
     }
 
     #[test]
@@ -2742,12 +2758,12 @@ mod tests {
     fn theme_url_shape() {
         assert_eq!(
             theme_url(
-                "https://parquetry.geomermaids.com",
+                "https://parquetry.geomermaids.com/osm",
                 "latest/",
                 "country=US/state=US-AR",
                 "buildings"
             ),
-            "https://parquetry.geomermaids.com/latest/country=US/state=US-AR/buildings.parquet"
+            "https://parquetry.geomermaids.com/osm/latest/country=US/state=US-AR/buildings.parquet"
         );
         // A repository holding one global dataset publishes it directly
         // under the snapshot: the empty dataset path must not leave a
@@ -3440,7 +3456,7 @@ mod tests {
     #[test]
     #[ignore]
     fn repo_live() {
-        let base = "https://parquetry.geomermaids.com";
+        let base = "https://parquetry.geomermaids.com/osm";
         let snaps = fetch_snapshots(base).unwrap();
         eprintln!("{} snapshots (incl. latest)", snaps.len());
         assert!(snaps.len() > 1);

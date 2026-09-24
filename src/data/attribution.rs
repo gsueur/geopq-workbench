@@ -459,7 +459,7 @@ project at the William & Mary geoLab.
         // An OSM theme sits four directories below the repository's own
         // notice, and must still find it.
         let osm = Source::Remote {
-            url: "https://parquetry.geomermaids.com/latest/country=US/state=US-AR/\
+            url: "https://parquetry.geomermaids.com/osm/latest/country=US/state=US-AR/\
                   buildings.parquet"
                 .replace(' ', "")
                 .to_string(),
