@@ -911,7 +911,6 @@ pub fn name_color(name: &str) -> Option<Color32> {
             ],
             (123, 124, 186),
         ),
-        (&["water_reservoir"], (58, 133, 217)),
         (&["bathymetry"], (48, 90, 148)),
         (
             &[
@@ -1368,7 +1367,6 @@ mod name_color_tests {
             ("water_tower", (123, 124, 186)),
             ("water_well", (123, 124, 186)),
             ("pressurised_waterway", (123, 124, 186)),
-            ("water_reservoir", (58, 133, 217)),
         ];
         for (layer, want) in expect {
             assert_eq!(rgb(layer), Some(want), "{layer}");
