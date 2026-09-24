@@ -894,13 +894,21 @@ pub fn name_color(name: &str) -> Option<Color32> {
         (&["telecom_building"], (125, 89, 171)),
         (&["telecom", "street_cabinet"], (97, 99, 122)),
         (&["utility_pole"], (68, 68, 68)),
-        (&["pipeline_feature", "petroleum", "offshore_platform"], (107, 107, 107)),
+        (
+            &["pipeline_feature", "petroleum", "offshore_platform"],
+            (107, 107, 107),
+        ),
         (&["pipeline"], (234, 151, 45)),
         (&["marker"], (186, 186, 186)),
         (&["water_treatment_plant"], (123, 186, 172)),
         (&["wastewater_plant"], (193, 150, 83)),
         (
-            &["pumping_station", "water_tower", "water_well", "pressurised_waterway"],
+            &[
+                "pumping_station",
+                "water_tower",
+                "water_well",
+                "pressurised_waterway",
+            ],
             (123, 124, 186),
         ),
         (&["water_reservoir"], (58, 133, 217)),
