@@ -875,6 +875,35 @@ pub fn palette_color(i: usize) -> Color32 {
 pub fn name_color(name: &str) -> Option<Color32> {
     type Keys = &'static [&'static str];
     const TABLE: &[(Keys, (u8, u8, u8))] = &[
+        // The layers of the geomermaids OSM infrastructure repository, in
+        // Open Infrastructure Map's colours (web/src/style/style_oim_*.ts).
+        // First, because their names also hold the generic keys below
+        // ("water_tower", "utility_pole"), and the specific name wins.
+        // OIM colours lines and substations by voltage; one colour per
+        // layer can only take a band, so lines get the 220 kV red, the
+        // band OIM's transmission maps are mostly drawn in. A graduated
+        // style on voltage_kv reproduces the full scale.
+        (&["power_line"], (199, 48, 48)),
+        (&["power_circuit"], (181, 78, 178)),
+        (&["power_tower"], (68, 68, 68)),
+        (&["power_substation"], (124, 69, 68)),
+        (&["power_plant"], (107, 89, 71)),
+        (&["power_generator"], (114, 107, 169)),
+        (&["power_switchgear"], (30, 30, 30)),
+        (&["power_other"], (153, 153, 153)),
+        (&["telecom_building"], (125, 89, 171)),
+        (&["telecom", "street_cabinet"], (97, 99, 122)),
+        (&["utility_pole"], (68, 68, 68)),
+        (&["pipeline_feature", "petroleum", "offshore_platform"], (107, 107, 107)),
+        (&["pipeline"], (234, 151, 45)),
+        (&["marker"], (186, 186, 186)),
+        (&["water_treatment_plant"], (123, 186, 172)),
+        (&["wastewater_plant"], (193, 150, 83)),
+        (
+            &["pumping_station", "water_tower", "water_well", "pressurised_waterway"],
+            (123, 124, 186),
+        ),
+        (&["water_reservoir"], (58, 133, 217)),
         (&["bathymetry"], (48, 90, 148)),
         (
             &[
@@ -1296,6 +1325,50 @@ mod name_color_tests {
 
         // No keyword: fall through to the rotating palette.
         assert_eq!(name_color("mystery_dataset_42"), None);
+    }
+
+    /// The OSM infrastructure layers take Open Infrastructure Map's
+    /// colours, not the generic group their names also match.
+    #[test]
+    fn infrastructure_layers_take_oim_colours() {
+        let rgb = |n: &str| name_color(n).map(|c| (c.r(), c.g(), c.b()));
+        let expect = [
+            ("power_line", (199, 48, 48)),
+            ("power_circuit", (181, 78, 178)),
+            ("power_tower", (68, 68, 68)),
+            ("power_substation", (124, 69, 68)),
+            ("power_plant", (107, 89, 71)),
+            ("power_generator", (114, 107, 169)),
+            ("power_switchgear", (30, 30, 30)),
+            ("power_other", (153, 153, 153)),
+            ("telecom_cable", (97, 99, 122)),
+            ("telecom_building", (125, 89, 171)),
+            ("telecom_location", (97, 99, 122)),
+            ("telecom_mast", (97, 99, 122)),
+            ("telecom_antenna", (97, 99, 122)),
+            ("utility_pole", (68, 68, 68)),
+            ("street_cabinet", (97, 99, 122)),
+            ("pipeline", (234, 151, 45)),
+            ("petroleum_site", (107, 107, 107)),
+            ("petroleum_well", (107, 107, 107)),
+            ("offshore_platform", (107, 107, 107)),
+            ("pipeline_feature", (107, 107, 107)),
+            ("marker", (186, 186, 186)),
+            ("water_treatment_plant", (123, 186, 172)),
+            ("wastewater_plant", (193, 150, 83)),
+            ("pumping_station", (123, 124, 186)),
+            ("water_tower", (123, 124, 186)),
+            ("water_well", (123, 124, 186)),
+            ("pressurised_waterway", (123, 124, 186)),
+            ("water_reservoir", (58, 133, 217)),
+        ];
+        for (layer, want) in expect {
+            assert_eq!(rgb(layer), Some(want), "{layer}");
+        }
+        // The OSM themes they sit beside keep their own colours.
+        assert_eq!(rgb("power"), Some((168, 144, 62)));
+        assert_eq!(rgb("water"), Some((66, 120, 179)));
+        assert_eq!(rgb("waterways"), Some((66, 120, 179)));
     }
 
     /// Every theme of the geomermaids parquetry repositories resolves to
