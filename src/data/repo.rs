@@ -543,6 +543,33 @@ pub struct Dataset {
     pub name: String,
     /// Folder path under the snapshot ("country=US/state=US-AR").
     pub path: String,
+    /// Name of the `country=` folder it sits in, when the repository
+    /// says ("United States of America"); the browser groups by it.
+    #[serde(default)]
+    pub country_name: Option<String>,
+}
+
+impl Dataset {
+    /// The `country=` value of the path, if it has one.
+    pub fn country(&self) -> Option<&str> {
+        self.path
+            .split('/')
+            .find_map(|s| s.strip_prefix("country="))
+    }
+
+    /// List label: the name, with the code when it tells the reader
+    /// something ("Rhode Island (US-RI)"). Numeric codes (GAUL units) and
+    /// technical folders (`_offshore`, `_intl`) only add noise.
+    pub fn label(&self) -> String {
+        let meaningful = self.code != self.name
+            && !self.code.starts_with('_')
+            && !self.code.chars().all(|c| c.is_ascii_digit());
+        if meaningful {
+            format!("{} ({})", self.name, self.code)
+        } else {
+            self.name.clone()
+        }
+    }
 }
 
 /// `~/.config/geopq-viewer/repo_cache.json`: discovered dataset lists per
@@ -659,6 +686,10 @@ pub fn discover_datasets(base: &str, snapshot: &str) -> Result<Vec<Dataset>, Str
                     .to_string(),
                 code,
                 path: path.trim_matches('/').to_string(),
+                country_name: d
+                    .get("country_name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             });
         }
         if !out.is_empty() {
@@ -692,6 +723,7 @@ pub fn discover_datasets(base: &str, snapshot: &str) -> Result<Vec<Dataset>, Str
                         code: code.to_string(),
                         name: name.to_string(),
                         path,
+                        country_name: probe_country_name(country).map(str::to_string),
                     }),
                     Ok(false) => {}
                     // Fail the whole discovery rather than return (and
@@ -844,6 +876,7 @@ pub fn discover_datasets_stac(base: &str, snapshot: &str) -> Result<Vec<Dataset>
             code: t.clone(),
             name: t.clone(),
             path: t,
+            country_name: None,
         })
         .collect())
 }
@@ -1973,6 +2006,17 @@ pub fn download_to(
 
 /// ISO 3166-2 regions probed when a repository has no index.json.
 /// 404s drop out, so over-listing is harmless.
+/// Names of the countries in `REGIONS`, for repositories without an
+/// index.json.
+fn probe_country_name(code: &str) -> Option<&'static str> {
+    match code {
+        "US" => Some("United States"),
+        "CA" => Some("Canada"),
+        "MX" => Some("Mexico"),
+        _ => None,
+    }
+}
+
 const REGIONS: &[(&str, &str, &str)] = &[
     ("US", "US-AL", "Alabama"),
     ("US", "US-AK", "Alaska"),
@@ -2279,6 +2323,43 @@ mod tests {
         let gone = dir.join("sub").join("x.json");
         assert!(write_atomic(&gone, "x").is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dataset_label_keeps_only_codes_that_mean_something() {
+        let d = |code: &str, name: &str, path: &str| Dataset {
+            code: code.into(),
+            name: name.into(),
+            path: path.into(),
+            country_name: None,
+        };
+        let ri = d("US-RI", "Rhode Island", "country=US/state=US-RI");
+        assert_eq!(ri.label(), "Rhode Island (US-RI)");
+        assert_eq!(ri.country(), Some("US"));
+        assert_eq!(
+            d("2311", "Florida", "country=US/state=2311").label(),
+            "Florida"
+        );
+        assert_eq!(
+            d(
+                "_offshore",
+                "Honduras (offshore)",
+                "country=HN/state=_offshore"
+            )
+            .label(),
+            "Honduras (offshore)"
+        );
+        let world = d("WORLD", "WORLD", "");
+        assert_eq!(world.label(), "WORLD");
+        assert_eq!(world.country(), None);
+    }
+
+    /// Caches written before `country_name` existed still load.
+    #[test]
+    fn dataset_without_country_name_deserializes() {
+        let d: Dataset =
+            serde_json::from_str(r#"{"code":"FRA","name":"France","path":"country=FRA"}"#).unwrap();
+        assert_eq!(d.country_name, None);
     }
 
     #[test]
