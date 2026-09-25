@@ -552,6 +552,18 @@ pub struct ViewerApp {
     display_gen: u64,
 }
 
+/// One dataset of the repository browser's list.
+struct DsRow {
+    /// Index into the discovered datasets.
+    idx: usize,
+    /// What the list shows ("Florida", "Rhode Island (US-RI)").
+    label: String,
+    /// Lower-cased name, code and country name, for the filter box.
+    haystack: String,
+    /// `country=` value; empty when the repository has no country level.
+    country: String,
+}
+
 /// Browser over external GeoParquet repositories (parquetry layout):
 /// snapshot picker, discovered datasets, per-theme loading.
 struct RepoBrowser {
@@ -561,15 +573,15 @@ struct RepoBrowser {
     sel_snapshot: usize,
     /// None = discovery in flight.
     datasets: Option<Result<Vec<crate::data::repo::Dataset>, String>>,
-    /// Owned (index, name, code, path) view of `datasets`, and the
-    /// distinct `country=` values in it. Both are built when the
+    /// Owned row view of `datasets`, and the distinct `country=` values
+    /// in it as (code, name), sorted by name. Both are built when the
     /// discovery lands: the list widget mutates the browser while it
     /// iterates, so it needs an owned copy, and cloning three strings per
     /// dataset (plus sorting the country list) per frame was the cost of
     /// having this window open. Shared so a frame can hold one while the
     /// widgets below write to the browser.
-    ds_rows: Arc<Vec<(usize, String, String, String)>>,
-    countries: Arc<Vec<String>>,
+    ds_rows: Arc<Vec<DsRow>>,
+    countries: Arc<Vec<(String, String)>>,
     filter: String,
     /// Country filter over the dataset list; empty = all.
     country: String,
@@ -5315,23 +5327,35 @@ impl ViewerApp {
                 RepoMsg::Datasets(g, res, cached_at) if g == b.generation => {
                     let (rows, countries) = match &res {
                         Ok(ds) => {
-                            let rows: Vec<(usize, String, String, String)> = ds
+                            let rows: Vec<DsRow> = ds
                                 .iter()
                                 .enumerate()
-                                .map(|(i, d)| {
-                                    (i, d.name.clone(), d.code.clone(), d.path.clone())
+                                .map(|(i, d)| DsRow {
+                                    idx: i,
+                                    label: d.label(),
+                                    haystack: format!(
+                                        "{}\n{}\n{}",
+                                        d.name,
+                                        d.code,
+                                        d.country_name.as_deref().unwrap_or("")
+                                    )
+                                    .to_lowercase(),
+                                    country: d.country().unwrap_or("").to_string(),
                                 })
                                 .collect();
-                            let mut countries: Vec<String> = rows
-                                .iter()
-                                .filter_map(|(_, _, _, path)| {
-                                    path.split('/')
-                                        .find_map(|s| s.strip_prefix("country="))
-                                        .map(str::to_string)
-                                })
-                                .collect();
-                            countries.sort_unstable();
-                            countries.dedup();
+                            // (code, name), named after the first dataset
+                            // that names its country, sorted by name.
+                            let mut countries: Vec<(String, String)> = Vec::new();
+                            for d in ds {
+                                let Some(c) = d.country() else { continue };
+                                let name = d.country_name.as_deref().unwrap_or(c);
+                                match countries.iter_mut().find(|(k, _)| k == c) {
+                                    Some((_, n)) if n == c => *n = name.to_string(),
+                                    Some(_) => {}
+                                    None => countries.push((c.to_string(), name.to_string())),
+                                }
+                            }
+                            countries.sort_by(|a, b| a.1.cmp(&b.1));
                             (rows, countries)
                         }
                         Err(_) => (Vec::new(), Vec::new()),
@@ -5545,7 +5569,7 @@ impl ViewerApp {
                     // --- datasets (left) + themes (right) ---
                     // Owned views of the async state, so the widgets below
                     // can mutate the browser (filters, checkboxes) freely.
-                    let ds_view: Option<Result<Arc<Vec<(usize, String, String, String)>>, String>> =
+                    let ds_view: Option<Result<Arc<Vec<DsRow>>, String>> =
                         match &b.datasets {
                             None => None,
                             Some(Err(e)) => Some(Err(e.clone())),
@@ -5591,24 +5615,26 @@ impl ViewerApp {
                                     ui.horizontal(|ui| {
                                         let country_before = b.country.clone();
                                         if countries.len() > 1 {
+                                            let current = countries
+                                                .iter()
+                                                .find(|(c, _)| *c == b.country)
+                                                .map(|(_, n)| n.clone())
+                                                .unwrap_or_else(|| "All".to_string());
                                             egui::ComboBox::from_id_salt("repo_country")
-                                                .width(70.0)
-                                                .selected_text(if b.country.is_empty() {
-                                                    "All".to_string()
-                                                } else {
-                                                    b.country.clone()
-                                                })
+                                                .width(110.0)
+                                                .truncate()
+                                                .selected_text(current)
                                                 .show_ui(ui, |ui| {
                                                     ui.selectable_value(
                                                         &mut b.country,
                                                         String::new(),
                                                         "All",
                                                     );
-                                                    for c in countries.iter() {
+                                                    for (c, name) in countries.iter() {
                                                         ui.selectable_value(
                                                             &mut b.country,
                                                             c.clone(),
-                                                            c.as_str(),
+                                                            name.as_str(),
                                                         );
                                                     }
                                                 });
@@ -5633,35 +5659,55 @@ impl ViewerApp {
                                         );
                                     });
                                     let needle = b.filter.to_lowercase();
-                                    let country = format!("country={}", b.country);
+                                    let shown = |r: &&DsRow| {
+                                        (b.country.is_empty() || r.country == b.country)
+                                            && (needle.is_empty() || r.haystack.contains(&needle))
+                                    };
                                     egui::ScrollArea::vertical()
                                         .max_height(320.0)
                                         .show(ui, |ui| {
-                                            for (i, name, code, path) in ds.iter() {
-                                                if !b.country.is_empty()
-                                                    && !path.contains(&country)
-                                                {
-                                                    continue;
-                                                }
-                                                if !needle.is_empty()
-                                                    && !name.to_lowercase().contains(&needle)
-                                                    && !code.to_lowercase().contains(&needle)
-                                                {
-                                                    continue;
-                                                }
-                                                let row = if code == name {
-                                                    name.clone()
-                                                } else {
-                                                    format!("{name} ({code})")
-                                                };
+                                            let mut row = |ui: &mut egui::Ui, r: &DsRow| {
                                                 if ui
                                                     .selectable_label(
-                                                        sel_idx == Some(*i),
-                                                        row,
+                                                        sel_idx == Some(r.idx),
+                                                        r.label.as_str(),
                                                     )
                                                     .clicked()
                                                 {
-                                                    fetch_manifest = Some(*i);
+                                                    fetch_manifest = Some(r.idx);
+                                                }
+                                            };
+                                            // Several countries and none picked:
+                                            // one collapsible group per country,
+                                            // opened while a filter is typed.
+                                            if b.country.is_empty() && countries.len() > 1 {
+                                                for (c, name) in countries.iter() {
+                                                    let rs: Vec<&DsRow> = ds
+                                                        .iter()
+                                                        .filter(|r| r.country == *c)
+                                                        .filter(shown)
+                                                        .collect();
+                                                    if rs.is_empty() {
+                                                        continue;
+                                                    }
+                                                    egui::CollapsingHeader::new(format!(
+                                                        "{name} ({})",
+                                                        rs.len()
+                                                    ))
+                                                    .id_salt(("repo_country_group", c))
+                                                    .open((!needle.is_empty()).then_some(true))
+                                                    .show(ui, |ui| {
+                                                        for r in rs {
+                                                            row(ui, r);
+                                                        }
+                                                    });
+                                                }
+                                                for r in ds.iter().filter(|r| r.country.is_empty()).filter(shown) {
+                                                    row(ui, r);
+                                                }
+                                            } else {
+                                                for r in ds.iter().filter(shown) {
+                                                    row(ui, r);
                                                 }
                                             }
                                         });
