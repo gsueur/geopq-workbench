@@ -558,12 +558,12 @@ impl Dataset {
     }
 
     /// List label: the name, with the code when it tells the reader
-    /// something ("Rhode Island (US-RI)"). Numeric codes (GAUL units) and
-    /// technical folders (`_offshore`, `_intl`) only add noise.
+    /// something ("Rhode Island (US-RI)"). Codes worth showing are ISO
+    /// style, upper case; a folder slug (`texas`), a numeric id or a
+    /// technical folder (`_offshore`, `_intl`) only repeats the name.
     pub fn label(&self) -> String {
-        let meaningful = self.code != self.name
-            && !self.code.starts_with('_')
-            && !self.code.chars().all(|c| c.is_ascii_digit());
+        let meaningful =
+            self.code != self.name && self.code.chars().any(|c| c.is_ascii_uppercase());
         if meaningful {
             format!("{} ({})", self.name, self.code)
         } else {
@@ -2340,6 +2340,16 @@ mod tests {
             d("2311", "Florida", "country=US/state=2311").label(),
             "Florida"
         );
+        assert_eq!(
+            d(
+                "ile-de-france",
+                "Île-de-France",
+                "country=FR/state=ile-de-france"
+            )
+            .label(),
+            "Île-de-France"
+        );
+        assert_eq!(d("FRA", "France", "country=FRA").label(), "France (FRA)");
         assert_eq!(
             d(
                 "_offshore",
