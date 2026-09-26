@@ -184,6 +184,14 @@ pub enum LoadMsg {
         source: String,
         error: String,
     },
+    /// The folder the user opened holds several datasets side by side
+    /// (`power_line.parquet`, `pipeline.parquet`, ...), not the parts of
+    /// one: the app opens each of `sources` as its own layer instead.
+    Split {
+        job: u64,
+        source: String,
+        sources: Vec<Source>,
+    },
     /// A non-indexable file too big for a full build opened under
     /// `LoadMode::Auto`: the app must ask the user (Optimize / load all /
     /// cancel) before anything is decoded (docs/OPEN_POLICY.md). Carries
@@ -805,6 +813,30 @@ pub fn spawn_load(
                 return;
             }
         };
+        // A folder of different datasets (a parquetry state folder: one
+        // file per theme) cannot open as one layer; hand the app one source
+        // per dataset instead of failing on their differing schemas.
+        if matches!(source, Source::Dir(_)) || source.is_s3_prefix() {
+            match layer_sources(&source) {
+                Ok(Some(sources)) => {
+                    handle.send(LoadMsg::Split {
+                        job,
+                        source: source.label(),
+                        sources,
+                    });
+                    return;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    handle.send(LoadMsg::Failed {
+                        job,
+                        source: source.label(),
+                        error: e,
+                    });
+                    return;
+                }
+            }
+        }
         handle.send(LoadMsg::Progress {
             job,
             frac: 0.02,
@@ -2814,16 +2846,17 @@ fn glob_match(pat: &str, key: &str) -> bool {
     ps.len() == ks.len() && ps.iter().zip(&ks).all(|(p, k)| seg_match(p, k))
 }
 
-/// Open `s3://bucket/prefix/` (or a `*` glob like
-/// `s3://bucket/d/state=*/roads.parquet`) as one multi-fragment remote
-/// dataset: list the objects under the literal prefix, keep the
-/// matching parquet parts, and turn hive `key=value` path segments
-/// into virtual partition columns — the remote twin of
-/// `open_dir_store`.
-fn open_s3_prefix_store(source: &Source) -> Result<StoreOpen, String> {
-    use super::store::hive_segments;
-
-    let Source::S3 { uri, profile, endpoint, .. } = source else {
+/// The parquet objects an `s3://` prefix or glob names: (bucket, literal
+/// listing prefix, keys). Sidecars (`_manifest.json`, `.hidden/`) and
+/// non-parquet objects are left out.
+fn list_s3_prefix(source: &Source) -> Result<(String, String, Vec<String>), String> {
+    let Source::S3 {
+        uri,
+        profile,
+        endpoint,
+        ..
+    } = source
+    else {
         return Err("not an S3 prefix".into());
     };
     let rest = uri.strip_prefix("s3://").unwrap_or(uri);
@@ -2839,14 +2872,11 @@ fn open_s3_prefix_store(source: &Source) -> Result<StoreOpen, String> {
         None => (keypat, None),
     };
     let list_uri = format!("s3://{bucket}/{prefix}");
-    let listed = crate::data::source::aws::list_prefix(
-        &list_uri,
-        profile.as_deref(),
-        endpoint.as_deref(),
-    )?;
-    let keys: Vec<&str> = listed
-        .iter()
-        .map(|(k, _)| k.as_str())
+    let listed =
+        crate::data::source::aws::list_prefix(&list_uri, profile.as_deref(), endpoint.as_deref())?;
+    let keys: Vec<String> = listed
+        .into_iter()
+        .map(|(k, _)| k)
         .filter(|k| {
             let rel = k.strip_prefix(prefix).unwrap_or(k);
             matches!(
@@ -2864,6 +2894,170 @@ fn open_s3_prefix_store(source: &Source) -> Result<StoreOpen, String> {
             None => format!("no .parquet objects under {uri}"),
         });
     }
+    Ok((bucket.to_string(), prefix.to_string(), keys))
+}
+
+/// Whether a file stem names a part of a dataset (`part-00001-abc`,
+/// `data_0`, `00003`) rather than a dataset of its own.
+fn is_part_stem(stem: &str) -> bool {
+    let lower = stem.to_ascii_lowercase();
+    let digits_after = |p: &str| {
+        lower
+            .strip_prefix(p)
+            .map(|r| r.trim_start_matches(['-', '_', '.']))
+            .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+    };
+    stem.chars().all(|c| c.is_ascii_digit())
+        || ["part", "data", "chunk"].iter().any(|p| digits_after(p))
+}
+
+/// Group the files of a folder by the dataset they belong to, when they
+/// are several datasets side by side. `rel` are paths relative to the
+/// opened folder. `None` means one dataset (keep opening it as one layer):
+/// part-named files, or a single file name however many folders repeat it.
+/// It is several when one directory holds files of different names, the
+/// shape of a parquetry state folder (one file per theme). Groups keep
+/// the first-seen order of their names.
+fn split_by_dataset(rel: &[String]) -> Option<Vec<(String, Vec<usize>)>> {
+    let stem = |r: &str| {
+        let name = r.rsplit('/').next().unwrap_or(r);
+        name.rsplit_once('.').map_or(name, |(s, _)| s).to_string()
+    };
+    let dir = |r: &str| r.rsplit_once('/').map_or("", |(d, _)| d).to_string();
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (i, r) in rel.iter().enumerate() {
+        let st = stem(r);
+        if is_part_stem(&st) {
+            return None;
+        }
+        match groups.iter_mut().find(|(s, _)| *s == st) {
+            Some((_, v)) => v.push(i),
+            None => groups.push((st, vec![i])),
+        }
+    }
+    if groups.len() < 2 {
+        return None;
+    }
+    let mut by_dir: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for r in rel {
+        by_dir.entry(dir(r)).or_default().insert(stem(r));
+    }
+    by_dir
+        .values()
+        .any(|stems| stems.len() > 1)
+        .then_some(groups)
+}
+
+/// The glob naming every path of a group: the segments they share, and
+/// where they differ `key=*` for a hive segment, `*` otherwise. `None` when
+/// the paths are not all at the same depth.
+fn group_glob(paths: &[&str]) -> Option<String> {
+    let split: Vec<Vec<&str>> = paths.iter().map(|p| p.split('/').collect()).collect();
+    let depth = split[0].len();
+    if split.iter().any(|s| s.len() != depth) {
+        return None;
+    }
+    Some(
+        (0..depth)
+            .map(|i| {
+                let first = split[0][i];
+                if split.iter().all(|s| s[i] == first) {
+                    return first.to_string();
+                }
+                match first.split_once('=') {
+                    Some((key, _))
+                        if split
+                            .iter()
+                            .all(|s| s[i].split_once('=').is_some_and(|(k, _)| k == key)) =>
+                    {
+                        format!("{key}=*")
+                    }
+                    _ => "*".to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
+/// One source per dataset when `source` (a local folder or an `s3://`
+/// prefix) holds several side by side; `None` when it is one dataset.
+fn layer_sources(source: &Source) -> Result<Option<Vec<Source>>, String> {
+    match source {
+        Source::Dir(dir) => {
+            let paths = list_dataset_files(dir)?;
+            let rel: Vec<String> = paths
+                .iter()
+                .map(|p| {
+                    p.strip_prefix(dir)
+                        .unwrap_or(p)
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .collect();
+            let Some(groups) = split_by_dataset(&rel) else {
+                return Ok(None);
+            };
+            // A local group spread over several folders would need a
+            // multi-file local source, which does not exist: keep the old
+            // behaviour for it.
+            if groups.iter().any(|(_, v)| v.len() > 1) {
+                return Ok(None);
+            }
+            Ok(Some(
+                groups
+                    .iter()
+                    .map(|(_, v)| Source::Local(paths[v[0]].clone()))
+                    .collect(),
+            ))
+        }
+        Source::S3 {
+            profile, endpoint, ..
+        } => {
+            let (bucket, prefix, keys) = list_s3_prefix(source)?;
+            let rel: Vec<String> = keys
+                .iter()
+                .map(|k| k.strip_prefix(&prefix).unwrap_or(k).to_string())
+                .collect();
+            let Some(groups) = split_by_dataset(&rel) else {
+                return Ok(None);
+            };
+            let mut out = Vec::new();
+            for (_, v) in &groups {
+                let members: Vec<&str> = v.iter().map(|&i| keys[i].as_str()).collect();
+                let Some(key) = group_glob(&members) else {
+                    return Ok(None);
+                };
+                out.push(Source::S3 {
+                    uri: format!("s3://{bucket}/{key}"),
+                    profile: profile.clone(),
+                    endpoint: endpoint.clone(),
+                    url: String::new(),
+                    len: 0,
+                });
+            }
+            Ok(Some(out))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Open `s3://bucket/prefix/` (or a `*` glob like
+/// `s3://bucket/d/state=*/roads.parquet`) as one multi-fragment remote
+/// dataset: list the objects under the literal prefix, keep the
+/// matching parquet parts, and turn hive `key=value` path segments
+/// into virtual partition columns — the remote twin of
+/// `open_dir_store`.
+fn open_s3_prefix_store(source: &Source) -> Result<StoreOpen, String> {
+    use super::store::hive_segments;
+
+    let Source::S3 { uri, profile, endpoint, .. } = source else {
+        return Err("not an S3 prefix".into());
+    };
+    let (bucket, prefix, keys) = list_s3_prefix(source)?;
+    let (bucket, prefix) = (bucket.as_str(), prefix.as_str());
+    let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
     if keys.len() > PREFIX_PART_CAP {
         return Err(format!(
             "{} parquet files under {uri} (cap {PREFIX_PART_CAP} per load) — \
@@ -7862,6 +8056,134 @@ mod hive_tests {
         // Multiple stars in one segment backtrack correctly.
         assert!(glob_match("*-x-*.parquet", "part-x-1.parquet"));
         assert!(!glob_match("*-x-*.parquet", "part-y-1.parquet"));
+    }
+
+    #[test]
+    fn part_names_are_told_from_dataset_names() {
+        for part in [
+            "part-00001-abc",
+            "data_0",
+            "data_12",
+            "chunk.3",
+            "00042",
+            "PART-0",
+        ] {
+            assert!(is_part_stem(part), "{part}");
+        }
+        for name in ["power_line", "partner_sites", "database", "roads", "L1"] {
+            assert!(!is_part_stem(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_folder_of_datasets_splits_by_file_name() {
+        let rel = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // A parquetry state folder: one file per theme.
+        let groups = split_by_dataset(&rel(&["power_line.parquet", "pipeline.parquet"])).unwrap();
+        assert_eq!(
+            groups,
+            vec![("power_line".into(), vec![0]), ("pipeline".into(), vec![1])]
+        );
+        // A country: the same themes in every state folder, one group each.
+        let groups = split_by_dataset(&rel(&[
+            "state=a/roads.parquet",
+            "state=a/water.parquet",
+            "state=b/roads.parquet",
+            "state=b/water.parquet",
+        ]))
+        .unwrap();
+        assert_eq!(
+            groups,
+            vec![("roads".into(), vec![0, 2]), ("water".into(), vec![1, 3])]
+        );
+        // One dataset: parts, or one name repeated across partitions.
+        assert!(split_by_dataset(&rel(&["data_0.parquet", "data_1.parquet"])).is_none());
+        assert!(
+            split_by_dataset(&rel(&["state=a/roads.parquet", "state=b/roads.parquet"])).is_none()
+        );
+        assert!(split_by_dataset(&rel(&["roads.parquet"])).is_none());
+        // Different names, never two in one folder: nothing says they are
+        // separate datasets rather than oddly named parts. Left alone.
+        assert!(split_by_dataset(&rel(&["a/x.parquet", "b/y.parquet"])).is_none());
+    }
+
+    #[test]
+    fn a_group_is_named_by_one_glob() {
+        assert_eq!(
+            group_glob(&[
+                "d/country=IT/state=a/roads.parquet",
+                "d/country=IT/state=b/roads.parquet"
+            ]),
+            Some("d/country=IT/state=*/roads.parquet".into())
+        );
+        assert_eq!(
+            group_glob(&["d/roads.parquet"]),
+            Some("d/roads.parquet".into())
+        );
+        assert_eq!(
+            group_glob(&["d/a/roads.parquet", "d/b/roads.parquet"]),
+            Some("d/*/roads.parquet".into())
+        );
+        assert_eq!(group_glob(&["d/a/roads.parquet", "d/roads.parquet"]), None);
+    }
+
+    /// A local folder of themes opens as one layer per file; a folder of
+    /// parts still opens as one layer.
+    #[test]
+    fn a_local_folder_of_datasets_opens_as_layers() {
+        let root = std::env::temp_dir().join(format!("geopq_split_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write_part(&root.join("themes/power_line.parquet"), 10, 0, 10.0, 45.0);
+        write_part(&root.join("themes/pipeline.parquet"), 10, 10, 10.0, 45.0);
+        write_part(&root.join("parts/data_0.parquet"), 10, 0, 10.0, 45.0);
+        write_part(&root.join("parts/data_1.parquet"), 10, 10, 10.0, 45.0);
+        let split = layer_sources(&Source::Dir(root.join("themes")))
+            .unwrap()
+            .unwrap();
+        let names: Vec<String> = split.iter().map(Source::name).collect();
+        assert_eq!(names, vec!["pipeline", "power_line"]);
+        assert!(split.iter().all(|s| matches!(s, Source::Local(_))));
+        assert!(
+            layer_sources(&Source::Dir(root.join("parts")))
+                .unwrap()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Live: a parquetry state folder over S3 splits into its themes, and a
+    /// country folder into one glob per theme.
+    #[test]
+    #[ignore]
+    fn a_parquetry_folder_splits_live() {
+        let s3 = |uri: &str| Source::S3 {
+            uri: uri.into(),
+            profile: None,
+            endpoint: Some("s3.geomermaids.com".into()),
+            url: String::new(),
+            len: 0,
+        };
+        let state = layer_sources(&s3(
+            "s3://parquetry/osm-infrastructure/latest/country=IT/state=lombardia/",
+        ))
+        .unwrap()
+        .expect("a state folder is several datasets");
+        eprintln!("{:?}", state.iter().map(Source::name).collect::<Vec<_>>());
+        assert!(state.len() > 10);
+        assert!(state.iter().any(|s| s.name() == "power_line"));
+        let country = layer_sources(&s3("s3://parquetry/osm-infrastructure/latest/country=LU/"))
+            .unwrap()
+            .expect("a country folder is several datasets");
+        let Source::S3 { uri, .. } = country.iter().find(|s| s.name() == "power_line").unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            uri,
+            "s3://parquetry/osm-infrastructure/latest/country=LU/state=*/power_line.parquet"
+        );
+        // One layer's glob is one dataset: no split.
+        assert!(layer_sources(&s3(uri)).unwrap().is_none());
     }
 
     /// End-to-end S3 prefix open against a fake S3 endpoint: listing XML
