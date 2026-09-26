@@ -2062,6 +2062,9 @@ impl ViewerApp {
         let mut rebuild_display: Option<DisplayCrs> = None;
         let mut decider_done = false;
         let mut first_layer_fit = false;
+        // Datasets found side by side in one opened folder, each opened as
+        // its own layer once the loop is done.
+        let mut split_loads: Vec<Source> = Vec::new();
         while let Ok(msg) = self.load_rx.try_recv() {
             // New geometry may arrive: owe the frames that upload it,
             // strip the CPU copies, evict superseded GPU buffers and let
@@ -2538,6 +2541,22 @@ impl ViewerApp {
                         self.quality_gates.push(gate);
                     }
                 }
+                LoadMsg::Split {
+                    job,
+                    source,
+                    sources,
+                } => {
+                    self.loading.remove(&job);
+                    if self.projection_decider == Some(job) {
+                        self.projection_decider = None;
+                        decider_done = true;
+                    }
+                    log::info!(
+                        "{source}: {} datasets side by side, opening each as its own layer",
+                        sources.len()
+                    );
+                    split_loads.extend(sources);
+                }
                 LoadMsg::Failed { job, source, error } => {
                     self.loading.remove(&job);
                     if self.projection_decider == Some(job) {
@@ -2574,6 +2593,9 @@ impl ViewerApp {
         // waited for it, in the display that decision produced.
         if decider_done {
             self.flush_deferred_loads(ctx);
+        }
+        for source in split_loads {
+            self.enqueue_load(source, ctx);
         }
     }
 
