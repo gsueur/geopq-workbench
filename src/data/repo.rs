@@ -145,8 +145,8 @@ pub fn default_repos() -> Vec<Repository> {
         },
         Repository {
             name: "Geomermaids OSM infrastructure (power, telecoms, oil & gas, water)".into(),
-            // Open Infrastructure Map's content, one folder per GAUL
-            // level 1 unit. Only `latest/` is published: no snapshots.
+            // Open Infrastructure Map's content, one whole-world file per
+            // layer. Only `latest/` is published: no snapshots.
             url: "https://parquetry.geomermaids.com/osm-infrastructure".into(),
             kind: RepoKind::Parquetry,
             // As for OSM: the fallback when ATTRIBUTION.txt cannot be
@@ -3615,7 +3615,7 @@ mod tests {
     }
 
     /// Live probe of the OSM infrastructure repository: latest only, one
-    /// folder per country and GAUL level 1 unit, named in index.json.
+    /// dataset (the whole world, at an empty path) with one file per layer.
     #[test]
     #[ignore]
     fn repo_live_osm_infrastructure() {
@@ -3624,15 +3624,13 @@ mod tests {
         assert_eq!(snaps.len(), 1);
         assert_eq!(snaps[0].path, "latest/");
         let ds = discover_datasets(base, "latest/").unwrap();
-        let fl = ds
-            .iter()
-            .find(|d| d.name == "Florida")
-            .expect("Florida listed");
-        assert!(fl.path.starts_with("country=US/state="), "{}", fl.path);
-        let m = fetch_manifest(base, "latest/", &fl.path).unwrap();
+        assert_eq!(ds.len(), 1, "one dataset, the whole world");
+        assert!(ds[0].path.is_empty());
+        let m = fetch_manifest(base, "latest/", &ds[0].path).unwrap();
         assert!(m.themes.iter().any(|(t, _)| t == "power_line"));
         for (theme, _) in &m.themes {
-            let url = theme_url(base, "latest/", &fl.path, theme);
+            let url = theme_url(base, "latest/", &ds[0].path, theme);
+            assert!(url.ends_with(&format!("/latest/{theme}.parquet")), "{url}");
             assert!(exists(&url).unwrap(), "{url}");
         }
     }
