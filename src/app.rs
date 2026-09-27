@@ -1250,6 +1250,13 @@ impl ViewerApp {
         // watermarked without one); pick it up from the environment or the
         // settings file, and default to OpenStreetMap when there is none.
         crate::map::tiles::set_carto_api_key(load_carto_api_key());
+        // The published repository list, off the UI thread: File →
+        // Repositories reads whatever is in hand when it opens (this
+        // fetch, else the last one cached, else the list built in).
+        std::thread::spawn(|| match crate::data::repo::refresh_published() {
+            Ok(n) => log::info!("published repository list: {n} repositories"),
+            Err(e) => log::warn!("published repository list: {e}"),
+        });
         // Same file, read here so the export dialog never touches the disk
         // mid-frame for its COGP defaults.
         let _ = crate::data::settings::cogp_defaults();

@@ -125,6 +125,9 @@ pub fn credit_for_url(url: &str, license: Option<&str>) -> Option<String> {
         .and_then(|r| r.credit_for(license).map(str::to_string))
 }
 
+/// The built-in repositories as this build shipped them: the list in use
+/// until the published one (`PUBLISHED_URL`) has been read once. Keep it
+/// in step with osm-geoparquet `meta/repositories.json`.
 pub fn default_repos() -> Vec<Repository> {
     vec![
         Repository {
@@ -231,37 +234,212 @@ fn config_file() -> Option<PathBuf> {
     config_path("repositories.json")
 }
 
-pub fn load_repos() -> Vec<Repository> {
-    let list = config_file()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| repos_from_json(&s));
-    match list {
-        Some(l) if !l.is_empty() => upgrade_moved(l),
-        _ => default_repos(),
+/// The repository list Geomermaids publishes: the built-in entries, and
+/// where built-ins moved. Adding, renaming or moving a repository is an
+/// edit to this file (osm-geoparquet `meta/repositories.json`), not a
+/// release of this app.
+pub const PUBLISHED_URL: &str = "https://parquetry.geomermaids.com/meta/repositories.json";
+
+/// The last published list this app read, for offline starts.
+const PUBLISHED_CACHE: &str = "published_repositories.json";
+
+/// The format of the published list this build reads. A newer one is
+/// ignored whole, and the last list this build could read stays in use.
+const PUBLISHED_VERSION: u64 = 1;
+
+#[derive(Clone)]
+struct Published {
+    repos: Vec<Repository>,
+    /// Old URL to new, no trailing slashes.
+    moved: Vec<(String, String)>,
+}
+
+impl Published {
+    /// What this build knew when it was released: the start-up list until
+    /// the published one has been read once.
+    fn builtin() -> Self {
+        Published {
+            repos: default_repos(),
+            moved: MOVED_REPOS
+                .iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect(),
+        }
+    }
+
+    /// `url` where it lives now.
+    fn current_url(&self, url: &str) -> String {
+        let url = url.trim_end_matches('/');
+        self.moved
+            .iter()
+            .find(|(old, _)| old == url)
+            .map_or(url, |(_, new)| new.as_str())
+            .to_string()
+    }
+
+    fn has(&self, url: &str) -> bool {
+        self.repos.iter().any(|r| r.url == url)
     }
 }
 
-/// Built-in repositories that moved, old URL to new. The server still
-/// answers the old URL, but a saved list would keep showing the old name.
+/// Entry by entry, as the user's file: an entry of a kind this build does
+/// not know is dropped alone. Only https bases are taken from the network.
+fn published_from_json(s: &str) -> Option<Published> {
+    let v: Value = serde_json::from_str(s).ok()?;
+    if v.get("version").and_then(Value::as_u64)? != PUBLISHED_VERSION {
+        return None;
+    }
+    let repos: Vec<Repository> = v
+        .get("repositories")?
+        .as_array()?
+        .iter()
+        .filter_map(|e| serde_json::from_value::<Repository>(e.clone()).ok())
+        .map(|mut r| {
+            r.url = r.url.trim_end_matches('/').to_string();
+            r
+        })
+        .filter(|r| r.url.starts_with("https://") && !r.name.trim().is_empty())
+        .collect();
+    if repos.is_empty() {
+        return None;
+    }
+    let mut moved: Vec<(String, String)> = v
+        .get("moved")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(old, new)| {
+            Some((
+                old.trim_end_matches('/').to_string(),
+                new.as_str()?.trim_end_matches('/').to_string(),
+            ))
+        })
+        .collect();
+    // What this build already knew moved stays moved.
+    for (old, new) in MOVED_REPOS {
+        if !moved.iter().any(|(o, _)| o == old) {
+            moved.push((old.to_string(), new.to_string()));
+        }
+    }
+    Some(Published { repos, moved })
+}
+
+fn published_slot() -> &'static std::sync::RwLock<Option<Published>> {
+    static SLOT: std::sync::OnceLock<std::sync::RwLock<Option<Published>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// The published list: as fetched this session, else as last cached on
+/// disk, else as this build shipped it. Never touches the network, so it
+/// is safe on the UI thread.
+fn published() -> Published {
+    if let Some(p) = published_slot().read().unwrap().clone() {
+        return p;
+    }
+    let p = config_path(PUBLISHED_CACHE)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| published_from_json(&s))
+        .unwrap_or_else(Published::builtin);
+    *published_slot().write().unwrap() = Some(p.clone());
+    p
+}
+
+/// Fetch the published list and keep it, in memory and on disk. Blocking:
+/// run it off the UI thread. On any failure the list in use stays.
+pub fn refresh_published() -> Result<usize, String> {
+    let v = get_json(PUBLISHED_URL)?.ok_or_else(|| format!("{PUBLISHED_URL}: not found"))?;
+    let text = v.to_string();
+    let p = published_from_json(&text)
+        .ok_or_else(|| format!("{PUBLISHED_URL}: not a version {PUBLISHED_VERSION} list"))?;
+    let n = p.repos.len();
+    save_config(PUBLISHED_CACHE, &v)?;
+    *published_slot().write().unwrap() = Some(p);
+    Ok(n)
+}
+
+/// What the user changed on top of the published list. Only this is
+/// saved: a new or renamed built-in reaches everyone, including users who
+/// saved their list before it existed.
+#[derive(Default, Serialize, Deserialize)]
+struct UserRepos {
+    /// Repositories the user added.
+    #[serde(default)]
+    added: Vec<Repository>,
+    /// Built-in repositories the user removed, by URL.
+    #[serde(default)]
+    removed: Vec<String>,
+}
+
+/// The user's file. Up to 0.9.4 it was the whole list, a JSON array: its
+/// entries that are not published become the user's own, and no built-in
+/// counts as removed, since such a list cannot tell one the user removed
+/// from one published after it was saved.
+fn user_from_json(s: &str, p: &Published) -> Option<UserRepos> {
+    let v: Value = serde_json::from_str(s).ok()?;
+    if v.is_array() {
+        let added = repos_from_json(s)?
+            .into_iter()
+            .filter(|r| !p.has(&p.current_url(&r.url)))
+            .collect();
+        return Some(UserRepos { added, removed: Vec::new() });
+    }
+    let mut u = UserRepos {
+        added: v
+            .get("added")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| serde_json::from_value(e.clone()).ok())
+            .collect(),
+        removed: v
+            .get("removed")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.as_str().map(str::to_string))
+            .collect(),
+    };
+    u.removed = u.removed.iter().map(|r| p.current_url(r)).collect();
+    Some(u)
+}
+
+/// The published list minus what the user removed, then what they added.
+/// An added entry at a URL that is now published gives way to it.
+fn merge(p: &Published, u: &UserRepos) -> Vec<Repository> {
+    let mut out: Vec<Repository> = p
+        .repos
+        .iter()
+        .filter(|r| !u.removed.contains(&r.url))
+        .cloned()
+        .collect();
+    for a in &u.added {
+        let url = p.current_url(&a.url);
+        if p.has(&url) || out.iter().any(|r| r.url == url) {
+            continue;
+        }
+        out.push(Repository { url, ..a.clone() });
+    }
+    out
+}
+
+pub fn load_repos() -> Vec<Repository> {
+    let p = published();
+    let user = config_file()
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .and_then(|s| user_from_json(&s, &p))
+        .unwrap_or_default();
+    let list = merge(&p, &user);
+    if list.is_empty() { p.repos } else { list }
+}
+
+/// Built-in repositories that moved, old URL to new, as this build knows
+/// them. The published list carries the same table, and newer moves.
 const MOVED_REPOS: &[(&str, &str)] = &[(
     // Renamed GMWID on 2026-09-27.
     "https://parquetry.geomermaids.com/osm-infrastructure",
     "https://parquetry.geomermaids.com/gmwid",
 )];
-
-/// A saved entry at a moved URL becomes the current built-in entry, in
-/// the same place in the list. Anything else is left as the user saved it.
-fn upgrade_moved(mut list: Vec<Repository>) -> Vec<Repository> {
-    let defaults = default_repos();
-    for r in &mut list {
-        let url = r.url.trim_end_matches('/');
-        let moved = MOVED_REPOS.iter().find(|(old, _)| *old == url);
-        if let Some(d) = moved.and_then(|(_, new)| defaults.iter().find(|d| d.url == *new)) {
-            *r = d.clone();
-        }
-    }
-    list
-}
 
 /// Entry by entry, not the list at once: one unreadable entry (say a
 /// kind this build no longer knows, like the pre-0.7.1 "Dcat" moved out
@@ -277,8 +455,31 @@ fn repos_from_json(s: &str) -> Option<Vec<Repository>> {
     )
 }
 
+/// Save the list the user sees as what differs from the published one.
 pub fn save_repos(repos: &[Repository]) -> Result<(), String> {
-    save_config("repositories.json", &repos)
+    let p = published();
+    let before = config_file()
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .and_then(|s| user_from_json(&s, &p))
+        .unwrap_or_default();
+    let mut removed: Vec<String> = p
+        .repos
+        .iter()
+        .filter(|r| !repos.iter().any(|x| x.url == r.url))
+        .map(|r| r.url.clone())
+        .collect();
+    // A removal of a built-in that is not published right now is kept,
+    // in case it comes back.
+    for r in before.removed {
+        if !p.has(&r) && !removed.contains(&r) {
+            removed.push(r);
+        }
+    }
+    let added: Vec<Repository> = repos.iter().filter(|r| !p.has(&r.url)).cloned().collect();
+    save_config(
+        "repositories.json",
+        &serde_json::json!({ "version": 2, "added": added, "removed": removed }),
+    )
 }
 
 /// Every built-in portal: the major US cities plus the state portals of
@@ -2563,11 +2764,92 @@ mod tests {
             ..saved[0].clone()
         };
         saved.push(custom);
-        let up = upgrade_moved(saved);
+        let p = Published::builtin();
+        let json = serde_json::to_string(&saved).unwrap();
+        let up = merge(&p, &user_from_json(&json, &p).unwrap());
         assert_eq!(up[at].url, "https://parquetry.geomermaids.com/gmwid");
         assert!(up[at].name.starts_with("GMWID"));
         assert_eq!(up.last().unwrap().url, "https://example.org/osm-infrastructure");
         assert_eq!(up.len(), default_repos().len() + 1);
+    }
+
+    #[test]
+    /// The reason the list is published: a repository added after a user
+    /// saved their list still reaches them, and a user's own entries and
+    /// removals survive a new published list.
+    fn a_newly_published_repository_reaches_a_saved_list() {
+        let old = Published {
+            repos: default_repos()[..2].to_vec(),
+            moved: Vec::new(),
+        };
+        // Up to 0.9.4 the file was the whole list.
+        let mut legacy = old.repos.clone();
+        legacy.push(Repository {
+            name: "Mine".into(),
+            url: "https://repo.example".into(),
+            ..old.repos[0].clone()
+        });
+        let u = user_from_json(&serde_json::to_string(&legacy).unwrap(), &old).unwrap();
+        assert_eq!(u.added.len(), 1);
+        assert!(u.removed.is_empty());
+        let now = Published::builtin();
+        let list = merge(&now, &u);
+        assert!(list.iter().any(|r| r.url.ends_with("/clc")), "a new built-in shows");
+        assert_eq!(list.last().unwrap().url, "https://repo.example");
+        assert_eq!(list.len(), now.repos.len() + 1);
+
+        // Removing a built-in sticks; it is saved by URL, not as a list.
+        let u = UserRepos {
+            added: Vec::new(),
+            removed: vec!["https://parquetry.geomermaids.com/clc".into()],
+        };
+        let back = user_from_json(&serde_json::to_string(&u).unwrap(), &now).unwrap();
+        let list = merge(&now, &back);
+        assert!(!list.iter().any(|r| r.url.ends_with("/clc")));
+        assert_eq!(list.len(), now.repos.len() - 1);
+    }
+
+    #[test]
+    /// An entry the user added at a URL that is later published gives way
+    /// to the published one (its name and credit), without a duplicate.
+    fn a_user_entry_later_published_gives_way() {
+        let p = Published::builtin();
+        let u = UserRepos {
+            added: vec![Repository {
+                name: "my CLC".into(),
+                url: "https://parquetry.geomermaids.com/clc/".into(),
+                ..p.repos[0].clone()
+            }],
+            removed: Vec::new(),
+        };
+        let list = merge(&p, &u);
+        assert_eq!(list.len(), p.repos.len());
+        assert!(list.iter().all(|r| r.name != "my CLC"));
+    }
+
+    #[test]
+    fn a_published_list_is_read_entry_by_entry() {
+        let doc = r#"{
+            "version": 1,
+            "repositories": [
+                {"name": "A", "url": "https://a.example/", "kind": "Parquetry"},
+                {"name": "Plain http", "url": "http://b.example", "kind": "Parquetry"},
+                {"name": "A portal", "url": "https://p.example", "kind": "Dcat"},
+                {"name": "S", "url": "https://s.example", "kind": "Stac",
+                 "attribution": "S Foundation", "future_field": 1}
+            ],
+            "moved": {"https://old.example/": "https://a.example"}
+        }"#;
+        let p = published_from_json(doc).unwrap();
+        let urls: Vec<&str> = p.repos.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(urls, ["https://a.example", "https://s.example"]);
+        assert_eq!(p.repos[1].attribution.as_deref(), Some("S Foundation"));
+        assert_eq!(p.current_url("https://old.example"), "https://a.example");
+        // What this build knew moved is kept even when the list omits it.
+        assert!(p.current_url("https://parquetry.geomermaids.com/osm-infrastructure").ends_with("/gmwid"));
+        // A newer format, or an empty list, is not taken.
+        assert!(published_from_json(&doc.replace("\"version\": 1", "\"version\": 2")).is_none());
+        assert!(published_from_json(r#"{"version": 1, "repositories": []}"#).is_none());
     }
 
     #[test]
@@ -3613,6 +3895,22 @@ mod tests {
         let m = fetch_manifest(base, "latest/", "country=US/state=US-AR").unwrap();
         eprintln!("US-AR: {:?}, {} themes", m.state_name, m.themes.len());
         assert!(m.themes.iter().any(|(t, _)| t == "buildings"));
+    }
+
+    /// Live probe of the published repository list: readable by this
+    /// build, and in step with the list it ships. Opt-in:
+    /// cargo test --release repo_live_published_list -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn repo_live_published_list() {
+        let v = get_json(PUBLISHED_URL).unwrap().expect("published");
+        let p = published_from_json(&v.to_string()).expect("a version 1 list");
+        let live: Vec<&str> = p.repos.iter().map(|r| r.url.as_str()).collect();
+        let built: Vec<String> = default_repos().into_iter().map(|r| r.url).collect();
+        eprintln!("{live:?}");
+        for url in &built {
+            assert!(live.contains(&url.as_str()), "{url} built in, not published");
+        }
     }
 
     /// Live probe of CLC: the Europe file under the release plus one
