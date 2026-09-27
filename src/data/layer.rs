@@ -875,7 +875,7 @@ pub fn palette_color(i: usize) -> Color32 {
 pub fn name_color(name: &str) -> Option<Color32> {
     type Keys = &'static [&'static str];
     const TABLE: &[(Keys, (u8, u8, u8))] = &[
-        // The layers of the geomermaids OSM infrastructure repository, in
+        // The layers of the geomermaids GMWID repository (OSM infrastructure), in
         // Open Infrastructure Map's colours (web/src/style/style_oim_*.ts).
         // First, because their names also hold the generic keys below
         // ("water_tower", "utility_pole"), and the specific name wins.
@@ -1334,7 +1334,7 @@ mod name_color_tests {
         assert_eq!(name_color("mystery_dataset_42"), None);
     }
 
-    /// The OSM infrastructure layers take Open Infrastructure Map's
+    /// The GMWID (OSM infrastructure) layers take Open Infrastructure Map's
     /// colours, not the generic group their names also match.
     #[test]
     fn infrastructure_layers_take_oim_colours() {

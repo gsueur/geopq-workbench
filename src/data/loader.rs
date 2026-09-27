@@ -8164,14 +8164,14 @@ mod hive_tests {
             len: 0,
         };
         let state = layer_sources(&s3(
-            "s3://parquetry/osm-infrastructure/latest/country=IT/state=lombardia/",
+            "s3://parquetry/gmwid/latest/country=IT/state=lombardia/",
         ))
         .unwrap()
         .expect("a state folder is several datasets");
         eprintln!("{:?}", state.iter().map(Source::name).collect::<Vec<_>>());
         assert!(state.len() > 10);
         assert!(state.iter().any(|s| s.name() == "power_line"));
-        let country = layer_sources(&s3("s3://parquetry/osm-infrastructure/latest/country=LU/"))
+        let country = layer_sources(&s3("s3://parquetry/gmwid/latest/country=LU/"))
             .unwrap()
             .expect("a country folder is several datasets");
         let Source::S3 { uri, .. } = country.iter().find(|s| s.name() == "power_line").unwrap()
@@ -8180,7 +8180,7 @@ mod hive_tests {
         };
         assert_eq!(
             uri,
-            "s3://parquetry/osm-infrastructure/latest/country=LU/state=*/power_line.parquet"
+            "s3://parquetry/gmwid/latest/country=LU/state=*/power_line.parquet"
         );
         // One layer's glob is one dataset: no split.
         assert!(layer_sources(&s3(uri)).unwrap().is_none());

@@ -144,10 +144,13 @@ pub fn default_repos() -> Vec<Repository> {
             attribution_by_license: BTreeMap::new(),
         },
         Repository {
-            name: "Geomermaids OSM infrastructure (power, telecoms, oil & gas, water)".into(),
-            // Open Infrastructure Map's content, one whole-world file per
-            // layer. Only `latest/` is published: no snapshots.
-            url: "https://parquetry.geomermaids.com/osm-infrastructure".into(),
+            name: "GMWID, Geomermaids World Infrastructures (power, telecoms, oil & gas, water)"
+                .into(),
+            // OpenStreetMap's infrastructure (Open Infrastructure Map's
+            // content) completed from authoritative sources, one
+            // whole-world file per layer. Only `latest/` is published: no
+            // snapshots. gmwid.geomermaids.com
+            url: "https://parquetry.geomermaids.com/gmwid".into(),
             kind: RepoKind::Parquetry,
             // As for OSM: the fallback when ATTRIBUTION.txt cannot be
             // fetched.
@@ -233,9 +236,31 @@ pub fn load_repos() -> Vec<Repository> {
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| repos_from_json(&s));
     match list {
-        Some(l) if !l.is_empty() => l,
+        Some(l) if !l.is_empty() => upgrade_moved(l),
         _ => default_repos(),
     }
+}
+
+/// Built-in repositories that moved, old URL to new. The server still
+/// answers the old URL, but a saved list would keep showing the old name.
+const MOVED_REPOS: &[(&str, &str)] = &[(
+    // Renamed GMWID on 2026-09-27.
+    "https://parquetry.geomermaids.com/osm-infrastructure",
+    "https://parquetry.geomermaids.com/gmwid",
+)];
+
+/// A saved entry at a moved URL becomes the current built-in entry, in
+/// the same place in the list. Anything else is left as the user saved it.
+fn upgrade_moved(mut list: Vec<Repository>) -> Vec<Repository> {
+    let defaults = default_repos();
+    for r in &mut list {
+        let url = r.url.trim_end_matches('/');
+        let moved = MOVED_REPOS.iter().find(|(old, _)| *old == url);
+        if let Some(d) = moved.and_then(|(_, new)| defaults.iter().find(|d| d.url == *new)) {
+            *r = d.clone();
+        }
+    }
+    list
 }
 
 /// Entry by entry, not the list at once: one unreadable entry (say a
@@ -2527,6 +2552,25 @@ mod tests {
     /// as its base, so the geoBoundaries and CLC repositories sit under it.
     /// Matching the shorter base would credit their polygons to
     /// OpenStreetMap, which is worse than crediting nobody.
+    fn a_saved_repository_at_a_moved_url_takes_the_new_entry() {
+        let mut saved = default_repos();
+        let at = saved.iter().position(|r| r.url.ends_with("/gmwid")).unwrap();
+        saved[at].url = "https://parquetry.geomermaids.com/osm-infrastructure/".into();
+        saved[at].name = "Geomermaids OSM infrastructure".into();
+        let custom = Repository {
+            name: "Mine".into(),
+            url: "https://example.org/osm-infrastructure".into(),
+            ..saved[0].clone()
+        };
+        saved.push(custom);
+        let up = upgrade_moved(saved);
+        assert_eq!(up[at].url, "https://parquetry.geomermaids.com/gmwid");
+        assert!(up[at].name.starts_with("GMWID"));
+        assert_eq!(up.last().unwrap().url, "https://example.org/osm-infrastructure");
+        assert_eq!(up.len(), default_repos().len() + 1);
+    }
+
+    #[test]
     fn a_nested_repository_does_not_inherit_its_parents_credit() {
         // Defaults are in play only when the user has no config of their
         // own; these tests share a per-process temp config file.
@@ -3614,12 +3658,12 @@ mod tests {
         }
     }
 
-    /// Live probe of the OSM infrastructure repository: latest only, one
-    /// dataset (the whole world, at an empty path) with one file per layer.
+    /// Live probe of the GMWID repository: latest only, one dataset (the
+    /// whole world, at an empty path) with one file per layer.
     #[test]
     #[ignore]
-    fn repo_live_osm_infrastructure() {
-        let base = "https://parquetry.geomermaids.com/osm-infrastructure";
+    fn repo_live_gmwid() {
+        let base = "https://parquetry.geomermaids.com/gmwid";
         let snaps = fetch_snapshots(base).unwrap();
         assert_eq!(snaps.len(), 1);
         assert_eq!(snaps[0].path, "latest/");
