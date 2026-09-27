@@ -12,7 +12,7 @@ it into a fast one, and lets you query everything in SQL. It opens local
 files, plain HTTPS URLs, S3 buckets, and whole catalogs like Overture
 Maps.
 
-It is also opinionated on purpose: most GeoParquet in the wild is a raw
+It also takes a stand on file quality: most GeoParquet in the wild is a raw
 database export that performs far below what the format allows. The
 workbench shows you what your file is missing and fixes it in one click,
 so it doubles as a hands-on guide to GeoParquet best practices.
