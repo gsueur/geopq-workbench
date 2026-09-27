@@ -3615,8 +3615,9 @@ mod tests {
         assert!(m.themes.iter().any(|(t, _)| t == "buildings"));
     }
 
-    /// Live probe of every single-dataset repository, opt-in:
-    /// cargo test --release repo_live_geoboundaries -- --ignored --nocapture
+    /// Live probe of CLC: the Europe file under the release plus one
+    /// folder per country, all from index.json.
+    /// cargo test --release repo_live_clc -- --ignored --nocapture
     #[test]
     #[ignore]
     fn repo_live_clc() {
@@ -3624,14 +3625,18 @@ mod tests {
         let snaps = fetch_snapshots(base).unwrap();
         assert_eq!(snaps[0].path, "2018/", "latest aliases the release");
         let ds = discover_datasets(base, "2018/").unwrap();
-        assert_eq!(ds.len(), 1);
-        let m = fetch_manifest(base, "2018/", &ds[0].path).unwrap();
-        eprintln!("clc: {:?} {:?}", m.state_name, m.themes);
-        assert_eq!(m.themes.len(), 1);
-        for (theme, rows) in &m.themes {
-            let url = theme_url(base, "2018/", &ds[0].path, theme);
-            eprintln!("{theme}: {rows} rows -> {url}");
-            assert!(exists(&url).unwrap(), "{url}");
+        eprintln!("{} datasets", ds.len());
+        assert!(ds[0].path.is_empty(), "Europe comes first");
+        let fr = ds.iter().find(|d| d.code == "FR").expect("France listed");
+        for d in [&ds[0], fr] {
+            let m = fetch_manifest(base, "2018/", &d.path).unwrap();
+            eprintln!("{}: {:?} {:?}", d.name, m.state_name, m.themes);
+            assert_eq!(m.themes.len(), 1);
+            for (theme, rows) in &m.themes {
+                let url = theme_url(base, "2018/", &d.path, theme);
+                eprintln!("{theme}: {rows} rows -> {url}");
+                assert!(exists(&url).unwrap(), "{url}");
+            }
         }
     }
 
@@ -3679,6 +3684,8 @@ mod tests {
         }
     }
 
+    /// Live probe of a single-dataset repository, opt-in:
+    /// cargo test --release repo_live_geoboundaries -- --ignored --nocapture
     #[test]
     #[ignore]
     fn repo_live_geoboundaries() {
