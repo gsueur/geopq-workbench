@@ -126,16 +126,16 @@ struct ChunkGpu {
     underlay: bool,
     /// World-space bounds of this chunk's vertices, for viewport culling.
     bounds_world: [f64; 4],
-    fill_vbuf: Option<wgpu::Buffer>,
-    fill_ibuf: Option<wgpu::Buffer>,
+    fill_vbuf: Option<Span>,
+    fill_ibuf: Option<Span>,
     /// Uint16 when the chunk has ≤ 65536 fill vertices (half the index
     /// bytes — most chunks), Uint32 otherwise.
     fill_index_format: wgpu::IndexFormat,
     fill_index_count: u32,
     /// Index 0 = full detail, 1.. = simplified LODs (see LINE_LOD_TOLERANCE).
-    /// Each entry: buffer + feature-size prefix index (see LineLod).
-    line_bufs: [Option<(wgpu::Buffer, Vec<(f32, u32)>)>; LINE_LODS_TOTAL],
-    point_buf: Option<wgpu::Buffer>,
+    /// Each entry: point stream + feature-size prefix index (see LineLod).
+    line_bufs: [Option<(Span, Vec<(f32, u32)>)>; LINE_LODS_TOTAL],
+    point_buf: Option<Span>,
     point_count: u32,
 }
 
@@ -175,6 +175,89 @@ fn line_count_for_scale(index: &[(f32, u32)], pt_per_world: f64) -> u32 {
 
 struct LayerGpu {
     chunks: Vec<ChunkGpu>,
+    /// Every chunk's vertex data (fills, line streams, points), packed.
+    vbufs: Vec<wgpu::Buffer>,
+    /// Every chunk's fill indices, packed.
+    ibufs: Vec<wgpu::Buffer>,
+}
+
+impl LayerGpu {
+    /// `span` of the vertex pool, starting `skip` bytes in.
+    fn vslice(&self, span: Span, skip: u64) -> wgpu::BufferSlice<'_> {
+        self.vbufs[span.buf as usize].slice(span.off + skip..span.off + span.len)
+    }
+
+    fn islice(&self, span: Span) -> wgpu::BufferSlice<'_> {
+        self.ibufs[span.buf as usize].slice(span.off..span.off + span.len)
+    }
+}
+
+/// Where one chunk array sits in a section's pooled buffers.
+#[derive(Clone, Copy)]
+struct Span {
+    buf: u32,
+    off: u64,
+    len: u64,
+}
+
+/// Bytes per pooled buffer. Well under wgpu's default 256 MB
+/// `max_buffer_size`; a chunk array larger than this (they are capped
+/// at ~96 MB, see `SplitCaps`) gets a buffer of its own.
+const POOL_BYTES: usize = 64 << 20;
+
+/// Packs a section's chunk arrays into a few large buffers.
+///
+/// One buffer per chunk and kind was the old layout, and Metal backs
+/// every buffer with at least a page whatever it holds: a worldwide
+/// layer's tens of thousands of chunks spent gigabytes on nearly empty
+/// pages (power lines: 1.8 GB of GPU memory in 116,000 allocations for
+/// 160 MB of segments), enough to take the whole machine down with a
+/// few layers open. Chunks now draw from ranges of shared buffers.
+#[derive(Default)]
+struct Packer {
+    cur: Vec<u8>,
+    done: Vec<Vec<u8>>,
+}
+
+impl Packer {
+    fn push(&mut self, data: &[u8]) -> Option<Span> {
+        if data.is_empty() {
+            return None;
+        }
+        if !self.cur.is_empty() && self.cur.len() + data.len() > POOL_BYTES {
+            self.done.push(std::mem::take(&mut self.cur));
+        }
+        let span = Span {
+            buf: self.done.len() as u32,
+            off: self.cur.len() as u64,
+            len: data.len() as u64,
+        };
+        self.cur.extend_from_slice(data);
+        // Vertex and index buffer offsets must be multiples of 4.
+        self.cur.resize(self.cur.len().next_multiple_of(4), 0);
+        Some(span)
+    }
+
+    fn into_buffers(
+        mut self,
+        device: &wgpu::Device,
+        usage: wgpu::BufferUsages,
+        label: &str,
+    ) -> Vec<wgpu::Buffer> {
+        if !self.cur.is_empty() {
+            self.done.push(std::mem::take(&mut self.cur));
+        }
+        self.done
+            .iter()
+            .map(|data| {
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: data,
+                    usage,
+                })
+            })
+            .collect()
+    }
 }
 
 /// Convert a LOD's 16 B/segment `[x0,y0,x1,y1]` list into a shared point
@@ -346,6 +429,16 @@ impl MapResources {
     /// Whether GPU buffers exist for this (layer id, generation).
     pub fn has_layer_uploaded(&self, key: (u64, u64)) -> bool {
         self.layers.contains_key(&key)
+    }
+
+    /// Bytes of layer geometry resident on the GPU: every pooled vertex
+    /// and index buffer of every uploaded section.
+    pub fn geometry_bytes(&self) -> u64 {
+        self.layers
+            .values()
+            .flat_map(|l| l.vbufs.iter().chain(&l.ibufs))
+            .map(|b| b.size())
+            .sum()
     }
 }
 
@@ -900,21 +993,13 @@ impl MapResources {
         if self.layers.contains_key(&draw.key) {
             return;
         }
+        let mut vpool = Packer::default();
+        let mut ipool = Packer::default();
         let chunks = draw
             .chunks
             .iter()
             .map(|c| {
-                let mk_buf = |data: &[u8], usage, label: &str| {
-                    if data.is_empty() {
-                        None
-                    } else {
-                        Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some(label),
-                            contents: data,
-                            usage,
-                        }))
-                    }
-                };
+                let small_index = c.fill_vertices.len() <= (u16::MAX as usize) + 1;
                 ChunkGpu {
                     origin: c.origin,
                     bin: c.bin,
@@ -925,69 +1010,49 @@ impl MapResources {
                         c.origin[0] + c.bounds_local[2] as f64,
                         c.origin[1] + c.bounds_local[3] as f64,
                     ],
-                    fill_vbuf: mk_buf(
-                        bytemuck::cast_slice(&c.fill_vertices),
-                        wgpu::BufferUsages::VERTEX,
-                        "fill verts",
-                    ),
-                    fill_ibuf: if c.fill_vertices.len() <= (u16::MAX as usize) + 1 {
-                        // Half-width indices; pad to a 4-byte buffer size.
-                        let mut idx: Vec<u16> =
-                            c.fill_indices.iter().map(|&i| i as u16).collect();
-                        if idx.len() % 2 == 1 {
-                            idx.push(0);
-                        }
-                        mk_buf(
-                            bytemuck::cast_slice(&idx),
-                            wgpu::BufferUsages::INDEX,
-                            "fill idx u16",
-                        )
+                    fill_vbuf: vpool.push(bytemuck::cast_slice(&c.fill_vertices)),
+                    fill_ibuf: if small_index {
+                        // Half-width indices; the packer pads to 4 bytes.
+                        let idx: Vec<u16> = c.fill_indices.iter().map(|&i| i as u16).collect();
+                        ipool.push(bytemuck::cast_slice(&idx))
                     } else {
-                        mk_buf(
-                            bytemuck::cast_slice(&c.fill_indices),
-                            wgpu::BufferUsages::INDEX,
-                            "fill idx",
-                        )
+                        ipool.push(bytemuck::cast_slice(&c.fill_indices))
                     },
-                    fill_index_format: if c.fill_vertices.len() <= (u16::MAX as usize) + 1 {
+                    fill_index_format: if small_index {
                         wgpu::IndexFormat::Uint16
                     } else {
                         wgpu::IndexFormat::Uint32
                     },
                     fill_index_count: c.fill_indices.len() as u32,
                     line_bufs: {
-                        let mk_lines = |lod: &crate::data::geometry::LineLod| {
-                            let (points, index) = line_point_stream(lod);
-                            mk_buf(
-                                bytemuck::cast_slice(&points),
-                                wgpu::BufferUsages::VERTEX,
-                                "line points",
-                            )
-                            .map(|b| (b, index))
-                        };
-                        let mut bufs: [Option<(wgpu::Buffer, Vec<(f32, u32)>)>;
-                            LINE_LODS_TOTAL] = Default::default();
+                        let mut bufs: [Option<(Span, Vec<(f32, u32)>)>; LINE_LODS_TOTAL] =
+                            Default::default();
                         for k in 0..LINE_LODS_TOTAL {
                             let target = c.line_alias[k] as usize;
                             bufs[k] = if target == k {
-                                mk_lines(&c.lines[k])
+                                if c.lines[k].segments.is_empty() {
+                                    None
+                                } else {
+                                    let (points, index) = line_point_stream(&c.lines[k]);
+                                    vpool
+                                        .push(bytemuck::cast_slice(&points))
+                                        .map(|span| (span, index))
+                                }
                             } else {
-                                // Aliased: share the finer level's buffer.
+                                // Aliased: share the finer level's stream.
                                 bufs[target].clone()
                             };
                         }
                         bufs
                     },
-                    point_buf: mk_buf(
-                        bytemuck::cast_slice(&c.point_instances),
-                        wgpu::BufferUsages::VERTEX,
-                        "points",
-                    ),
+                    point_buf: vpool.push(bytemuck::cast_slice(&c.point_instances)),
                     point_count: c.point_instances.len() as u32,
                 }
             })
             .collect();
-        self.layers.insert(draw.key, LayerGpu { chunks });
+        let vbufs = vpool.into_buffers(device, wgpu::BufferUsages::VERTEX, "layer vertices");
+        let ibufs = ipool.into_buffers(device, wgpu::BufferUsages::INDEX, "layer indices");
+        self.layers.insert(draw.key, LayerGpu { chunks, vbufs, ibufs });
     }
 }
 
@@ -1410,12 +1475,12 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                     continue;
                 };
                 let c = &gpu.chunks[*ci];
-                let (Some(vb), Some(ib)) = (&c.fill_vbuf, &c.fill_ibuf) else {
+                let (Some(vb), Some(ib)) = (c.fill_vbuf, c.fill_ibuf) else {
                     continue;
                 };
                 pass.set_bind_group(0, &res.uniform_bg, &[*uoffset]);
-                pass.set_vertex_buffer(0, vb.slice(..));
-                pass.set_index_buffer(ib.slice(..), c.fill_index_format);
+                pass.set_vertex_buffer(0, gpu.vslice(vb, 0));
+                pass.set_index_buffer(gpu.islice(ib), c.fill_index_format);
                 pass.draw_indexed(0..c.fill_index_count, 0, 0..1);
             }
         }
@@ -1501,13 +1566,13 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                 } => {
                     let Some(l) = res.layers.get(layer) else { continue };
                     let c = &l.chunks[*chunk];
-                    let (Some(vb), Some(ib)) = (&c.fill_vbuf, &c.fill_ibuf) else {
+                    let (Some(vb), Some(ib)) = (c.fill_vbuf, c.fill_ibuf) else {
                         continue;
                     };
                     set(pass, Pipe::Fill);
                     pass.set_bind_group(0, &res.uniform_bg, &[*uoffset]);
-                    pass.set_vertex_buffer(0, vb.slice(..));
-                    pass.set_index_buffer(ib.slice(..), c.fill_index_format);
+                    pass.set_vertex_buffer(0, l.vslice(vb, 0));
+                    pass.set_index_buffer(l.islice(ib), c.fill_index_format);
                     pass.draw_indexed(0..c.fill_index_count, 0, 0..1);
                 }
                 DrawCmd::Line {
@@ -1519,7 +1584,7 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                 } => {
                     let Some(l) = res.layers.get(layer) else { continue };
                     let c = &l.chunks[*chunk];
-                    let Some((buf, _)) = &c.line_bufs[*lod] else {
+                    let Some((span, _)) = &c.line_bufs[*lod] else {
                         continue;
                     };
                     set(pass, Pipe::Line);
@@ -1527,10 +1592,10 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                     // The stream is sentinel-padded on both ends: element
                     // 0 is the pad, so the segment endpoints sit at +12
                     // and +24, with prev at 0 and next at +36.
-                    pass.set_vertex_buffer(0, buf.slice(12..));
-                    pass.set_vertex_buffer(1, buf.slice(24..));
-                    pass.set_vertex_buffer(2, buf.slice(..));
-                    pass.set_vertex_buffer(3, buf.slice(36..));
+                    pass.set_vertex_buffer(0, l.vslice(*span, 12));
+                    pass.set_vertex_buffer(1, l.vslice(*span, 24));
+                    pass.set_vertex_buffer(2, l.vslice(*span, 0));
+                    pass.set_vertex_buffer(3, l.vslice(*span, 36));
                     pass.draw(0..6, 0..*count);
                 }
                 DrawCmd::Point {
@@ -1541,10 +1606,10 @@ impl egui_wgpu::CallbackTrait for MapCallback {
                 } => {
                     let Some(l) = res.layers.get(layer) else { continue };
                     let c = &l.chunks[*chunk];
-                    let Some(buf) = &c.point_buf else { continue };
+                    let Some(span) = c.point_buf else { continue };
                     set(pass, Pipe::Point);
                     pass.set_bind_group(0, &res.uniform_bg, &[*uoffset]);
-                    pass.set_vertex_buffer(0, buf.slice(..));
+                    pass.set_vertex_buffer(0, l.vslice(span, 0));
                     pass.draw(0..6, 0..*count);
                 }
             }
@@ -3771,6 +3836,99 @@ mod tests {
             .save(&out)
             .expect("write png");
         eprintln!("wrote {out}");
+    }
+
+    /// Chunks draw from ranges of a section's shared buffers: every chunk
+    /// past the first sits at a non-zero offset, and a line stream is read
+    /// at three further offsets. Fills, lines and points in nine separate
+    /// chunks must each land where they belong, from one vertex pool.
+    #[test]
+    fn chunks_draw_from_their_own_ranges_of_a_shared_pool() {
+        use crate::data::geometry::{FeatureRef, CHUNK_WORLD};
+        let Some((device, queue)) = super::test_gpu() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let size = 256u32;
+        let step = CHUNK_WORLD * 3.0;
+        let at = |i: usize| (0.5 + (i % 3) as f64 * step, 0.5 + (i / 3) as f64 * step);
+        let mut mb = MeshBuilder::default();
+        for i in 0..9 {
+            let (x, y) = at(i);
+            let h = CHUNK_WORLD / 8.0;
+            match i % 3 {
+                0 => {
+                    let poly = geo_types::Polygon::new(
+                        geo_types::LineString::from(vec![
+                            (x - h, y - h),
+                            (x + h, y - h),
+                            (x + h, y + h),
+                            (x - h, y + h),
+                            (x - h, y - h),
+                        ]),
+                        vec![],
+                    );
+                    mb.add(&geo_types::Geometry::Polygon(poly), FeatureRef::INVALID);
+                }
+                1 => {
+                    let line = geo_types::LineString::from(vec![(x - h, y), (x + h, y)]);
+                    mb.add(&geo_types::Geometry::LineString(line), FeatureRef::INVALID);
+                }
+                _ => {
+                    mb.add(&geo_types::Geometry::Point(geo_types::Point::new(x, y)), FeatureRef::INVALID);
+                }
+            }
+        }
+        let chunks = std::sync::Arc::new(mb.finish());
+        assert_eq!(chunks.len(), 9, "one chunk per feature");
+        let mut camera = crate::map::camera::Camera::default();
+        let (x0, y0) = at(0);
+        let (x1, y1) = at(8);
+        camera.fit([x0 - step / 2.0, y0 - step / 2.0, x1 + step / 2.0, y1 + step / 2.0], [size as f32; 2], 0.0);
+        let cb = MapCallback {
+            camera,
+            viewport_px: [size as f32, size as f32],
+            tile_opacity: 1.0,
+            tile_draws: vec![],
+            tile_uploads: vec![],
+            alive_tiles: Default::default(),
+            alive_layers: Default::default(),
+            layers: vec![LayerDraw {
+                key: (1, 0),
+                composite_group: 1,
+                chunks,
+                style: DrawStyle {
+                    fill_color: [1.0, 0.0, 0.0, 1.0],
+                    line_color: [0.0, 1.0, 0.0, 1.0],
+                    point_color: [0.0, 0.0, 1.0, 1.0],
+                    line_half_width_px: 2.0,
+                    point_radius_px: 4.0,
+                    point_shape: crate::data::layer::PointShape::Circle,
+                    ..Default::default()
+                },
+            }],
+            background: [0.0; 4],
+        };
+        let mut resources = egui_wgpu::CallbackResources::default();
+        resources.insert(MapResources::new(&device, wgpu::TextureFormat::Rgba8Unorm));
+        let data = render_to_pixels(&device, &queue, &mut resources, &cb, size);
+        let res: &MapResources = resources.get().unwrap();
+        let gpu = &res.layers[&(1, 0)];
+        assert_eq!(gpu.vbufs.len(), 1, "one vertex pool for the section");
+        assert!(res.geometry_bytes() > 0);
+        for i in 0..9 {
+            let (x, y) = at(i);
+            let [px, py] = cb.camera.world_to_screen([x, y], [size as f32; 2]);
+            let (px, py) = (px.round() as u32, py.round() as u32);
+            let o = ((py * size + px) * 4) as usize;
+            let c = &data[o..o + 3];
+            let want = match i % 3 {
+                0 => 0, // red fill
+                1 => 1, // green line
+                _ => 2, // blue point
+            };
+            assert!(c[want] > 128, "feature {i} at ({px},{py}) came back as {c:?}");
+        }
     }
 
     /// Run one callback through prepare + paint and read the frame back.

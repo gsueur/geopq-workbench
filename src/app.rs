@@ -350,6 +350,16 @@ pub struct ViewerApp {
     /// (auto-projection, first layer); later jobs wait for it.
     projection_decider: Option<u64>,
     deferred_loads: Vec<DeferredLoad>,
+    /// Loads waiting for a slot: at most `MAX_CONCURRENT_LOADS` decode at
+    /// once.
+    load_queue: std::collections::VecDeque<DeferredLoad>,
+    /// Jobs whose loader thread is running.
+    running_loads: HashSet<u64>,
+    /// Layer geometry resident on the GPU, read back each frame.
+    geometry_bytes: u64,
+    /// Geometry the layers may hold before refinement stops adding to it
+    /// (`GEOMETRY_BUDGET_FRACTION` of physical memory).
+    geometry_budget: u64,
     /// Has the user explicitly moved the camera (pan/zoom/fit) since
     /// startup? The automatic empty-map world fit does not count: "still
     /// the original full-world viewport" is what first-layer adoption
@@ -1041,6 +1051,91 @@ fn fresh_cancel(
     c
 }
 
+/// Loads decoding at once. Each runs on the shared rayon pool with its own
+/// batches and prefetch buffers in flight: five worldwide layers started
+/// together passed 6 GB before any of them was on screen.
+const MAX_CONCURRENT_LOADS: usize = 2;
+
+/// Share of physical memory the layers' geometry may take before
+/// refinement stops adding to it. Past this, a few worldwide layers
+/// refined over a pan or two took an 18 GB machine into swap and froze
+/// the whole system; now the layers panel says so instead.
+const GEOMETRY_BUDGET_FRACTION: f64 = 0.2;
+
+fn geometry_budget() -> u64 {
+    ((physical_memory() as f64 * GEOMETRY_BUDGET_FRACTION) as u64).max(1 << 30)
+}
+
+/// Installed RAM in bytes; 8 GB when the platform will not say.
+fn physical_memory() -> u64 {
+    const FALLBACK: u64 = 8 << 30;
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn sysctlbyname(
+                name: *const std::ffi::c_char,
+                oldp: *mut std::ffi::c_void,
+                oldlenp: *mut usize,
+                newp: *mut std::ffi::c_void,
+                newlen: usize,
+            ) -> std::ffi::c_int;
+        }
+        let mut bytes = 0u64;
+        let mut len = std::mem::size_of::<u64>();
+        let rc = unsafe {
+            sysctlbyname(
+                c"hw.memsize".as_ptr(),
+                (&mut bytes as *mut u64).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 && bytes > 0 {
+            return bytes;
+        }
+        FALLBACK
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("MemTotal:"))
+                    .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            })
+            .map_or(FALLBACK, |kb| kb * 1024)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        #[repr(C)]
+        struct MemoryStatusEx {
+            length: u32,
+            memory_load: u32,
+            total_phys: u64,
+            avail_phys: u64,
+            total_page_file: u64,
+            avail_page_file: u64,
+            total_virtual: u64,
+            avail_virtual: u64,
+            avail_extended_virtual: u64,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+        }
+        let mut m: MemoryStatusEx = unsafe { std::mem::zeroed() };
+        m.length = std::mem::size_of::<MemoryStatusEx>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut m) } != 0 && m.total_phys > 0 {
+            return m.total_phys;
+        }
+        FALLBACK
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    FALLBACK
+}
+
 /// Ask the allocator to hand freed pages back to the OS. Tessellation
 /// churn leaves gigabytes of empty malloc depots parked in free lists on
 /// macOS, and Activity Monitor keeps counting them as app memory; the
@@ -1348,6 +1443,10 @@ impl ViewerApp {
             appending: HashSet::new(),
             projection_decider: None,
             deferred_loads: Vec::new(),
+            load_queue: Default::default(),
+            running_loads: HashSet::new(),
+            geometry_bytes: 0,
+            geometry_budget: geometry_budget(),
             camera_moved: false,
             append_cancel: HashMap::new(),
             rebuild_cancel: HashMap::new(),
@@ -1491,8 +1590,39 @@ impl ViewerApp {
             });
             return job;
         }
-        self.spawn_load_job(job, layer_id, source, color, cancel, auto_project, ctx);
+        if auto_project {
+            // The projection decider starts at once: every other load
+            // waits on it anyway.
+            self.spawn_load_job(job, layer_id, source, color, cancel, true, ctx);
+        } else {
+            self.load_queue.push_back(DeferredLoad { job, layer_id, source, color, cancel });
+            self.pump_load_queue(ctx);
+        }
         job
+    }
+
+    /// Start queued loads while fewer than `MAX_CONCURRENT_LOADS` run. A
+    /// queued load cancelled before its turn is dropped here.
+    fn pump_load_queue(&mut self, ctx: &egui::Context) {
+        let loading = &self.loading;
+        self.running_loads.retain(|j| loading.contains_key(j));
+        while self.running_loads.len() < MAX_CONCURRENT_LOADS {
+            let Some(d) = self.load_queue.pop_front() else { break };
+            if d.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                self.loading.remove(&d.job);
+                continue;
+            }
+            if !self.loading.contains_key(&d.job) {
+                continue;
+            }
+            self.spawn_load_job(d.job, d.layer_id, d.source, d.color, d.cancel, false, ctx);
+        }
+        let waiting: Vec<u64> = self.load_queue.iter().map(|d| d.job).collect();
+        for job in waiting {
+            if let Some(j) = self.loading.get_mut(&job) {
+                j.stage = format!("queued ({MAX_CONCURRENT_LOADS} loads at a time)");
+            }
+        }
     }
 
     fn spawn_load_job(
@@ -1505,6 +1635,7 @@ impl ViewerApp {
         auto_project: bool,
         ctx: &egui::Context,
     ) {
+        self.running_loads.insert(job);
         // Deferred jobs spawn later: stamp the display generation they
         // actually build for.
         if let Some(j) = self.loading.get_mut(&job) {
@@ -1547,6 +1678,7 @@ impl ViewerApp {
         };
         job.stage = "loading all rows".into();
         let cancel = Arc::clone(&job.cancel);
+        self.running_loads.insert(gate.job);
         loader::spawn_load_gated(
             LoaderHandle {
                 tx: self.load_tx.clone(),
@@ -1579,9 +1711,8 @@ impl ViewerApp {
 
     /// Start the loads that waited on the projection decision.
     fn flush_deferred_loads(&mut self, ctx: &egui::Context) {
-        for d in std::mem::take(&mut self.deferred_loads) {
-            self.spawn_load_job(d.job, d.layer_id, d.source, d.color, d.cancel, false, ctx);
-        }
+        self.load_queue.extend(std::mem::take(&mut self.deferred_loads));
+        self.pump_load_queue(ctx);
     }
 
     /// Move the camera to the same geographic place after a projection
@@ -2531,6 +2662,9 @@ impl ViewerApp {
                     color,
                     auto_project,
                 } => {
+                    // The loader thread has ended; the dialog waits on the
+                    // user, not on a slot.
+                    self.running_loads.remove(&job);
                     let gate = QualityGateState {
                         job,
                         layer_id,
@@ -2601,6 +2735,8 @@ impl ViewerApp {
         if decider_done {
             self.flush_deferred_loads(ctx);
         }
+        // Finished loads free their slots.
+        self.pump_load_queue(ctx);
         for source in split_loads {
             self.enqueue_load(source, ctx);
         }
@@ -2642,6 +2778,8 @@ impl ViewerApp {
         // "Load all", and the load would land in the replaced session.
         self.quality_gates.clear();
         self.deferred_loads.clear();
+        self.load_queue.clear();
+        self.running_loads.clear();
         self.pending_styles.clear();
         self.pending_filters.clear();
         self.pending_names.clear();
@@ -3297,8 +3435,15 @@ impl ViewerApp {
         use crate::data::layer::GroupLoad;
         use crate::data::loader::{complement_ranges, GroupSel};
         self.switch_pyramid_levels(ctx);
+        // Over the geometry budget nothing more is added; the layers panel
+        // says so, and removing a layer or reloading to the viewport
+        // frees room.
+        if self.over_geometry_budget() {
+            return;
+        }
         self.append_parts_for_view(ctx);
         let view = self.last_view_world;
+        let mut deferred_now: Vec<(u64, u64)> = Vec::new();
         for l in &self.layers {
             if !l.is_partial()
                 || l.mode == crate::data::layer::LayerMode::Direct
@@ -3396,6 +3541,26 @@ impl ViewerApp {
             if jobs.is_empty() {
                 continue;
             }
+            // Rows of groups the viewport contains whole are certain to
+            // be selected. When they alone pass the budget the exact
+            // covering scan can only defer, after reading every group's
+            // bbox column: ~20 s per layer at world zoom, at every settle.
+            let certain: u64 = jobs
+                .iter()
+                .filter_map(|j| match j {
+                    GroupSel::Rect(g, _) => Some(*g as usize),
+                    _ => None,
+                })
+                .filter(|&g| {
+                    let b = rg.boxes[g];
+                    b[0] >= rect[0] && b[1] >= rect[1] && b[2] <= rect[2] && b[3] <= rect[3]
+                })
+                .map(|g| starts[g + 1] - starts[g])
+                .sum();
+            if certain > crate::data::loader::MAX_BUILD_ROWS {
+                deferred_now.push((l.id, certain));
+                continue;
+            }
             // The worker resolves covering/x-y rows exactly before it
             // applies the budget; never gate refinement on bbox area.
             log::info!("{}: checking {} row groups for refinement", l.name, jobs.len());
@@ -3425,6 +3590,15 @@ impl ViewerApp {
                 )),
             );
         }
+        // Same hold and badge as a deferral the worker proves.
+        for (id, rows) in deferred_now {
+            self.refine_hold.insert(id);
+            self.refine_deferred.insert(id, (rows, None));
+        }
+    }
+
+    fn over_geometry_budget(&self) -> bool {
+        self.geometry_bytes >= self.geometry_budget
     }
 
     /// Clear the picked feature and cancel any pick in flight.
@@ -4187,6 +4361,9 @@ impl ViewerApp {
             let rebuilding = &self.rebuilding;
             let filter_pending = &self.filter_pending;
             let n_layers = self.layers.len();
+            let budget = self
+                .over_geometry_budget()
+                .then_some((self.geometry_bytes, self.geometry_budget));
             for (idx, l) in self.layers.iter_mut().enumerate().rev() {
                 let is_rebuilding = rebuilding.contains(&l.id);
                 crate::theme::card(ui.style()).show(ui, |ui| {
@@ -4597,6 +4774,18 @@ impl ViewerApp {
                                 fmt_count(l.feature_count)
                             ))
                             .weak()
+                            .small(),
+                        );
+                    }
+                    if let Some((held, limit)) = budget.filter(|_| l.is_partial()) {
+                        ui.label(
+                            RichText::new(format!(
+                                "memory budget reached: layers hold {} of geometry (limit {})\n\
+                                 remove a layer or reload to the viewport to refine further",
+                                crate::data::info::fmt_bytes(held),
+                                crate::data::info::fmt_bytes(limit),
+                            ))
+                            .color(Color32::from_rgb(242, 140, 26))
                             .small(),
                         );
                     }
@@ -13554,6 +13743,7 @@ impl ViewerApp {
         else {
             return;
         };
+        self.geometry_bytes = res.geometry_bytes();
         for l in &mut self.layers {
             if self.rebuilding.contains(&l.id) {
                 continue;

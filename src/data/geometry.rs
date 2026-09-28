@@ -680,7 +680,8 @@ impl MeshBuilder {
 
     fn finish_with_caps(self, caps: &SplitCaps) -> Vec<ChunkMesh> {
         let mut chunks: Vec<ChunkMesh> = Vec::new();
-        for chunk in self.chunks.into_values().filter(|c| !c.is_empty()) {
+        let merged = coarsen(self.chunks, self.cell);
+        for chunk in merged.into_values().filter(|c| !c.is_empty()) {
             let parts = split_oversized(chunk, caps);
             // split_oversized slices each LOD level independently, so the
             // levels of one part are not views of the same feature set;
@@ -760,6 +761,67 @@ impl MeshBuilder {
         chunks.sort_by_key(|c| !c.underlay);
         chunks
     }
+}
+
+/// Chunks one build may produce before neighbours merge into coarser
+/// cells.
+///
+/// Each chunk is a draw call per frame and a culling cell; the fine grid
+/// suits a city, but a worldwide layer on it made 40,000 to 100,000
+/// chunks, each drawn separately (64,000 draws cost 40 ms of GPU time
+/// against 1.6 ms for the same points in one draw). A dense small-area
+/// build never reaches this and keeps its fine cells.
+pub const MAX_BUILD_CHUNKS: usize = 4096;
+
+/// Chunk key: cell x, cell y, style bin, underlay.
+type ChunkKey = (i64, i64, u8, bool);
+
+/// Merge chunks into cells twice as large until at most
+/// `MAX_BUILD_CHUNKS` remain, or the cell reaches the box grid, where
+/// chunk-local f32 still resolves centimetres. Runs before the LOD sort:
+/// extents are still per segment and aliases still identity.
+fn coarsen(mut chunks: HashMap<ChunkKey, ChunkMesh>, mut cell: f64) -> HashMap<ChunkKey, ChunkMesh> {
+    while chunks.len() > MAX_BUILD_CHUNKS && cell * 2.0 <= BOX_CHUNK_WORLD {
+        cell *= 2.0;
+        let mut out: HashMap<ChunkKey, ChunkMesh> = HashMap::with_capacity(chunks.len() / 2);
+        for ((_, _, bin, underlay), c) in chunks {
+            let key = (
+                (c.origin[0] / cell).floor() as i64,
+                (c.origin[1] / cell).floor() as i64,
+                bin,
+                underlay,
+            );
+            let dst = out.entry(key).or_insert_with(|| ChunkMesh {
+                origin: [key.0 as f64 * cell, key.1 as f64 * cell],
+                bin,
+                underlay,
+                ..Default::default()
+            });
+            append_rebased(dst, c);
+        }
+        chunks = out;
+    }
+    chunks
+}
+
+/// Append `src` to `dst`, moving its chunk-local coordinates onto `dst`'s
+/// origin (through f64, so the move adds no rounding of its own).
+fn append_rebased(dst: &mut ChunkMesh, src: ChunkMesh) {
+    let (o, d) = (src.origin, dst.origin);
+    let at = |x: f32, y: f32| local(d, o[0] + x as f64, o[1] + y as f64);
+    let base = dst.fill_vertices.len() as u32;
+    dst.fill_vertices.extend(src.fill_vertices.iter().map(|v| at(v[0], v[1])));
+    dst.fill_indices.extend(src.fill_indices.iter().map(|i| i + base));
+    for (dl, sl) in dst.lines.iter_mut().zip(src.lines) {
+        dl.segments.extend(sl.segments.iter().map(|s| {
+            let a = at(s[0], s[1]);
+            let b = at(s[2], s[3]);
+            [a[0], a[1], b[0], b[1]]
+        }));
+        dl.extents.extend_from_slice(&sl.extents);
+    }
+    dst.point_instances.extend(src.point_instances.iter().map(|p| at(p[0], p[1])));
+    dst.point_refs.extend_from_slice(&src.point_refs);
 }
 
 /// Recover a chunk's key from its origin. `cell` must be the grid the
@@ -1222,5 +1284,141 @@ mod underlay_tests {
             under[..first_normal].iter().all(|u| *u),
             "underlay chunks must come first: {under:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod coarsen_tests {
+    use super::*;
+
+    /// Deterministic points spread over a `span`-wide square of the
+    /// world: the sparse layer the fine grid cannot hold.
+    fn scattered(n: u32, span: f64) -> Vec<(f64, f64)> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let x = 0.5 - span / 2.0 + span * ((state >> 11) as f64 / (1u64 << 53) as f64);
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let y = 0.5 - span / 2.0 + span * ((state >> 11) as f64 / (1u64 << 53) as f64);
+                (x, y)
+            })
+            .collect()
+    }
+
+    #[test]
+    /// 40,000 points over a continent used to make ~40,000 chunks, each
+    /// its own draw. They now land in at most MAX_BUILD_CHUNKS, and every
+    /// point keeps its position (to well under a centimetre) and feature.
+    fn a_sparse_continental_build_merges_into_few_chunks() {
+        let pts = scattered(40_000, 0.3);
+        let mut mb = MeshBuilder::default();
+        for (i, &(x, y)) in pts.iter().enumerate() {
+            mb.add_point_xy(x, y, FeatureRef { index: i as u32 });
+        }
+        let chunks = mb.finish();
+        assert!(chunks.len() <= MAX_BUILD_CHUNKS, "{} chunks", chunks.len());
+        let mut seen = vec![false; pts.len()];
+        for c in &chunks {
+            for (p, r) in c.point_instances.iter().zip(&c.point_refs) {
+                let (x, y) = pts[r.index as usize];
+                let (wx, wy) = (c.origin[0] + p[0] as f64, c.origin[1] + p[1] as f64);
+                // 1e-9 world units is 4 cm at the equator.
+                assert!((wx - x).abs() < 1e-9 && (wy - y).abs() < 1e-9, "{wx},{wy} vs {x},{y}");
+                seen[r.index as usize] = true;
+            }
+        }
+        assert!(seen.iter().all(|s| *s), "every point survives the merge once");
+    }
+
+    #[test]
+    /// Fill indices point at the merged vertex list, and line segments
+    /// keep their world position and extent, through a merge.
+    fn merged_fills_and_lines_keep_their_geometry() {
+        let pts = scattered(6_000, 0.3);
+        let half = CHUNK_WORLD / 10.0;
+        let mut mb = MeshBuilder::default();
+        for &(x, y) in &pts {
+            let ring = vec![
+                geo_types::Coord { x: x - half, y: y - half },
+                geo_types::Coord { x: x + half, y: y - half },
+                geo_types::Coord { x: x + half, y: y + half },
+                geo_types::Coord { x: x - half, y: y + half },
+                geo_types::Coord { x: x - half, y: y - half },
+            ];
+            mb.add(
+                &geo_types::Geometry::Polygon(geo_types::Polygon::new(geo_types::LineString(ring), vec![])),
+                FeatureRef::INVALID,
+            );
+        }
+        let chunks = mb.finish();
+        assert!(chunks.len() <= MAX_BUILD_CHUNKS);
+        let mut triangles = 0usize;
+        for c in &chunks {
+            assert_eq!(c.fill_indices.len() % 3, 0);
+            for t in c.fill_indices.chunks(3) {
+                let v: Vec<[f64; 2]> = t
+                    .iter()
+                    .map(|&i| {
+                        let p = c.fill_vertices[i as usize];
+                        [c.origin[0] + p[0] as f64, c.origin[1] + p[1] as f64]
+                    })
+                    .collect();
+                // Each triangle belongs to one small square: its corners
+                // sit within the square's diagonal of each other.
+                for a in &v {
+                    for b in &v {
+                        assert!((a[0] - b[0]).abs() <= 2.0 * half + 1e-9);
+                        assert!((a[1] - b[1]).abs() <= 2.0 * half + 1e-9);
+                    }
+                }
+                triangles += 1;
+            }
+            let full = &c.lines[0];
+            for s in &full.segments {
+                let len = ((s[2] - s[0]).powi(2) + (s[3] - s[1]).powi(2)).sqrt() as f64;
+                assert!((len - 2.0 * half).abs() < 1e-8, "outline edge {len}");
+            }
+        }
+        assert_eq!(triangles, 2 * pts.len(), "two triangles per square");
+    }
+
+    #[test]
+    /// Over the whole world the merge stops at the box grid (whose f32
+    /// precision is the floor), however many cells stay occupied.
+    fn a_worldwide_build_stops_at_the_box_grid() {
+        let pts = scattered(40_000, 0.9);
+        let mut mb = MeshBuilder::default();
+        for (i, &(x, y)) in pts.iter().enumerate() {
+            mb.add_point_xy(x, y, FeatureRef { index: i as u32 });
+        }
+        let chunks = mb.finish();
+        assert!(chunks.len() <= 128 * 128, "{}", chunks.len());
+        for c in &chunks {
+            let kx = c.origin[0] / BOX_CHUNK_WORLD;
+            assert!((kx - kx.round()).abs() < 1e-9, "origin on the box grid");
+        }
+    }
+
+    #[test]
+    /// Dense data on a small area never reaches the cap: it keeps the
+    /// fine cells that make culling at city zoom worth something.
+    fn a_dense_local_build_keeps_its_fine_grid() {
+        let mut mb = MeshBuilder::default();
+        for i in 0..20_000u32 {
+            let x = 0.5 + (i % 200) as f64 * CHUNK_WORLD / 20.0;
+            let y = 0.5 + (i / 200) as f64 * CHUNK_WORLD / 20.0;
+            mb.add_point_xy(x, y, FeatureRef { index: i });
+        }
+        let chunks = mb.finish();
+        for c in &chunks {
+            let kx = c.origin[0] / CHUNK_WORLD;
+            assert!((kx - kx.round()).abs() < 1e-9, "origin still on the fine grid");
+        }
+        assert!(chunks.len() > 1 && chunks.len() < 200, "{}", chunks.len());
     }
 }
