@@ -496,7 +496,7 @@ the spec adopts it, which the info panel and quality check C8 both say.
   upwards with the nearest notice winning — so one file at a
   repository's root credits everything under it (OpenStreetMap for the
   Parquetry mirror) while a dataset that needs its own can override it
-  (geoBoundaries under CC BY).
+  (FAO GAUL under CC BY).
 - **Attributes on click**, fetched lazily from the file; a floating
   window that never resizes the map. Works identically on remote files
   (each click is a small ranged read, off the UI thread).

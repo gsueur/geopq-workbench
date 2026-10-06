@@ -446,16 +446,6 @@ project at the William & Mary geoLab.
     #[test]
     #[ignore]
     fn attribution_live() {
-        let src = Source::Remote {
-            url: "https://parquetry.geomermaids.com/geoboundaries/6.0.0/cgaz_adm0.parquet"
-                .to_string(),
-            len: 0,
-        };
-        let a = find(&src, &[]).expect("ATTRIBUTION.txt beside the data");
-        eprintln!("geoboundaries: {}", a.credit);
-        assert!(a.credit.contains("geoBoundaries"), "{}", a.credit);
-        assert!(a.text.contains("CC BY 4.0"));
-
         // An OSM theme sits four directories below the repository's own
         // notice, and must still find it.
         let osm = Source::Remote {
@@ -470,7 +460,7 @@ project at the William & Mary geoLab.
         assert!(a.credit.contains("OpenStreetMap"), "{}", a.credit);
         assert!(a.text.contains("ODbL"));
 
-        // CORINE: the notice sits beside the data, like geoBoundaries.
+        // CORINE: the notice sits beside the data.
         let clc = Source::Remote {
             url: "https://parquetry.geomermaids.com/clc/2018/clc_2018.parquet".to_string(),
             len: 0,
