@@ -115,8 +115,8 @@ impl Repository {
 /// one: a repository can sit under another's base (a saved OSM entry from
 /// before the bucket moved OSM to /osm still has the bucket root, above
 /// every other parquetry.geomermaids.com repository), and crediting
-/// geoBoundaries polygons to OpenStreetMap would be worse than crediting
-/// them to nobody.
+/// CORINE polygons to OpenStreetMap would be worse than crediting them to
+/// nobody.
 pub fn credit_for_url(url: &str, license: Option<&str>) -> Option<String> {
     load_repos()
         .into_iter()
@@ -161,13 +161,6 @@ pub fn default_repos() -> Vec<Repository> {
             attribution_by_license: BTreeMap::new(),
         },
         Repository {
-            name: "Geomermaids geoBoundaries (global admin)".into(),
-            url: "https://parquetry.geomermaids.com/geoboundaries".into(),
-            kind: RepoKind::Parquetry,
-            attribution: None,
-            attribution_by_license: BTreeMap::new(),
-        },
-        Repository {
             name: "Geomermaids FAO GAUL 2024 (global admin)".into(),
             url: "https://parquetry.geomermaids.com/gaul".into(),
             kind: RepoKind::Parquetry,
@@ -182,6 +175,15 @@ pub fn default_repos() -> Vec<Repository> {
             url: "https://parquetry.geomermaids.com/clc".into(),
             kind: RepoKind::Parquetry,
             attribution: None,
+            attribution_by_license: BTreeMap::new(),
+        },
+        Repository {
+            name: "Geomermaids FEMA NFHL flood hazard areas (US)".into(),
+            // One file per FEMA county delivery, replaced daily as FEMA
+            // republishes. nfhl.geomermaids.com
+            url: "https://parquetry.geomermaids.com/nfhl".into(),
+            kind: RepoKind::Parquetry,
+            attribution: Some("FEMA National Flood Hazard Layer".into()),
             attribution_by_license: BTreeMap::new(),
         },
         Repository {
@@ -2750,7 +2752,7 @@ mod tests {
 
     #[test]
     /// A saved OSM entry from before the move to /osm has the bucket root
-    /// as its base, so the geoBoundaries and CLC repositories sit under it.
+    /// as its base, so the GAUL and CLC repositories sit under it.
     /// Matching the shorter base would credit their polygons to
     /// OpenStreetMap, which is worse than crediting nobody.
     fn a_saved_repository_at_a_moved_url_takes_the_new_entry() {
@@ -2871,7 +2873,7 @@ mod tests {
         );
         assert_eq!(
             credit_for_url(
-                "https://parquetry.geomermaids.com/geoboundaries/6.0.0/a.parquet",
+                "https://parquetry.geomermaids.com/clc/2018/a.parquet",
                 None,
             ),
             None,
@@ -3198,16 +3200,16 @@ mod tests {
         // double slash, which object storage reads as another key.
         assert_eq!(
             theme_url(
-                "https://parquetry.geomermaids.com/geoboundaries",
-                "6.0.0/",
+                "https://parquetry.geomermaids.com/clc",
+                "2018/",
                 "",
-                "cgaz_adm0"
+                "clc_2018"
             ),
-            "https://parquetry.geomermaids.com/geoboundaries/6.0.0/cgaz_adm0.parquet"
+            "https://parquetry.geomermaids.com/clc/2018/clc_2018.parquet"
         );
         assert_eq!(
-            dataset_prefix("6.0.0/", ""),
-            "6.0.0/",
+            dataset_prefix("2018/", ""),
+            "2018/",
             "manifest and theme URLs share the prefix"
         );
     }
@@ -3256,13 +3258,13 @@ mod tests {
     fn index_json_may_name_a_single_global_dataset() {
         let base = spawn_files(&[(
             "index.json",
-            r#"{"datasets":[{"path":"","code":"","name":"geoBoundaries CGAZ (global)"}]}"#,
+            r#"{"datasets":[{"path":"","code":"","name":"Corine Land Cover 2018 (Europe)"}]}"#,
         )]);
         let ds = discover_datasets(&base, "6.0.0/").unwrap();
         assert_eq!(ds.len(), 1);
         assert_eq!(ds[0].path, "");
         assert_eq!(ds[0].code, "");
-        assert_eq!(ds[0].name, "geoBoundaries CGAZ (global)");
+        assert_eq!(ds[0].name, "Corine Land Cover 2018 (Europe)");
     }
 
     // -----------------------------------------------------------------
@@ -3979,36 +3981,6 @@ mod tests {
             let url = theme_url(base, "latest/", &ds[0].path, theme);
             assert!(url.ends_with(&format!("/latest/{theme}.parquet")), "{url}");
             assert!(exists(&url).unwrap(), "{url}");
-        }
-    }
-
-    /// Live probe of a single-dataset repository, opt-in:
-    /// cargo test --release repo_live_geoboundaries -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn repo_live_geoboundaries() {
-        let base = "https://parquetry.geomermaids.com/geoboundaries";
-        let snaps = fetch_snapshots(base).unwrap();
-        eprintln!("snapshots: {:?}", snaps.iter().map(|s| (&s.label, &s.path)).collect::<Vec<_>>());
-        // "latest" is aliased onto the release, not a 404 prefix.
-        assert_eq!(snaps[0].label, "latest");
-        assert_eq!(snaps[0].path, "6.0.0/");
-
-        let ds = discover_datasets(base, "6.0.0/").unwrap();
-        eprintln!("datasets: {:?}", ds.iter().map(|d| (&d.name, &d.path)).collect::<Vec<_>>());
-        assert_eq!(ds.len(), 1);
-        assert!(ds[0].path.is_empty());
-
-        let m = fetch_manifest(base, "6.0.0/", &ds[0].path).unwrap();
-        eprintln!("manifest: {:?} {:?}", m.state_name, m.themes);
-        assert_eq!(m.themes.len(), 3);
-
-        // Every theme URL must actually resolve.
-        for (theme, rows) in &m.themes {
-            let url = theme_url(base, "6.0.0/", &ds[0].path, theme);
-            let ok = exists(&url).unwrap();
-            eprintln!("{theme}: {rows} rows -> {url} [{}]", if ok { "OK" } else { "MISSING" });
-            assert!(ok, "{url}");
         }
     }
 }
