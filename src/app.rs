@@ -5985,7 +5985,7 @@ impl ViewerApp {
                                                             let mut on =
                                                                 b.checked.contains(theme);
                                                             if ui
-                                                                .checkbox(&mut on, theme)
+                                                                .checkbox(&mut on, m.display(theme))
                                                                 .changed()
                                                             {
                                                                 if on {
@@ -6038,9 +6038,9 @@ impl ViewerApp {
                                                                 len: 0,
                                                             },
                                                             if code.is_empty() {
-                                                                theme.clone()
+                                                                m.display(theme)
                                                             } else {
-                                                                format!("{code} {theme}")
+                                                                format!("{code} {}", m.display(theme))
                                                             },
                                                         ),
                                                         RepoKind::Stac => (

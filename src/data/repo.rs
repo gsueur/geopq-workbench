@@ -978,8 +978,23 @@ pub fn discover_datasets(base: &str, snapshot: &str) -> Result<Vec<Dataset>, Str
 pub struct Manifest {
     pub state_name: Option<String>,
     pub total_features: Option<u64>,
-    /// (theme, feature count), manifest order.
+    /// (theme, feature count), manifest order, or label order when the
+    /// manifest has labels.
     pub themes: Vec<(String, u64)>,
+    /// Readable names for themes that are codes: the NFHL names its files
+    /// by FEMA delivery id (48201C) and labels each with its county
+    /// ("Harris"). Empty for repositories whose themes are already names.
+    pub labels: BTreeMap<String, String>,
+}
+
+impl Manifest {
+    /// What the list shows for a theme: "Harris (48201C)", or the theme.
+    pub fn display(&self, theme: &str) -> String {
+        match self.labels.get(theme) {
+            Some(l) => format!("{l} ({theme})"),
+            None => theme.to_string(),
+        }
+    }
 }
 
 /// Prefix of a dataset's files, snapshot included. A repository holding
@@ -997,7 +1012,11 @@ fn dataset_prefix(snapshot: &str, path: &str) -> String {
 pub fn fetch_manifest(base: &str, snapshot: &str, path: &str) -> Result<Manifest, String> {
     let url = format!("{base}/{}_manifest.json", dataset_prefix(snapshot, path));
     let v = get_json(&url)?.ok_or_else(|| format!("{url}: not found"))?;
-    let themes = v
+    Ok(parse_manifest(&v))
+}
+
+fn parse_manifest(v: &Value) -> Manifest {
+    let mut themes: Vec<(String, u64)> = v
         .get("themes")
         .and_then(Value::as_object)
         .map(|m| {
@@ -1006,14 +1025,28 @@ pub fn fetch_manifest(base: &str, snapshot: &str, path: &str) -> Result<Manifest
                 .collect()
         })
         .unwrap_or_default();
-    Ok(Manifest {
+    let labels: BTreeMap<String, String> = v
+        .get("labels")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    // A reader looks a county up by name, not by code.
+    if !labels.is_empty() {
+        themes.sort_by_cached_key(|(t, _)| (labels.get(t).map(|l| l.to_lowercase()), t.clone()));
+    }
+    Manifest {
         state_name: v
             .get("state_name")
             .and_then(Value::as_str)
             .map(String::from),
         total_features: v.get("total_features").and_then(Value::as_u64),
         themes,
-    })
+        labels,
+    }
 }
 
 pub fn theme_url(base: &str, snapshot: &str, path: &str, theme: &str) -> String {
@@ -1255,6 +1288,7 @@ pub fn fetch_stac_manifest(base: &str, snapshot: &str, theme: &str) -> Result<Ma
         state_name: Some(theme.to_string()),
         total_features: None,
         themes: out.into_inner().unwrap().into_iter().flatten().collect(),
+        labels: BTreeMap::new(),
     })
 }
 
@@ -2356,6 +2390,23 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn manifest_labels_name_and_order_the_themes() {
+        let m = parse_manifest(&serde_json::json!({
+            "state_name": "Texas",
+            "themes": {"48001C": 3, "48157C": 2, "48201C": 1},
+            "labels": {"48001C": "Anderson", "48157C": "Fort Bend", "48201C": "Harris"},
+        }));
+        assert_eq!(m.display("48201C"), "Harris (48201C)");
+        let order: Vec<&str> = m.themes.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(order, ["48001C", "48157C", "48201C"]);
+
+        // Without labels: manifest order, themes shown as they are.
+        let m = parse_manifest(&serde_json::json!({"themes": {"roads": 2, "buildings": 1}}));
+        assert!(m.labels.is_empty());
+        assert_eq!(m.display("roads"), "roads");
+    }
 
     /// Loopback HTTP responder: answers every request with `status` and an
     /// empty body, counting requests. Returns the base URL (no path).
