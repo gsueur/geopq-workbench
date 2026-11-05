@@ -630,8 +630,18 @@ target/release/geopq-cli --input roads.gpkg --layer roads \
 It wraps the same import (`data::gpkg`/`shp`/`geojson`) and optimize
 (`data::optimize`) machinery the GUI dialogs call, opens no window,
 and touches no GPU — `geopq-cli --help` lists every flag (format
-flavor, row group size and bytes, compression, Hilbert sort, covering
-column, H3 resolution, partitioning, COGP levels).
+flavor, row group size and bytes, compression, bloom filters, Hilbert
+sort, covering column, H3 resolution, partitioning, COGP levels).
+
+`--bloom` picks the bloom filters: `preserve` (default) keeps the ones
+the source has, `all` writes one on every string, binary, integer and
+date attribute column, `none` writes none. A Hilbert-sorted file spreads
+any id across every row group's min/max range, so `--bloom all` is what
+lets a `WHERE id = ...` lookup skip row groups:
+
+```bash
+geopq-cli --input sites.parquet --output sites_bloom.parquet --bloom all
+```
 
 Sources are the ones the Import dialog takes — `.gpkg`, `.shp`,
 `.geojson` — plus `.parquet`, which skips the import and goes straight

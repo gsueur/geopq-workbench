@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use geopq_workbench::data::import::ImportFormat;
 use geopq_workbench::data::info::fmt_bytes;
-use geopq_workbench::data::optimize::{self, Codec, GpVersion, OptimizeOptions, OptimizeReport};
+use geopq_workbench::data::optimize::{
+    self, BloomMode, Codec, GpVersion, OptimizeOptions, OptimizeReport,
+};
 use geopq_workbench::data::partition::PartitionBy;
 use geopq_workbench::data::source::Source;
 use geopq_workbench::data::{geojson, gpkg, settings, shp};
@@ -48,6 +50,13 @@ struct Cli {
     /// Compression codec.
     #[arg(long, value_enum, default_value = "zstd")]
     compression: CompressionArg,
+
+    /// Bloom filters: keep the ones found in the source (`preserve`),
+    /// write one on every string/binary/integer/date attribute column
+    /// (`all`, for fast `WHERE id = ...` lookups in a spatially sorted
+    /// file), or write none.
+    #[arg(long, value_enum, default_value = "preserve")]
+    bloom: BloomArg,
 
     /// Skip the Hilbert spatial sort (on by default — it's what makes
     /// row-group bboxes prunable instead of all covering the whole extent).
@@ -105,6 +114,13 @@ enum FormatArg {
     Wkb,
     Geoarrow,
     Native2,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy)]
+enum BloomArg {
+    Preserve,
+    All,
+    None,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy)]
@@ -263,6 +279,11 @@ fn options(cli: &Cli) -> Result<OptimizeOptions, String> {
             CompressionArg::Zstd => Codec::Zstd,
             CompressionArg::Snappy => Codec::Snappy,
             CompressionArg::None => Codec::Uncompressed,
+        },
+        bloom: match cli.bloom {
+            BloomArg::Preserve => BloomMode::Preserve,
+            BloomArg::All => BloomMode::AllAttributes,
+            BloomArg::None => BloomMode::None,
         },
         hilbert_sort: !cli.no_hilbert,
         covering: !cli.no_covering,

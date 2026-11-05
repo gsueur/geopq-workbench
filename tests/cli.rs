@@ -359,3 +359,37 @@ fn refuses_impossible_flag_combinations_before_doing_any_work() {
     ]);
     assert!(!out.status.success());
 }
+
+/// Bloom filters on the attribute columns of every row group, read back
+/// from the footer `--bloom all` wrote.
+fn bloom_columns(path: &Path) -> Vec<String> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let reader = SerializedFileReader::new(std::fs::File::open(path).expect("open output"))
+        .expect("parquet footer");
+    let rg = reader.metadata().row_group(0);
+    rg.columns()
+        .iter()
+        .filter(|c| c.bloom_filter_offset().is_some())
+        .map(|c| c.column_path().string())
+        .collect()
+}
+
+#[test]
+fn writes_bloom_filters_on_request() {
+    let scratch = Scratch::new("bloom");
+    let src = scratch.path("points.geojson");
+    write_geojson(&src);
+
+    let all = scratch.path("all.parquet");
+    stdout_ok(&["--input", src.to_str().unwrap(), "--output", all.to_str().unwrap(), "--bloom", "all"]);
+    let cols = bloom_columns(&all);
+    assert!(cols.iter().any(|c| c == "region"), "bloom columns: {cols:?}");
+    // The geometry and the covering bbox are never bloom-filtered.
+    assert!(cols.iter().all(|c| c == "region"), "bloom columns: {cols:?}");
+    assert_eq!(open(Source::Local(all)).rows, 2);
+
+    // The default keeps the source's filters; a GeoJSON has none.
+    let default = scratch.path("default.parquet");
+    stdout_ok(&["--input", src.to_str().unwrap(), "--output", default.to_str().unwrap()]);
+    assert!(bloom_columns(&default).is_empty());
+}
