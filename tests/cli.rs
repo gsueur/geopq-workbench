@@ -393,3 +393,114 @@ fn writes_bloom_filters_on_request() {
     stdout_ok(&["--input", src.to_str().unwrap(), "--output", default.to_str().unwrap()]);
     assert!(bloom_columns(&default).is_empty());
 }
+
+/// File-level key-value metadata of a written output, as (key, value) in
+/// footer order.
+fn kv_metadata(path: &Path) -> Vec<(String, String)> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let reader = SerializedFileReader::new(std::fs::File::open(path).expect("open output"))
+        .expect("parquet footer");
+    reader
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|kv| (kv.key, kv.value.unwrap_or_default()))
+        .collect()
+}
+
+fn kv_value<'a>(kv: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    kv.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+}
+
+#[test]
+fn sets_replaces_and_drops_key_value_metadata() {
+    let scratch = Scratch::new("kv");
+    let src = scratch.path("points.geojson");
+    write_geojson(&src);
+
+    // First pass: add two keys. A value may itself contain '=' and spaces.
+    let first = scratch.path("first.parquet");
+    stdout_ok(&[
+        "--input",
+        src.to_str().unwrap(),
+        "--output",
+        first.to_str().unwrap(),
+        "--kv",
+        "license=Terms at https://example.org/legal?a=b (no commercial use)",
+        "--kv",
+        "citation=Example (2026)",
+    ]);
+    let kv = kv_metadata(&first);
+    assert_eq!(
+        kv_value(&kv, "license"),
+        Some("Terms at https://example.org/legal?a=b (no commercial use)")
+    );
+    assert_eq!(kv_value(&kv, "citation"), Some("Example (2026)"));
+    assert!(kv_value(&kv, "geo").is_some(), "geo still written: {kv:?}");
+
+    // Second pass over that output: source keys carry over unless
+    // replaced or dropped, and a replaced key appears once.
+    let second = scratch.path("second.parquet");
+    stdout_ok(&[
+        "--input",
+        first.to_str().unwrap(),
+        "--output",
+        second.to_str().unwrap(),
+        "--kv",
+        "license=New terms",
+        "--drop-kv",
+        "citation",
+        "--drop-kv",
+        "not-there",
+    ]);
+    let kv = kv_metadata(&second);
+    assert_eq!(kv_value(&kv, "license"), Some("New terms"));
+    assert_eq!(
+        kv.iter().filter(|(k, _)| k == "license").count(),
+        1,
+        "{kv:?}"
+    );
+    assert_eq!(kv_value(&kv, "citation"), None, "{kv:?}");
+    assert_eq!(open(Source::Local(second.clone())).rows, 2);
+
+    // Without the flags, source keys pass through unchanged.
+    let third = scratch.path("third.parquet");
+    stdout_ok(&[
+        "--input",
+        second.to_str().unwrap(),
+        "--output",
+        third.to_str().unwrap(),
+    ]);
+    assert_eq!(kv_value(&kv_metadata(&third), "license"), Some("New terms"));
+
+    // Mistakes in the calling script fail before any work.
+    for (args, expect) in [
+        (vec!["--kv", "license"], "KEY=VALUE"),
+        (vec!["--kv", "=x"], "empty key"),
+        (vec!["--kv", "geo={}"], "cannot set 'geo'"),
+        (vec!["--kv", "cogp=1"], "cannot set 'cogp'"),
+        (
+            vec!["--drop-kv", "ARROW:schema"],
+            "cannot drop 'ARROW:schema'",
+        ),
+        (vec!["--kv", "a=1", "--kv", "a=2"], "twice"),
+        (vec!["--kv", "a=1", "--drop-kv", "a"], "both set"),
+    ] {
+        let dst = scratch.path("never-written-kv");
+        let mut full = vec![
+            "--input",
+            src.to_str().unwrap(),
+            "--output",
+            dst.to_str().unwrap(),
+        ];
+        full.extend_from_slice(&args);
+        let out = run(&full);
+        assert!(!out.status.success(), "{args:?} should have failed");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(expect), "{args:?}: stderr was {err:?}");
+        assert!(!dst.exists(), "{args:?} wrote an output anyway");
+    }
+}

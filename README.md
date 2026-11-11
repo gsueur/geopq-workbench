@@ -643,6 +643,20 @@ lets a `WHERE id = ...` lookup skip row groups:
 geopq-cli --input sites.parquet --output sites_bloom.parquet --bloom all
 ```
 
+File-level key-value metadata from the source passes through, except the
+keys the optimize pass rebuilds (`geo`, `ARROW:schema`, `cogp`). `--kv
+KEY=VALUE` sets a key (repeatable; it replaces the source's value), and
+`--drop-kv KEY` leaves a source key out. Typical use: put the licence
+and citation in plain keys any Parquet reader lists, and drop a writer's
+options that no longer describe the re-laid-out file:
+
+```bash
+geopq-cli --input sites_gdal.parquet --output sites.parquet \
+  --kv "license=CC BY 4.0, https://example.org/terms" \
+  --kv "citation=Example Org (2026), Sites dataset" \
+  --drop-kv gdal:creation-options
+```
+
 Sources are the ones the Import dialog takes — `.gpkg`, `.shp`,
 `.geojson` — plus `.parquet`, which skips the import and goes straight
 to the optimize pass. That last one is how you re-optimize an existing
