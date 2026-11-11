@@ -104,6 +104,18 @@ struct Cli {
     #[arg(long)]
     cogp: bool,
 
+    /// Set a file-level key-value metadata entry, `KEY=VALUE` (repeatable),
+    /// e.g. `--kv license="..." --kv citation="..."`. Replaces the
+    /// source's value for that key. `geo`, `ARROW:schema`, `cogp` and
+    /// `geopq:pyramid` are written by this tool and cannot be set.
+    #[arg(long = "kv", value_name = "KEY=VALUE")]
+    kv: Vec<String>,
+
+    /// Do not carry this source key-value metadata key over (repeatable),
+    /// e.g. `--drop-kv gdal:creation-options`.
+    #[arg(long = "drop-kv", value_name = "KEY")]
+    drop_kv: Vec<String>,
+
     /// List the tables in --input and exit, instead of converting.
     #[arg(long)]
     list_layers: bool,
@@ -270,6 +282,7 @@ fn options(cli: &Cli) -> Result<OptimizeOptions, String> {
     if cli.row_group_mib == 0 {
         return Err("--row-group-mib must be positive".into());
     }
+    let (kv_set, kv_drop) = kv_options(&cli.kv, &cli.drop_kv)?;
 
     Ok(OptimizeOptions {
         version,
@@ -290,8 +303,48 @@ fn options(cli: &Cli) -> Result<OptimizeOptions, String> {
         h3_resolution: cli.h3,
         partition,
         cogp,
+        kv_set,
+        kv_drop,
         ..Default::default()
     })
+}
+
+/// `--kv KEY=VALUE` and `--drop-kv KEY`, checked: a key this tool writes
+/// itself, a key given twice, or a key both set and dropped is a mistake
+/// in the calling script, so it fails before any work rather than
+/// writing a file whose metadata is not what the script asked for.
+fn kv_options(
+    set: &[String],
+    drop: &[String],
+) -> Result<(Vec<(String, String)>, Vec<String>), String> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for arg in set {
+        let (k, v) = arg
+            .split_once('=')
+            .ok_or_else(|| format!("--kv expects KEY=VALUE, got {arg:?}"))?;
+        if k.is_empty() {
+            return Err(format!("--kv has an empty key: {arg:?}"));
+        }
+        if optimize::is_rebuilt_kv_key(k) {
+            return Err(format!("--kv cannot set '{k}': geopq-cli writes it"));
+        }
+        if pairs.iter().any(|(p, _)| p == k) {
+            return Err(format!("--kv sets '{k}' twice"));
+        }
+        pairs.push((k.to_string(), v.to_string()));
+    }
+    for k in drop {
+        if k.is_empty() {
+            return Err("--drop-kv has an empty key".into());
+        }
+        if optimize::is_rebuilt_kv_key(k) {
+            return Err(format!("--drop-kv cannot drop '{k}': geopq-cli writes it"));
+        }
+        if pairs.iter().any(|(p, _)| p == k) {
+            return Err(format!("'{k}' is both set (--kv) and dropped (--drop-kv)"));
+        }
+    }
+    Ok((pairs, drop.to_vec()))
 }
 
 /// The one line stdout gets on success, so a shell pipeline has something

@@ -789,6 +789,25 @@ pub struct OptimizeOptions {
     /// coordinate columns (x/lon, y/lat) — materializes x/y layers into
     /// real GeoParquet.
     pub xy_geom: Option<(usize, usize)>,
+    /// File-level key-value metadata to write, in order, after the
+    /// source's pass-through keys. A key set here replaces the source's
+    /// value instead of appearing twice. Keys this pass rebuilds itself
+    /// (see [`is_rebuilt_kv_key`]) are refused by callers.
+    pub kv_set: Vec<(String, String)>,
+    /// Source key-value metadata keys not to carry over, e.g. a writer's
+    /// `gdal:creation-options` that no longer describes the re-laid-out
+    /// file.
+    pub kv_drop: Vec<String>,
+}
+
+/// Key-value metadata keys the optimize pass writes itself, so a caller
+/// cannot set them: `geo` and `cogp` are rebuilt from the new layout,
+/// `ARROW:schema` comes from the Arrow writer, and the pyramid key is
+/// written only for pyramid files.
+pub fn is_rebuilt_kv_key(key: &str) -> bool {
+    matches!(key, "geo" | "ARROW:schema")
+        || key == super::cogp::KEY
+        || key == super::pyramid::FILE_KEY
 }
 
 impl Default for OptimizeOptions {
@@ -811,6 +830,8 @@ impl Default for OptimizeOptions {
             cogp: None,
             pyramid: None,
             xy_geom: None,
+            kv_set: Vec::new(),
+            kv_drop: Vec::new(),
         }
     }
 }
@@ -3058,9 +3079,19 @@ pub fn optimize(
             // and carrying them onto a file this pass has just re-laid out
             // would publish a confidently wrong index.
             for entry in kv.iter().filter(|kv| {
-                kv.key != "geo" && kv.key != "ARROW:schema" && kv.key != super::cogp::KEY
+                kv.key != "geo"
+                    && kv.key != "ARROW:schema"
+                    && kv.key != super::cogp::KEY
+                    && !opts.kv_drop.contains(&kv.key)
+                    && !opts.kv_set.iter().any(|(k, _)| *k == kv.key)
             }) {
                 writer.append_key_value_metadata(entry.clone());
+            }
+            for (k, v) in &opts.kv_set {
+                writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+                    k.clone(),
+                    v.clone(),
+                ));
             }
             open.push(PartWriter { writer, part: pi });
         }
